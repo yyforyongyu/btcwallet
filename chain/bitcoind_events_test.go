@@ -12,10 +12,10 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/integration/rpctest"
-	oldrpcclient "github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/rpcclient"
+	"github.com/btcsuite/btcwallet/rpctest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -244,7 +244,7 @@ func testReorg(t *testing.T, miner1, miner2 *rpctest.Harness,
 	}
 
 	// Now disconnect the two miners.
-	err = miner1.Client.AddNode(miner2.P2PAddress(), oldrpcclient.ANRemove)
+	err = miner1.Client.AddNode(miner2.P2PAddress(), rpcclient.ANRemove)
 	require.NoError(err)
 
 	// Generate 5 blocks on miner2.
