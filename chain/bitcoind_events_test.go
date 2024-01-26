@@ -13,7 +13,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/integration/rpctest"
-	"github.com/btcsuite/btcd/rpcclient"
+	oldrpcclient "github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/stretchr/testify/require"
@@ -244,7 +244,7 @@ func testReorg(t *testing.T, miner1, miner2 *rpctest.Harness,
 	}
 
 	// Now disconnect the two miners.
-	err = miner1.Client.AddNode(miner2.P2PAddress(), rpcclient.ANRemove)
+	err = miner1.Client.AddNode(miner2.P2PAddress(), oldrpcclient.ANRemove)
 	require.NoError(err)
 
 	// Generate 5 blocks on miner2.
@@ -427,7 +427,8 @@ func setupBitcoind(t *testing.T, minerAddr string,
 
 	rpcPort := rand.Int()%(65536-1024) + 1024
 	bitcoind := exec.Command(
-		"bitcoind",
+		// "bitcoind",
+		"/Users/yong/Projects/lightning_labs/bitcoin/src/bitcoind",
 		"-datadir="+tempBitcoindDir,
 		"-regtest",
 		"-connect="+minerAddr,

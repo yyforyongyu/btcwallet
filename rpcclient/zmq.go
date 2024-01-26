@@ -3,7 +3,7 @@ package rpcclient
 import (
 	"encoding/json"
 
-	"github.com/btcsuite/btcd/btcjson"
+	"github.com/btcsuite/btcwallet/btcjson"
 )
 
 // FutureGetZmqNotificationsResult is a future promise to deliver the result of

@@ -6,13 +6,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/gcs"
 	"github.com/btcsuite/btcd/btcutil/gcs/builder"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/rpcclient"
+	"github.com/btcsuite/btcwallet/btcjson"
+
+	oldrpcclient "github.com/btcsuite/btcd/rpcclient"
+
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
@@ -474,7 +476,7 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 
 	s.clientMtx.Lock()
 	newRescan := s.newRescan(
-		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+		neutrino.NotificationHandlers(oldrpcclient.NotificationHandlers{
 			OnBlockConnected:         s.onBlockConnected,
 			OnFilteredBlockConnected: s.onFilteredBlockConnected,
 			OnBlockDisconnected:      s.onBlockDisconnected,
@@ -530,7 +532,7 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 
 	// Rescan with just the specified addresses.
 	newRescan := s.newRescan(
-		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
+		neutrino.NotificationHandlers(oldrpcclient.NotificationHandlers{
 			OnBlockConnected:         s.onBlockConnected,
 			OnFilteredBlockConnected: s.onFilteredBlockConnected,
 			OnBlockDisconnected:      s.onBlockDisconnected,
