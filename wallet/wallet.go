@@ -11,21 +11,21 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcwallet/btcjson"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/btcjson"
 	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/rpcclient"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
@@ -3770,6 +3770,9 @@ func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
 		return &txid, nil
 	}
 
+	// TODO(yy): consider returning the rpcclient errors directly and let
+	// the upper layers handle the errors, which can be useful for
+	// validating RBF rules.
 	returnErr = MapBroadcastBackendError(err)
 
 	var errInMempool *ErrInMempool
@@ -4045,23 +4048,6 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 	return w, nil
 }
 
-// matchBitcoindErr takes an error returned from bitcoind RPC client and
-// matches it against the specified string. If the expected string pattern is
-// found in the error passed, return true.
-func matchBitcoindErr(err error, s string) bool {
-	// Replace all dashes found in the error string with spaces.
-	strippedErrStr := strings.Replace(err.Error(), "-", " ", -1)
-
-	// Replace all dashes found in the error string with spaces.
-	strippedMatchStr := strings.Replace(s, "-", " ", -1)
-
-	// Match against the lowercase.
-	return strings.Contains(
-		strings.ToLower(strippedErrStr),
-		strings.ToLower(strippedMatchStr),
-	)
-}
-
 // MapBroadcastBackendError maps the different backend errors when broadcasting
 // a transaction to the bitcoin network to an internal error type.
 func MapBroadcastBackendError(err error) error {
@@ -4078,21 +4064,8 @@ func MapBroadcastBackendError(err error) error {
 	case err == nil:
 		return nil
 
-	// Since we have different backends that can be used with the wallet,
-	// we'll need to check specific errors for each one.
-	//
 	// If the transaction is already in the mempool, we can just return now.
-	//
-	// This error is returned when broadcasting/sending a transaction to a
-	// btcd node that already has it in their mempool.
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L953
-	case matchBitcoindErr(err, "already have transaction"):
-		fallthrough
-
-	// This error is returned when broadcasting a transaction to a bitcoind
-	// node that already has it in their mempool.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L590
-	case matchBitcoindErr(err, "txn-already-in-mempool"):
+	case errors.Is(err, rpcclient.ErrTxAlreadyInMempool):
 		return &ErrInMempool{
 			backendError: err,
 		}
@@ -4101,141 +4074,95 @@ func MapBroadcastBackendError(err error) error {
 	// from the unconfirmed store as it should already exist within the
 	// confirmed store. We'll avoid returning an error as the broadcast was
 	// in a sense successful.
-	//
-	// This error is returned when sending a transaction that has already
-	// confirmed to a btcd/bitcoind node over RPC.
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/rpcserver.go#L3355
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/node/transaction.cpp#L36
 	case rpcTxConfirmed:
 		fallthrough
 
 	// This error is returned when broadcasting a transaction that has
 	// already confirmed to a btcd node over the P2P network.
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L1036
-	case matchBitcoindErr(err, "transaction already exists"):
-		fallthrough
-
-	// This error is returned when broadcasting a transaction that has
-	// already confirmed to a bitcoind node over the P2P network.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L648
-	case matchBitcoindErr(err, "txn-already-known"):
+	case errors.Is(err, rpcclient.ErrTxAlreadyKnown):
 		return &ErrAlreadyConfirmed{
 			backendError: err,
 		}
 
-	// If the transactions is invalid since it attempts to double spend a
+		// If the transactions is invalid since it attempts to double spend a
 	// transaction already in the mempool or in the chain, we'll remove it
 	// from the store and return an error.
+
+	// This error is returned from rpcclient when there is already a
+	// transaction not signaling replacement in the mempool that spends one
+	// of the referenced outputs.
 	//
-	// This error is returned from btcd when there is already a transaction
-	// not signaling replacement in the mempool that spends one of the
-	// referenced outputs.
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L591
-	case matchBitcoindErr(err, "already spent"):
+	// TODO(yy): move to RBF error?
+	case errors.Is(err, rpcclient.ErrMempoolConflict):
 		fallthrough
 
-	// This error is returned from btcd when a referenced output cannot be
-	// found, meaning it etiher has been spent or doesn't exist.
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/blockchain/chain.go#L405
-	case matchBitcoindErr(err, "already been spent"):
-		fallthrough
-
-	// This error is returned from btcd when a transaction is spending
-	// either output that is missing or already spent, and orphans aren't
-	// allowed.
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L1409
-	case matchBitcoindErr(err, "orphan transaction"):
-		fallthrough
-
-	// Error returned from bitcoind when output was spent by other
-	// non-replacable transaction already in the mempool.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L622
-	case matchBitcoindErr(err, "txn-mempool-conflict"):
-		fallthrough
-
-	// Returned by bitcoind on the RPC when broadcasting a transaction that
-	// is spending either output that is missing or already spent.
-	//
-	// https://github.com/bitcoin/bitcoin/blob/3ba8de1b704d590fa4e1975620bd21d830d11666/test/functional/mempool_accept.py#L163C1-L163C1
-	case matchBitcoindErr(err, "missing-inputs") ||
-		matchBitcoindErr(err, "bad-txns-inputs-missingorspent"):
-
+	case errors.Is(err, rpcclient.ErrMissingInputs):
 		returnErr = &ErrDoubleSpend{
 			backendError: err,
 		}
 
-	// Returned by bitcoind if the transaction spends outputs that would be
-	// replaced by it.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L790
-	case matchBitcoindErr(err, "bad-txns-spends-conflicting-tx"):
+	// Returned by rpcclient if the transaction spends outputs that would
+	// be replaced by it.
+	//
+	// TODO(yy): double check.
+	case errors.Is(err, rpcclient.ErrConflictingTx):
 		fallthrough
 
-	// Returned by bitcoind when a replacement transaction did not have
+	// Returned by rpcclient when a replacement transaction did not have
 	// enough fee.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L830
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L894
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L904
-	case matchBitcoindErr(err, "insufficient fee"):
+	case errors.Is(err, rpcclient.ErrInsufficientFee):
 		fallthrough
 
-	// Returned by bitcoind in case the transaction would replace too many
+	// Returned by rpcclient in case the transaction would replace too many
 	// transaction in the mempool.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L858
-	case matchBitcoindErr(err, "too many potential replacements"):
+	case errors.Is(err, rpcclient.ErrTooManyReplacements):
 		fallthrough
 
-	// Returned by bitcoind if the transaction spends an output that is
+	// Returned by rpcclient if the transaction spends an output that is
 	// unconfimed and not spent by the transaction it replaces.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L882
-	case matchBitcoindErr(err, "replacement-adds-unconfirmed"):
+	case errors.Is(err, rpcclient.ErrReplacementAddsUnconfirmed):
 		fallthrough
 
-	// Returned by btcd when replacement transaction was rejected for
-	// whatever reason.
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L841
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L854
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L875
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L896
-	// https://github.com/btcsuite/btcd/blob/130ea5bddde33df32b06a1cdb42a6316eb73cff5/mempool/mempool.go#L913
-	case matchBitcoindErr(err, "replacement transaction"):
-		returnErr = &ErrReplacement{
-			backendError: err,
-		}
-
-	// Returned by bitcoind when a transaction does not meet the fee
-	// requirements to be accepted into mempool. This happens when the
-	// mempool reached its limits and is now purging low fee transactions.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L510
-	case matchBitcoindErr(err, "mempool min fee not met"):
-		fallthrough
-
-	// Returned by btcd when a transaction does not meet the fee
-	// requirements to be accepted into mempool.
-	// https://github.com/btcsuite/btcd/blob/9c16d23918b15c468c5647c388b9b7db3bc48dc7/mempool/mempool.go#L1151
-	case matchBitcoindErr(err, "fees which is under the required amount"):
-		fallthrough
-
-	// Returned by btcd when a transaction does not meet the fee
-	// requirements to be accepted into mempool. The error states priority
-	// but decreasing the min relay fee prevents checking for the priority
-	// in the first place therefore we consider this a mempool fee error.
-	// https://github.com/btcsuite/btcd/blob/9c16d23918b15c468c5647c388b9b7db3bc48dc7/mempool/mempool.go#L1162
-	case matchBitcoindErr(err, "has insufficient priority"):
-		fallthrough
-
-	// Returned by bitcoind when a transaction does not meet the fee
+	// Returned by rpcclient when a transaction does not meet the fee
 	// requirements to be accepted into mempool because the policy of the
 	// mempool has a higher min relay fee. Default value for bitcoind is
 	// 1000 sat/kvbyte but this is configurable.
-	// https://github.com/bitcoin/bitcoin/blob/9bf5768dd628b3a7c30dd42b5ed477a92c4d3540/src/validation.cpp#L514
-	case matchBitcoindErr(err, "min relay fee not met"):
+	case errors.Is(err, rpcclient.ErrBelowOutValue):
 		returnErr = &ErrMempoolFee{
 			backendError: err,
 		}
 
+	// TODO(yy): define and match the following errors:
+	// case errors.Is(err, rpcclient.ErrEmptyOutput):
+	// case errors.Is(err, rpcclient.ErrEmptyInput):
+	// case errors.Is(err, rpcclient.ErrTxTooSmall):
+	// case errors.Is(err, rpcclient.ErrTxTooLarge):
+	// case errors.Is(err, rpcclient.ErrDuplicateInput):
+	// case errors.Is(err, rpcclient.ErrEmptyPrevOut):
+	// case errors.Is(err, rpcclient.ErrNegativeOutput):
+	// case errors.Is(err, rpcclient.ErrLargeOutput):
+	// case errors.Is(err, rpcclient.ErrLargeTotalOutput):
+	// case errors.Is(err, rpcclient.ErrScriptVerifyFlag):
+	// case errors.Is(err, rpcclient.ErrTooManySigOps):
+	// case errors.Is(err, rpcclient.ErrInvalidOpcode):
+	// case errors.Is(err, rpcclient.ErrOversizeTx):
+	// case errors.Is(err, rpcclient.ErrCoinbaseTx):
+	// case errors.Is(err, rpcclient.ErrNonStandardVersion):
+	// case errors.Is(err, rpcclient.ErrNonStandardScript):
+	// case errors.Is(err, rpcclient.ErrBareMultiSig):
+	// case errors.Is(err, rpcclient.ErrScriptSigNotPushOnly):
+	// case errors.Is(err, rpcclient.ErrScriptSigSize):
+	// case errors.Is(err, rpcclient.ErrDust):
+	// case errors.Is(err, rpcclient.ErrMultiOpReturn):
+	// case errors.Is(err, rpcclient.ErrNonFinal):
+	// case errors.Is(err, rpcclient.ErrNonBIP68Final):
+	// case errors.Is(err, rpcclient.ErrSameNonWitnessData):
+	// case errors.Is(err, rpcclient.ErrNonMandatoryScriptVerifyFlag):
+	// case errors.Is(err, rpcclient.ErrMaxFeeExceeded):
+
 	// We received an error not matching any of the above cases.
 	default:
-		returnErr = fmt.Errorf("unmatched backend error: %v", err)
+		returnErr = fmt.Errorf("unmatched backend error: %w", err)
 	}
 
 	return returnErr
