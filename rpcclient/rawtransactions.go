@@ -10,10 +10,10 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/btcsuite/btcwallet/btcjson"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/btcjson"
 )
 
 const (
@@ -321,7 +321,7 @@ type FutureSendRawTransactionResult chan *Response
 func (r FutureSendRawTransactionResult) Receive() (*chainhash.Hash, error) {
 	res, err := ReceiveFuture(r)
 	if err != nil {
-		return nil, err
+		return nil, MapRPCErr(err)
 	}
 
 	// Unmarshal result as a string.
