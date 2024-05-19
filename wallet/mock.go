@@ -42,6 +42,12 @@ func (m *mockChainClient) GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader,
 	return nil, nil
 }
 
+func (m *mockChainClient) GetBlockHeaderVerbose(
+	*chainhash.Hash) (*btcjson.GetBlockHeaderVerboseResult, error) {
+
+	return nil, nil
+}
+
 func (m *mockChainClient) IsCurrent() bool {
 	return false
 }

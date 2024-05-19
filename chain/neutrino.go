@@ -209,6 +209,15 @@ func (s *NeutrinoClient) GetBlockHeader(
 	return s.CS.GetBlockHeader(blockHash)
 }
 
+// GetBlockHeader returns the block header for the given block hash, or an error
+// if the client has been shut down or the hash doesn't exist or is unknown.
+func (s *NeutrinoClient) GetBlockHeaderVerbose(
+	blockHash *chainhash.Hash) (*btcjson.GetBlockHeaderVerboseResult,
+	error) {
+
+	return nil, ErrUnimplemented
+}
+
 // IsCurrent returns whether the chain backend considers its view of the network
 // as "current".
 func (s *NeutrinoClient) IsCurrent() bool {
