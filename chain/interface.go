@@ -39,6 +39,7 @@ type Interface interface {
 	GetBlock(*chainhash.Hash) (*wire.MsgBlock, error)
 	GetBlockHash(int64) (*chainhash.Hash, error)
 	GetBlockHeader(*chainhash.Hash) (*wire.BlockHeader, error)
+	GetBlockHeaderVerbose(*chainhash.Hash) (*btcjson.GetBlockHeaderVerboseResult, error)
 	IsCurrent() bool
 	FilterBlocks(*FilterBlocksRequest) (*FilterBlocksResponse, error)
 	BlockStamp() (*waddrmgr.BlockStamp, error)
