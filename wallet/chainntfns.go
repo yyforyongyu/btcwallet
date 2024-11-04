@@ -6,6 +6,7 @@ package wallet
 
 import (
 	"bytes"
+	"errors"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -242,6 +243,9 @@ func (w *Wallet) handleChainNotifications() {
 // the passed block.
 func (w *Wallet) connectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) error {
 	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
+	if addrmgrNs == nil {
+		return errors.New("empty waddrmgr bucket")
+	}
 
 	bs := waddrmgr.BlockStamp{
 		Height:    b.Height,
