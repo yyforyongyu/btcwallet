@@ -399,6 +399,23 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	isDevEnv := w.isDevEnv()
 	backend := chainClient.BackEnd()
 
+	// Finally, we'll trigger a wallet rescan and request notifications for
+	// transactions sending to all wallet addresses and spending all wallet
+	// UTXOs.
+	var (
+		addrs   []btcutil.Address
+		unspent []wtxmgr.Credit
+	)
+	err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
+		addrs, unspent, err = w.activeData(dbtx)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+
+	// isEmpty := len(addrs) == 0 && len(unspent) == 0
+
 	// Neutrino relies on the information given to it by the cfheader server
 	// so it knows exactly whether it's synced up to the server's state or
 	// not, even on dev chains. To recover a Neutrino wallet, we need to
@@ -444,6 +461,18 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 		// we persist this height to ensure we don't store any blocks
 		// before it.
 		startHeight := birthdayStamp.Height
+
+		// if isDevEnv && isEmpty {
+		// 	w.SetChainSynced(true)
+		// 	_, bestHeight, err := chainClient.GetBestBlock()
+		// 	if err != nil {
+		// 		return err
+		// 	}
+
+		// 	startHeight = bestHeight
+		// 	log.Warnf("Fastforwarding synced block to current "+
+		// 		"height %v for empty wallet", startHeight)
+		// }
 
 		// With the starting height obtained, get the remaining block
 		// details required by the wallet.
@@ -521,6 +550,8 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 			return nil
 		}
 
+		log.Debugf("Rolling back to block %v", rollbackStamp)
+
 		// Otherwise, we'll mark this as our new synced height.
 		err := w.Manager.SetSyncedTo(addrmgrNs, &rollbackStamp)
 		if err != nil {
@@ -560,21 +591,6 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 	// notification re-registrations, in which case the code here should be
 	// left as is.
 	if err := chainClient.NotifyBlocks(); err != nil {
-		return err
-	}
-
-	// Finally, we'll trigger a wallet rescan and request notifications for
-	// transactions sending to all wallet addresses and spending all wallet
-	// UTXOs.
-	var (
-		addrs   []btcutil.Address
-		unspent []wtxmgr.Credit
-	)
-	err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
-		addrs, unspent, err = w.activeData(dbtx)
-		return err
-	})
-	if err != nil {
 		return err
 	}
 
@@ -730,10 +746,11 @@ func locateBirthdayBlock(chainClient chainConn,
 		return nil, err
 	}
 
-	if isDev {
-		return locateDevBirthdayBlock(chainClient, bestHeight)
-	}
+	// if isDev {
+	// 	return locateDevBirthdayBlock(chainClient, bestHeight)
+	// }
 
+	// var birthdayBlock *waddrmgr.BlockStamp
 	birthdayBlock, err := optimisticLocate(
 		chainClient, birthday, bestHeight,
 	)

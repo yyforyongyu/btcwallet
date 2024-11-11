@@ -523,6 +523,28 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	s.rescanQuit = make(chan struct{})
 	s.scanning = true
 
+	var startHash chainhash.Hash
+
+	startBlock := s.lastFilteredBlockHeader
+	if startBlock == nil {
+		_, height, err := s.GetBestBlock()
+		if err != nil {
+			s.clientMtx.Unlock()
+			return err
+		}
+
+		lookbackHeight := int64(height - 2)
+		blockHash, err := s.CS.GetBlockHash(lookbackHeight)
+		if err != nil {
+			s.clientMtx.Unlock()
+			return err
+		}
+
+		startHash = *blockHash
+	} else {
+		startHash = startBlock.BlockHash()
+	}
+
 	// Don't need RescanFinished or RescanProgress notifications.
 	s.finished = true
 	s.lastProgressSent = true
@@ -535,6 +557,7 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 			OnFilteredBlockConnected: s.onFilteredBlockConnected,
 			OnBlockDisconnected:      s.onBlockDisconnected,
 		}),
+		neutrino.StartBlock(&headerfs.BlockStamp{Hash: startHash}),
 		neutrino.StartTime(s.startTime),
 		neutrino.QuitChan(s.rescanQuit),
 		neutrino.WatchAddrs(addrs...),
@@ -567,6 +590,10 @@ func (s *NeutrinoClient) SetStartTime(startTime time.Time) {
 // channel.
 func (s *NeutrinoClient) onFilteredBlockConnected(height int32,
 	header *wire.BlockHeader, relevantTxs []*btcutil.Tx) {
+
+	log.Debugf("Filtered block connected: height=%d, hash=%v, "+
+		"relevantTxs=%d", height, header.BlockHash(), len(relevantTxs))
+
 	ntfn := FilteredBlockConnected{
 		Block: &wtxmgr.BlockMeta{
 			Block: wtxmgr.Block{
@@ -577,6 +604,9 @@ func (s *NeutrinoClient) onFilteredBlockConnected(height int32,
 		},
 	}
 	for _, tx := range relevantTxs {
+		log.Debugf("FilteredBlockConnected on relevant tx: %v",
+			tx.Hash())
+
 		rec, err := wtxmgr.NewTxRecordFromMsgTx(tx.MsgTx(),
 			header.Timestamp)
 		if err != nil {
@@ -622,7 +652,7 @@ func (s *NeutrinoClient) onBlockDisconnected(hash *chainhash.Hash, height int32,
 }
 
 func (s *NeutrinoClient) onBlockConnected(hash *chainhash.Hash, height int32,
-	time time.Time) {
+	blockTime time.Time) {
 	// TODO: Move this closure out and parameterize it? Is it useful
 	// outside here?
 	sendRescanProgress := func() {
@@ -630,16 +660,21 @@ func (s *NeutrinoClient) onBlockConnected(hash *chainhash.Hash, height int32,
 		case s.enqueueNotification <- &RescanProgress{
 			Hash:   *hash,
 			Height: height,
-			Time:   time,
+			Time:   blockTime,
 		}:
 		case <-s.quit:
 		case <-s.rescanQuit:
 		}
 	}
+
 	// Only send BlockConnected notification if we're processing blocks
 	// before the birthday. Otherwise, we can just update using
 	// RescanProgress notifications.
-	if time.Before(s.startTime) {
+	if s.startTime.Sub(blockTime) > 120*time.Minute {
+		log.Debugf("Birthday %v is more than 2 hours after block %v "+
+			"(%v), skipping BlockConnected notification",
+			s.startTime, hash, blockTime)
+
 		// Send a RescanProgress notification every 10K blocks.
 		if height%10000 == 0 {
 			s.clientMtx.Lock()
@@ -654,6 +689,11 @@ func (s *NeutrinoClient) onBlockConnected(hash *chainhash.Hash, height int32,
 		// the boundary between pre-birthday and post-birthday blocks,
 		// and note that we've sent it.
 		s.clientMtx.Lock()
+
+		log.Debugf("Checking rescan progress: lastProgressSent=%v, "+
+			"isRescan=%v, finished=%v", s.lastProgressSent,
+			s.isRescan, s.finished)
+
 		if !s.lastProgressSent {
 			shouldSend := s.isRescan && !s.finished
 			if shouldSend {
@@ -670,7 +710,7 @@ func (s *NeutrinoClient) onBlockConnected(hash *chainhash.Hash, height int32,
 				Hash:   *hash,
 				Height: height,
 			},
-			Time: time,
+			Time: blockTime,
 		}:
 		case <-s.quit:
 		case <-s.rescanQuit:
