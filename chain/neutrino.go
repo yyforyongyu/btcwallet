@@ -407,6 +407,8 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 			"is not started")
 	}
 	if s.scanning {
+		log.Debugf("---> Rescan close old rescan")
+
 		// Restart the rescan by killing the existing rescan.
 		close(s.rescanQuit)
 		rescan := s.rescan
@@ -433,6 +435,8 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		return fmt.Errorf("can't get block header for hash %v: %w",
 			bestBlock.Hash, err)
 	}
+
+	log.Debugf("---> Rescan with start hash %v, header %v", startHash, header.BlockHash())
 
 	// If the wallet is already fully caught up, or the rescan has started
 	// with state that indicates a "fresh" wallet, we'll send a
@@ -473,6 +477,9 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 	}
 
 	s.clientMtx.Lock()
+
+	log.Debugf("Rescan: creating rescan with start hash %v", startHash)
+
 	newRescan := s.newRescan(
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
 			OnBlockConnected:         s.onBlockConnected,
@@ -517,6 +524,7 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	// addresses to the watch list.
 	if s.scanning {
 		s.clientMtx.Unlock()
+		log.Debugf("NotifyReceived: updating addr=%v", addrs)
 		return s.rescan.Update(neutrino.AddAddrs(addrs...))
 	}
 
@@ -549,6 +557,8 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	s.finished = true
 	s.lastProgressSent = true
 	s.lastFilteredBlockHeader = nil
+
+	log.Debugf("NotifyReceived: creating rescan with start hash %v", startHash)
 
 	// Rescan with just the specified addresses.
 	newRescan := s.newRescan(
