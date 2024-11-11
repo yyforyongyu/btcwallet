@@ -604,18 +604,49 @@ func (w *Wallet) waitUntilBackendSynced(chainClient chain.Interface) error {
 	}
 }
 
-// locateBirthdayBlock returns a block that meets the given birthday timestamp
-// by a margin of +/-2 hours. This is safe to do as the timestamp is already 2
-// days in the past of the actual timestamp.
-func locateBirthdayBlock(chainClient chainConn,
-	birthday time.Time) (*waddrmgr.BlockStamp, error) {
+func optimisticLocate(chainClient chainConn, birthday time.Time,
+	bestHeight int32) (*waddrmgr.BlockStamp, error) {
 
-	// Retrieve the lookup range for our block.
-	startHeight := int32(0)
-	_, bestHeight, err := chainClient.GetBestBlock()
+	lookupHeight := bestHeight - 6
+
+	log.Debugf("Optimisticall locating block for birthday %v at height %v",
+		birthday, lookupHeight)
+
+	hash, err := chainClient.GetBlockHash(int64(lookupHeight))
 	if err != nil {
 		return nil, err
 	}
+	header, err := chainClient.GetBlockHeader(hash)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the block's timestamp is greater than the birthday block, it
+	// means the wallet is not new, it must be reloaded from seed since it
+	// has a timestamp in the past. In that case we will return nil here
+	// and hand it to the binaryLocate.
+	delta := header.Timestamp.Sub(birthday)
+
+	// Use 10min as a comparison delta - given we are looking at the block
+	// one hour(6 blocks) ago, 10min should be safe.
+	if delta > 10*time.Minute {
+		return nil, nil
+	}
+
+	birthdayBlock := &waddrmgr.BlockStamp{
+		Hash:      *hash,
+		Height:    lookupHeight,
+		Timestamp: header.Timestamp,
+	}
+
+	return birthdayBlock, nil
+}
+
+func binaryLocate(chainClient chainConn, birthday time.Time,
+	bestHeight int32) (*waddrmgr.BlockStamp, error) {
+
+	// Retrieve the lookup range for our block.
+	startHeight := int32(0)
 
 	log.Debugf("Locating suitable block for birthday %v between blocks "+
 		"%v-%v", birthday, startHeight, bestHeight)
@@ -656,7 +687,7 @@ func locateBirthdayBlock(chainClient chainConn,
 
 		// The block's timestamp is more than 2 hours after the
 		// birthday, so look for a lower block.
-		if header.Timestamp.Sub(birthday) > birthdayBlockDelta {
+		if header.Timestamp.After(birthday) {
 			right = mid
 			continue
 		}
@@ -674,6 +705,36 @@ func locateBirthdayBlock(chainClient chainConn,
 			Timestamp: header.Timestamp,
 		}
 		break
+	}
+
+	return birthdayBlock, nil
+}
+
+// locateBirthdayBlock returns a block that meets the given birthday timestamp
+// by a margin of +/-2 hours. This is safe to do as the timestamp is already 2
+// days in the past of the actual timestamp.
+func locateBirthdayBlock(chainClient chainConn,
+	birthday time.Time) (*waddrmgr.BlockStamp, error) {
+
+	_, bestHeight, err := chainClient.GetBestBlock()
+	if err != nil {
+		return nil, err
+	}
+
+	birthdayBlock, err := optimisticLocate(
+		chainClient, birthday, bestHeight,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if birthdayBlock == nil {
+		birthdayBlock, err = binaryLocate(
+			chainClient, birthday, bestHeight,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	log.Debugf("Found birthday block: height=%d, hash=%v, timestamp=%v",
@@ -4079,8 +4140,6 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 		return nil, err
 	}
 
-	log.Infof("Opened wallet") // TODO: log balance? last sync height?
-
 	w := &Wallet{
 		publicPassphrase:    pubPass,
 		db:                  db,
@@ -4109,6 +4168,10 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 	w.TxStore.NotifyUnspent = func(hash *chainhash.Hash, index uint32) {
 		w.NtfnServer.notifyUnspentOutput(0, hash, index)
 	}
+
+	log.Infof("Opened wallet: birthday=%v, recovery_window=%v, "+
+		"sync_retry_interval=%v", w.Manager.Birthday(), recoveryWindow,
+		syncRetryInterval)
 
 	return w, nil
 }
