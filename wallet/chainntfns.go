@@ -120,6 +120,8 @@ func (w *Wallet) handleChainNotifications() {
 		}
 	}
 
+	isDevEnv := w.isDevEnv() && w.recoveryWindow == 0
+
 	for {
 		select {
 		case n, ok := <-chainClient.Notifications():
@@ -140,7 +142,7 @@ func (w *Wallet) handleChainNotifications() {
 					manager: w.Manager,
 				}
 				birthdayBlock, err := birthdaySanityCheck(
-					chainClient, birthdayStore,
+					chainClient, birthdayStore, isDevEnv,
 				)
 				if err != nil && !waddrmgr.IsError(
 					err, waddrmgr.ErrBirthdayBlockNotSet,
@@ -523,7 +525,7 @@ func (s *walletBirthdayStore) SetBirthdayBlock(block waddrmgr.BlockStamp) error 
 // waddrmgr.ErrBirthdayBlockNotSet is returned if the birthday block has not
 // been set yet.
 func birthdaySanityCheck(chainConn chainConn,
-	birthdayStore birthdayStore) (*waddrmgr.BlockStamp, error) {
+	birthdayStore birthdayStore, isDev bool) (*waddrmgr.BlockStamp, error) {
 
 	// We'll start by fetching our wallet's birthday timestamp and block.
 	birthdayTimestamp := birthdayStore.Birthday()
@@ -545,7 +547,9 @@ func birthdaySanityCheck(chainConn chainConn,
 
 	// Otherwise, we'll attempt to locate a better one now that we have
 	// access to the chain.
-	newBirthdayBlock, err := locateBirthdayBlock(chainConn, birthdayTimestamp)
+	newBirthdayBlock, err := locateBirthdayBlock(
+		chainConn, birthdayTimestamp, isDev,
+	)
 	if err != nil {
 		return nil, err
 	}

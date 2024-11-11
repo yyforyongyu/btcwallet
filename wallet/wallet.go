@@ -396,33 +396,42 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 		return err
 	}
 
+	isDevEnv := w.isDevEnv()
+	backend := chainClient.BackEnd()
+
 	// Neutrino relies on the information given to it by the cfheader server
 	// so it knows exactly whether it's synced up to the server's state or
 	// not, even on dev chains. To recover a Neutrino wallet, we need to
 	// make sure it's synced before we start scanning for addresses,
 	// otherwise we might miss some if we only scan up to its current sync
 	// point.
-	neutrinoRecovery := chainClient.BackEnd() == "neutrino" &&
-		w.recoveryWindow > 0
+	neutrinoRecovery := backend == "neutrino" && w.recoveryWindow > 0
+
+	log.Debugf("Waiting for chain backend to sync to tip, isDevEnv=%v, "+
+		"backend=%v, recoveryWindow=%v", isDevEnv, backend,
+		w.recoveryWindow)
 
 	// We'll wait until the backend is synced to ensure we get the latest
 	// MaxReorgDepth blocks to store. We don't do this for development
 	// environments as we can't guarantee a lively chain, except for
 	// Neutrino, where the cfheader server tells us what it believes the
 	// chain tip is.
-	if !w.isDevEnv() || neutrinoRecovery {
-		log.Debug("Waiting for chain backend to sync to tip")
+	if !isDevEnv || neutrinoRecovery {
 		if err := w.waitUntilBackendSynced(chainClient); err != nil {
 			return err
 		}
 		log.Debug("Chain backend synced to tip!")
+	} else {
+		log.Debug("Chain backend sync skipped for dev env")
 	}
 
 	// If we've yet to find our birthday block, we'll do so now.
 	if birthdayStamp == nil {
+		isDevEnv = isDevEnv && w.recoveryWindow == 0
+
 		var err error
 		birthdayStamp, err = locateBirthdayBlock(
-			chainClient, w.Manager.Birthday(),
+			chainClient, w.Manager.Birthday(), isDevEnv,
 		)
 		if err != nil {
 			return fmt.Errorf("unable to locate birthday block: %w",
@@ -607,7 +616,7 @@ func (w *Wallet) waitUntilBackendSynced(chainClient chain.Interface) error {
 func optimisticLocate(chainClient chainConn, birthday time.Time,
 	bestHeight int32) (*waddrmgr.BlockStamp, error) {
 
-	lookupHeight := bestHeight - 6
+	lookupHeight := bestHeight - 12
 
 	log.Debugf("Optimisticall locating block for birthday %v at height %v",
 		birthday, lookupHeight)
@@ -628,7 +637,7 @@ func optimisticLocate(chainClient chainConn, birthday time.Time,
 	delta := header.Timestamp.Sub(birthday)
 
 	// Use 10min as a comparison delta - given we are looking at the block
-	// one hour(6 blocks) ago, 10min should be safe.
+	// two hours ago, 10min should be safe.
 	if delta > 10*time.Minute {
 		return nil, nil
 	}
@@ -714,11 +723,15 @@ func binaryLocate(chainClient chainConn, birthday time.Time,
 // by a margin of +/-2 hours. This is safe to do as the timestamp is already 2
 // days in the past of the actual timestamp.
 func locateBirthdayBlock(chainClient chainConn,
-	birthday time.Time) (*waddrmgr.BlockStamp, error) {
+	birthday time.Time, isDev bool) (*waddrmgr.BlockStamp, error) {
 
 	_, bestHeight, err := chainClient.GetBestBlock()
 	if err != nil {
 		return nil, err
+	}
+
+	if isDev {
+		return locateDevBirthdayBlock(chainClient, bestHeight)
 	}
 
 	birthdayBlock, err := optimisticLocate(
@@ -740,6 +753,33 @@ func locateBirthdayBlock(chainClient chainConn,
 	log.Debugf("Found birthday block: height=%d, hash=%v, timestamp=%v",
 		birthdayBlock.Height, birthdayBlock.Hash,
 		birthdayBlock.Timestamp)
+
+	return birthdayBlock, nil
+}
+
+// locateDevBirthdayBlock...
+func locateDevBirthdayBlock(chainClient chainConn,
+	bestHeight int32) (*waddrmgr.BlockStamp, error) {
+
+	lookupHeight := bestHeight - 6
+
+	log.Warnf("Fast-locating dev env block for birthday at height %v",
+		lookupHeight)
+
+	hash, err := chainClient.GetBlockHash(int64(lookupHeight))
+	if err != nil {
+		return nil, err
+	}
+	header, err := chainClient.GetBlockHeader(hash)
+	if err != nil {
+		return nil, err
+	}
+
+	birthdayBlock := &waddrmgr.BlockStamp{
+		Hash:      *hash,
+		Height:    lookupHeight,
+		Timestamp: header.Timestamp,
+	}
 
 	return birthdayBlock, nil
 }
