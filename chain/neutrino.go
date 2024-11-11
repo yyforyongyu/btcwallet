@@ -66,6 +66,8 @@ type NeutrinoClient struct {
 	// should ideally be synchronized by the same lock or via some other
 	// shared mechanism.
 	clientMtx sync.Mutex
+
+	addrs map[btcutil.Address]struct{}
 }
 
 // A compile-time check to ensure that RPCClient satisfies the chain.Interface
@@ -92,6 +94,7 @@ func NewNeutrinoClient(chainParams *chaincfg.Params,
 		CS:          chainService,
 		chainParams: chainParams,
 		newRescan:   newRescan,
+		addrs:       make(map[btcutil.Address]struct{}),
 	}
 }
 
@@ -409,6 +412,8 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 	if s.scanning {
 		log.Debugf("---> Rescan close old rescan")
 
+		s.rescanErr = nil
+
 		// Restart the rescan by killing the existing rescan.
 		close(s.rescanQuit)
 		rescan := s.rescan
@@ -416,7 +421,6 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		rescan.WaitForShutdown()
 		s.clientMtx.Lock()
 		s.rescan = nil
-		s.rescanErr = nil
 	}
 	s.rescanQuit = make(chan struct{})
 	s.scanning = true
@@ -442,6 +446,7 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 	// with state that indicates a "fresh" wallet, we'll send a
 	// notification indicating the rescan has "finished".
 	if header.BlockHash() == *startHash {
+		log.Debugf("---> Rescan finished before it started")
 		s.clientMtx.Lock()
 		s.finished = true
 		rescanQuit := s.rescanQuit
@@ -478,7 +483,14 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 
 	s.clientMtx.Lock()
 
-	log.Debugf("Rescan: creating rescan with start hash %v", startHash)
+	log.Debugf("---> Rescan: creating rescan with address=%v", addrs)
+	for addr := range s.addrs {
+		log.Debugf("but i have addr %v", addr)
+	}
+
+	for _, addr := range addrs {
+		s.addrs[addr] = struct{}{}
+	}
 
 	newRescan := s.newRescan(
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
@@ -519,6 +531,9 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	defer s.rescanMtx.Unlock()
 
 	s.clientMtx.Lock()
+	for _, addr := range addrs {
+		s.addrs[addr] = struct{}{}
+	}
 
 	// If we have a rescan running, we just need to add the appropriate
 	// addresses to the watch list.
