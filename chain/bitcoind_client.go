@@ -16,6 +16,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/davecgh/go-spew/spew"
 )
 
 var (
@@ -170,8 +171,8 @@ func (c *BitcoindClient) GetBlockHeaderVerbose(
 	return c.chainConn.client.GetBlockHeaderVerbose(hash)
 }
 
-// IsCurrent returns whether the chain backend considers its view of the network
-// as "current".
+// IsCurrent returns whether the chain backend considers its view of the
+// network as "current".
 func (c *BitcoindClient) IsCurrent() bool {
 	bestHash, _, err := c.GetBestBlock()
 	if err != nil {
@@ -181,6 +182,15 @@ func (c *BitcoindClient) IsCurrent() bool {
 	if err != nil {
 		return false
 	}
+
+	resp, err := c.chainConn.client.GetBlockChainInfo()
+	if err != nil {
+		log.Errorf("GetBlockChainInfo failed: %v", err)
+		return false
+	}
+
+	log.Debugf("--------> %v", spew.Sdump(resp))
+
 	return bestHeader.Timestamp.After(time.Now().Add(-isCurrentDelta))
 }
 
