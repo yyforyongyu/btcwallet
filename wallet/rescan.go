@@ -303,6 +303,13 @@ func (w *Wallet) rescanWithTarget(addrs []btcutil.Address,
 		*startStamp = w.Manager.SyncedTo()
 	}
 
+	// TODO: Should also submit an ending block height, which is the height
+	// when Rescan is called, which is the best height N found when this
+	// method is called inside syncWithChain. Otherwise, when calling
+	// `Rescan` in `chain/btcd/RPCClient`, and we call `Rescan`, which
+	// calls the rescan method implemented in `btcd`. That method can
+	// query a new block height X that's in the future, and we will miss
+	// notifying the blocks from N to X.
 	job := &RescanJob{
 		InitialSync: true,
 		Addrs:       addrs,

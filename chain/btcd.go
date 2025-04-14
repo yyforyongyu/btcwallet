@@ -279,7 +279,15 @@ func (c *RPCClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Address,
 		flatOutpoints = append(flatOutpoints, &ops)
 	}
 
-	return c.Client.Rescan(startHash, addrs, flatOutpoints) // nolint:staticcheck
+	// Get the best known block as the ending height for the scan.
+	bestHash, bestHeight, err := c.GetBestBlock()
+	if err != nil {
+		return err
+	}
+
+	log.Debugf("Starting rescanning, catching up to block %v", bestHeight)
+
+	return c.Client.Rescan(startHash, bestHash, addrs, flatOutpoints) // nolint:staticcheck
 }
 
 // WaitForShutdown blocks until both the client has finished disconnecting
