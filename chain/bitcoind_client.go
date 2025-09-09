@@ -2,6 +2,7 @@ package chain
 
 import (
 	"container/list"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -498,7 +499,7 @@ func (c *BitcoindClient) Rescan(blockHash *chainhash.Hash,
 // and ZMQ notifications.
 //
 // NOTE: This is part of the chain.Interface interface.
-func (c *BitcoindClient) Start() error {
+func (c *BitcoindClient) Start(_ context.Context) error {
 	if !atomic.CompareAndSwapInt32(&c.started, 0, 1) {
 		return nil
 	}

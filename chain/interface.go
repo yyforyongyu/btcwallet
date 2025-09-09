@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"context"
 	"time"
 
 	"github.com/btcsuite/btcd/btcjson"
@@ -32,7 +33,7 @@ func BackEnds() []string {
 // btcd RPC chain server, or an SPV library, as long as we write a driver for
 // it.
 type Interface interface {
-	Start() error
+	Start(ctx context.Context) error
 	Stop()
 	WaitForShutdown()
 	GetBestBlock() (*chainhash.Hash, int32, error)

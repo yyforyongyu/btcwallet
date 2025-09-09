@@ -32,7 +32,7 @@ func TestNeutrinoClientSequentialStartStop(t *testing.T) {
 		go func() {
 			defer close(done)
 
-			err := nc.Start()
+			err := nc.Start(t.Context())
 			require.NoError(t, err)
 			nc.Stop()
 			nc.WaitForShutdown()
@@ -196,7 +196,7 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 	}
 
 	// Start the client.
-	err := nc.Start()
+	err := nc.Start(t.Context())
 	require.NoError(t, err)
 
 	// Wait for all calls to complete or test to time out.
