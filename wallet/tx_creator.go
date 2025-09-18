@@ -6,11 +6,62 @@ package wallet
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
+	"github.com/btcsuite/btcwallet/wallet/txrules"
+)
+
+var (
+	// ErrUnsupportedInputs is returned when the `Inputs` field of a
+	// TxIntent is not of a supported type.
+	ErrUnsupportedInputs = errors.New("unsupported inputs type")
+
+	// ErrUtxoNotEligible is returned when a UTXO is not eligible to be
+	// spent.
+	ErrUtxoNotEligible = errors.New("utxo not eligible")
+
+	// ErrDuplicateUtxo is returned when a UTXO is specified multiple times.
+	ErrDuplicateUtxo = errors.New("duplicate utxo")
+
+	// ErrAccountNotFound is returned when an account is not found.
+	ErrAccountNotFound = errors.New("account not found")
+
+	// ErrNoOutputs is returned when a transaction is created without any
+	// outputs.
+	ErrNoOutputs = errors.New("transaction has no outputs")
+
+	// ErrInsaneFee is returned when a transaction is created with a fee
+	// that is too high.
+	ErrInsaneFee = errors.New("insane fee")
+
+	// ErrNoChangeSource is returned when a change source is not provided.
+	ErrNoChangeSource = errors.New("change source cannot be nil")
+
+	// ErrMissingAccountName is returned when an account name is required but
+	// not provided.
+	ErrMissingAccountName = errors.New(
+		"account name cannot be empty",
+	)
+
+	// ErrNoInputSource is returned when an input source is not provided.
+	ErrNoInputSource = errors.New("input source cannot be nil")
+
+	// ErrManualInputsEmpty is returned when manual inputs are specified but
+	// the list is empty.
+	ErrManualInputsEmpty = errors.New("manual inputs cannot be empty")
+
+	// ErrUnsupportedCoinSource is returned when the `Source` field of a
+	// CoinSelectionPolicy is not of a supported type.
+	ErrUnsupportedCoinSource = errors.New("unsupported coin source type")
+
+	// ErrMissingInputs is returned when a transaction is created without any
+	// inputs.
+	ErrMissingInputs = errors.New("transaction has no inputs")
 )
 
 // TxCreator provides an interface for creating transactions. Its primary role is
@@ -142,6 +193,11 @@ type Inputs interface {
 	// within this package. This ensures that only the intended types
 	// can be used as an Inputs implementation.
 	isInputs()
+
+	// validate performs a series of checks on the input source to ensure
+	// it is well-formed. This method is called before any database
+	// transactions are opened, allowing for early, efficient validation.
+	validate() error
 }
 
 // InputsManual implements the Inputs interface and specifies the exact UTXOs
@@ -175,9 +231,63 @@ type InputsPolicy struct {
 // isInputs marks InputsManual as an implementation of the Inputs interface.
 func (InputsManual) isInputs() {}
 
+// validate performs validation on the manual inputs.
+func (i *InputsManual) validate() error {
+	if len(i.UTXOs) == 0 {
+		return ErrManualInputsEmpty
+	}
+
+	// Make sure there are no duplicates in the specified UTXO list.
+	seenUTXOs := make(map[wire.OutPoint]struct{})
+	for _, utxo := range i.UTXOs {
+		if _, ok := seenUTXOs[utxo]; ok {
+			return ErrDuplicateUtxo
+		}
+		seenUTXOs[utxo] = struct{}{}
+	}
+
+	return nil
+}
+
 // isInputs marks InputsPolicy as an implementation of the Inputs
 // interface.
 func (InputsPolicy) isInputs() {}
+
+// validate performs validation on the input policy.
+func (i *InputsPolicy) validate() error {
+	if i.Source == nil {
+		return nil
+	}
+
+	switch source := i.Source.(type) {
+	// If the source is a scoped account, it must have a non-empty
+	// account name.
+	case *ScopedAccount:
+		if source.AccountName == "" {
+			return ErrMissingAccountName
+		}
+
+	// If the source is a list of UTXOs, it must not be empty and
+	// must not contain duplicates.
+	case *CoinSourceUTXOs:
+		if len(source.UTXOs) == 0 {
+			return ErrManualInputsEmpty
+		}
+		seenUTXOs := make(map[wire.OutPoint]struct{})
+		for _, utxo := range source.UTXOs {
+			if _, ok := seenUTXOs[utxo]; ok {
+				return ErrDuplicateUtxo
+			}
+			seenUTXOs[utxo] = struct{}{}
+		}
+	// Any other source type is unsupported.
+	default:
+		return fmt.Errorf("%w: %T",
+			ErrUnsupportedCoinSource, source)
+	}
+
+	return nil
+}
 
 // A compile-time assertion to ensure that all types implementing the Inputs
 // interface adhere to it.
@@ -227,3 +337,50 @@ func (CoinSourceUTXOs) isCoinSource() {}
 // interface adhere to it.
 var _ CoinSource = (*ScopedAccount)(nil)
 var _ CoinSource = (*CoinSourceUTXOs)(nil)
+
+// validateTxIntent performs a series of checks on a TxIntent to ensure it is
+// well-formed. This function is called before any transaction creation logic
+// to ensure that the caller has provided a valid intent. This function is for
+// validation only and does not modify the TxIntent.
+//
+// The following checks are performed:
+//   - The intent must have at least one output.
+//   - Each output must not be a dust output.
+//   - If a change source is specified, it must have a non-empty account name.
+//   - The intent must have a valid, non-nil input source.
+//   - The input source itself is validated via the `validate` method.
+func validateTxIntent(intent *TxIntent) error {
+	// The intent must have at least one output.
+	if len(intent.Outputs) == 0 {
+		return ErrNoOutputs
+	}
+
+	// Each output must not be a dust output according to the default relay
+	// fee policy.
+	for _, output := range intent.Outputs {
+		err := txrules.CheckOutput(
+			&output, txrules.DefaultRelayFeePerKb,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	// If a change source is specified, it must have a non-empty account
+	// name.
+	if intent.ChangeSource != nil && intent.ChangeSource.AccountName == "" {
+		return ErrMissingAccountName
+	}
+
+	// If no input source is specified, an error is returned.
+	if intent.Inputs == nil {
+		return ErrMissingInputs
+	}
+
+	// Validate the inputs.
+	if err := intent.Inputs.validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
