@@ -159,6 +159,11 @@ func (m *mockTxStore) UnspentOutputs(
 	ns walletdb.ReadBucket) ([]wtxmgr.Credit, error) {
 
 	args := m.Called(ns)
+
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
 	return args.Get(0).([]wtxmgr.Credit), args.Error(1)
 }
 
@@ -738,4 +743,20 @@ func (m *mockManagedAddress) InternalAccount() uint32 {
 func (m *mockManagedAddress) DerivationInfo() (waddrmgr.KeyScope, waddrmgr.DerivationPath, bool) {
 	args := m.Called()
 	return args.Get(0).(waddrmgr.KeyScope), args.Get(1).(waddrmgr.DerivationPath), args.Bool(2)
+}
+
+// mockCoinSelectionStrategy is a mock implementation of the
+// CoinSelectionStrategy interface used for testing purposes.
+type mockCoinSelectionStrategy struct {
+	mock.Mock
+}
+
+// ArrangeCoins implements the CoinSelectionStrategy interface.
+func (m *mockCoinSelectionStrategy) ArrangeCoins(coins []Coin,
+	feePerKb btcutil.Amount) ([]Coin, error) {
+	args := m.Called(coins, feePerKb)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]Coin), args.Error(1)
 }
