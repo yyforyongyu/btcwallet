@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/btcsuite/btcd/wire"
@@ -539,6 +540,261 @@ func TestGetEligibleUTXOs(t *testing.T) {
 			)
 
 			require.ErrorIs(t, err, tc.expectedErr)
+		})
+	}
+}
+
+// TestCreateManualInputSource verifies that the createManualInputSource
+// function correctly creates an input source from a manually specified list of
+// UTXOs. It tests the success path, where all UTXOs are valid and spendable,
+// and the failure path, where a UTXO is not found in the wallet, ensuring that
+// the function returns the expected error in that case.
+func TestCreateManualInputSource(t *testing.T) {
+	t.Parallel()
+
+	w, mocks := testWalletWithMocks(t)
+	dbtx := &mockReadTx{}
+
+	utxo1 := wire.OutPoint{Hash: [32]byte{1}, Index: 0}
+	credit1 := &wtxmgr.Credit{OutPoint: utxo1}
+
+	utxo2 := wire.OutPoint{Hash: [32]byte{2}, Index: 0}
+
+	testCases := []struct {
+		name        string
+		inputs      *InputsManual
+		setupMocks  func()
+		expectedErr error
+	}{
+		{
+			name: "success",
+			inputs: &InputsManual{
+				UTXOs: []wire.OutPoint{utxo1},
+			},
+			setupMocks: func() {
+				mocks.txStore.On("GetUtxo",
+					mock.Anything, utxo1,
+				).Return(credit1, nil).Once()
+			},
+		},
+		{
+			name: "utxo not found",
+			inputs: &InputsManual{
+				UTXOs: []wire.OutPoint{utxo2},
+			},
+			setupMocks: func() {
+				mocks.txStore.On("GetUtxo",
+					mock.Anything, utxo2,
+				).Return(nil, wtxmgr.ErrUtxoNotFound).Once()
+			},
+			expectedErr: ErrUtxoNotEligible,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tc.setupMocks()
+
+			source, err := w.createManualInputSource(
+				dbtx, tc.inputs,
+			)
+
+			require.ErrorIs(t, err, tc.expectedErr)
+			if err == nil {
+				require.NotNil(t, source)
+			} else {
+				require.Nil(t, source)
+			}
+		})
+	}
+}
+
+// TestCreatePolicyInputSource tests the functionality of the
+// createPolicyInputSource method. It ensures that the method correctly creates
+// an input source for coin selection based on a given policy. The test covers
+// scenarios where a default coin selection strategy is used, as well as cases
+// with a custom strategy. It also verifies that errors from underlying
+// dependencies, such as the database or the coin selection strategy itself, are
+// properly propagated.
+func TestCreatePolicyInputSource(t *testing.T) {
+	t.Parallel()
+
+	dbtx := &mockReadTx{}
+	feeRate := SatPerKVByte(1000)
+
+	utxo1 := wtxmgr.Credit{
+		OutPoint: wire.OutPoint{Hash: [32]byte{1}, Index: 0},
+	}
+	utxo2 := wtxmgr.Credit{
+		OutPoint: wire.OutPoint{Hash: [32]byte{2}, Index: 0},
+	}
+	eligibleUtxos := []wtxmgr.Credit{utxo1, utxo2}
+
+	// A mock strategy that just returns the coins as is.
+	mockStrategy := &mockCoinSelectionStrategy{}
+	mockStrategy.On("ArrangeCoins", mock.Anything, mock.Anything).
+		Return(make([]Coin, 0), nil)
+
+	// A mock strategy that returns an error.
+	errStrategy := &mockCoinSelectionStrategy{}
+	errStrategy.On("ArrangeCoins", mock.Anything, mock.Anything).
+		Return(([]Coin)(nil), errors.New("strategy error"))
+
+	testCases := []struct {
+		name        string
+		policy      *InputsPolicy
+		setupMocks  func(m *mockers)
+		expectedErr error
+	}{
+		{
+			name: "success with default strategy",
+			policy: &InputsPolicy{
+				// Should default to default account
+				Source:   nil,
+				MinConfs: 1,
+			},
+			setupMocks: func(m *mockers) {
+				m.txStore.On("UnspentOutputs", mock.Anything).
+					Return(eligibleUtxos, nil).Once()
+			},
+		},
+		{
+			name: "success with custom strategy",
+			policy: &InputsPolicy{
+				Strategy: mockStrategy,
+				Source:   nil,
+				MinConfs: 1,
+			},
+			setupMocks: func(m *mockers) {
+				m.txStore.On("UnspentOutputs", mock.Anything).
+					Return(eligibleUtxos, nil).Once()
+			},
+		},
+		{
+			name: "getEligibleUTXOs fails",
+			policy: &InputsPolicy{
+				Source:   nil,
+				MinConfs: 1,
+			},
+			setupMocks: func(m *mockers) {
+				m.txStore.On("UnspentOutputs",
+					mock.Anything,
+				).Return(nil, errors.New("db error")).Once()
+			},
+			expectedErr: errors.New("db error"),
+		},
+		{
+			name: "strategy ArrangeCoins fails",
+			policy: &InputsPolicy{
+				Strategy: errStrategy,
+				Source:   nil,
+				MinConfs: 1,
+			},
+			setupMocks: func(m *mockers) {
+				m.txStore.On("UnspentOutputs", mock.Anything).
+					Return(eligibleUtxos, nil).Once()
+			},
+			expectedErr: errors.New("strategy error"),
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			w, mocks := testWalletWithMocks(t)
+			tc.setupMocks(mocks)
+
+			source, err := w.createPolicyInputSource(
+				dbtx, tc.policy, feeRate,
+			)
+
+			if tc.expectedErr != nil {
+				require.Error(t, err)
+				require.Contains(t, err.Error(),
+					tc.expectedErr.Error())
+				require.Nil(t, source)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, source)
+			}
+		})
+	}
+}
+
+// TestCreateInputSource serves as a dispatcher test for the createInputSource
+// method. It verifies that the method correctly delegates to the appropriate
+// specialized input source creator—either for manual or policy-based coin
+// selection—based on the type of the `Inputs` field in the `TxIntent`. The test
+// also ensures that an `ErrUnsupportedInputs` error is returned if an unknown
+// input type is provided.
+func TestCreateInputSource(t *testing.T) {
+	t.Parallel()
+
+	dbtx := &mockReadTx{}
+
+	utxo := wire.OutPoint{Hash: [32]byte{1}, Index: 0}
+	credit := &wtxmgr.Credit{OutPoint: utxo}
+
+	manualInputs := &InputsManual{UTXOs: []wire.OutPoint{utxo}}
+	policyInputs := &InputsPolicy{}
+	unsupported := &unsupportedInputs{}
+
+	intentManual := &TxIntent{Inputs: manualInputs}
+	intentPolicy := &TxIntent{Inputs: policyInputs, FeeRate: 1000}
+	intentUnsupported := &TxIntent{Inputs: unsupported}
+
+	testCases := []struct {
+		name        string
+		intent      *TxIntent
+		setupMocks  func(m *mockers)
+		expectedErr error
+	}{
+		{
+			name:   "manual inputs",
+			intent: intentManual,
+			setupMocks: func(m *mockers) {
+				m.txStore.On("GetUtxo", mock.Anything, utxo).
+					Return(credit, nil).Once()
+			},
+		},
+		{
+			name:   "policy inputs",
+			intent: intentPolicy,
+			setupMocks: func(m *mockers) {
+				m.txStore.On("UnspentOutputs",
+					mock.Anything,
+				).Return([]wtxmgr.Credit{*credit}, nil).Once()
+			},
+		},
+		{
+			name:        "unsupported inputs",
+			intent:      intentUnsupported,
+			setupMocks:  func(m *mockers) {},
+			expectedErr: ErrUnsupportedInputs,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			w, mocks := testWalletWithMocks(t)
+			tc.setupMocks(mocks)
+
+			source, err := w.createInputSource(dbtx, tc.intent)
+
+			require.ErrorIs(t, err, tc.expectedErr)
+			if err == nil {
+				require.NotNil(t, source)
+			} else {
+				require.Nil(t, source)
+			}
 		})
 	}
 }
