@@ -37,6 +37,10 @@ type TxReader interface {
 		[]*TxDetail, error)
 }
 
+// A compile-time assertion to ensure that Wallet implements the TxReader
+// interface.
+var _ TxReader = (*Wallet)(nil)
+
 // Output contains details for a tx output.
 type Output struct {
 	// Type is the script class of the output.
@@ -155,6 +159,46 @@ func (w *Wallet) GetTx(ctx context.Context, txHash chainhash.Hash) (
 	currentHeight := bestBlock.Height
 
 	return w.buildTxDetail(txDetails, currentHeight), nil
+}
+
+// ListTxns returns a list of all txns which are relevant to the
+// wallet over a given block range.
+//
+// NOTE: This method is part of the TxReader interface.
+//
+// Time complexity: O(B + T), where B is the number of blocks in the range and T
+// is the number of transactions in those blocks.
+func (w *Wallet) ListTxns(ctx context.Context, startHeight,
+	endHeight int32) ([]*TxDetail, error) {
+
+	bestBlock := w.SyncedTo()
+	currentHeight := bestBlock.Height
+
+	var details []*TxDetail
+	err := walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
+		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+
+		err := w.txStore.RangeTransactions(
+			txmgrNs, startHeight, endHeight,
+			func(d []wtxmgr.TxDetails) (bool, error) {
+				for i := range d {
+					detail := &d[i]
+
+					txDetail := w.buildTxDetail(
+						detail, currentHeight,
+					)
+					details = append(details, txDetail)
+				}
+				return false, nil
+			},
+		)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return details, nil
 }
 
 // fetchTxDetails fetches the tx details for the given tx hash
