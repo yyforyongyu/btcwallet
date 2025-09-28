@@ -92,6 +92,11 @@ type UnsafeSigner interface {
 		*btcec.PrivateKey, error)
 }
 
+// A compile-time check to ensure that Wallet implements the Signer and
+// UnsafeSigner interfaces.
+var _ Signer = (*Wallet)(nil)
+var _ UnsafeSigner = (*Wallet)(nil)
+
 // BIP32Path contains the full information needed to derive a key from the
 // wallet's master seed, as defined by BIP-32. It combines the high-level key
 // scope with the specific derivation path.
@@ -731,4 +736,28 @@ func (w *Wallet) ComputeRawSig(ctx context.Context, params *RawSigParams) (
 	// With the private key retrieved and tweaked, we can now delegate the
 	// actual signing to the version-specific details object.
 	return params.Details.Sign(params, privKey)
+}
+
+// DerivePrivKey derives a private key from a full BIP-32 derivation
+// path.
+//
+// DANGER: This method exports sensitive key material.
+func (w *Wallet) DerivePrivKey(ctx context.Context, path BIP32Path) (
+	*btcec.PrivateKey, error) {
+
+	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return managedPubKeyAddr.PrivKey()
+}
+
+// GetPrivKeyForAddress returns the private key for a given address.
+//
+// DANGER: This method exports sensitive key material.
+func (w *Wallet) GetPrivKeyForAddress(ctx context.Context, a btcutil.Address) (
+	*btcec.PrivateKey, error) {
+
+	return w.PrivKeyForAddress(a)
 }
