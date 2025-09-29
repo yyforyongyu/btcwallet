@@ -2035,10 +2035,17 @@ func (w *Wallet) LookupAccount(name string) (waddrmgr.KeyScope, uint32, error) {
 		var err error
 
 		keyScope, account, err = w.addrStore.LookupAccount(ns, name)
-		return err
-	})
+		if err != nil {
+			return fmt.Errorf("failed to lookup account: %w", err)
+		}
 
-	return keyScope, account, err
+		return nil
+	})
+	if err != nil {
+		return keyScope, account, fmt.Errorf("failed to view walletdb: %w", err)
+	}
+
+	return keyScope, account, nil
 }
 
 // CreditCategory describes the type of wallet transaction output.  The category

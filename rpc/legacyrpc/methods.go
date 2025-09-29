@@ -671,7 +671,12 @@ func renameAccount(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		return nil, err
 	}
 
-	return nil, w.RenameAccountDeprecated(waddrmgr.KeyScopeBIP0044, account, cmd.NewAccount)
+	err = w.RenameAccountDeprecated(waddrmgr.KeyScopeBIP0044, account, cmd.NewAccount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to rename account: %w", err)
+	}
+
+	return nil, &ErrReservedAccountName
 }
 
 // getNewAddress handles a getnewaddress request by returning a new
