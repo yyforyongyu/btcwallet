@@ -595,6 +595,13 @@ func (w *Wallet) ImportAccount(_ context.Context,
 
 // extractAddrFromPKScript extracts an address from a public key script. If the
 // script cannot be parsed or does not contain any addresses, it returns nil.
+//
+// NOTE: This function is disabled from the ireturn linter because the
+// underlying txscript.ExtractPkScriptAddrs returns a slice of btcutil.Address
+// interfaces, which can be of different concrete types. Returning the
+// interface is the most appropriate design here.
+//
+//nolint:ireturn
 func extractAddrFromPKScript(pkScript []byte,
 	chainParams *chaincfg.Params) btcutil.Address {
 
