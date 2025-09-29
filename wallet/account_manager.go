@@ -110,7 +110,10 @@ func (w *Wallet) NewAccount(_ context.Context, scope waddrmgr.KeyScope,
 
 	manager, err := w.addrStore.FetchScopedKeyManager(scope)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch scoped key manager for scope %s: %w", scope, err)
+		return nil, fmt.Errorf(
+			"failed to fetch scoped key manager for scope %s: %w",
+			scope, err,
+		)
 	}
 
 	// Validate that the scope manager can add this new account.
@@ -127,13 +130,16 @@ func (w *Wallet) NewAccount(_ context.Context, scope waddrmgr.KeyScope,
 		// Create a new account under the current key scope.
 		accNum, err := manager.NewAccount(addrmgrNs, name)
 		if err != nil {
-			return fmt.Errorf("failed to create new account: %w", err)
+			return fmt.Errorf("failed to create new "+
+				"account: %w", err)
 		}
 
 		// Get the account's properties.
 		props, err = manager.AccountProperties(addrmgrNs, accNum)
 		if err != nil {
-			return fmt.Errorf("failed to get account properties: %w", err)
+			return fmt.Errorf(
+				"failed to get account properties: %w", err,
+			)
 		}
 
 		return nil
@@ -198,8 +204,8 @@ func (w *Wallet) ListAccounts(_ context.Context) (*AccountsResult, error) {
 			return err
 		}
 
-		// Now, iterate through each key scope to assemble the final list
-		// of accounts with their properties and balances.
+		// Now, iterate through each key scope to assemble the final
+		// list of accounts with their properties and balances.
 		for _, scopeMgr := range scopes {
 			scope := scopeMgr.Scope()
 			accountBalances := scopedBalances[scope]
@@ -254,7 +260,10 @@ func (w *Wallet) ListAccountsByScope(_ context.Context,
 	// manager will be used to list the accounts.
 	manager, err := w.addrStore.FetchScopedKeyManager(scope)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch scoped key manager for scope %s: %w", scope, err)
+		return nil, fmt.Errorf(
+			"failed to fetch scoped key manager for scope %s: %w",
+			scope, err,
+		)
 	}
 
 	var accounts []AccountResult
@@ -335,7 +344,9 @@ func (w *Wallet) ListAccountsByName(_ context.Context,
 					continue
 				}
 
-				return fmt.Errorf("failed to lookup account: %w", err)
+				return fmt.Errorf(
+					"failed to lookup account: %w", err,
+				)
 			}
 
 			// Retrieve the account's properties.
@@ -343,7 +354,10 @@ func (w *Wallet) ListAccountsByName(_ context.Context,
 				addrmgrNs, accNum,
 			)
 			if err != nil {
-				return fmt.Errorf("failed to get account properties: %w", err)
+				return fmt.Errorf(
+					"failed to get account properties: %w",
+					err,
+				)
 			}
 
 			// Get the pre-calculated balance for this account. If
@@ -388,7 +402,10 @@ func (w *Wallet) GetAccount(_ context.Context, scope waddrmgr.KeyScope,
 
 	manager, err := w.addrStore.FetchScopedKeyManager(scope)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch scoped key manager for scope %s: %w", scope, err)
+		return nil, fmt.Errorf(
+			"failed to fetch scoped key manager for scope %s: %w",
+			scope, err,
+		)
 	}
 
 	var account *AccountResult
@@ -406,7 +423,9 @@ func (w *Wallet) GetAccount(_ context.Context, scope waddrmgr.KeyScope,
 		// Retrieve the static properties for the account.
 		props, err := manager.AccountProperties(addrmgrNs, accNum)
 		if err != nil {
-			return fmt.Errorf("failed to get account properties: %w", err)
+			return fmt.Errorf(
+				"failed to get account properties: %w", err,
+			)
 		}
 
 		account = &AccountResult{
@@ -449,7 +468,10 @@ func (w *Wallet) RenameAccount(_ context.Context, scope waddrmgr.KeyScope,
 
 	manager, err := w.addrStore.FetchScopedKeyManager(scope)
 	if err != nil {
-		return fmt.Errorf("failed to fetch scoped key manager for scope %s: %w", scope, err)
+		return fmt.Errorf(
+			"failed to fetch scoped key manager for scope %s: %w",
+			scope, err,
+		)
 	}
 
 	// Validate the new account name to ensure it meets the required
@@ -500,7 +522,10 @@ func (w *Wallet) Balance(_ context.Context, conf int32,
 		// Look up the account number for the given name and scope.
 		manager, err := w.addrStore.FetchScopedKeyManager(scope)
 		if err != nil {
-			return fmt.Errorf("failed to fetch scoped key manager for scope %s: %w", scope, err)
+			return fmt.Errorf(
+				"failed to fetch scoped key manager for "+
+					"scope %s: %w", scope, err,
+			)
 		}
 
 		accNum, err := manager.LookupAccount(addrmgrNs, name)
@@ -514,7 +539,9 @@ func (w *Wallet) Balance(_ context.Context, conf int32,
 
 		utxos, err := w.txStore.UnspentOutputs(txmgrNs)
 		if err != nil {
-			return fmt.Errorf("failed to get unspent outputs: %w", err)
+			return fmt.Errorf(
+				"failed to get unspent outputs: %w", err,
+			)
 		}
 
 		for _, utxo := range utxos {
@@ -808,7 +835,9 @@ func listAccountsWithBalances(scopeMgr *waddrmgr.ScopedKeyManager,
 		// properties from the database.
 		props, err := scopeMgr.AccountProperties(addrmgrNs, accNum)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get account properties: %w", err)
+			return nil, fmt.Errorf(
+				"failed to get account properties: %w", err,
+			)
 		}
 
 		// We'll look up the pre-calculated balance for this account.

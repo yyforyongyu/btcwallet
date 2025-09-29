@@ -14,7 +14,9 @@ import (
 // restoring, new accounts may not be created when all of the previous 100
 // accounts have no transaction history (this is a deviation from the BIP0044
 // spec, which allows no unused account gaps).
-func (w *Wallet) NextAccount(scope waddrmgr.KeyScope, name string) (uint32, error) {
+func (w *Wallet) NextAccount(scope waddrmgr.KeyScope,
+	name string) (uint32, error) {
+
 	manager, err := w.addrStore.FetchScopedKeyManager(scope)
 	if err != nil {
 		return 0, err
@@ -42,8 +44,8 @@ func (w *Wallet) NextAccount(scope waddrmgr.KeyScope, name string) (uint32, erro
 		return err
 	})
 	if err != nil {
-		log.Errorf("Cannot fetch new account properties for notification "+
-			"after account creation: %v", err)
+		log.Errorf("Cannot fetch new account properties for "+
+			"notification after account creation: %v", err)
 	} else {
 		w.NtfnServer.notifyAccountProperties(props)
 	}
@@ -79,18 +81,21 @@ func (w *Wallet) Accounts(scope waddrmgr.KeyScope) (*AccountsResult, error) {
 		if err != nil {
 			return err
 		}
-		err = manager.ForEachAccount(addrmgrNs, func(acct uint32) error {
-			props, err := manager.AccountProperties(addrmgrNs, acct)
-			if err != nil {
-				return err
-			}
-			accounts = append(accounts, AccountResult{
-				AccountProperties: *props,
-				// TotalBalance set below
-			})
+		err = manager.ForEachAccount(
+			addrmgrNs, func(acct uint32) error {
+				props, err := manager.AccountProperties(
+					addrmgrNs, acct)
+				if err != nil {
+					return err
+				}
+				accounts = append(accounts, AccountResult{
+					AccountProperties: *props,
+					// TotalBalance set below
+				})
 
-			return nil
-		})
+				return nil
+			},
+		)
 		if err != nil {
 			return err
 		}
@@ -102,9 +107,13 @@ func (w *Wallet) Accounts(scope waddrmgr.KeyScope) (*AccountsResult, error) {
 		for i := range unspent {
 			output := unspent[i]
 			var outputAcct uint32
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript, w.chainParams)
+			_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+				output.PkScript, w.chainParams,
+			)
 			if err == nil && len(addrs) > 0 {
-				_, outputAcct, err = w.addrStore.AddrAccount(addrmgrNs, addrs[0])
+				_, outputAcct, err = w.addrStore.AddrAccount(
+					addrmgrNs, addrs[0],
+				)
 			}
 			if err == nil {
 				amt, ok := m[outputAcct]

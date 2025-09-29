@@ -120,20 +120,24 @@ type Interface interface {
 	RenameAccountDeprecated(scope waddrmgr.KeyScope, account uint32,
 		newName string) error
 
-	// ImportAccountDeprecated imports an account backed by an extended public key.
+	// ImportAccountDeprecated imports an account backed by an extended
+	// public key.
 	// This creates a watch-only account.
 	//
 	// Deprecated: Use AccountManager.ImportAccount instead.
-	ImportAccountDeprecated(name string, accountPubKey *hdkeychain.ExtendedKey,
+	ImportAccountDeprecated(
+		name string, accountPubKey *hdkeychain.ExtendedKey,
 		masterKeyFingerprint uint32, addrType *waddrmgr.AddressType,
 	) (*waddrmgr.AccountProperties, error)
 
 	// ImportAccountDryRun imports an account backed by an extended public
 	// key, but does not save it to the database. This is useful for
 	// validating an account before importing it.
-	ImportAccountDryRun(name string, accountPubKey *hdkeychain.ExtendedKey,
+	ImportAccountDryRun(
+		name string, accountPubKey *hdkeychain.ExtendedKey,
 		masterKeyFingerprint uint32, addrType *waddrmgr.AddressType,
-		numAddrs uint32) (*waddrmgr.AccountProperties,
+		numAddrs uint32,
+	) (*waddrmgr.AccountProperties,
 		[]waddrmgr.ManagedAddress, []waddrmgr.ManagedAddress, error)
 
 	// InitAccounts initializes the accounts for all the key families.

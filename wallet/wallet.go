@@ -460,7 +460,8 @@ func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
 				return err
 			}
 
-			return w.addrStore.SetBirthdayBlock(ns, *birthdayStamp, true)
+			return w.addrStore.SetBirthdayBlock(
+				ns, *birthdayStamp, true)
 		})
 		if err != nil {
 			return fmt.Errorf("unable to persist initial sync "+
@@ -807,7 +808,8 @@ func (w *Wallet) recovery(chainClient chain.Interface,
 				// point to become desyncronized. Refactor so
 				// that this cannot happen.
 				for _, block := range blocks {
-					err := w.addrStore.SetSyncedTo(ns, block)
+					err := w.addrStore.SetSyncedTo(
+						ns, block)
 					if err != nil {
 						return err
 					}
@@ -1424,7 +1426,9 @@ out:
 		case req := <-w.unlockRequests:
 			err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 				addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-				return w.addrStore.Unlock(addrmgrNs, req.passphrase)
+
+				return w.addrStore.Unlock(
+					addrmgrNs, req.passphrase)
 			})
 			if err != nil {
 				req.err <- err
@@ -1623,10 +1627,12 @@ func (w *Wallet) AccountAddresses(account uint32) (addrs []btcutil.Address, err 
 	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 
-		return w.addrStore.ForEachAccountAddress(addrmgrNs, account, func(maddr waddrmgr.ManagedAddress) error {
-			addrs = append(addrs, maddr.Address())
-			return nil
-		})
+		return w.addrStore.ForEachAccountAddress(
+			addrmgrNs, account,
+			func(maddr waddrmgr.ManagedAddress) error {
+				addrs = append(addrs, maddr.Address())
+				return nil
+			})
 	})
 	return
 }
@@ -1719,7 +1725,8 @@ func (w *Wallet) CalculateAccountBalances(account uint32, confirms int32) (Balan
 			_, addrs, _, err := txscript.ExtractPkScriptAddrs(
 				output.PkScript, w.chainParams)
 			if err == nil && len(addrs) > 0 {
-				_, outputAcct, err = w.addrStore.AddrAccount(addrmgrNs, addrs[0])
+				_, outputAcct, err = w.addrStore.AddrAccount(
+					addrmgrNs, addrs[0])
 			}
 			if err != nil || outputAcct != account {
 				continue
@@ -2042,7 +2049,8 @@ func (w *Wallet) LookupAccount(name string) (waddrmgr.KeyScope, uint32, error) {
 		return nil
 	})
 	if err != nil {
-		return keyScope, account, fmt.Errorf("failed to view walletdb: %w", err)
+		return keyScope, account, fmt.Errorf("failed to view "+
+			"walletdb: %w", err)
 	}
 
 	return keyScope, account, nil
@@ -2285,7 +2293,8 @@ func (w *Wallet) ListTransactions(from, count int) ([]btcjson.ListTransactionsRe
 				}
 
 				jsonResults := listTransactions(tx, &details[i],
-					w.addrStore, syncBlock.Height, w.chainParams)
+					w.addrStore, syncBlock.Height,
+					w.chainParams)
 				txList = append(txList, jsonResults...)
 
 				if len(jsonResults) > 0 {
@@ -2336,7 +2345,9 @@ func (w *Wallet) ListAddressTransactions(pkHashes map[string]struct{}) ([]btcjso
 					}
 
 					jsonResults := listTransactions(tx, detail,
-						w.addrStore, syncBlock.Height, w.chainParams)
+						w.addrStore,
+						syncBlock.Height,
+						w.chainParams)
 					txList = append(txList, jsonResults...)
 					continue loopDetails
 				}
@@ -2367,7 +2378,8 @@ func (w *Wallet) ListAllTransactions() ([]btcjson.ListTransactionsResult, error)
 			// unsorted, but it will process mined transactions in the
 			// reverse order they were marked mined.
 			for i := len(details) - 1; i >= 0; i-- {
-				jsonResults := listTransactions(tx, &details[i], w.addrStore,
+				jsonResults := listTransactions(
+					tx, &details[i], w.addrStore,
 					syncBlock.Height, w.chainParams)
 				txList = append(txList, jsonResults...)
 			}
@@ -2761,7 +2773,9 @@ func (w *Wallet) ListUnspent(minconf, maxconf int32,
 				continue
 			}
 			if len(addrs) > 0 {
-				smgr, acct, err := w.addrStore.AddrAccount(addrmgrNs, addrs[0])
+				smgr, acct, err := w.addrStore.AddrAccount(
+					addrmgrNs, addrs[0],
+				)
 				if err == nil {
 					s, err := smgr.AccountName(addrmgrNs, acct)
 					if err == nil {
@@ -2798,7 +2812,9 @@ func (w *Wallet) ListUnspent(minconf, maxconf int32,
 				spendable = true
 			case txscript.MultiSigTy:
 				for _, a := range addrs {
-					_, err := w.addrStore.Address(addrmgrNs, a)
+					_, err := w.addrStore.Address(
+						addrmgrNs, a,
+					)
 					if err == nil {
 						continue
 					}
@@ -2855,7 +2871,9 @@ func (w *Wallet) ListLeasedOutputs() ([]*ListLeasedOutputResult, error) {
 		}
 
 		for _, output := range outputs {
-			details, err := w.txStore.TxDetails(ns, &output.Outpoint.Hash)
+			details, err := w.txStore.TxDetails(
+				ns, &output.Outpoint.Hash,
+			)
 			if err != nil {
 				return err
 			}
@@ -2890,29 +2908,38 @@ func (w *Wallet) DumpPrivKeys() ([]string, error) {
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		// Iterate over each active address, appending the private key to
-		// privkeys.
-		return w.addrStore.ForEachActiveAddress(addrmgrNs, func(addr btcutil.Address) error {
-			ma, err := w.addrStore.Address(addrmgrNs, addr)
-			if err != nil {
-				return err
-			}
+		return w.addrStore.ForEachActiveAddress(
+			addrmgrNs, func(addr btcutil.Address) error {
+				ma, err := w.addrStore.Address(addrmgrNs, addr)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot get address: %w", err,
+					)
+				}
 
-			// Only those addresses with keys needed.
-			pka, ok := ma.(waddrmgr.ManagedPubKeyAddress)
-			if !ok {
+				// Only those addresses with keys needed.
+				pka, ok := ma.(waddrmgr.ManagedPubKeyAddress)
+				if !ok {
+					return nil
+				}
+
+				wif, err := pka.ExportPrivKey()
+				if err != nil {
+					// It would be nice to zero out the
+					// array here. However, since strings in
+					// go are immutable, and we have no
+					// control over the caller I don't
+					// think we can. :(
+					return fmt.Errorf(
+						"cannot export private key: %w",
+						err,
+					)
+				}
+
+				privkeys = append(privkeys, wif.String())
+
 				return nil
-			}
-
-			wif, err := pka.ExportPrivKey()
-			if err != nil {
-				// It would be nice to zero out the array here. However,
-				// since strings in go are immutable, and we have no
-				// control over the caller I don't think we can. :(
-				return err
-			}
-			privkeys = append(privkeys, wif.String())
-			return nil
-		})
+			})
 	})
 	return privkeys, err
 }
@@ -3078,10 +3105,14 @@ func (w *Wallet) SortedActivePaymentAddresses() ([]string, error) {
 	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 
-		return w.addrStore.ForEachActiveAddress(addrmgrNs, func(addr btcutil.Address) error {
-			addrStrs = append(addrStrs, addr.EncodeAddress())
-			return nil
-		})
+		return w.addrStore.ForEachActiveAddress(
+			addrmgrNs, func(addr btcutil.Address) error {
+				addrStrs = append(
+					addrStrs, addr.EncodeAddress(),
+				)
+
+				return nil
+			})
 	})
 	if err != nil {
 		return nil, err
@@ -3293,7 +3324,11 @@ func (w *Wallet) TotalReceivedForAccounts(scope waddrmgr.KeyScope,
 					var outputAcct uint32
 					_, addrs, _, err := txscript.ExtractPkScriptAddrs(pkScript, w.chainParams)
 					if err == nil && len(addrs) > 0 {
-						_, outputAcct, err = w.addrStore.AddrAccount(addrmgrNs, addrs[0])
+						_, outputAcct, err =
+							w.addrStore.AddrAccount(
+								addrmgrNs,
+								addrs[0],
+							)
 					}
 					if err == nil {
 						acctIndex := int(outputAcct)
@@ -3310,7 +3345,9 @@ func (w *Wallet) TotalReceivedForAccounts(scope waddrmgr.KeyScope,
 			return false, nil
 		}
 
-		return w.txStore.RangeTransactions(txmgrNs, 0, stopHeight, rangeFn)
+		return w.txStore.RangeTransactions(
+			txmgrNs, 0, stopHeight, rangeFn,
+		)
 	})
 	return results, err
 }
@@ -3358,7 +3395,9 @@ func (w *Wallet) TotalReceivedForAddr(addr btcutil.Address, minConf int32) (btcu
 			return false, nil
 		}
 
-		return w.txStore.RangeTransactions(txmgrNs, 0, stopHeight, rangeFn)
+		return w.txStore.RangeTransactions(
+			txmgrNs, 0, stopHeight, rangeFn,
+		)
 	})
 	return amount, err
 }
@@ -3478,7 +3517,9 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx, hashType txscript.SigHashType,
 				prevHash := &txIn.PreviousOutPoint.Hash
 				prevIndex := txIn.PreviousOutPoint.Index
 
-				txDetails, err := w.txStore.TxDetails(txmgrNs, prevHash)
+				txDetails, err := w.txStore.TxDetails(
+					txmgrNs, prevHash,
+				)
 				if err != nil {
 					return fmt.Errorf("cannot query previous transaction "+
 						"details for %v: %w", txIn.PreviousOutPoint, err)
@@ -3506,7 +3547,9 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx, hashType txscript.SigHashType,
 					return wif.PrivKey, wif.CompressPubKey, nil
 				}
 
-				address, err := w.addrStore.Address(addrmgrNs, addr)
+				address, err := w.addrStore.Address(
+					addrmgrNs, addr,
+				)
 				if err != nil {
 					return nil, false, err
 				}
@@ -3536,7 +3579,9 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx, hashType txscript.SigHashType,
 					return script, nil
 				}
 
-				address, err := w.addrStore.Address(addrmgrNs, addr)
+				address, err := w.addrStore.Address(
+					addrmgrNs, addr,
+				)
 				if err != nil {
 					return nil, err
 				}
