@@ -5,6 +5,7 @@
 package db
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"time"
@@ -64,6 +65,10 @@ var (
 	// lastAccountName is used to store the metadata - last account
 	// in the manager.
 	lastAccountName = []byte("lastaccount")
+
+	// acctBucketName is the bucket directly below the scope bucket in the
+	// hierarchy.
+	acctBucketName = []byte("acct")
 )
 
 // PutBirthday stores the wallet's birthday in the database.
@@ -243,27 +248,295 @@ func PutCryptoKeys(ns walletdb.ReadWriteBucket, pubKeyEncrypted, privKeyEncrypte
 	return nil
 }
 
-// FetchLastAccount retrieves the last account from the database.
-// If no accounts, returns twos-complement representation of -1, so that the next account is zero
-func FetchLastAccount(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope) (uint32, error) {
+// FetchAccountInfo loads information about the passed account from the
+// database.
+func FetchAccountInfo(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope,
+	account uint32) (interface{}, error) {
+
 	scopedBucket, err := fetchReadScopeBucket(ns, scope)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	metaBucket := scopedBucket.NestedReadBucket(metaBucketName)
+	acctBucket := scopedBucket.NestedReadBucket(acctBucketName)
 
-	val := metaBucket.Get(lastAccountName)
-	if val == nil {
-		return (1 << 32) - 1, nil
-	}
-	if len(val) != 4 {
-		return 0, newError(ErrDatabase, fmt.Sprintf("malformed metadata '%s' stored in database", lastAccountName), nil)
+	accountID := uint32ToBytes(account)
+	serializedRow := acctBucket.Get(accountID)
+	if serializedRow == nil {
+		return nil, newError(ErrDatabase, fmt.Sprintf("account %d not found", account), nil)
 	}
 
-	account := binary.LittleEndian.Uint32(val[0:4])
-	return account, nil
+	row, err := deserializeAccountRow(accountID, serializedRow)
+	if err != nil {
+		return nil, err
+	}
+
+	switch row.acctType {
+	case accountDefault:
+		return deserializeDefaultAccountRow(accountID, row)
+	case 1: // accountWatchOnly
+		return deserializeWatchOnlyAccountRow(accountID, row)
+	}
+
+	return nil, newError(ErrDatabase, fmt.Sprintf("unsupported account type '%d'", row.acctType), nil)
 }
+
+// deserializeAccountRow deserializes the passed serialized account information.
+// This is used as a common base for the various account types to deserialize
+// the common parts.
+func deserializeAccountRow(accountID []byte, serializedAccount []byte) (*dbAccountRow, error) {
+	// The serialized account format is:
+	//   <acctType><rdlen><rawdata>
+	//
+	// 1 byte acctType + 4 bytes raw data length + raw data
+
+	// Given the above, the length of the entry must be at a minimum
+	// the constant value sizes.
+	if len(serializedAccount) < 5 {
+		return nil, newError(ErrDatabase, fmt.Sprintf("malformed serialized account for key %x", accountID), nil)
+	}
+
+	row := dbAccountRow{}
+	row.acctType = AccountType(serializedAccount[0])
+	rdlen := binary.LittleEndian.Uint32(serializedAccount[1:5])
+	row.rawData = make([]byte, rdlen)
+	copy(row.rawData, serializedAccount[5:5+rdlen])
+
+	return &row, nil
+}
+
+// deserializeDefaultAccountRow deserializes the raw data from the passed
+
+// account row as a BIP0044-like account.
+
+func deserializeDefaultAccountRow(accountID []byte, row *dbAccountRow) (*DbDefaultAccountRow, error) {
+
+	// The serialized BIP0044 account raw data format is:
+
+	//   <encpubkeylen><encpubkey><encprivkeylen><encprivkey><nextextidx>
+
+	//   <nextintidx><namelen><name>
+
+	//
+
+	// 4 bytes encrypted pubkey len + encrypted pubkey + 4 bytes encrypted
+
+	// privkey len + encrypted privkey + 4 bytes next external index +
+
+	// 4 bytes next internal index + 4 bytes name len + name
+
+
+
+	// Given the above, the length of the entry must be at a minimum
+
+	// the constant value sizes.
+
+	if len(row.rawData) < 20 {
+
+		return nil, newError(ErrDatabase, fmt.Sprintf("malformed serialized bip0044 account for key %x", accountID), nil)
+
+	}
+
+
+
+	retRow := DbDefaultAccountRow{}
+
+
+
+	pubLen := binary.LittleEndian.Uint32(row.rawData[0:4])
+
+	retRow.PubKeyEncrypted = make([]byte, pubLen)
+
+	copy(retRow.PubKeyEncrypted, row.rawData[4:4+pubLen])
+
+	offset := 4 + pubLen
+
+	privLen := binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
+
+	offset += 4
+
+	retRow.PrivKeyEncrypted = make([]byte, privLen)
+
+	copy(retRow.PrivKeyEncrypted, row.rawData[offset:offset+privLen])
+
+	offset += privLen
+
+	retRow.NextExternalIndex = binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
+
+	offset += 4
+
+	retRow.NextInternalIndex = binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
+
+	offset += 4
+
+	nameLen := binary.LittleEndian.Uint32(row.rawData[offset : offset+4])
+
+	offset += 4
+
+	retRow.Name = string(row.rawData[offset : offset+nameLen])
+
+
+
+	return &retRow, nil
+
+}
+
+
+
+// deserializeWatchOnlyAccountRow deserializes the raw data from the passed
+
+// account row as a watch-only account.
+
+func deserializeWatchOnlyAccountRow(accountID []byte,
+
+	row *dbAccountRow) (*DbWatchOnlyAccountRow, error) {
+
+
+
+	// The serialized BIP0044 watch-only account raw data format is:
+
+	//   <encpubkeylen><encpubkey><masterkeyfingerprint><nextextidx>
+
+	//   <nextintidx><namelen><name>
+
+	//
+
+	// 4 bytes encrypted pubkey len + encrypted pubkey + 4 bytes master key
+
+	// fingerprint + 4 bytes next external index + 4 bytes next internal
+
+	// index + 4 bytes name len + name + 1 byte addr schema exists + 2 bytes
+
+	// addr schema (if exists)
+
+
+
+	// Given the above, the length of the entry must be at a minimum
+
+	// the constant value sizes.
+
+	if len(row.rawData) < 21 {
+
+		return nil, newError(ErrDatabase, fmt.Sprintf("malformed serialized watch-only account for key %x", accountID), nil)
+
+	}
+
+
+
+	retRow := DbWatchOnlyAccountRow{}
+
+	r := bytes.NewReader(row.rawData)
+
+
+
+	var pubLen uint32
+
+	err := binary.Read(r, binary.LittleEndian, &pubLen)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+	retRow.PubKeyEncrypted = make([]byte, pubLen)
+
+	err = binary.Read(r, binary.LittleEndian, &retRow.PubKeyEncrypted)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+
+
+	err = binary.Read(r, binary.LittleEndian, &retRow.MasterKeyFingerprint)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+
+
+	err = binary.Read(r, binary.LittleEndian, &retRow.NextExternalIndex)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+	err = binary.Read(r, binary.LittleEndian, &retRow.NextInternalIndex)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+
+
+	var nameLen uint32
+
+	err = binary.Read(r, binary.LittleEndian, &nameLen)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+	name := make([]byte, nameLen)
+
+	err = binary.Read(r, binary.LittleEndian, &name)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+	retRow.Name = string(name)
+
+
+
+	var addrSchemaExists bool
+
+	err = binary.Read(r, binary.LittleEndian, &addrSchemaExists)
+
+	if err != nil {
+
+		return nil, err
+
+	}
+
+	if addrSchemaExists {
+
+		var addrSchemaBytes [2]byte
+
+		err = binary.Read(r, binary.LittleEndian, &addrSchemaBytes)
+
+		if err != nil {
+
+			return nil, err
+
+		}
+
+				addrSchema := ScopeSchemaFromBytes(addrSchemaBytes[:])
+
+				retRow.AddrSchema = &addrSchema
+
+			}
+
+
+
+	return &retRow, nil
+
+}
+
 
 func fetchReadScopeBucket(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope) (walletdb.ReadBucket, error) {
 	rootScopeBucket := ns.NestedReadBucket(scopeBucketName)
@@ -275,6 +548,36 @@ func fetchReadScopeBucket(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope) (wal
 	}
 
 	return scopedBucket, nil
+}
+
+// uint32ToBytes converts a 32 bit unsigned integer into a 4-byte slice in
+// little-endian order: 1 -> [1 0 0 0].
+func uint32ToBytes(number uint32) []byte {
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, number)
+	return buf
+}
+
+const (
+	// accountDefault is the current "default" account type within the
+	// database. This is an account that re-uses the key derivation schema
+	// of BIP0044-like accounts.
+	accountDefault AccountType = 0 // not iota as they need to be stable
+)
+
+// dbAccountRow houses information stored about an account in the database.
+type dbAccountRow struct {
+	acctType AccountType
+	rawData  []byte // Varies based on account type field.
+}
+
+// ScopeSchemaFromBytes decodes a new scope schema instance from the set of
+// serialized bytes.
+func ScopeSchemaFromBytes(schemaBytes []byte) waddrmgr.ScopeAddrSchema {
+	return waddrmgr.ScopeAddrSchema{
+		InternalAddrType: waddrmgr.AddressType(schemaBytes[0]),
+		ExternalAddrType: waddrmgr.AddressType(schemaBytes[1]),
+	}
 }
 
 // PutMasterKeyParams stores the master key parameters needed to derive them to

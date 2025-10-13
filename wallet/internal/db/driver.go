@@ -262,19 +262,14 @@ func (d *KvdbStore) GetAccount(ctx context.Context, query GetAccountQuery) (Acco
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		scope := fromDBKeyScope(query.Scope)
 
-		manager, err := d.addrStore.FetchScopedKeyManager(scope)
-		if err != nil {
-			return err
-		}
-
 		// Look up the account number for the given name and scope.
-		accNum, err := manager.LookupAccount(addrmgrNs, *query.Name)
+		_, accNum, err := d.addrStore.LookupAccount(addrmgrNs, *query.Name)
 		if err != nil {
 			return err
 		}
 
 		// Retrieve the static properties for the account.
-		props, err := manager.AccountProperties(addrmgrNs, accNum)
+		row, err := FetchAccountInfo(addrmgrNs, &scope, accNum)
 		if err != nil {
 			return err
 		}
@@ -287,12 +282,21 @@ func (d *KvdbStore) GetAccount(ctx context.Context, query GetAccountQuery) (Acco
 			return err
 		}
 
-		info = AccountInfo{
-			AccountNumber:    props.AccountNumber,
-			AccountName:      props.AccountName,
-			ExternalKeyCount: props.ExternalKeyCount,
-			InternalKeyCount: props.InternalKeyCount,
-			ImportedKeyCount: props.ImportedKeyCount,
+		switch row := row.(type) {
+		case *DbDefaultAccountRow:
+			info = AccountInfo{
+				AccountNumber:    accNum,
+				AccountName:      row.Name,
+				ExternalKeyCount: row.NextExternalIndex,
+				InternalKeyCount: row.NextInternalIndex,
+			}
+		case *DbWatchOnlyAccountRow:
+			info = AccountInfo{
+				AccountNumber:    accNum,
+				AccountName:      row.Name,
+				ExternalKeyCount: row.NextExternalIndex,
+				InternalKeyCount: row.NextInternalIndex,
+			}
 		}
 
 		// Assign the balances to the account result.

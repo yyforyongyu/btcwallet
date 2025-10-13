@@ -1613,7 +1613,13 @@ func (s *ScopedKeyManager) NewRawAccount(ns walletdb.ReadWriteBucket, number uin
 	// derivation, we'll create a new name for this account based off of
 	// the account number.
 	name := fmt.Sprintf("act:%v", number)
-	return s.newAccount(ns, number, name)
+	// With the name validated, we'll create a new account for the new
+	// contiguous account.
+	if _, _, err := s.PrepareNewAccount(ns, number, name); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // NewRawAccountWatchingOnly creates a new watching only account for the scoped
@@ -1664,82 +1670,10 @@ func (s *ScopedKeyManager) NewAccount(ns walletdb.ReadWriteBucket, name string) 
 	}
 	account++
 
-	// With the name validated, we'll create a new account for the new
-	// contiguous account.
-	if err := s.newAccount(ns, account, name); err != nil {
+	// Prepare the new account.
+	acctPubEnc, acctPrivEnc, err := s.PrepareNewAccount(ns, account, name)
+	if err != nil {
 		return 0, err
-	}
-
-	return account, nil
-}
-
-// newAccount is a helper function that derives a new precise account number,
-// and creates a mapping from the passed name to the account number in the
-// database.
-//
-// NOTE: This function MUST be called with the manager lock held for writes.
-func (s *ScopedKeyManager) newAccount(ns walletdb.ReadWriteBucket,
-	account uint32, name string) error {
-
-	// Validate the account name.
-	if err := ValidateAccountName(name); err != nil {
-		return err
-	}
-
-	// Check that account with the same name does not exist
-	_, err := s.lookupAccount(ns, name)
-	if err == nil {
-		str := "account with the same name already exists"
-		return managerError(ErrDuplicateAccount, str, err)
-	}
-
-	// Fetch the cointype key which will be used to derive the next account
-	// extended keys
-	_, coinTypePrivEnc, err := fetchCoinTypeKeys(ns, &s.scope)
-	if err != nil {
-		return err
-	}
-
-	// Decrypt the cointype key.
-	serializedKeyPriv, err := s.rootManager.cryptoKeyPriv.Decrypt(coinTypePrivEnc)
-	if err != nil {
-		str := "failed to decrypt cointype serialized private key"
-		return managerError(ErrLocked, str, err)
-	}
-	coinTypeKeyPriv, err := hdkeychain.NewKeyFromString(string(serializedKeyPriv))
-	zero.Bytes(serializedKeyPriv)
-	if err != nil {
-		str := "failed to create cointype extended private key"
-		return managerError(ErrKeyChain, str, err)
-	}
-
-	// Derive the account key using the cointype key
-	acctKeyPriv, err := deriveAccountKey(coinTypeKeyPriv, account)
-	coinTypeKeyPriv.Zero()
-	if err != nil {
-		str := "failed to convert private key for account"
-		return managerError(ErrKeyChain, str, err)
-	}
-	acctKeyPub, err := acctKeyPriv.Neuter()
-	if err != nil {
-		str := "failed to convert public key for account"
-		return managerError(ErrKeyChain, str, err)
-	}
-
-	// Encrypt the default account keys with the associated crypto keys.
-	acctPubEnc, err := s.rootManager.cryptoKeyPub.Encrypt(
-		[]byte(acctKeyPub.String()),
-	)
-	if err != nil {
-		str := "failed to  encrypt public key for account"
-		return managerError(ErrCrypto, str, err)
-	}
-	acctPrivEnc, err := s.rootManager.cryptoKeyPriv.Encrypt(
-		[]byte(acctKeyPriv.String()),
-	)
-	if err != nil {
-		str := "failed to encrypt private key for account"
-		return managerError(ErrCrypto, str, err)
 	}
 
 	// We have the encrypted account extended keys, so save them to the
@@ -1748,11 +1682,85 @@ func (s *ScopedKeyManager) newAccount(ns walletdb.ReadWriteBucket,
 		ns, &s.scope, account, acctPubEnc, acctPrivEnc, 0, 0, name,
 	)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Save last account metadata
-	return putLastAccount(ns, &s.scope, account)
+	err = putLastAccount(ns, &s.scope, account)
+	if err != nil {
+		return 0, err
+	}
+
+	return account, nil
+}
+
+// PrepareNewAccount prepares a new account for the scoped manager. It returns the
+// encrypted public and private keys for the new account.
+func (s *ScopedKeyManager) PrepareNewAccount(ns walletdb.ReadBucket,
+	account uint32, name string) ([]byte, []byte, error) {
+
+	// Validate the account name.
+	if err := ValidateAccountName(name); err != nil {
+		return nil, nil, err
+	}
+
+	// Check that account with the same name does not exist
+	_, err := s.lookupAccount(ns, name)
+	if err == nil {
+		str := "account with the same name already exists"
+		return nil, nil, managerError(ErrDuplicateAccount, str, err)
+	}
+
+	// Fetch the cointype key which will be used to derive the next account
+	// extended keys
+	_, coinTypePrivEnc, err := fetchCoinTypeKeys(ns, &s.scope)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Decrypt the cointype key.
+	serializedKeyPriv, err := s.rootManager.cryptoKeyPriv.Decrypt(coinTypePrivEnc)
+	if err != nil {
+		str := "failed to decrypt cointype serialized private key"
+		return nil, nil, managerError(ErrLocked, str, err)
+	}
+	coinTypeKeyPriv, err := hdkeychain.NewKeyFromString(string(serializedKeyPriv))
+	zero.Bytes(serializedKeyPriv)
+	if err != nil {
+		str := "failed to create cointype extended private key"
+		return nil, nil, managerError(ErrKeyChain, str, err)
+	}
+
+	// Derive the account key using the cointype key
+	acctKeyPriv, err := deriveAccountKey(coinTypeKeyPriv, account)
+	coinTypeKeyPriv.Zero()
+	if err != nil {
+		str := "failed to convert private key for account"
+		return nil, nil, managerError(ErrKeyChain, str, err)
+	}
+	acctKeyPub, err := acctKeyPriv.Neuter()
+	if err != nil {
+		str := "failed to convert public key for account"
+		return nil, nil, managerError(ErrKeyChain, str, err)
+	}
+
+	// Encrypt the default account keys with the associated crypto keys.
+	acctPubEnc, err := s.rootManager.cryptoKeyPub.Encrypt(
+		[]byte(acctKeyPub.String()),
+	)
+	if err != nil {
+		str := "failed to  encrypt public key for account"
+		return nil, nil, managerError(ErrCrypto, str, err)
+	}
+	acctPrivEnc, err := s.rootManager.cryptoKeyPriv.Encrypt(
+		[]byte(acctKeyPriv.String()),
+	)
+	if err != nil {
+		str := "failed to encrypt private key for account"
+		return nil, nil, managerError(ErrCrypto, str, err)
+	}
+
+	return acctPubEnc, acctPrivEnc, nil
 }
 
 // NewAccountWatchingOnly is similar to NewAccount, but for watch-only wallets.
