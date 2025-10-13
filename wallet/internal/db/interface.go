@@ -32,7 +32,6 @@ type WalletStore interface {
 	GetWallet(ctx context.Context, name string) (WalletInfo, error)
 	ListWallets(ctx context.Context) ([]WalletInfo, error)
 	UpdateSyncState(ctx context.Context, params UpdateSyncStateParams) error
-	GetHDSeed(ctx context.Context, params GetHDSeedParams) ([]byte, error)
 	GetEncryptedHDSeed(ctx context.Context) ([]byte, error)
 	ChangePassphrase(ctx context.Context, old, new []byte, private bool) error
 	Unlock(ctx context.Context, passphrase []byte) error

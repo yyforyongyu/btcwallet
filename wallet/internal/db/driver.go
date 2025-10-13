@@ -104,12 +104,6 @@ func (d *KvdbStore) UpdateSyncState(ctx context.Context, params UpdateSyncStateP
 	})
 }
 
-// GetHDSeed is a placeholder for the GetHDSeed method.
-func (d *KvdbStore) GetHDSeed(ctx context.Context, params GetHDSeedParams) ([]byte, error) {
-	// TODO(yy): implement
-	return nil, nil
-}
-
 // GetEncryptedHDSeed returns the encrypted HD seed of the wallet.
 func (d *KvdbStore) GetEncryptedHDSeed(ctx context.Context) ([]byte, error) {
 	var encryptedSeed []byte
