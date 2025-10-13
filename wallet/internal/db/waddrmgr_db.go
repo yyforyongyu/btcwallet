@@ -129,3 +129,20 @@ func deserializeBlockStamp(serializedBlock []byte) (*waddrmgr.BlockStamp, error)
 	copy(block.Hash[:], serializedBlock[4:36])
 	return &block, nil
 }
+
+// PutSyncedTo stores the wallet's current sync state in the database.
+func PutSyncedTo(ns walletdb.ReadWriteBucket, bs *waddrmgr.BlockStamp) error {
+	syncBucket := ns.NestedReadWriteBucket(syncBucketName)
+	if syncBucket == nil {
+		return errNoSyncBucket
+	}
+
+	// Store synced to block.
+	serializedBlock := serializeBlockStamp(bs)
+	err := syncBucket.Put([]byte("syncedto"), serializedBlock)
+	if err != nil {
+		return newError(ErrDatabase, "failed to store synced to block", err)
+	}
+
+	return nil
+}

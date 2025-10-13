@@ -86,13 +86,13 @@ func (d *KvdbStore) UpdateSyncState(ctx context.Context, params UpdateSyncStateP
 			Height:    params.SyncState.Height,
 			Timestamp: params.SyncState.Timestamp,
 		}
-		err := d.addrStore.SetSyncedTo(addrmgrNs, &bs)
+		err := PutSyncedTo(addrmgrNs, &bs)
 		if err != nil {
 			return err
 		}
 
 		if params.BirthdayBlock != nil {
-			err := d.addrStore.SetBirthdayBlock(
+			err := PutBirthdayBlock(
 				addrmgrNs, *params.BirthdayBlock, false,
 			)
 			if err != nil {
