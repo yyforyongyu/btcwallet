@@ -5,7 +5,8 @@
 package wallet
 
 import (
-	"bytes"
+	"context"
+	"errors"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -13,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -47,32 +49,11 @@ func (w *Wallet) handleChainNotifications() {
 		// rescan.
 		log.Infof("Catching up block hashes to height %d, this"+
 			" might take a while", height)
-		err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-			startBlock := w.addrStore.SyncedTo()
-
-			for i := startBlock.Height + 1; i <= height; i++ {
-				hash, err := client.GetBlockHash(int64(i))
-				if err != nil {
-					return err
-				}
-				header, err := chainClient.GetBlockHeader(hash)
-				if err != nil {
-					return err
-				}
-
-				bs := waddrmgr.BlockStamp{
-					Height:    i,
-					Hash:      *hash,
-					Timestamp: header.Timestamp,
-				}
-				err = w.addrStore.SetSyncedTo(ns, &bs)
-				if err != nil {
-					return err
-				}
-			}
-			return nil
+		err := w.store.UpdateSyncState(context.Background(), db.UpdateSyncStateParams{
+			WalletID: w.ID(),
+			SyncState: db.SyncState{
+				Height: height,
+			},
 		})
 		if err != nil {
 			log.Errorf("Failed to update address manager "+
@@ -135,11 +116,11 @@ func (w *Wallet) handleChainNotifications() {
 				// been set correctly to potentially prevent
 				// missing relevant events.
 				birthdayStore := &walletBirthdayStore{
-					db:      w.db,
-					manager: w.addrStore,
+					store: w.store,
 				}
 				birthdayBlock, err := birthdaySanityCheck(
-					chainClient, birthdayStore,
+					context.Background(), chainClient,
+					birthdayStore,
 				)
 				if err != nil && !waddrmgr.IsError(
 					err, waddrmgr.ErrBirthdayBlockNotSet,
@@ -159,18 +140,34 @@ func (w *Wallet) handleChainNotifications() {
 				}
 
 			case chain.BlockConnected:
-				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-					return w.connectBlock(tx, wtxmgr.BlockMeta(n))
+				err = w.store.UpdateSyncState(context.Background(), db.UpdateSyncStateParams{
+					WalletID: w.ID(),
+					SyncState: db.SyncState{
+						SyncedTo: n.Hash,
+						Height:   n.Height,
+					},
 				})
 				notificationName = "block connected"
 			case chain.BlockDisconnected:
-				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-					return w.disconnectBlock(tx, wtxmgr.BlockMeta(n))
+				err = w.store.UpdateSyncState(context.Background(), db.UpdateSyncStateParams{
+					WalletID: w.ID(),
+					SyncState: db.SyncState{
+						SyncedTo: n.Hash,
+						Height:   n.Height,
+					},
 				})
 				notificationName = "block disconnected"
 			case chain.RelevantTx:
-				err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-					return w.addRelevantTx(tx, n.TxRecord, n.Block)
+				err = w.store.UpdateTx(context.Background(), db.UpdateTxParams{
+					WalletID: w.ID(),
+					TxHash:   n.TxRecord.Hash,
+					Data: db.TxUpdateData{
+						BlockMeta: db.BlockMeta{
+							Hash:   n.Block.Hash,
+							Height: n.Block.Height,
+							Time:   n.Block.Time,
+						},
+					},
 				})
 				notificationName = "relevant transaction"
 			case chain.FilteredBlockConnected:
@@ -180,7 +177,7 @@ func (w *Wallet) handleChainNotifications() {
 						tx walletdb.ReadWriteTx) error {
 						var err error
 						for _, rec := range n.RelevantTxs {
-							err = w.addRelevantTx(tx, rec,
+							err = w.addRelevantTx(context.Background(), tx, rec,
 								n.Block)
 							if err != nil {
 								return err
@@ -237,178 +234,195 @@ func (w *Wallet) handleChainNotifications() {
 	}
 }
 
-// connectBlock handles a chain server notification by marking a wallet
-// that's currently in-sync with the chain server as being synced up to
-// the passed block.
-func (w *Wallet) connectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) error {
-	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-	bs := waddrmgr.BlockStamp{
-		Height:    b.Height,
-		Hash:      b.Hash,
-		Timestamp: b.Time,
-	}
-	err := w.addrStore.SetSyncedTo(addrmgrNs, &bs)
-	if err != nil {
-		return err
-	}
-
-	// Notify interested clients of the connected block.
-	//
-	// TODO: move all notifications outside of the database transaction.
-	w.NtfnServer.notifyAttachedBlock(dbtx, &b)
-	return nil
-}
-
-// disconnectBlock handles a chain server reorganize by rolling back all
-// block history from the reorged block for a wallet in-sync with the chain
-// server.
-func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) error {
-	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
-	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-	if !w.ChainSynced() {
-		return nil
-	}
-
-	// Disconnect the removed block and all blocks after it if we know about
-	// the disconnected block. Otherwise, the block is in the future.
-	//nolint:nestif
-	if b.Height <= w.addrStore.SyncedTo().Height {
-		hash, err := w.addrStore.BlockHash(addrmgrNs, b.Height)
-		if err != nil {
-			return err
-		}
-		if bytes.Equal(hash[:], b.Hash[:]) {
-			bs := waddrmgr.BlockStamp{
-				Height: b.Height - 1,
-			}
-			hash, err = w.addrStore.BlockHash(addrmgrNs, bs.Height)
-			if err != nil {
-				return err
-			}
-			b.Hash = *hash
-
-			client := w.ChainClient()
-			header, err := client.GetBlockHeader(hash)
-			if err != nil {
-				return err
-			}
-
-			bs.Timestamp = header.Timestamp
-			err = w.addrStore.SetSyncedTo(addrmgrNs, &bs)
-			if err != nil {
-				return err
-			}
-
-			err = w.txStore.Rollback(txmgrNs, b.Height)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// Notify interested clients of the disconnected block.
-	w.NtfnServer.notifyDetachedBlock(&b.Hash)
-
-	return nil
-}
-
-func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord,
+// addRelevantTx adds a relevant transaction to the wallet's transaction store.
+func (w *Wallet) addRelevantTx(ctx context.Context, dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord,
 	block *wtxmgr.BlockMeta) error {
 
-	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
 	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
 
 	// At the moment all notified transactions are assumed to actually be
 	// relevant.  This assumption will not hold true when SPV support is
 	// added, but until then, simply insert the transaction because there
 	// should either be one or more relevant inputs or outputs.
-	exists, err := w.txStore.InsertTxCheckIfExists(txmgrNs, rec, block)
-	if err != nil {
-		return err
+	_, err := w.store.GetTx(ctx, db.GetTxQuery{
+		WalletID: w.ID(),
+		TxHash:   rec.Hash,
+	})
+	if err == nil {
+		return nil
 	}
 
 	// If the transaction has already been recorded, we can return early.
 	// Note: Returning here is safe as we're within the context of an atomic
 	// database transaction, so we don't need to worry about the MarkUsed
 	// calls below.
-	if exists {
-		return nil
+	if !errors.Is(err, db.ErrNotFound) {
+		return err
 	}
 
-	// Check every output to determine whether it is controlled by a wallet
-	// key.  If so, mark the output as a credit.
-	for i, output := range rec.MsgTx.TxOut {
-		_, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript,
-			w.chainParams)
-		if err != nil {
-			// Non-standard outputs are skipped.
-			log.Warnf("Cannot extract non-std pkScript=%x",
-				output.PkScript)
+		var credits []db.CreditData
 
-			continue
-		}
+		for i, output := range rec.MsgTx.TxOut {
 
-		for _, addr := range addrs {
-			ma, err := w.addrStore.Address(addrmgrNs, addr)
+			_, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript,
 
-			switch {
-			// Missing addresses are skipped.
-			case waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound):
+				w.chainParams)
+
+			if err != nil {
+
+				// Non-standard outputs are skipped.
+
+				log.Warnf("Cannot extract non-std pkScript=%x",
+
+					output.PkScript)
+
+	
+
 				continue
 
-			// Other errors should be propagated.
-			case err != nil:
-				return err
 			}
 
-			// Prevent addresses from non-default scopes to be
-			// detected here. We don't watch funds sent to
-			// non-default scopes in other places either, so
-			// detecting them here would mean we'd also not properly
-			// detect them as spent later.
-			scopedManager, _, err := w.addrStore.AddrAccount(
-				addrmgrNs, addr,
-			)
-			if err != nil {
-				return err
-			}
-			if !waddrmgr.IsDefaultScope(scopedManager.Scope()) {
-				log.Debugf("Skipping non-default scope "+
-					"address %v", addr)
+	
 
-				continue
+			for _, addr := range addrs {
+
+				addrInfo, err := w.store.GetAddress(ctx, db.GetAddressQuery{
+
+					WalletID: w.ID(),
+
+					Address:  addr,
+
+				})
+
+	
+
+				switch {
+
+				// Missing addresses are skipped.
+
+				case errors.Is(err, db.ErrNotFound):
+
+					continue
+
+	
+
+				// Other errors should be propagated.
+
+				case err != nil:
+
+					return err
+
+				}
+
+	
+
+				// Prevent addresses from non-default scopes to be
+
+				// detected here. We don't watch funds sent to
+
+				// non-default scopes in other places either, so
+
+				// detecting them here would mean we'd also not properly
+
+				// detect them as spent later.
+
+				keyScope := waddrmgr.KeyScope{
+
+					Purpose: addrInfo.DerivationInfo.KeyScope.Purpose,
+
+					Coin:    addrInfo.DerivationInfo.KeyScope.Coin,
+
+				}
+
+				if !waddrmgr.IsDefaultScope(keyScope) {
+
+					log.Debugf("Skipping non-default scope "+
+
+						"address %v", addr)
+
+	
+
+					continue
+
+				}
+
+	
+
+				credits = append(credits, db.CreditData{
+
+					Index:   uint32(i),
+
+					Address: addr,
+
+				})
+
+				err = w.store.MarkAddressAsUsed(ctx, db.MarkAddressAsUsedParams{
+
+					WalletID: w.ID(),
+
+					Address:  addr,
+
+				})
+
+				if err != nil {
+
+					return err
+
+				}
+
+				log.Debugf("Marked address %v used", addr)
+
 			}
 
-			// TODO: Credits should be added with the
-			// account they belong to, so wtxmgr is able to
-			// track per-account balances.
-			err = w.txStore.AddCredit(
-				txmgrNs, rec, block, uint32(i), ma.Internal(),
-			)
-			if err != nil {
-				return err
-			}
-			err = w.addrStore.MarkUsed(addrmgrNs, addr)
-			if err != nil {
-				return err
-			}
-			log.Debugf("Marked address %v used", addr)
 		}
-	}
 
-	// Send notification of mined or unmined transaction to any interested
-	// clients.
-	//
-	// TODO: Avoid the extra db hits.
-	if block == nil {
-		w.NtfnServer.notifyUnminedTransaction(dbtx, txmgrNs, rec.Hash)
-	} else {
-		w.NtfnServer.notifyMinedTransaction(
-			dbtx, txmgrNs, rec.Hash, block,
-		)
-	}
+	
+
+		if len(credits) > 0 {
+
+			err = w.store.CreateTx(ctx, db.CreateTxParams{
+
+				WalletID: w.ID(),
+
+				Tx:       &rec.MsgTx,
+
+				Credits:  credits,
+
+			})
+
+			if err != nil {
+
+				return err
+
+			}
+
+		}
+
+	
+
+		// Send notification of mined or unmined transaction to any interested
+
+		// clients.
+
+		//
+
+		// TODO: Avoid the extra db hits.
+
+		if block == nil {
+
+			w.NtfnServer.notifyUnminedTransaction(dbtx, txmgrNs, rec.Hash)
+
+		} else {
+
+			w.NtfnServer.notifyMinedTransaction(
+
+				dbtx, txmgrNs, rec.Hash, block,
+
+			)
+
+		}
+
+	
 
 	return nil
 }
@@ -431,12 +445,12 @@ type chainConn interface {
 // information required to perform a birthday block sanity check.
 type birthdayStore interface {
 	// Birthday returns the birthday timestamp of the wallet.
-	Birthday() time.Time
+	Birthday(ctx context.Context) time.Time
 
 	// BirthdayBlock returns the birthday block of the wallet. The boolean
 	// returned should signal whether the wallet has already verified the
 	// correctness of its birthday block.
-	BirthdayBlock() (waddrmgr.BlockStamp, bool, error)
+	BirthdayBlock(ctx context.Context) (waddrmgr.BlockStamp, bool, error)
 
 	// SetBirthdayBlock updates the birthday block of the wallet to the
 	// given block. The boolean can be used to signal whether this block
@@ -445,38 +459,37 @@ type birthdayStore interface {
 	// NOTE: This should also set the wallet's synced tip to reflect the new
 	// birthday block. This will allow the wallet to rescan from this point
 	// to detect any potentially missed events.
-	SetBirthdayBlock(waddrmgr.BlockStamp) error
+	SetBirthdayBlock(ctx context.Context, block waddrmgr.BlockStamp) error
 }
 
 // walletBirthdayStore is a wrapper around the wallet's database and address
 // manager that satisfies the birthdayStore interface.
 type walletBirthdayStore struct {
-	db      walletdb.DB
-	manager waddrmgr.AddrStore
+	store db.Store
 }
 
 var _ birthdayStore = (*walletBirthdayStore)(nil)
 
 // Birthday returns the birthday timestamp of the wallet.
-func (s *walletBirthdayStore) Birthday() time.Time {
-	return s.manager.Birthday()
+func (s *walletBirthdayStore) Birthday(ctx context.Context) time.Time {
+	info, err := s.store.GetWallet(ctx, "")
+	if err != nil {
+		return time.Time{}
+	}
+	return info.SyncState.Timestamp
 }
 
 // BirthdayBlock returns the birthday block of the wallet.
-func (s *walletBirthdayStore) BirthdayBlock() (waddrmgr.BlockStamp, bool, error) {
-	var (
-		birthdayBlock         waddrmgr.BlockStamp
-		birthdayBlockVerified bool
-	)
-
-	err := walletdb.View(s.db, func(tx walletdb.ReadTx) error {
-		var err error
-		ns := tx.ReadBucket(waddrmgrNamespaceKey)
-		birthdayBlock, birthdayBlockVerified, err = s.manager.BirthdayBlock(ns)
-		return err
-	})
-
-	return birthdayBlock, birthdayBlockVerified, err
+func (s *walletBirthdayStore) BirthdayBlock(ctx context.Context) (waddrmgr.BlockStamp, bool, error) {
+	info, err := s.store.GetWallet(ctx, "")
+	if err != nil {
+		return waddrmgr.BlockStamp{}, false, err
+	}
+	return waddrmgr.BlockStamp{
+		Hash:      info.SyncState.SyncedTo,
+		Height:    info.SyncState.Height,
+		Timestamp: info.SyncState.Timestamp,
+	}, true, nil
 }
 
 // SetBirthdayBlock updates the birthday block of the wallet to the
@@ -486,14 +499,14 @@ func (s *walletBirthdayStore) BirthdayBlock() (waddrmgr.BlockStamp, bool, error)
 // NOTE: This should also set the wallet's synced tip to reflect the new
 // birthday block. This will allow the wallet to rescan from this point
 // to detect any potentially missed events.
-func (s *walletBirthdayStore) SetBirthdayBlock(block waddrmgr.BlockStamp) error {
-	return walletdb.Update(s.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		err := s.manager.SetBirthdayBlock(ns, block, true)
-		if err != nil {
-			return err
-		}
-		return s.manager.SetSyncedTo(ns, &block)
+func (s *walletBirthdayStore) SetBirthdayBlock(ctx context.Context, block waddrmgr.BlockStamp) error {
+	return s.store.UpdateSyncState(ctx, db.UpdateSyncStateParams{
+		WalletID: 0, // TODO(yy): get wallet ID
+		SyncState: db.SyncState{
+			SyncedTo:  block.Hash,
+			Height:    block.Height,
+			Timestamp: block.Timestamp,
+		},
 	})
 }
 
@@ -505,12 +518,12 @@ func (s *walletBirthdayStore) SetBirthdayBlock(block waddrmgr.BlockStamp) error 
 // block to ensure we do not miss any relevant events throughout rescans.
 // waddrmgr.ErrBirthdayBlockNotSet is returned if the birthday block has not
 // been set yet.
-func birthdaySanityCheck(chainConn chainConn,
+func birthdaySanityCheck(ctx context.Context, chainConn chainConn,
 	birthdayStore birthdayStore) (*waddrmgr.BlockStamp, error) {
 
 	// We'll start by fetching our wallet's birthday timestamp and block.
-	birthdayTimestamp := birthdayStore.Birthday()
-	birthdayBlock, birthdayBlockVerified, err := birthdayStore.BirthdayBlock()
+	birthdayTimestamp := birthdayStore.Birthday(ctx)
+	birthdayBlock, birthdayBlockVerified, err := birthdayStore.BirthdayBlock(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -533,7 +546,7 @@ func birthdaySanityCheck(chainConn chainConn,
 		return nil, err
 	}
 
-	if err := birthdayStore.SetBirthdayBlock(*newBirthdayBlock); err != nil {
+	if err := birthdayStore.SetBirthdayBlock(ctx, *newBirthdayBlock); err != nil {
 		return nil, err
 	}
 

@@ -6,15 +6,16 @@
 package wallet
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
@@ -39,68 +40,47 @@ func (p *OutputSelectionPolicy) meetsRequiredConfs(txHeight, curHeight int32) bo
 // UnspentOutputs fetches all unspent outputs from the wallet that match rules
 // described in the passed policy.
 func (w *Wallet) UnspentOutputs(policy OutputSelectionPolicy) ([]*TransactionOutput, error) {
-	var outputResults []*TransactionOutput
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
+	ctx := context.Background()
 
-		syncBlock := w.addrStore.SyncedTo()
-
-		// TODO: actually stream outputs from the db instead of fetching
-		// all of them at once.
-		outputs, err := w.txStore.UnspentOutputs(txmgrNs)
-		if err != nil {
-			return err
-		}
-
-		for _, output := range outputs {
-			// Ignore outputs that haven't reached the required
-			// number of confirmations.
-			if !policy.meetsRequiredConfs(output.Height, syncBlock.Height) {
-				continue
-			}
-
-			// Ignore outputs that are not controlled by the account.
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript,
-				w.chainParams)
-			if err != nil || len(addrs) == 0 {
-				// Cannot determine which account this belongs
-				// to without a valid address.  TODO: Fix this
-				// by saving outputs per account, or accounts
-				// per output.
-				continue
-			}
-			_, outputAcct, err := w.addrStore.AddrAccount(addrmgrNs, addrs[0])
-			if err != nil {
-				return err
-			}
-			if outputAcct != policy.Account {
-				continue
-			}
-
-			// Stakebase isn't exposed by wtxmgr so those will be
-			// OutputKindNormal for now.
-			outputSource := OutputKindNormal
-			if output.FromCoinBase {
-				outputSource = OutputKindCoinbase
-			}
-
-			result := &TransactionOutput{
-				OutPoint: output.OutPoint,
-				Output: wire.TxOut{
-					Value:    int64(output.Amount),
-					PkScript: output.PkScript,
-				},
-				OutputKind:      outputSource,
-				ContainingBlock: BlockIdentity(output.Block),
-				ReceiveTime:     output.Received,
-			}
-			outputResults = append(outputResults, result)
-		}
-
-		return nil
+	// TODO: actually stream outputs from the db instead of fetching
+	// all of them at once.
+	outputs, err := w.ListUnspent(ctx, UtxoQuery{
+		MinConfs: policy.RequiredConfirmations,
+		MaxConfs: 9999999,
 	})
-	return outputResults, err
+	if err != nil {
+		return nil, err
+	}
+
+	outputResults := make([]*TransactionOutput, 0, len(outputs))
+	for _, output := range outputs {
+		// Ignore outputs that are not controlled by the account.
+		addrInfo, err := w.AddressInfo(ctx, output.Address)
+		if err != nil {
+			return nil, err
+		}
+		if addrInfo.Account != policy.Account {
+			continue
+		}
+
+		// Stakebase isn't exposed by wtxmgr so those will be
+		// OutputKindNormal for now.
+		outputSource := OutputKindNormal
+
+		result := &TransactionOutput{
+			OutPoint: output.OutPoint,
+			Output: wire.TxOut{
+				Value:    int64(output.Amount),
+				PkScript: output.PkScript,
+			},
+			OutputKind:      outputSource,
+			ContainingBlock: BlockIdentity{},
+			ReceiveTime:     time.Now(), // TODO(yy): fix this
+		}
+		outputResults = append(outputResults, result)
+	}
+
+	return outputResults, nil
 }
 
 // FetchInputInfo queries for the wallet's knowledge of the passed outpoint. If
@@ -184,7 +164,11 @@ func (w *Wallet) FetchOutpointInfo(prevOut *wire.OutPoint) (*wire.MsgTx,
 	pkScript := txDetail.TxRecord.MsgTx.TxOut[prevOut.Index].PkScript
 
 	// Determine the number of confirmations the output currently has.
-	_, currentHeight, err := w.chainClient.GetBestBlock()
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	_, currentHeight, err := chainClient.GetBestBlock()
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("unable to retrieve current "+
 			"height: %w", err)

@@ -12,6 +12,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
 	"github.com/btcsuite/btcwallet/walletdb"
@@ -423,10 +424,9 @@ func (w *Wallet) CreateTransaction(ctx context.Context, intent *TxIntent) (
 	var (
 		changeSource *txauthor.ChangeSource
 		inputSource  txauthor.InputSource
+		err          error
 	)
-	// We perform the core logic of creating the input and change sources
-	// within a single database transaction to ensure atomicity.
-	err := walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
+	err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
 		changeKeyScope := &intent.ChangeSource.KeyScope
 		accountName := intent.ChangeSource.AccountName
 
@@ -452,8 +452,8 @@ func (w *Wallet) CreateTransaction(ctx context.Context, intent *TxIntent) (
 		// derivation to occur within the same atomic transaction as
 		// the rest of the tx creation logic. Once fixed, we can remove
 		// the above `w.newAddrMtx` lock.
-		_, changeSource, err = w.addrMgrWithChangeSource(
-			dbtx, changeKeyScope, account,
+		changeSource, err = w.addrMgrWithChangeSource(
+			changeKeyScope, account,
 		)
 		if err != nil {
 			return err
@@ -541,7 +541,14 @@ func (w *Wallet) createManualInputSource(dbtx walletdb.ReadTx,
 	inputs *InputsManual) (
 	txauthor.InputSource, error) {
 
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+	// TODO(yy): This is inefficient. We should have a GetUtxo method on the
+	// store.
+	utxos, err := w.store.ListUTXOs(context.Background(), db.ListUtxosQuery{
+		WalletID: w.ID(),
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	// Create a slice to hold the eligible UTXOs.
 	var eligibleSelectedUtxo []wtxmgr.Credit
@@ -549,15 +556,28 @@ func (w *Wallet) createManualInputSource(dbtx walletdb.ReadTx,
 	// Iterate through the manually specified UTXOs and ensure that each
 	// one is eligible for spending.
 	for _, outpoint := range inputs.UTXOs {
-		// Fetch the UTXO from the database.
-		credit, err := w.txStore.GetUtxo(txmgrNs, outpoint)
-		if err != nil {
+		var found bool
+		for _, utxo := range utxos {
+			if utxo.OutPoint == outpoint {
+				eligibleSelectedUtxo = append(eligibleSelectedUtxo, wtxmgr.Credit{
+					OutPoint: utxo.OutPoint,
+					BlockMeta: wtxmgr.BlockMeta{
+						Block: wtxmgr.Block{
+							Height: utxo.Height,
+						},
+					},
+					Amount:       utxo.Amount,
+					PkScript:     utxo.PkScript,
+					FromCoinBase: utxo.FromCoinBase,
+				})
+				found = true
+				break
+			}
+		}
+		if !found {
 			return nil, fmt.Errorf("%w: %v", ErrUtxoNotEligible,
 				outpoint)
 		}
-
-		// TODO(yy): check for locked utxos and log a warning.
-		eligibleSelectedUtxo = append(eligibleSelectedUtxo, *credit)
 	}
 
 	// Return a constant input source that will only provide the selected
@@ -641,23 +661,23 @@ func (w *Wallet) getEligibleUTXOs(dbtx walletdb.ReadTx,
 	}
 
 	// Dispatch based on the type of the coin source.
-	switch source := source.(type) {
+	switch src := source.(type) {
 	// If the source is nil, we'll use the default account.
 	case nil:
 		return w.findEligibleOutputs(
-			dbtx, &waddrmgr.KeyScopeBIP0086,
-			waddrmgr.DefaultAccountNum, int32(minconf), bs, nil,
+			nil, waddrmgr.DefaultAccountNum, int32(minconf),
+			bs, nil,
 		)
 
 	// If the source is a scoped account, we find all eligible outputs for
 	// that specific account and key scope.
 	case *ScopedAccount:
-		return w.getEligibleUTXOsFromAccount(dbtx, source, minconf, bs)
+		return w.getEligibleUTXOsFromAccount(dbtx, src, minconf, bs)
 
 	// If the source is a list of UTXOs, we validate and fetch each UTXO
 	// from the provided list.
 	case *CoinSourceUTXOs:
-		return w.getEligibleUTXOsFromList(dbtx, source, minconf, bs)
+		return w.getEligibleUTXOsFromList(dbtx, src, minconf, bs)
 
 	// Any other source type is unsupported.
 	default:
@@ -679,7 +699,7 @@ func (w *Wallet) getEligibleUTXOsFromAccount(dbtx walletdb.ReadTx,
 	}
 
 	return w.findEligibleOutputs(
-		dbtx, keyScope, account, int32(minconf), bs, nil,
+		keyScope, account, int32(minconf), bs, nil,
 	)
 }
 
@@ -689,41 +709,61 @@ func (w *Wallet) getEligibleUTXOsFromList(dbtx walletdb.ReadTx,
 	source *CoinSourceUTXOs, minconf uint32, bs *waddrmgr.BlockStamp) (
 	[]wtxmgr.Credit, error) {
 
+	// TODO(yy): This is inefficient. We should have a GetUtxo method on the
+	// store.
+	utxos, err := w.store.ListUTXOs(context.Background(), db.ListUtxosQuery{
+		WalletID: w.ID(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	// Create a slice to hold the eligible UTXOs.
 	var eligible []wtxmgr.Credit
-
-	// Get the transaction manager's namespace.
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
 
 	// Iterate through the manually specified UTXOs and ensure that each
 	// one is eligible for spending.
 	for _, outpoint := range source.UTXOs {
-		// Fetch the UTXO from the database.
-		credit, err := w.txStore.GetUtxo(txmgrNs, outpoint)
-		if err != nil {
+		var found bool
+		for _, utxo := range utxos {
+			if utxo.OutPoint == outpoint {
+				// A UTXO is only eligible if it has reached the required
+				// number of confirmations.
+				if !confirmed(int32(minconf), utxo.Height, bs.Height) {
+					// Calculate the number of confirmations for the
+					// warning message.
+					confs := int32(0)
+					if utxo.Height != -1 {
+						confs = bs.Height - utxo.Height + 1
+					}
+
+					log.Warnf("Skipping user-specified UTXO %v "+
+						"because it has %d confs but needs %d",
+						utxo.OutPoint, confs, minconf)
+
+					continue
+				}
+
+				// If the UTXO is eligible, add it to the list.
+				eligible = append(eligible, wtxmgr.Credit{
+					OutPoint: utxo.OutPoint,
+					BlockMeta: wtxmgr.BlockMeta{
+						Block: wtxmgr.Block{
+							Height: utxo.Height,
+						},
+					},
+					Amount:       utxo.Amount,
+					PkScript:     utxo.PkScript,
+					FromCoinBase: utxo.FromCoinBase,
+				})
+				found = true
+				break
+			}
+		}
+		if !found {
 			return nil, fmt.Errorf("%w: %v",
 				ErrUtxoNotEligible, outpoint)
 		}
-
-		// A UTXO is only eligible if it has reached the required
-		// number of confirmations.
-		if !confirmed(int32(minconf), credit.Height, bs.Height) {
-			// Calculate the number of confirmations for the
-			// warning message.
-			confs := int32(0)
-			if credit.Height != -1 {
-				confs = bs.Height - credit.Height + 1
-			}
-
-			log.Warnf("Skipping user-specified UTXO %v "+
-				"because it has %d confs but needs %d",
-				credit.OutPoint, confs, minconf)
-
-			continue
-		}
-
-		// If the UTXO is eligible, add it to the list.
-		eligible = append(eligible, *credit)
 	}
 
 	return eligible, nil

@@ -32,9 +32,6 @@ type Interface interface {
 	// Start starts the goroutines necessary to manage a wallet.
 	Start()
 
-	// Stop signals all wallet goroutines to shutdown.
-	Stop()
-
 	// WaitForShutdown blocks until all wallet goroutines have finished.
 	WaitForShutdown()
 
@@ -80,6 +77,7 @@ type Interface interface {
 	// NotificationServer returns the internal NotificationServer.
 	NotificationServer() *NotificationServer
 
+	// TODO(yy): remove this once the Store is fully used in wallet.
 	// AddrManager returns the internal address manager.
 	AddrManager() waddrmgr.AddrStore
 
@@ -91,11 +89,6 @@ type Interface interface {
 	AccountProperties(scope waddrmgr.KeyScope, account uint32) (
 		*waddrmgr.AccountProperties, error,
 	)
-
-	// AccountPropertiesByName returns the properties of an account by its
-	// name.
-	AccountPropertiesByName(scope waddrmgr.KeyScope,
-		name string) (*waddrmgr.AccountProperties, error)
 
 	// AccountNumber returns the account number for a given account name
 	// and key scope.
@@ -313,9 +306,7 @@ type Interface interface {
 		*GetTransactionsResult, error)
 
 	// LabelTransaction adds or overwrites a label for a given transaction.
-	LabelTransaction(hash chainhash.Hash, label string,
-		overwrite bool) error
-
+	LabelTransaction(hash chainhash.Hash, label string, overwrite bool) error
 	// RemoveDescendants removes all transactions from the wallet that
 	// spend outputs from the passed transaction.
 	RemoveDescendants(tx *wire.MsgTx) error
@@ -348,5 +339,39 @@ type Interface interface {
 		[]byte, []byte, error)
 }
 
+// Balances records total, spendable (by policy), and immature coinbase
+// reward balance amounts.
+type Balances struct {
+	Total          btcutil.Amount
+	Spendable      btcutil.Amount
+	ImmatureReward btcutil.Amount
+}
+
+// ListLeasedOutputResult is a result of the ListLeasedOutputs command.
+type ListLeasedOutputResult struct {
+	OutPoint   wire.OutPoint
+	Expiration time.Time
+}
+
+// GetTransactionResult is the result of the GetTransaction command.
+type GetTransactionResult struct {
+	Tx          *wire.MsgTx
+	BlockHash   *chainhash.Hash
+	BlockHeight int32
+	Timestamp   time.Time
+}
+
+// BlockIdentifier specifies a block by either its hash or height.
+type BlockIdentifier struct {
+	Hash   *chainhash.Hash
+	Height int32
+}
+
+// GetTransactionsResult is the result of the GetTransactions command.
+type GetTransactionsResult struct {
+	MinedTransactions   []*GetTransactionResult
+	UnminedTransactions []*GetTransactionResult
+}
+
 // A compile time check to ensure that Wallet implements the interface.
-var _ Interface = (*Wallet)(nil)
+// var _ Interface = (*Wallet)(nil)

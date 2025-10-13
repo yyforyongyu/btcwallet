@@ -6,8 +6,6 @@
 package wtxmgr
 
 import (
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/walletdb"
 )
 
@@ -30,14 +28,14 @@ func (s *Store) insertMemPoolTx(ns walletdb.ReadWriteBucket, rec *TxRecord) erro
 	// transaction's outputs to determine if we've already seen them to
 	// prevent from adding this transaction to the unconfirmed bucket.
 	for i := range rec.MsgTx.TxOut {
-		k := canonicalOutPoint(&rec.Hash, uint32(i))
+		k := CanonicalOutPoint(&rec.Hash, uint32(i))
 		if existsRawUnspent(ns, k) != nil {
 			return nil
 		}
 	}
 
 	log.Infof("Inserting unconfirmed transaction %v", rec.Hash)
-	v, err := valueTxRecord(rec)
+	v, err := ValueTxRecord(rec)
 	if err != nil {
 		return err
 	}
@@ -48,7 +46,7 @@ func (s *Store) insertMemPoolTx(ns walletdb.ReadWriteBucket, rec *TxRecord) erro
 
 	for _, input := range rec.MsgTx.TxIn {
 		prevOut := &input.PreviousOutPoint
-		k := canonicalOutPoint(&prevOut.Hash, prevOut.Index)
+		k := CanonicalOutPoint(&prevOut.Hash, prevOut.Index)
 		err = putRawUnminedInput(ns, k, rec.Hash[:])
 		if err != nil {
 			return err
@@ -68,7 +66,7 @@ func (s *Store) insertMemPoolTx(ns walletdb.ReadWriteBucket, rec *TxRecord) erro
 func (s *Store) removeDoubleSpends(ns walletdb.ReadWriteBucket, rec *TxRecord) error {
 	for _, input := range rec.MsgTx.TxIn {
 		prevOut := &input.PreviousOutPoint
-		prevOutKey := canonicalOutPoint(&prevOut.Hash, prevOut.Index)
+		prevOutKey := CanonicalOutPoint(&prevOut.Hash, prevOut.Index)
 
 		doubleSpendHashes := fetchUnminedInputSpendTxHashes(ns, prevOutKey)
 		for _, doubleSpendHash := range doubleSpendHashes {
@@ -119,7 +117,7 @@ func (s *Store) removeConflict(ns walletdb.ReadWriteBucket, rec *TxRecord) error
 	// be recursively removed as well.  Once the spenders are removed, the
 	// credit is deleted.
 	for i := range rec.MsgTx.TxOut {
-		k := canonicalOutPoint(&rec.Hash, uint32(i))
+		k := CanonicalOutPoint(&rec.Hash, uint32(i))
 		spenderHashes := fetchUnminedInputSpendTxHashes(ns, k)
 		for _, spenderHash := range spenderHashes {
 			// If the spending transaction spends multiple outputs
@@ -155,7 +153,7 @@ func (s *Store) removeConflict(ns walletdb.ReadWriteBucket, rec *TxRecord) error
 	// output in the unmined inputs bucket.
 	for _, input := range rec.MsgTx.TxIn {
 		prevOut := &input.PreviousOutPoint
-		k := canonicalOutPoint(&prevOut.Hash, prevOut.Index)
+		k := CanonicalOutPoint(&prevOut.Hash, prevOut.Index)
 		err := deleteRawUnminedInput(ns, k, rec.Hash)
 		if err != nil {
 			return err
@@ -163,60 +161,4 @@ func (s *Store) removeConflict(ns walletdb.ReadWriteBucket, rec *TxRecord) error
 	}
 
 	return deleteRawUnmined(ns, rec.Hash[:])
-}
-
-// UnminedTxs returns the underlying transactions for all unmined transactions
-// which are not known to have been mined in a block.  Transactions are
-// guaranteed to be sorted by their dependency order.
-func (s *Store) UnminedTxs(ns walletdb.ReadBucket) ([]*wire.MsgTx, error) {
-	recSet, err := s.unminedTxRecords(ns)
-	if err != nil {
-		return nil, err
-	}
-
-	txSet := make(map[chainhash.Hash]*wire.MsgTx, len(recSet))
-	for txHash, txRec := range recSet {
-		txSet[txHash] = &txRec.MsgTx
-	}
-
-	return DependencySort(txSet), nil
-}
-
-func (s *Store) unminedTxRecords(ns walletdb.ReadBucket) (map[chainhash.Hash]*TxRecord, error) {
-	unmined := make(map[chainhash.Hash]*TxRecord)
-	err := ns.NestedReadBucket(bucketUnmined).ForEach(func(k, v []byte) error {
-		var txHash chainhash.Hash
-		err := readRawUnminedHash(k, &txHash)
-		if err != nil {
-			return err
-		}
-
-		rec := new(TxRecord)
-		err = readRawTxRecord(&txHash, v, rec)
-		if err != nil {
-			return err
-		}
-		unmined[rec.Hash] = rec
-		return nil
-	})
-	return unmined, err
-}
-
-// UnminedTxHashes returns the hashes of all transactions not known to have been
-// mined in a block.
-func (s *Store) UnminedTxHashes(ns walletdb.ReadBucket) ([]*chainhash.Hash, error) {
-	return s.unminedTxHashes(ns)
-}
-
-func (s *Store) unminedTxHashes(ns walletdb.ReadBucket) ([]*chainhash.Hash, error) {
-	var hashes []*chainhash.Hash
-	err := ns.NestedReadBucket(bucketUnmined).ForEach(func(k, v []byte) error {
-		hash := new(chainhash.Hash)
-		err := readRawUnminedHash(k, hash)
-		if err == nil {
-			hashes = append(hashes, hash)
-		}
-		return err
-	})
-	return hashes, err
 }

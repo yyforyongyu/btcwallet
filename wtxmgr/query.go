@@ -74,7 +74,7 @@ func (s *Store) minedTxDetails(ns walletdb.ReadBucket, txHash *chainhash.Hash, r
 		// The credit iterator does not record whether this credit was
 		// spent by an unmined transaction, so check that here.
 		if !credIter.elem.Spent {
-			k := canonicalOutPoint(txHash, credIter.elem.Index)
+			k := CanonicalOutPoint(txHash, credIter.elem.Index)
 			spent := existsRawUnminedInput(ns, k) != nil
 			credIter.elem.Spent = spent
 		}
@@ -139,7 +139,7 @@ func (s *Store) unminedTxDetails(ns walletdb.ReadBucket, txHash *chainhash.Hash,
 	// when spent by an unmined transaction), and credits from other unmined
 	// transactions.  Both situations must be considered.
 	for i, output := range details.MsgTx.TxIn {
-		opKey := canonicalOutPoint(&output.PreviousOutPoint.Hash,
+		opKey := CanonicalOutPoint(&output.PreviousOutPoint.Hash,
 			output.PreviousOutPoint.Index)
 		credKey := existsRawUnspent(ns, opKey)
 		if credKey != nil {
@@ -409,7 +409,7 @@ func (s *Store) PreviousPkScripts(ns walletdb.ReadBucket, rec *TxRecord, block *
 				// Ensure a credit exists for this
 				// unmined transaction before including
 				// the output script.
-				k := canonicalOutPoint(&prevOut.Hash, prevOut.Index)
+				k := CanonicalOutPoint(&prevOut.Hash, prevOut.Index)
 				if existsRawUnminedCredit(ns, k) == nil {
 					continue
 				}
@@ -561,10 +561,8 @@ func (s *Store) getUnminedUtxo(ns walletdb.ReadBucket,
 func (s *Store) GetUtxo(ns walletdb.ReadBucket,
 	outpoint wire.OutPoint) (*Credit, error) {
 
-	k := canonicalOutPoint(&outpoint.Hash, outpoint.Index)
-
-	// First, check if the UTXO is a mined and unspent credit.
-	unspentVal := ns.NestedReadBucket(bucketUnspent).Get(k)
+	k := CanonicalOutPoint(&outpoint.Hash, outpoint.Index)
+	unspentVal := existsRawUnspent(ns, k)
 	if unspentVal != nil {
 		return s.getMinedUtxo(ns, outpoint, unspentVal)
 	}

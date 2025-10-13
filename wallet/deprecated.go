@@ -5,12 +5,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
-	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 )
 
 // NextAccount creates the next account and returns its account number.  The
@@ -19,40 +17,38 @@ import (
 // accounts have no transaction history (this is a deviation from the BIP0044
 // spec, which allows no unused account gaps).
 func (w *Wallet) NextAccount(scope waddrmgr.KeyScope, name string) (uint32, error) {
-	manager, err := w.addrStore.FetchScopedKeyManager(scope)
+	dbScope := db.KeyScope{
+		Purpose: scope.Purpose,
+		Coin:    scope.Coin,
+	}
+	params := db.CreateAccountParams{
+		WalletID: w.ID(),
+		Scope:    dbScope,
+		Name:     name,
+	}
+	info, err := w.store.CreateAccount(context.Background(), params)
 	if err != nil {
 		return 0, err
 	}
 
-	// Validate that the scope manager can add this new account.
-	err = manager.CanAddAccount()
-	if err != nil {
-		return 0, err
-	}
-
-	var (
-		account uint32
-		props   *waddrmgr.AccountProperties
-	)
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		var err error
-		account, err = manager.NewAccount(addrmgrNs, name)
-		if err != nil {
-			return err
-		}
-		props, err = manager.AccountProperties(addrmgrNs, account)
-
-		return err
+	info, err = w.store.GetAccount(context.Background(), db.GetAccountQuery{
+		Scope: dbScope,
+		Name:  &name,
 	})
 	if err != nil {
 		log.Errorf("Cannot fetch new account properties for notification "+
 			"after account creation: %v", err)
 	} else {
-		w.NtfnServer.notifyAccountProperties(props)
+		w.NtfnServer.notifyAccountProperties(&waddrmgr.AccountProperties{
+			AccountNumber:    info.AccountNumber,
+			AccountName:      info.AccountName,
+			ExternalKeyCount: info.ExternalKeyCount,
+			InternalKeyCount: info.InternalKeyCount,
+			ImportedKeyCount: info.ImportedKeyCount,
+		})
 	}
 
-	return account, err
+	return info.AccountNumber, nil
 }
 
 // Accounts returns the current names, numbers, and total balances of all
@@ -62,69 +58,27 @@ func (w *Wallet) NextAccount(scope waddrmgr.KeyScope, name string) (uint32, erro
 // TODO(jrick): Is the chain tip really needed, since only the total balances
 // are included?
 func (w *Wallet) Accounts(scope waddrmgr.KeyScope) (*AccountsResult, error) {
-	manager, err := w.addrStore.FetchScopedKeyManager(scope)
+	walletInfo, err := w.store.GetWallet(context.Background(), w.Name())
+	if err != nil {
+		return nil, err
+	}
+	syncBlock := walletInfo.SyncState
+	dbScope := db.KeyScope{
+		Purpose: scope.Purpose,
+		Coin:    scope.Coin,
+	}
+	accounts, err := w.store.ListAccounts(context.Background(), db.ListAccountsQuery{
+		WalletID: w.ID(),
+		Scope:    &dbScope,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	var (
-		accounts        []AccountResult
-		syncBlockHash   *chainhash.Hash
-		syncBlockHeight int32
-	)
-	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		syncBlock := w.addrStore.SyncedTo()
-		syncBlockHash = &syncBlock.Hash
-		syncBlockHeight = syncBlock.Height
-		unspent, err := w.txStore.UnspentOutputs(txmgrNs)
-		if err != nil {
-			return err
-		}
-		err = manager.ForEachAccount(addrmgrNs, func(acct uint32) error {
-			props, err := manager.AccountProperties(addrmgrNs, acct)
-			if err != nil {
-				return err
-			}
-			accounts = append(accounts, AccountResult{
-				AccountProperties: *props,
-				// TotalBalance set below
-			})
-
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		m := make(map[uint32]*btcutil.Amount)
-		for i := range accounts {
-			a := &accounts[i]
-			m[a.AccountNumber] = &a.TotalBalance
-		}
-		for i := range unspent {
-			output := unspent[i]
-			var outputAcct uint32
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript, w.chainParams)
-			if err == nil && len(addrs) > 0 {
-				_, outputAcct, err = w.addrStore.AddrAccount(addrmgrNs, addrs[0])
-			}
-			if err == nil {
-				amt, ok := m[outputAcct]
-				if ok {
-					*amt += output.Amount
-				}
-			}
-		}
-
-		return nil
-	})
-
 	return &AccountsResult{
 		Accounts:           accounts,
-		CurrentBlockHash:   *syncBlockHash,
-		CurrentBlockHeight: syncBlockHeight,
+		CurrentBlockHash:   syncBlock.SyncedTo,
+		CurrentBlockHeight: syncBlock.Height,
 	}, err
 }
 
@@ -132,24 +86,32 @@ func (w *Wallet) Accounts(scope waddrmgr.KeyScope) (*AccountsResult, error) {
 func (w *Wallet) RenameAccountDeprecated(scope waddrmgr.KeyScope,
 	account uint32, newName string) error {
 
-	manager, err := w.addrStore.FetchScopedKeyManager(scope)
+	dbScope := db.KeyScope{
+		Purpose: scope.Purpose,
+		Coin:    scope.Coin,
+	}
+	err := w.store.UpdateAccountName(context.Background(), db.UpdateAccountNameParams{
+		WalletID: w.ID(),
+		Scope:    dbScope,
+		OldName:  "", // TODO(yy): fix this
+		NewName:  newName,
+	})
 	if err != nil {
 		return err
 	}
 
-	var props *waddrmgr.AccountProperties
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		err := manager.RenameAccount(addrmgrNs, account, newName)
-		if err != nil {
-			return err
-		}
-		props, err = manager.AccountProperties(addrmgrNs, account)
-
-		return err
+	info, err := w.store.GetAccount(context.Background(), db.GetAccountQuery{
+		Scope: dbScope,
+		Name:  &newName,
 	})
 	if err == nil {
-		w.NtfnServer.notifyAccountProperties(props)
+		w.NtfnServer.notifyAccountProperties(&waddrmgr.AccountProperties{
+			AccountNumber:    info.AccountNumber,
+			AccountName:      info.AccountName,
+			ExternalKeyCount: info.ExternalKeyCount,
+			InternalKeyCount: info.InternalKeyCount,
+			ImportedKeyCount: info.ImportedKeyCount,
+		})
 	}
 
 	return err
@@ -168,11 +130,20 @@ func (w *Wallet) ScriptForOutputDeprecated(output *wire.TxOut) (
 		return nil, nil, nil, err
 	}
 
-	addr := script.Addr
-	pubKeyAddr, ok := addr.(waddrmgr.ManagedPubKeyAddress)
+	// This is a messy conversion.
+	// TODO(yy): clean this up.
+	info, err := w.store.GetAddress(context.Background(), db.GetAddressQuery{
+		WalletID: w.ID(),
+		Address:  script.Addr.Address,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var managedAddr waddrmgr.ManagedAddress = &managedAddress{info: info}
+	pubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
 	if !ok {
 		return nil, nil, nil, fmt.Errorf("%w: addr %s",
-			ErrNotPubKeyAddress, addr.Address())
+			ErrNotPubKeyAddress, script.Addr.Address)
 	}
 
 	return pubKeyAddr, script.WitnessProgram, script.RedeemScript, nil

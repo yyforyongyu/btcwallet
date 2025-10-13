@@ -172,7 +172,7 @@ func (s *walletServer) Accounts(ctx context.Context, req *pb.AccountsRequest) (
 		accounts[i] = &pb.AccountsResponse_Account{
 			AccountNumber:    a.AccountNumber,
 			AccountName:      a.AccountName,
-			TotalBalance:     int64(a.TotalBalance),
+			TotalBalance:     int64(a.ConfirmedBalance + a.UnconfirmedBalance),
 			ExternalKeyCount: a.ExternalKeyCount,
 			InternalKeyCount: a.InternalKeyCount,
 			ImportedKeyCount: a.ImportedKeyCount,
@@ -229,9 +229,13 @@ func (s *walletServer) NextAddress(ctx context.Context, req *pb.NextAddressReque
 		addr btcutil.Address
 		err  error
 	)
+	accountName, err := s.wallet.AccountName(waddrmgr.KeyScopeBIP0044, req.Account)
+	if err != nil {
+		return nil, translateError(err)
+	}
 	switch req.Kind {
 	case pb.NextAddressRequest_BIP0044_EXTERNAL:
-		addr, err = s.wallet.NewAddressDeprecated(req.GetAccount(), waddrmgr.KeyScopeBIP0044)
+		addr, err = s.wallet.NewAddress(ctx, accountName, waddrmgr.WitnessPubKey, false)
 	case pb.NextAddressRequest_BIP0044_INTERNAL:
 		addr, err = s.wallet.NewChangeAddress(req.Account, waddrmgr.KeyScopeBIP0044)
 	default:
@@ -282,19 +286,25 @@ func (s *walletServer) ImportPrivateKey(ctx context.Context, req *pb.ImportPriva
 func (s *walletServer) Balance(ctx context.Context, req *pb.BalanceRequest) (
 	*pb.BalanceResponse, error) {
 
-	account := req.AccountNumber
 	reqConfs := req.RequiredConfirmations
-	bals, err := s.wallet.CalculateAccountBalances(account, reqConfs)
+	bals, err := s.wallet.CalculateAccountBalances(reqConfs)
 	if err != nil {
 		return nil, translateError(err)
+	}
+
+	var total, spendable, immature btcutil.Amount
+	for _, bal := range bals {
+		total += bal.Total
+		spendable += bal.Spendable
+		immature += bal.ImmatureReward
 	}
 
 	// TODO: Spendable currently includes multisig outputs that may not
 	// actually be spendable without additional keys.
 	resp := &pb.BalanceResponse{
-		Total:          int64(bals.Total),
-		Spendable:      int64(bals.Spendable),
-		ImmatureReward: int64(bals.ImmatureReward),
+		Total:          int64(total),
+		Spendable:      int64(spendable),
+		ImmatureReward: int64(immature),
 	}
 	return resp, nil
 }
@@ -348,19 +358,14 @@ func (s *walletServer) FundTransaction(ctx context.Context, req *pb.FundTransact
 	}, nil
 }
 
-func marshalGetTransactionsResult(wresp *wallet.GetTransactionsResult) (
-	*pb.GetTransactionsResponse, error) {
-
-	resp := &pb.GetTransactionsResponse{
-		MinedTransactions:   marshalBlocks(wresp.MinedTransactions),
-		UnminedTransactions: marshalTransactionDetails(wresp.UnminedTransactions),
-	}
-	return resp, nil
-}
-
 // BUGS:
 // - MinimumRecentTransactions is ignored.
 // - Wrong error codes when a block height or hash is not recognized
+func marshalGetTransactionsResult(gtr *wallet.GetTransactionsResult) (*pb.GetTransactionsResponse, error) {
+	// TODO(yy): implement
+	return nil, nil
+}
+
 func (s *walletServer) GetTransactions(ctx context.Context, req *pb.GetTransactionsRequest) (
 	resp *pb.GetTransactionsResponse, err error) {
 
@@ -460,19 +465,24 @@ func (s *walletServer) SignTransaction(ctx context.Context, req *pb.SignTransact
 		return nil, translateError(err)
 	}
 
-	invalidSigs, err := s.wallet.SignTransaction(&tx, txscript.SigHashAll, nil, nil, nil)
+	signedTx, complete, err := s.wallet.SignTransaction(&tx, 0, nil, nil)
 	if err != nil {
 		return nil, translateError(err)
 	}
 
-	invalidInputIndexes := make([]uint32, len(invalidSigs))
-	for i, e := range invalidSigs {
-		invalidInputIndexes[i] = e.InputIndex
+	invalidInputIndexes := make([]uint32, 0)
+	if !complete {
+		// TODO(jrick): This is returning all inputs as unsigned.
+		// The wallet needs to be updated to return the indexes of
+		// unsigned inputs.
+		for i := range tx.TxIn {
+			invalidInputIndexes = append(invalidInputIndexes, uint32(i))
+		}
 	}
 
 	var serializedTransaction bytes.Buffer
-	serializedTransaction.Grow(tx.SerializeSize())
-	err = tx.Serialize(&serializedTransaction)
+	serializedTransaction.Grow(signedTx.SerializeSize())
+	err = signedTx.Serialize(&serializedTransaction)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -535,34 +545,14 @@ func marshalTransactionOutputs(v []wallet.TransactionSummaryOutput) []*pb.Transa
 	return outputs
 }
 
-func marshalTransactionDetails(v []wallet.TransactionSummary) []*pb.TransactionDetails {
-	txs := make([]*pb.TransactionDetails, len(v))
-	for i := range v {
-		tx := &v[i]
-		txs[i] = &pb.TransactionDetails{
-			Hash:        tx.Hash[:],
-			Transaction: tx.Transaction,
-			Debits:      marshalTransactionInputs(tx.MyInputs),
-			Credits:     marshalTransactionOutputs(tx.MyOutputs),
-			Fee:         int64(tx.Fee),
-			Timestamp:   tx.Timestamp,
-		}
-	}
-	return txs
+func marshalBlocks(blocks []wallet.Block) ([]*pb.BlockDetails, error) {
+	// TODO(yy): implement
+	return nil, nil
 }
 
-func marshalBlocks(v []wallet.Block) []*pb.BlockDetails {
-	blocks := make([]*pb.BlockDetails, len(v))
-	for i := range v {
-		block := &v[i]
-		blocks[i] = &pb.BlockDetails{
-			Hash:         block.Hash[:],
-			Height:       block.Height,
-			Timestamp:    block.Timestamp,
-			Transactions: marshalTransactionDetails(block.Transactions),
-		}
-	}
-	return blocks
+func marshalTransactionDetails(txs []wallet.TransactionSummary) ([]*pb.TransactionDetails, error) {
+	// TODO(yy): implement
+	return nil, nil
 }
 
 func marshalHashes(v []*chainhash.Hash) [][]byte {
@@ -580,16 +570,25 @@ func (s *walletServer) TransactionNotifications(req *pb.TransactionNotifications
 	defer n.Done()
 
 	ctxDone := svr.Context().Done()
+	var resp pb.TransactionNotificationsResponse
 	for {
 		select {
 		case v := <-n.C:
-			resp := pb.TransactionNotificationsResponse{
-				AttachedBlocks:           marshalBlocks(v.AttachedBlocks),
+			attachedBlocks, err := marshalBlocks(v.AttachedBlocks)
+			if err != nil {
+				return err
+			}
+			unminedTransactions, err := marshalTransactionDetails(v.UnminedTransactions)
+			if err != nil {
+				return err
+			}
+			resp = pb.TransactionNotificationsResponse{
+				AttachedBlocks:           attachedBlocks,
 				DetachedBlocks:           marshalHashes(v.DetachedBlocks),
-				UnminedTransactions:      marshalTransactionDetails(v.UnminedTransactions),
+				UnminedTransactions:      unminedTransactions,
 				UnminedTransactionHashes: marshalHashes(v.UnminedTransactionHashes),
 			}
-			err := svr.Send(&resp)
+			err = svr.Send(&resp)
 			if err != nil {
 				return translateError(err)
 			}

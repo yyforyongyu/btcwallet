@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/netparams"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/walletdb"
 )
@@ -278,10 +280,14 @@ func (w *Wallet) importAccountScope(ns walletdb.ReadWriteBucket, name string,
 	keyScope waddrmgr.KeyScope, addrSchema *waddrmgr.ScopeAddrSchema) (
 	*waddrmgr.AccountProperties, error) {
 
-	scopedMgr, err := w.addrStore.FetchScopedKeyManager(keyScope)
+	dbScope := db.KeyScope{
+		Purpose: keyScope.Purpose,
+		Coin:    keyScope.Coin,
+	}
+	scopedMgr, err := w.store.FetchScopedKeyManager(dbScope)
 	if err != nil {
-		scopedMgr, err = w.addrStore.NewScopedKeyManager(
-			ns, keyScope, *addrSchema,
+		scopedMgr, err = w.store.NewScopedKeyManager(
+			dbScope, *addrSchema,
 		)
 		if err != nil {
 			return nil, err
@@ -341,8 +347,11 @@ func (w *Wallet) ImportAccountDryRun(name string,
 		// we go through the ScopedKeyManager instead to ensure
 		// addresses will be derived as expected from the wallet's
 		// point-of-view.
-		manager, err := w.addrStore.FetchScopedKeyManager(
-			accountProps.KeyScope,
+		manager, err := w.store.FetchScopedKeyManager(
+			db.KeyScope{
+				Purpose: accountProps.KeyScope.Purpose,
+				Coin:    accountProps.KeyScope.Coin,
+			},
 		)
 		if err != nil {
 			return err
@@ -411,7 +420,10 @@ func (w *Wallet) ImportPublicKeyDeprecated(pubKey *btcec.PublicKey,
 		return fmt.Errorf("address type %v is not supported", addrType)
 	}
 
-	scopedKeyManager, err := w.addrStore.FetchScopedKeyManager(keyScope)
+	scopedKeyManager, err := w.store.FetchScopedKeyManager(db.KeyScope{
+		Purpose: keyScope.Purpose,
+		Coin:    keyScope.Coin,
+	})
 	if err != nil {
 		return err
 	}
@@ -429,7 +441,11 @@ func (w *Wallet) ImportPublicKeyDeprecated(pubKey *btcec.PublicKey,
 
 	log.Infof("Imported address %v", addr.Address())
 
-	err = w.chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return err
+	}
+	err = chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
 	if err != nil {
 		return fmt.Errorf("unable to subscribe for address "+
 			"notifications: %w", err)
@@ -447,7 +463,10 @@ func (w *Wallet) ImportTaprootScriptDeprecated(scope waddrmgr.KeyScope,
 	witnessVersion byte, isSecretScript bool) (waddrmgr.ManagedAddress,
 	error) {
 
-	manager, err := w.addrStore.FetchScopedKeyManager(scope)
+	manager, err := w.store.FetchScopedKeyManager(db.KeyScope{
+		Purpose: scope.Purpose,
+		Coin:    scope.Coin,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +482,11 @@ func (w *Wallet) ImportTaprootScriptDeprecated(scope waddrmgr.KeyScope,
 	} else if bs.Timestamp.IsZero() {
 		// Only update the new birthday time from default value if we
 		// actually have timestamp info in the header.
-		header, err := w.chainClient.GetBlockHeader(&bs.Hash)
+		chainClient, err := w.requireChainClient()
+		if err != nil {
+			return nil, err
+		}
+		header, err := chainClient.GetBlockHeader(&bs.Hash)
 		if err == nil {
 			bs.Timestamp = header.Timestamp
 		}
@@ -484,7 +507,11 @@ func (w *Wallet) ImportTaprootScriptDeprecated(scope waddrmgr.KeyScope,
 
 	log.Infof("Imported address %v", addr.Address())
 
-	err = w.chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+	err = chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
 	if err != nil {
 		return nil, fmt.Errorf("unable to subscribe for address "+
 			"notifications: %w", err)
@@ -501,7 +528,10 @@ func (w *Wallet) ImportTaprootScriptDeprecated(scope waddrmgr.KeyScope,
 func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 	bs *waddrmgr.BlockStamp, rescan bool) (string, error) {
 
-	manager, err := w.addrStore.FetchScopedKeyManager(scope)
+	manager, err := w.store.FetchScopedKeyManager(db.KeyScope{
+		Purpose: scope.Purpose,
+		Coin:    scope.Coin,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -517,7 +547,11 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 	} else if bs.Timestamp.IsZero() {
 		// Only update the new birthday time from default value if we
 		// actually have timestamp info in the header.
-		header, err := w.chainClient.GetBlockHeader(&bs.Hash)
+		chainClient, err := w.requireChainClient()
+		if err != nil {
+			return "", err
+		}
+		header, err := chainClient.GetBlockHeader(&bs.Hash)
 		if err == nil {
 			bs.Timestamp = header.Timestamp
 		}
@@ -544,7 +578,7 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 		// before our current one. Otherwise, if we do, we can
 		// potentially miss detecting relevant chain events that
 		// occurred between them while rescanning.
-		birthdayBlock, _, err := w.addrStore.BirthdayBlock(addrmgrNs)
+		birthdayBlock, _, err := w.store.BirthdayBlock(context.Background())
 		if err != nil {
 			return err
 		}
@@ -552,7 +586,7 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 			return nil
 		}
 
-		err = w.addrStore.SetBirthday(addrmgrNs, bs.Timestamp)
+		err = w.store.SetBirthday(context.Background(), bs.Timestamp)
 		if err != nil {
 			return err
 		}
@@ -560,7 +594,7 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 		// To ensure this birthday block is correct, we'll mark it as
 		// unverified to prompt a sanity check at the next restart to
 		// ensure it is correct as it was provided by the caller.
-		return w.addrStore.SetBirthdayBlock(addrmgrNs, *bs, false)
+		return w.store.SetBirthdayBlock(context.Background(), *bs, false)
 	})
 	if err != nil {
 		return "", err
@@ -581,7 +615,11 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 		// required to be read, so discard the return value.
 		_ = w.SubmitRescan(job)
 	} else {
-		err := w.chainClient.NotifyReceived([]btcutil.Address{addr})
+		chainClient, err := w.requireChainClient()
+		if err != nil {
+			return "", err
+		}
+		err = chainClient.NotifyReceived([]btcutil.Address{addr})
 		if err != nil {
 			return "", fmt.Errorf("failed to subscribe for address ntfns for "+
 				"address %s: %w", addr.EncodeAddress(), err)

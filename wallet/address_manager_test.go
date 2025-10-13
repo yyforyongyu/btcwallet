@@ -14,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
@@ -69,7 +70,7 @@ func TestKeyScopeFromAddrType(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			scope, err := w.keyScopeFromAddrType(tc.addrType)
+			scope, err := w.keyScopeFromAddrType(db.AddressType(tc.addrType))
 			require.ErrorIs(t, err, tc.expectedErr)
 			require.Equal(t, tc.expectedScope, scope)
 		})
@@ -143,7 +144,7 @@ func TestNewAddress(t *testing.T) {
 			// parameters.
 			addr, err := w.NewAddress(
 				t.Context(), tc.accountName,
-				tc.addrType, tc.change,
+				db.AddressType(tc.addrType), tc.change,
 			)
 
 			// If an error is expected, assert that it occurs.
@@ -165,7 +166,7 @@ func TestNewAddress(t *testing.T) {
 			// internal or external.
 			addrInfo, err := w.AddressInfo(t.Context(), addr)
 			require.NoError(t, err)
-			require.Equal(t, tc.change, addrInfo.Internal())
+			require.Equal(t, tc.change, addrInfo.Internal)
 		})
 	}
 }
@@ -180,13 +181,13 @@ func TestGetUnusedAddress(t *testing.T) {
 
 	// Get a new address to start with.
 	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), false,
 	)
 	require.NoError(t, err)
 
 	// The first unused address should be the one we just created.
 	unusedAddr, err := w.GetUnusedAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), false,
 	)
 	require.NoError(t, err)
 	require.Equal(t, addr.String(), unusedAddr.String())
@@ -197,40 +198,36 @@ func TestGetUnusedAddress(t *testing.T) {
 
 	// We need to create a realistic transaction that has at least one
 	// input.
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+	msgTx := TstTx.MsgTx()
+	msgTx.TxOut = []*wire.TxOut{{
+		PkScript: pkScript,
+		Value:    1000,
+	}}
+	err = w.store.CreateTx(
+		t.Context(),
+		db.CreateTxParams{
+			WalletID: w.ID(),
+			Tx:       msgTx,
+			Credits: []db.CreditData{{
+				Index:   0,
+				Address: addr,
+			}},
+		},
+	)
+	require.NoError(t, err)
 
-		// Create a new transaction and set the output to the address
-		// we want to mark as used.
-		msgTx := TstTx.MsgTx()
-		msgTx.TxOut = []*wire.TxOut{{
-			PkScript: pkScript,
-			Value:    1000,
-		}}
-
-		rec, err := wtxmgr.NewTxRecordFromMsgTx(msgTx, time.Now())
-		if err != nil {
-			return err
-		}
-		err = w.txStore.InsertTx(txmgrNs, rec, nil)
-		if err != nil {
-			return err
-		}
-
-		err = w.txStore.AddCredit(txmgrNs, rec, nil, 0, false)
-		if err != nil {
-			return err
-		}
-
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		return w.addrStore.MarkUsed(addrmgrNs, addr)
-	})
+	err = w.store.MarkAddressAsUsed(
+		t.Context(),
+		db.MarkAddressAsUsedParams{
+			WalletID: w.ID(),
+			Address:  addr,
+		},
+	)
 	require.NoError(t, err)
 
 	// Get the next unused address.
 	nextAddr, err := w.GetUnusedAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), false,
 	)
 	require.NoError(t, err)
 
@@ -239,13 +236,13 @@ func TestGetUnusedAddress(t *testing.T) {
 
 	// Now, let's test the change address.
 	changeAddr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, true,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), true,
 	)
 	require.NoError(t, err)
 
 	// The first unused change address should be the one we just created.
 	unusedChangeAddr, err := w.GetUnusedAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, true,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), true,
 	)
 	require.NoError(t, err)
 	require.Equal(t, changeAddr.String(), unusedChangeAddr.String())
@@ -261,7 +258,7 @@ func TestAddressInfo(t *testing.T) {
 
 	// Get a new external address to test with.
 	extAddr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), false,
 	)
 	require.NoError(t, err)
 
@@ -270,15 +267,14 @@ func TestAddressInfo(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check the external address info.
-	require.Equal(t, extAddr.String(), extInfo.Address().String())
-	require.False(t, extInfo.Internal())
-	require.True(t, extInfo.Compressed())
-	require.False(t, extInfo.Imported())
-	require.Equal(t, waddrmgr.WitnessPubKey, extInfo.AddrType())
+	require.Equal(t, extAddr.String(), extInfo.Address.String())
+	require.False(t, extInfo.Internal)
+	require.True(t, extInfo.Compressed)
+	require.Equal(t, db.AddressType(waddrmgr.WitnessPubKey), extInfo.AddrType)
 
 	// Get a new internal address to test with.
 	intAddr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, true,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), true,
 	)
 	require.NoError(t, err)
 
@@ -287,11 +283,10 @@ func TestAddressInfo(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check the internal address info.
-	require.Equal(t, intAddr.String(), intInfo.Address().String())
-	require.True(t, intInfo.Internal())
-	require.True(t, intInfo.Compressed())
-	require.False(t, intInfo.Imported())
-	require.Equal(t, waddrmgr.WitnessPubKey, intInfo.AddrType())
+	require.Equal(t, intAddr.String(), intInfo.Address.String())
+	require.True(t, intInfo.Internal)
+	require.True(t, intInfo.Compressed)
+	require.Equal(t, db.AddressType(waddrmgr.WitnessPubKey), intInfo.AddrType)
 }
 
 // TestGetDerivationInfoExternalAddressSuccess tests that we can successfully
@@ -303,7 +298,7 @@ func TestGetDerivationInfoExternalAddressSuccess(t *testing.T) {
 	// with.
 	w := testWallet(t)
 	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), false,
 	)
 	require.NoError(t, err)
 
@@ -316,11 +311,10 @@ func TestGetDerivationInfoExternalAddressSuccess(t *testing.T) {
 
 	addrInfo, err := w.AddressInfo(t.Context(), addr)
 	require.NoError(t, err)
-	pubKeyAddr, ok := addrInfo.(waddrmgr.ManagedPubKeyAddress)
-	require.True(t, ok)
-	pubKey := pubKeyAddr.PubKey()
-	keyScope, derivPath, ok := pubKeyAddr.DerivationInfo()
-	require.True(t, ok)
+	pubKey, err := w.PubKeyForAddress(addr)
+	require.NoError(t, err)
+	keyScope := db.KeyScope(waddrmgr.KeyScopeBIP0084)
+	derivPath := addrInfo.DerivationInfo
 
 	expectedPath := []uint32{
 		keyScope.Purpose + hdkeychain.HardenedKeyStart,
@@ -346,7 +340,7 @@ func TestGetDerivationInfoInternalAddressSuccess(t *testing.T) {
 	// test with.
 	w := testWallet(t)
 	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, true,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), true,
 	)
 	require.NoError(t, err)
 
@@ -359,10 +353,8 @@ func TestGetDerivationInfoInternalAddressSuccess(t *testing.T) {
 
 	addrInfo, err := w.AddressInfo(t.Context(), addr)
 	require.NoError(t, err)
-	pubKeyAddr, ok := addrInfo.(waddrmgr.ManagedPubKeyAddress)
-	require.True(t, ok)
-	keyScope, derivPath, ok := pubKeyAddr.DerivationInfo()
-	require.True(t, ok)
+	keyScope := db.KeyScope(waddrmgr.KeyScopeBIP0084)
+	derivPath := addrInfo.DerivationInfo
 
 	expectedPath := []uint32{
 		keyScope.Purpose + hdkeychain.HardenedKeyStart,
@@ -399,7 +391,7 @@ func TestGetDerivationInfoNoDerivationInfo(t *testing.T) {
 	require.Error(t, err)
 
 	// Arrange: Import the key as a watch-only address.
-	err = w.ImportPublicKey(t.Context(), pubKey, waddrmgr.WitnessPubKey)
+	err = w.ImportPublicKey(t.Context(), pubKey, db.AddressType(waddrmgr.WitnessPubKey))
 	require.NoError(t, err)
 
 	// Act & Assert: Check that we still get an error because it's an
@@ -418,7 +410,7 @@ func TestListAddresses(t *testing.T) {
 
 	// Get a new address and give it a balance.
 	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), false,
 	)
 	require.NoError(t, err)
 
@@ -428,46 +420,42 @@ func TestListAddresses(t *testing.T) {
 
 	// We need to create a realistic transaction that has at least one
 	// input.
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+	msgTx := TstTx.MsgTx()
+	msgTx.TxOut = []*wire.TxOut{{
+		PkScript: pkScript,
+		Value:    1000,
+	}}
+	err = w.store.CreateTx(
+		t.Context(),
+		db.CreateTxParams{
+			WalletID: w.ID(),
+			Tx:       msgTx,
+			Credits: []db.CreditData{{
+				Index:   0,
+				Address: addr,
+			}},
+		},
+	)
+	require.NoError(t, err)
 
-		// Create a new transaction and set the output to the address
-		// we want to mark as used.
-		msgTx := TstTx.MsgTx()
-		msgTx.TxOut = []*wire.TxOut{{
-			PkScript: pkScript,
-			Value:    1000,
-		}}
-
-		rec, err := wtxmgr.NewTxRecordFromMsgTx(msgTx, time.Now())
-		if err != nil {
-			return err
-		}
-		err = w.txStore.InsertTx(txmgrNs, rec, nil)
-		if err != nil {
-			return err
-		}
-
-		err = w.txStore.AddCredit(txmgrNs, rec, nil, 0, false)
-		if err != nil {
-			return err
-		}
-
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		return w.addrStore.MarkUsed(addrmgrNs, addr)
-	})
+	err = w.store.MarkAddressAsUsed(
+		t.Context(),
+		db.MarkAddressAsUsedParams{
+			WalletID: w.ID(),
+			Address:  addr,
+		},
+	)
 	require.NoError(t, err)
 
 	// List the addresses for the default account.
 	addrs, err := w.ListAddresses(
-		t.Context(), "default", waddrmgr.WitnessPubKey,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey),
 	)
 	require.NoError(t, err)
 
 	// We should have one address with a balance of 1000.
 	require.Len(t, addrs, 1)
-	require.Equal(t, addr.String(), addrs[0].Address.String())
+	require.Equal(t, addr.String(), addrs[0].Address)
 	require.Equal(t, btcutil.Amount(1000), addrs[0].Balance)
 }
 
@@ -486,7 +474,7 @@ func TestImportPublicKey(t *testing.T) {
 
 	// Import the public key.
 	err = w.ImportPublicKey(
-		t.Context(), pubKey, waddrmgr.WitnessPubKey,
+		t.Context(), pubKey, db.AddressType(waddrmgr.WitnessPubKey),
 	)
 	require.NoError(t, err)
 
@@ -520,8 +508,7 @@ func TestImportTaprootScript(t *testing.T) {
 	leaf := txscript.NewTapLeaf(txscript.BaseLeafVersion, script)
 	tree := txscript.AssembleTaprootScriptTree(leaf)
 	rootHash := tree.RootNode.TapHash()
-	tapscript := waddrmgr.Tapscript{
-		Type: waddrmgr.TapscriptTypeFullTree,
+	tapscript := db.Tapscript{
 		ControlBlock: &txscript.ControlBlock{
 			InternalKey: pubKey,
 		},
@@ -554,7 +541,7 @@ func TestScriptForOutput(t *testing.T) {
 
 	// Create a new p2wkh address and output.
 	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
+		t.Context(), "default", db.AddressType(waddrmgr.WitnessPubKey), false,
 	)
 	require.NoError(t, err)
 	pkScript, err := txscript.PayToAddrScript(addr)

@@ -219,7 +219,7 @@ func (s *Server) Stop() {
 	chainClient := s.chainClient
 	s.handlerMu.Unlock()
 	if wallet != nil {
-		wallet.Stop()
+		s.walletLoader.UnloadWallet()
 	}
 	if chainClient != nil {
 		chainClient.Stop()

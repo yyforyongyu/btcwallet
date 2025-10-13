@@ -181,17 +181,13 @@ func TestLabelTransaction(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				err = walletdb.Update(w.db,
-					func(tx walletdb.ReadWriteTx) error {
-
-						ns := tx.ReadWriteBucket(
-							wtxmgrNamespaceKey,
-						)
-
-						return w.txStore.InsertTx(
-							ns, rec, nil,
-						)
-					})
+				err = w.store.CreateTx(
+					context.Background(),
+					db.CreateTxParams{
+						WalletID: w.ID(),
+						Tx:       rec.MsgTx,
+					},
+				)
 				if err != nil {
 					t.Fatalf("could not insert tx: %v", err)
 				}
@@ -237,46 +233,23 @@ func TestGetTransaction(t *testing.T) {
 		// Expected height.
 		expectedHeight int32
 
-		// Store function.
-		f func(wtxmgr.TxStore, walletdb.ReadWriteBucket) (wtxmgr.TxStore, error)
-
 		// The error we expect to be returned.
 		expectedErr error
 	}{
 		{
-			name: "existing unmined transaction",
-			txid: *TstTxHash,
-			// We write txdetail for the tx to disk.
-			f: func(s wtxmgr.TxStore, ns walletdb.ReadWriteBucket) (
-				wtxmgr.TxStore, error) {
-
-				err = s.InsertTx(ns, rec, nil)
-				return s, err
-			},
-			expectedErr: nil,
+			name:           "existing unmined transaction",
+			txid:           *TstTxHash,
+			expectedErr:    nil,
 		},
 		{
-			name: "existing mined transaction",
-			txid: *TstTxHash,
-			// We write txdetail for the tx to disk.
-			f: func(s wtxmgr.TxStore, ns walletdb.ReadWriteBucket) (
-				wtxmgr.TxStore, error) {
-
-				err = s.InsertTx(ns, rec, TstMinedSignedTxBlockDetails)
-				return s, err
-			},
+			name:           "existing mined transaction",
+			txid:           *TstTxHash,
 			expectedHeight: TstMinedTxBlockHeight,
 			expectedErr:    nil,
 		},
 		{
-			name: "non-existing transaction",
-			txid: *TstTxHash,
-			// Write no txdetail to disk.
-			f: func(s wtxmgr.TxStore, _ walletdb.ReadWriteBucket) (
-				wtxmgr.TxStore, error) {
-
-				return s, nil
-			},
+			name:        "non-existing transaction",
+			txid:        *TstTxHash,
 			expectedErr: ErrNoTx,
 		},
 	}
@@ -286,12 +259,35 @@ func TestGetTransaction(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			w := testWallet(t)
 
-			err := walletdb.Update(w.db, func(rw walletdb.ReadWriteTx) error {
-				ns := rw.ReadWriteBucket(wtxmgrNamespaceKey)
-				_, err := test.f(w.txStore, ns)
-				return err
-			})
-			require.NoError(t, err)
+			if test.name != "non-existing transaction" {
+				err := w.store.CreateTx(
+					context.Background(),
+					db.CreateTxParams{
+						WalletID: w.ID(),
+						Tx:       rec.MsgTx,
+					},
+				)
+				require.NoError(t, err)
+			}
+
+			if test.name == "existing mined transaction" {
+				err := w.store.UpdateTx(
+					context.Background(),
+					db.UpdateTxParams{
+						WalletID: w.ID(),
+						TxHash:   *TstTxHash,
+						Data: db.TxUpdateData{
+							BlockMeta: db.BlockMeta{
+								Hash:   TstMinedSignedTxBlockDetails.Hash,
+								Height: TstMinedSignedTxBlockDetails.Height,
+								Time:   TstMinedSignedTxBlockDetails.Time,
+							},
+						},
+					},
+				)
+				require.NoError(t, err)
+			}
+
 			tx, err := w.GetTransaction(test.txid)
 			require.ErrorIs(t, err, test.expectedErr)
 

@@ -19,6 +19,33 @@ import (
 	"github.com/btcsuite/btcwallet/walletdb"
 )
 
+// OpenWithRetry opens a wallet, retrying on error.
+func OpenWithRetry(db walletdb.DB, pubPassphrase []byte,
+	cbs *waddrmgr.OpenCallbacks, chainParams *chaincfg.Params,
+	recoveryWindow uint32, walletSyncRetryInterval time.Duration) (
+	*Wallet, error) {
+	// TODO(yy): implement
+	return nil, nil
+}
+
+// CreateWithCallback creates a new wallet using the provided wallet database,
+// public and private passphrases, and optional seed.
+func CreateWithCallback(db walletdb.DB, pubPassphrase, privPassphrase []byte,
+	rootKey *hdkeychain.ExtendedKey, chainParams *chaincfg.Params,
+	bday time.Time, callback func(wallet *Wallet) error) (*Wallet, error) {
+	// TODO(yy): implement
+	return nil, nil
+}
+
+// CreateWatchingOnlyWithCallback creates a new watch-only wallet using the
+// provided wallet database and public passphrase.
+func CreateWatchingOnlyWithCallback(db walletdb.DB, pubPassphrase []byte,
+	chainParams *chaincfg.Params, bday time.Time,
+	callback func(wallet *Wallet) error) (*Wallet, error) {
+	// TODO(yy): implement
+	return nil, nil
+}
+
 const (
 	// WalletDBName specified the database filename for the wallet.
 	WalletDBName = "wallet.db"
@@ -83,7 +110,7 @@ type Loader struct {
 	wallet         *Wallet
 	localDB        bool
 	walletExists   func() (bool, error)
-	walletCreated  func(db walletdb.ReadWriteTx) error
+	walletCreated  func(*Wallet) error
 	db             walletdb.DB
 	mu             sync.Mutex
 }
@@ -171,7 +198,7 @@ func (l *Loader) RunAfterLoad(fn func(*Wallet)) {
 // OnWalletCreated adds a function that will be executed the wallet structure
 // is initialized in the wallet database. This is useful if users want to add
 // extra fields in the same transaction (eg. to flag wallet existence).
-func (l *Loader) OnWalletCreated(fn func(walletdb.ReadWriteTx) error) {
+func (l *Loader) OnWalletCreated(fn func(*Wallet) error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.walletCreated = fn
@@ -270,7 +297,7 @@ func (l *Loader) createNewWallet(pubPassphrase, privPassphrase []byte,
 
 	// Initialize the newly created database for the wallet before opening.
 	if isWatchingOnly {
-		err := CreateWatchingOnlyWithCallback(
+		_, err := CreateWatchingOnlyWithCallback(
 			l.db, pubPassphrase, l.chainParams, bday,
 			l.walletCreated,
 		)
@@ -278,7 +305,7 @@ func (l *Loader) createNewWallet(pubPassphrase, privPassphrase []byte,
 			return nil, err
 		}
 	} else {
-		err := CreateWithCallback(
+		_, err := CreateWithCallback(
 			l.db, pubPassphrase, privPassphrase, rootKey,
 			l.chainParams, bday, l.walletCreated,
 		)
@@ -406,7 +433,6 @@ func (l *Loader) UnloadWallet() error {
 		return ErrNotLoaded
 	}
 
-	l.wallet.Stop()
 	l.wallet.WaitForShutdown()
 	if l.localDB {
 		err := l.db.Close()

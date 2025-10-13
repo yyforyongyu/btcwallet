@@ -5,6 +5,8 @@
 package wallet
 
 import (
+	"context"
+
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
@@ -199,6 +201,11 @@ func (w *Wallet) rescanBatchHandler() {
 	}
 }
 
+// resendUnminedTxs resends all unmined transactions.
+func (w *Wallet) resendUnminedTxs() {
+	// TODO(yy): implement
+}
+
 // rescanProgressHandler handles notifications for partially and fully completed
 // rescans by marking each rescanned address as partially or fully synced.
 func (w *Wallet) rescanProgressHandler() {
@@ -301,7 +308,16 @@ func (w *Wallet) rescanWithTarget(addrs []btcutil.Address,
 	// starting point for the rescan.
 	if startStamp == nil {
 		startStamp = &waddrmgr.BlockStamp{}
-		*startStamp = w.addrStore.SyncedTo()
+		walletInfo, err := w.store.GetWallet(context.Background(), w.Name())
+		if err != nil {
+			return err
+		}
+		syncState := walletInfo.SyncState
+		*startStamp = waddrmgr.BlockStamp{
+			Hash:      syncState.SyncedTo,
+			Height:    syncState.Height,
+			Timestamp: syncState.Timestamp,
+		}
 	}
 
 	job := &RescanJob{

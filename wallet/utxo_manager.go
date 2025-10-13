@@ -12,7 +12,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
-	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
@@ -150,92 +150,105 @@ type UtxoManager interface {
 //     UTXO set. A more scalable approach would use an iterator pattern.
 //
 // NOTE: This is part of the UtxoManager interface implementation.
-func (w *Wallet) ListUnspent(_ context.Context,
+func (w *Wallet) ListUnspent(ctx context.Context,
 	query UtxoQuery) ([]*Utxo, error) {
 
 	log.Debugf("ListUnspent using query: %v", query)
 
-	syncBlock := w.addrStore.SyncedTo()
+	syncBlock := w.SyncedTo()
 	currentHeight := syncBlock.Height
 
-	var utxos []*Utxo
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// First, fetch all unspent transaction outputs from the UTXO
-		// set.
-		unspent, err := w.txStore.UnspentOutputs(txmgrNs)
-		if err != nil {
-			return err
-		}
-
-		// Sort the outputs in ascending order of value. This is a
-		// convention to make the list more predictable and potentially
-		// useful for coin selection algorithms that prefer smaller
-		// UTXOs.
-		sort.Slice(unspent, func(i, j int) bool {
-			return unspent[i].Amount < unspent[j].Amount
-		})
-
-		// Iterate through each UTXO to apply filters and enrich it with
-		// address-specific details.
-		for _, output := range unspent {
-			// Calculate the current confirmation status based on the
-			// wallet's synced block height.
-			confs := int32(0)
-			if output.Height != -1 {
-				confs = currentHeight - output.Height
-			}
-
-			log.Tracef("Checking utxo[%v]: current height=%v, "+
-				"confirm height=%v, conf=%v", output.OutPoint,
-				currentHeight, output.Height, confs)
-
-			// Apply the MinConfs and MaxConfs filters from the
-			// query.
-			if confs < query.MinConfs || confs > query.MaxConfs {
-				continue
-			}
-
-			// Extract the address from the UTXO's public key script.
-			// For multi-address scripts, the first address is used.
-			addr := extractAddrFromPKScript(
-				output.PkScript, w.chainParams,
-			)
-
-			// Get all the required address-related details.
-			//
-			// NOTE: This lookup is the source of the N+1 query
-			// problem.
-			spendable, account, addrType := w.addrStore.
-				AddressDetails(addrmgrNs, addr)
-
-			log.Debugf("Found address: %s from account: %s",
-				addr.String(), account)
-
-			// Apply the Account filter from the query.
-			if query.Account != "" && account != query.Account {
-				continue
-			}
-
-			// If all filters pass, construct the final Utxo struct
-			// with all the combined data.
-			utxo := &Utxo{
-				OutPoint:      output.OutPoint,
-				Amount:        output.Amount,
-				PkScript:      output.PkScript,
-				Confirmations: confs,
-				Spendable:     spendable,
-				Address:       addr,
-				Account:       account,
-				AddressType:   addrType,
-			}
-			utxos = append(utxos, utxo)
-		}
-
-		return nil
+	// First, fetch all unspent transaction outputs from the UTXO
+	// set.
+	unspent, err := w.store.ListUTXOs(ctx, db.ListUtxosQuery{
+		WalletID: w.ID(),
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort the outputs in ascending order of value. This is a
+	// convention to make the list more predictable and potentially
+	// useful for coin selection algorithms that prefer smaller
+	// UTXOs.
+	sort.Slice(unspent, func(i, j int) bool {
+		return unspent[i].Amount < unspent[j].Amount
+	})
+
+	// Iterate through each UTXO to apply filters and enrich it with
+	// address-specific details.
+	var utxos []*Utxo
+	for _, output := range unspent {
+		// Calculate the current confirmation status based on the
+		// wallet's synced block height.
+		confs := int32(0)
+		if output.Height != -1 {
+			confs = currentHeight - output.Height + 1
+		}
+		log.Tracef("Checking utxo[%v]: current height=%v, "+
+			"confirm height=%v, conf=%v", output.OutPoint,
+			currentHeight, output.Height, confs)
+
+		// Apply the MinConfs and MaxConfs filters from the
+		// query.
+		if confs < query.MinConfs || confs > query.MaxConfs {
+			continue
+		}
+
+		// Extract the address from the UTXO's public key script.
+		// For multi-address scripts, the first address is used.
+		addr := extractAddrFromPKScript(
+			output.PkScript, w.chainParams,
+		)
+
+		// Get all the required address-related details.
+		//
+		// NOTE: This lookup is the source of the N+1 query
+		// problem.
+		addrInfo, err := w.store.GetAddress(ctx, db.GetAddressQuery{
+			WalletID: w.ID(),
+			Address:  addr,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		dbKeyScope := addrInfo.DerivationInfo.KeyScope
+		keyScope := waddrmgr.KeyScope{
+			Purpose: dbKeyScope.Purpose,
+			Coin:    dbKeyScope.Coin,
+		}
+		accountName, err := w.AccountName(keyScope, addrInfo.Account)
+		if err != nil {
+			return nil, err
+		}
+
+		spendable := addrInfo.Internal
+		account := accountName
+		addrType := waddrmgr.AddressType(addrInfo.AddrType)
+
+		log.Debugf("Found address: %s from account: %s",
+			addr.String(), account)
+
+		// Apply the Account filter from the query.
+		if query.Account != "" && account != accountName {
+			continue
+		}
+
+		// If all filters pass, construct the final Utxo struct
+		// with all the combined data.
+		utxo := &Utxo{
+			OutPoint:      output.OutPoint,
+			Amount:        output.Amount,
+			PkScript:      output.PkScript,
+			Confirmations: confs,
+			Spendable:     spendable,
+			Address:       addr,
+			Account:       account,
+			AddressType:   addrType,
+		}
+		utxos = append(utxos, utxo)
+	}
 
 	return utxos, err
 }
@@ -283,67 +296,89 @@ func (w *Wallet) ListUnspent(_ context.Context,
 // lookups into a single, efficient query.
 //
 // NOTE: This is part of the UtxoManager interface implementation.
-func (w *Wallet) GetUtxo(_ context.Context,
+func (w *Wallet) GetUtxo(ctx context.Context,
 	prevOut wire.OutPoint) (*Utxo, error) {
 
-	var utxo *Utxo
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// First, fetch the unspent transaction output from the UTXO
-		// set.
-		output, err := w.txStore.GetUtxo(txmgrNs, prevOut)
-		if err != nil {
-			return err
-		}
-
-		// If the output is not found, return an error.
-		if output == nil {
-			return wtxmgr.ErrUtxoNotFound
-		}
-
-		// Calculate the current confirmation status based on the
-		// wallet's synced block height.
-		syncBlock := w.addrStore.SyncedTo()
-		currentHeight := syncBlock.Height
-		confs := int32(0)
-		if output.Height != -1 {
-			confs = currentHeight - output.Height
-		}
-
-		// Extract the address from the UTXO's public key script.
-		// For multi-address scripts, the first address is used.
-		addr := extractAddrFromPKScript(output.PkScript, w.chainParams)
-		if addr == nil {
-			return wtxmgr.ErrUtxoNotFound
-		}
-
-		// In a single lookup, get all the required
-		// address-related details: spendability, account name,
-		// and address type. This avoids the N+1 query problem.
-		spendable, account, addrType := w.addrStore.
-			AddressDetails(addrmgrNs, addr)
-
-		// TODO(yy): This should be a column in the new utxo SQL table.
-		locked := w.LockedOutpoint(output.OutPoint)
-
-		// If all filters pass, construct the final Utxo struct
-		// with all the combined data.
-		utxo = &Utxo{
-			OutPoint:      output.OutPoint,
-			Amount:        output.Amount,
-			PkScript:      output.PkScript,
-			Confirmations: confs,
-			Spendable:     spendable,
-			Address:       addr,
-			Account:       account,
-			AddressType:   addrType,
-			Locked:        locked,
-		}
-
-		return nil
+	// First, fetch all unspent transaction outputs from the UTXO
+	// set.
+	//
+	// TODO(yy): This is inefficient. We should have a GetUtxo method on the
+	// store.
+	unspent, err := w.store.ListUTXOs(ctx, db.ListUtxosQuery{
+		WalletID: w.ID(),
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	var output *db.UtxoInfo
+	for _, u := range unspent {
+		if u.OutPoint == prevOut {
+			output = &u
+			break
+		}
+	}
+	if output == nil {
+		return nil, wtxmgr.ErrUtxoNotFound
+	}
+
+	// Calculate the current confirmation status based on the
+	// wallet's synced block height.
+	syncBlock := w.SyncedTo()
+	currentHeight := syncBlock.Height
+	confs := int32(0)
+	if output.Height != -1 {
+		confs = currentHeight - output.Height + 1
+	}
+
+	// Extract the address from the UTXO's public key script.
+	// For multi-address scripts, the first address is used.
+	addr := extractAddrFromPKScript(output.PkScript, w.chainParams)
+	if addr == nil {
+		return nil, wtxmgr.ErrUtxoNotFound
+	}
+
+	// In a single lookup, get all the required
+	// address-related details: spendability, account name,
+	// and address type. This avoids the N+1 query problem.
+	addrInfo, err := w.store.GetAddress(ctx, db.GetAddressQuery{
+		WalletID: w.ID(),
+		Address:  addr,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	dbKeyScope := addrInfo.DerivationInfo.KeyScope
+	keyScope := waddrmgr.KeyScope{
+		Purpose: dbKeyScope.Purpose,
+		Coin:    dbKeyScope.Coin,
+	}
+	accountName, err := w.AccountName(keyScope, addrInfo.Account)
+	if err != nil {
+		return nil, err
+	}
+
+	spendable := addrInfo.Internal
+	account := accountName
+	addrType := waddrmgr.AddressType(addrInfo.AddrType)
+
+	// TODO(yy): This should be a column in the new utxo SQL table.
+	locked := w.LockedOutpoint(output.OutPoint)
+
+	// If all filters pass, construct the final Utxo struct
+	// with all the combined data.
+	utxo := &Utxo{
+		OutPoint:      output.OutPoint,
+		Amount:        output.Amount,
+		PkScript:      output.PkScript,
+		Confirmations: confs,
+		Spendable:     spendable,
+		Address:       addr,
+		Account:       account,
+		AddressType:   addrType,
+		Locked:        locked,
+	}
 
 	return utxo, err
 }
@@ -385,19 +420,10 @@ func (w *Wallet) GetUtxo(_ context.Context,
 // improved to perform this check.
 //
 // NOTE: This is part of the UtxoManager interface implementation.
-func (w *Wallet) LeaseOutput(_ context.Context, id wtxmgr.LockID,
+func (w *Wallet) LeaseOutput(ctx context.Context, id wtxmgr.LockID,
 	op wire.OutPoint, duration time.Duration) (time.Time, error) {
 
-	var expiration time.Time
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		var err error
-		expiration, err = w.txStore.LockOutput(txmgrNs, id, op, duration)
-
-		return err
-	})
-
-	return expiration, err
+	return w.store.LeaseOutput(ctx, id, op, duration)
 }
 
 // ReleaseOutput unlocks a previously leased output, making it available for
@@ -435,13 +461,10 @@ func (w *Wallet) LeaseOutput(_ context.Context, id wtxmgr.LockID,
 // perform this check.
 //
 // NOTE: This is part of the UtxoManager interface implementation.
-func (w *Wallet) ReleaseOutput(_ context.Context, id wtxmgr.LockID,
+func (w *Wallet) ReleaseOutput(ctx context.Context, id wtxmgr.LockID,
 	op wire.OutPoint) error {
 
-	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		return w.txStore.UnlockOutput(txmgrNs, id, op)
-	})
+	return w.store.ReleaseOutput(ctx, id, op)
 }
 
 // ListLeasedOutputs returns a list of all currently leased outputs.
@@ -477,16 +500,7 @@ func (w *Wallet) ReleaseOutput(_ context.Context, id wtxmgr.LockID,
 //
 // NOTE: This is part of the UtxoManager interface implementation.
 func (w *Wallet) ListLeasedOutputs(
-	_ context.Context) ([]*wtxmgr.LockedOutput, error) {
+	ctx context.Context) ([]*wtxmgr.LockedOutput, error) {
 
-	var leasedOutputs []*wtxmgr.LockedOutput
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-		var err error
-		leasedOutputs, err = w.txStore.ListLockedOutputs(txmgrNs)
-
-		return err
-	})
-
-	return leasedOutputs, err
+	return w.store.ListLeasedOutputs(ctx)
 }

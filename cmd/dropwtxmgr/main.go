@@ -33,7 +33,7 @@ var opts = struct {
 }{
 	Force:   false,
 	DbPath:  filepath.Join(datadir, defaultNet, wallet.WalletDBName),
-	Timeout: wallet.DefaultDBTimeout,
+	Timeout: 10 * time.Second,
 }
 
 func init() {
@@ -98,7 +98,7 @@ func mainInt() int {
 		fmt.Println("Enter yes or no.")
 	}
 
-	db, err := walletdb.Open("bdb", opts.DbPath, true, opts.Timeout, false)
+	db, err := walletdb.Open("bdb", opts.DbPath, true, opts.Timeout)
 	if err != nil {
 		fmt.Println("Failed to open database:", err)
 		return 1
@@ -107,7 +107,102 @@ func mainInt() int {
 
 	fmt.Println("Dropping btcwallet transaction history")
 
-	err = wallet.DropTransactionHistory(db, !opts.DropLabels)
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket([]byte("wtxmgr"))
+		if ns == nil {
+			return nil
+		}
+
+		err := ns.DeleteNestedBucket([]byte("b"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("t"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("l"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("c"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("u"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("d"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("m"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("mc"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("mi"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+		err = ns.DeleteNestedBucket([]byte("lo"))
+		if err != nil && err != walletdb.ErrBucketNotFound {
+			return err
+		}
+
+		err = ns.Delete([]byte("bal"))
+		if err != nil {
+			return err
+		}
+
+		_, err = ns.CreateBucket([]byte("b"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("t"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("l"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("c"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("u"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("d"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("m"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("mc"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("mi"))
+		if err != nil {
+			return err
+		}
+		_, err = ns.CreateBucket([]byte("lo"))
+		if err != nil {
+			return err
+		}
+
+		v := make([]byte, 8)
+		return ns.Put([]byte("bal"), v)
+	})
 	if err != nil {
 		fmt.Println("Failed to drop and re-create namespace:", err)
 		return 1

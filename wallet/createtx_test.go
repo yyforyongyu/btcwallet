@@ -87,7 +87,7 @@ func TestTxToOutputsDryRun(t *testing.T) {
 	}
 	change := dryRunTx.Tx.TxOut[dryRunTx.ChangeIndex]
 
-	addresses, err := w.AccountAddresses(0)
+	addresses, err := w.AccountManagedAddresses(keyScope, 0)
 	if err != nil {
 		t.Fatalf("unable to get addresses: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestTxToOutputsDryRun(t *testing.T) {
 	}
 	change2 := dryRunTx2.Tx.TxOut[dryRunTx2.ChangeIndex]
 
-	addresses, err = w.AccountAddresses(0)
+	addresses, err = w.AccountManagedAddresses(keyScope, 0)
 	if err != nil {
 		t.Fatalf("unable to get addresses: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestTxToOutputsDryRun(t *testing.T) {
 	}
 	change3 := tx.Tx.TxOut[tx.ChangeIndex]
 
-	addresses, err = w.AccountAddresses(0)
+	addresses, err = w.AccountManagedAddresses(keyScope, 0)
 	if err != nil {
 		t.Fatalf("unable to get addresses: %v", err)
 	}
@@ -191,23 +191,22 @@ func addUtxo(t *testing.T, w *Wallet, incomingTx *wire.MsgTx) {
 		Time: time.Unix(1387737310, 0),
 	}
 
-	if err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		err = w.txStore.InsertTx(ns, rec, block)
-		if err != nil {
-			return err
+	credits := make([]db.CreditData, len(incomingTx.TxOut))
+	for i := range incomingTx.TxOut {
+		credits[i] = db.CreditData{
+			Index: uint32(i),
 		}
-		// Add all tx outputs as credits.
-		for i := 0; i < len(incomingTx.TxOut); i++ {
-			err = w.txStore.AddCredit(
-				ns, rec, block, uint32(i), false,
-			)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
+	}
+	err = w.store.CreateTx(
+		context.Background(),
+		db.CreateTxParams{
+			WalletID:  w.ID(),
+			Tx:        rec.MsgTx,
+			Credits:   credits,
+			BlockMeta: (*db.BlockMeta)(block),
+		},
+	)
+	if err != nil {
 		t.Fatalf("failed inserting tx: %v", err)
 	}
 }
@@ -235,21 +234,17 @@ func addTxAndCredit(t *testing.T, w *Wallet, tx *wire.MsgTx,
 		Time: time.Unix(1387737310, 0),
 	}
 
-	err = walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
-		ns := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
-		err = w.txStore.InsertTx(ns, rec, block)
-		if err != nil {
-			return err
-		}
-
-		// Add the specified output as credit.
-		err = w.txStore.AddCredit(ns, rec, block, creditIndex, false)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	err = w.store.CreateTx(
+		context.Background(),
+		db.CreateTxParams{
+			WalletID: w.ID(),
+			Tx:       rec.MsgTx,
+			Credits: []db.CreditData{{
+				Index: creditIndex,
+			}},
+			BlockMeta: (*db.BlockMeta)(block),
+		},
+	)
 	require.NoError(t, err, "failed inserting tx")
 }
 

@@ -6,6 +6,7 @@
 package wallet
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -13,9 +14,11 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txsizes"
 	"github.com/btcsuite/btcwallet/walletdb"
@@ -87,42 +90,36 @@ func constantInputSource(eligible []wtxmgr.Credit) txauthor.InputSource {
 // secretSource is an implementation of txauthor.SecretSource for the wallet's
 // address manager.
 type secretSource struct {
-	waddrmgr.AddrStore
-	addrmgrNs walletdb.ReadBucket
+	store       db.Store
+	chainParams *chaincfg.Params
 }
 
 func (s secretSource) GetKey(addr btcutil.Address) (*btcec.PrivateKey, bool, error) {
-	ma, err := s.Address(s.addrmgrNs, addr)
-	if err != nil {
-		return nil, false, err
-	}
-
-	mpka, ok := ma.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
-		e := fmt.Errorf("managed address type for %v is `%T` but "+
-			"want waddrmgr.ManagedPubKeyAddress", addr, ma)
-		return nil, false, e
-	}
-	privKey, err := mpka.PrivKey()
-	if err != nil {
-		return nil, false, err
-	}
-	return privKey, ma.Compressed(), nil
+	return s.store.GetPrivateKey(context.Background(), addr)
 }
 
 func (s secretSource) GetScript(addr btcutil.Address) ([]byte, error) {
-	ma, err := s.Address(s.addrmgrNs, addr)
+	info, err := s.store.GetAddress(context.Background(), db.GetAddressQuery{
+		Address: addr,
+	})
 	if err != nil {
 		return nil, err
 	}
+	return info.Script, nil
+}
 
-	msa, ok := ma.(waddrmgr.ManagedScriptAddress)
-	if !ok {
-		e := fmt.Errorf("managed address type for %v is `%T` but "+
-			"want waddrmgr.ManagedScriptAddress", addr, ma)
-		return nil, e
+func (s secretSource) ChainParams() *chaincfg.Params {
+	return s.chainParams
+}
+
+// confirmed checks whether a transaction has enough confirmations to be
+// considered confirmed.
+func confirmed(confirms, txHeight, curHeight int32) bool {
+	// A transaction at height -1 is unconfirmed.
+	if txHeight == -1 {
+		return confirms <= 0
 	}
-	return msa.Script()
+	return curHeight-txHeight+1 >= confirms
 }
 
 // txToOutputs creates a signed transaction which includes each output from
@@ -174,185 +171,187 @@ func (w *Wallet) txToOutputs(outputs []*wire.TxOut,
 	defer w.newAddrMtx.Unlock()
 
 	var tx *txauthor.AuthoredTx
-	err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
-		addrmgrNs, changeSource, err := w.addrMgrWithChangeSource(
-			dbtx, changeKeyScope, account,
-		)
-		if err != nil {
-			return err
-		}
-
-		eligible, err := w.findEligibleOutputs(
-			dbtx, coinSelectKeyScope, account, minconf,
-			bs, allowUtxo,
-		)
-		if err != nil {
-			return err
-		}
-
-		var inputSource txauthor.InputSource
-		if len(selectedUtxos) > 0 {
-			dedupUtxos := fn.NewSet(selectedUtxos...)
-			if len(dedupUtxos) != len(selectedUtxos) {
-				return errors.New("selected UTXOs contain " +
-					"duplicate values")
-			}
-
-			eligibleByOutpoint := make(
-				map[wire.OutPoint]wtxmgr.Credit,
-			)
-
-			for _, e := range eligible {
-				eligibleByOutpoint[e.OutPoint] = e
-			}
-
-			var eligibleSelectedUtxo []wtxmgr.Credit
-			for _, outpoint := range selectedUtxos {
-				e, ok := eligibleByOutpoint[outpoint]
-
-				if !ok {
-					return fmt.Errorf("selected outpoint "+
-						"not eligible for "+
-						"spending: %v", outpoint)
-				}
-				eligibleSelectedUtxo = append(
-					eligibleSelectedUtxo, e,
-				)
-			}
-
-			inputSource = constantInputSource(eligibleSelectedUtxo)
-
-		} else {
-			// Wrap our coins in a type that implements the
-			// SelectableCoin interface, so we can arrange them
-			// according to the selected coin selection strategy.
-			wrappedEligible := make([]Coin, len(eligible))
-			for i := range eligible {
-				wrappedEligible[i] = Coin{
-					TxOut: wire.TxOut{
-						Value: int64(
-							eligible[i].Amount,
-						),
-						PkScript: eligible[i].PkScript,
-					},
-					OutPoint: eligible[i].OutPoint,
-				}
-			}
-
-			arrangedCoins, err := strategy.ArrangeCoins(
-				wrappedEligible, feeSatPerKb,
-			)
-			if err != nil {
-				return err
-			}
-			inputSource = makeInputSource(arrangedCoins)
-		}
-
-		tx, err = txauthor.NewUnsignedTransaction(
-			outputs, feeSatPerKb, inputSource, changeSource,
-		)
-		if err != nil {
-			return err
-		}
-
-		// Randomize change position, if change exists, before signing.
-		// This doesn't affect the serialize size, so the change amount
-		// will still be valid.
-		if tx.ChangeIndex >= 0 {
-			tx.RandomizeChangePosition()
-		}
-
-		// If a dry run was requested, we return now before adding the
-		// input scripts, and don't commit the database transaction.
-		// By returning an error, we make sure the walletdb.Update call
-		// rolls back the transaction. But we'll react to this specific
-		// error outside of the DB transaction so we can still return
-		// the produced chain TX.
-		if dryRun {
-			return walletdb.ErrDryRunRollBack
-		}
-
-		// Before committing the transaction, we'll sign our inputs. If
-		// the inputs are part of a watch-only account, there's no
-		// private key information stored, so we'll skip signing such.
-		var watchOnly bool
-		if coinSelectKeyScope == nil {
-			// If a key scope wasn't specified, then coin selection
-			// was performed from the default wallet accounts
-			// (NP2WKH, P2WKH, P2TR), so any key scope provided
-			// doesn't impact the result of this call.
-			watchOnly, err = w.addrStore.IsWatchOnlyAccount(
-				addrmgrNs, waddrmgr.KeyScopeBIP0086, account,
-			)
-		} else {
-			watchOnly, err = w.addrStore.IsWatchOnlyAccount(
-				addrmgrNs, *coinSelectKeyScope, account,
-			)
-		}
-		if err != nil {
-			return err
-		}
-		if !watchOnly {
-			err = tx.AddAllInputScripts(
-				secretSource{w.addrStore, addrmgrNs},
-			)
-			if err != nil {
-				return err
-			}
-
-			err = validateMsgTx(
-				tx.Tx, tx.PrevScripts, tx.PrevInputValues,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		if tx.ChangeIndex >= 0 && account == waddrmgr.ImportedAddrAccount {
-			changeAmount := btcutil.Amount(
-				tx.Tx.TxOut[tx.ChangeIndex].Value,
-			)
-			log.Warnf("Spend from imported account produced "+
-				"change: moving %v from imported account into "+
-				"default account.", changeAmount)
-		}
-
-		// Finally, we'll request the backend to notify us of the
-		// transaction that pays to the change address, if there is one,
-		// when it confirms.
-		if tx.ChangeIndex >= 0 {
-			changePkScript := tx.Tx.TxOut[tx.ChangeIndex].PkScript
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-				changePkScript, w.chainParams,
-			)
-			if err != nil {
-				return err
-			}
-			if err := chainClient.NotifyReceived(addrs); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-	if err != nil && !errors.Is(err, walletdb.ErrDryRunRollBack) {
+	changeSource, err := w.addrMgrWithChangeSource(
+		changeKeyScope, account,
+	)
+	if err != nil {
 		return nil, err
+	}
+
+	eligible, err := w.findEligibleOutputs(
+		coinSelectKeyScope, account, minconf,
+		bs, allowUtxo,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var inputSource txauthor.InputSource
+	if len(selectedUtxos) > 0 {
+		dedupUtxos := fn.NewSet(selectedUtxos...)
+		if len(dedupUtxos) != len(selectedUtxos) {
+			return nil, errors.New("selected UTXOs contain " +
+				"duplicate values")
+		}
+
+		eligibleByOutpoint := make(
+			map[wire.OutPoint]wtxmgr.Credit,
+		)
+
+		for _, e := range eligible {
+			eligibleByOutpoint[e.OutPoint] = e
+		}
+
+		var eligibleSelectedUtxo []wtxmgr.Credit
+		for _, outpoint := range selectedUtxos {
+			e, ok := eligibleByOutpoint[outpoint]
+
+			if !ok {
+				return nil, fmt.Errorf("selected outpoint "+
+					"not eligible for "+
+					"spending: %v", outpoint)
+			}
+			eligibleSelectedUtxo = append(
+				eligibleSelectedUtxo, e,
+			)
+		}
+
+		inputSource = constantInputSource(eligibleSelectedUtxo)
+
+	} else {
+		// Wrap our coins in a type that implements the
+		// SelectableCoin interface, so we can arrange them
+		// according to the selected coin selection strategy.
+		wrappedEligible := make([]Coin, len(eligible))
+		for i := range eligible {
+			wrappedEligible[i] = Coin{
+				TxOut: wire.TxOut{
+					Value: int64(
+						eligible[i].Amount,
+					),
+					PkScript: eligible[i].PkScript,
+				},
+				OutPoint: eligible[i].OutPoint,
+			}
+		}
+
+		arrangedCoins, err := strategy.ArrangeCoins(
+			wrappedEligible, feeSatPerKb,
+		)
+		if err != nil {
+			return nil, err
+		}
+		inputSource = makeInputSource(arrangedCoins)
+	}
+
+	tx, err = txauthor.NewUnsignedTransaction(
+		outputs, feeSatPerKb, inputSource, changeSource,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Randomize change position, if change exists, before signing.
+	// This doesn't affect the serialize size, so the change amount
+	// will still be valid.
+	if tx.ChangeIndex >= 0 {
+		tx.RandomizeChangePosition()
+	}
+
+	// If a dry run was requested, we return now before adding the
+	// input scripts, and don't commit the database transaction.
+	// By returning an error, we make sure the walletdb.Update call
+	// rolls back the transaction. But we'll react to this specific
+	// error outside of the DB transaction so we can still return
+	// the produced chain TX.
+	if dryRun {
+		return nil, walletdb.ErrDryRunRollBack
+	}
+
+	// Before committing the transaction, we'll sign our inputs. If
+	// the inputs are part of a watch-only account, there's no
+	// private key information stored, so we'll skip signing such.
+	var watchOnly bool
+	if coinSelectKeyScope == nil {
+		// If a key scope wasn't specified, then coin selection
+		// was performed from the default wallet accounts
+		// (NP2WKH, P2WKH, P2TR), so any key scope provided
+		// doesn't impact the result of this call.
+		accountName := waddrmgr.AccountName(account)
+		info, err := w.store.GetAccount(
+			context.Background(), db.GetAccountQuery{
+				Scope: db.KeyScope{
+					Purpose: waddrmgr.KeyScopeBIP0086.Purpose,
+					Coin:    waddrmgr.KeyScopeBIP0086.Coin,
+				},
+				Name: &accountName,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		watchOnly = info.IsWatchOnly
+	} else {
+		accountName := waddrmgr.AccountName(account)
+		info, err := w.store.GetAccount(
+			context.Background(), db.GetAccountQuery{
+				Scope: db.KeyScope{
+					Purpose: coinSelectKeyScope.Purpose,
+					Coin:    coinSelectKeyScope.Coin,
+				},
+				Name: &accountName,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		watchOnly = info.IsWatchOnly
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !watchOnly {
+		err = tx.AddAllInputScripts(
+			secretSource{w.store, w.chainParams},
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		err = validateMsgTx(
+			tx.Tx, tx.PrevScripts, tx.PrevInputValues,
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return tx, nil
 }
 
-func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx,
-	keyScope *waddrmgr.KeyScope, account uint32, minconf int32,
-	bs *waddrmgr.BlockStamp,
+func (w *Wallet) findEligibleOutputs(keyScope *waddrmgr.KeyScope,
+	account uint32, minconf int32, bs *waddrmgr.BlockStamp,
 	allowUtxo func(utxo wtxmgr.Credit) bool) ([]wtxmgr.Credit, error) {
 
-	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-
-	unspent, err := w.txStore.UnspentOutputs(txmgrNs)
+	utxos, err := w.store.ListUTXOs(context.Background(), db.ListUtxosQuery{
+		WalletID: w.ID(),
+		MinConfs: minconf,
+	})
 	if err != nil {
 		return nil, err
+	}
+	unspent := make([]wtxmgr.Credit, len(utxos))
+	for i, utxo := range utxos {
+		unspent[i] = wtxmgr.Credit{
+			OutPoint: utxo.OutPoint,
+			BlockMeta: wtxmgr.BlockMeta{
+				Block: wtxmgr.Block{
+					Height: utxo.Height,
+				},
+			},
+			Amount:   utxo.Amount,
+			PkScript: utxo.PkScript,
+		}
 	}
 
 	// TODO: Eventually all of these filters (except perhaps output locking)
@@ -399,14 +398,13 @@ func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx,
 		if err != nil || len(addrs) != 1 {
 			continue
 		}
-		scopedMgr, addrAcct, err := w.addrStore.AddrAccount(addrmgrNs, addrs[0])
+		info, err := w.store.GetAddress(context.Background(), db.GetAddressQuery{
+			Address: addrs[0],
+		})
 		if err != nil {
 			continue
 		}
-		if keyScope != nil && scopedMgr.Scope() != *keyScope {
-			continue
-		}
-		if addrAcct != account {
+		if info.Account != account {
 			continue
 		}
 		eligible = append(eligible, *output)
@@ -433,9 +431,8 @@ func inputYieldsPositively(credit *wire.TxOut,
 // addresses will come from the specified key scope and account, unless a key
 // scope is not specified. In that case, change addresses will always come from
 // the P2WKH key scope.
-func (w *Wallet) addrMgrWithChangeSource(dbtx walletdb.ReadWriteTx,
-	changeKeyScope *waddrmgr.KeyScope, account uint32) (
-	walletdb.ReadWriteBucket, *txauthor.ChangeSource, error) {
+func (w *Wallet) addrMgrWithChangeSource(changeKeyScope *waddrmgr.KeyScope,
+	account uint32) (*txauthor.ChangeSource, error) {
 
 	// Determine the address type for change addresses of the given
 	// account.
@@ -446,14 +443,20 @@ func (w *Wallet) addrMgrWithChangeSource(dbtx walletdb.ReadWriteTx,
 
 	// It's possible for the account to have an address schema override, so
 	// prefer that if it exists.
-	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
-	scopeMgr, err := w.addrStore.FetchScopedKeyManager(*changeKeyScope)
-	if err != nil {
-		return nil, nil, err
+	dbScope := db.KeyScope{
+		Purpose: changeKeyScope.Purpose,
+		Coin:    changeKeyScope.Coin,
 	}
-	accountInfo, err := scopeMgr.AccountProperties(addrmgrNs, account)
+	accountName, err := w.AccountName(*changeKeyScope, account)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+	accountInfo, err := w.store.GetAccount(context.Background(), db.GetAccountQuery{
+		Scope: dbScope,
+		Name:  &accountName,
+	})
+	if err != nil {
+		return nil, err
 	}
 	if accountInfo.AddrSchema != nil {
 		addrType = accountInfo.AddrSchema.InternalAddrType
@@ -471,7 +474,7 @@ func (w *Wallet) addrMgrWithChangeSource(dbtx walletdb.ReadWriteTx,
 	case waddrmgr.TaprootPubKey:
 		scriptSize = txsizes.P2TRPkScriptSize
 	default:
-		return nil, nil, fmt.Errorf("unsupported address type: %v",
+		return nil, fmt.Errorf("unsupported address type: %v",
 			addrType)
 	}
 
@@ -484,13 +487,33 @@ func (w *Wallet) addrMgrWithChangeSource(dbtx walletdb.ReadWriteTx,
 			err        error
 		)
 		if account == waddrmgr.ImportedAddrAccount {
-			changeAddr, err = w.newChangeAddress(
-				addrmgrNs, 0, *changeKeyScope,
-			)
+			addrInfo, err := w.store.CreateAddress(context.Background(), db.CreateAddressParams{
+				WalletID:    w.ID(),
+				AccountName: "default",
+				Scope: db.KeyScope{
+					Purpose: changeKeyScope.Purpose,
+					Coin:    changeKeyScope.Coin,
+				},
+				Change: true,
+			})
+			if err != nil {
+				return nil, err
+			}
+			changeAddr = addrInfo.Address
 		} else {
-			changeAddr, err = w.newChangeAddress(
-				addrmgrNs, account, *changeKeyScope,
-			)
+			addrInfo, err := w.store.CreateAddress(context.Background(), db.CreateAddressParams{
+				WalletID:    w.ID(),
+				AccountName: accountName,
+				Scope: db.KeyScope{
+					Purpose: changeKeyScope.Purpose,
+					Coin:    changeKeyScope.Coin,
+				},
+				Change: true,
+			})
+			if err != nil {
+				return nil, err
+			}
+			changeAddr = addrInfo.Address
 		}
 		if err != nil {
 			return nil, err
@@ -498,7 +521,7 @@ func (w *Wallet) addrMgrWithChangeSource(dbtx walletdb.ReadWriteTx,
 		return txscript.PayToAddrScript(changeAddr)
 	}
 
-	return addrmgrNs, &txauthor.ChangeSource{
+	return &txauthor.ChangeSource{
 		ScriptSize: scriptSize,
 		NewScript:  newChangeScript,
 	}, nil

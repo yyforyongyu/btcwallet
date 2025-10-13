@@ -18,8 +18,6 @@ import (
 	"github.com/btcsuite/btcwallet/internal/prompt"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
-	"github.com/btcsuite/btcwallet/walletdb"
-	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 )
 
 // networkDir returns the directory name of a network directory to hold wallet
@@ -79,7 +77,8 @@ func convertLegacyKeystore(legacyKeyStore *keystore.Store, w *wallet.Wallet) {
 			}
 
 		case keystore.ScriptAddress:
-			_, err := w.ImportP2SHRedeemScript(addr.Script())
+			script := addr.Script()
+			_, err := w.ImportScript(script)
 			if err != nil {
 				fmt.Printf("WARN: Failed to import "+
 					"pay-to-script-hash script for "+
@@ -188,12 +187,11 @@ func createWallet(cfg *config) error {
 	}
 
 	fmt.Println("Creating the wallet...")
-	w, err := loader.CreateNewWallet(pubPass, privPass, seed, time.Now())
+	_, err = loader.CreateNewWallet(pubPass, privPass, seed, time.Now())
 	if err != nil {
 		return err
 	}
 
-	w.AddrManager().Close()
 	fmt.Println("The wallet has been created successfully.")
 	return nil
 }
@@ -208,20 +206,13 @@ func createSimulationWallet(cfg *config) error {
 	pubPass := []byte(wallet.InsecurePubPassphrase)
 
 	netDir := networkDir(cfg.AppDataDir.Value, activeNet.Params)
+	loader := wallet.NewLoader(
+		activeNet.Params, netDir, true, cfg.DBTimeout, 250,
+	)
 
 	// Create the wallet.
-	dbPath := filepath.Join(netDir, wallet.WalletDBName)
 	fmt.Println("Creating the wallet...")
-
-	// Create the wallet database backed by bolt db.
-	db, err := walletdb.Create("bdb", dbPath, true, cfg.DBTimeout, false)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	// Create the wallet.
-	err = wallet.Create(db, pubPass, privPass, nil, activeNet.Params, time.Now())
+	_, err := loader.CreateNewWallet(pubPass, privPass, nil, time.Now())
 	if err != nil {
 		return err
 	}

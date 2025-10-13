@@ -5,6 +5,7 @@
 package wallet
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"time"
@@ -15,7 +16,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/unit"
-	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
@@ -25,23 +26,17 @@ var (
 	ErrTxNotFound = errors.New("tx not found")
 )
 
-// TxReader provides an interface for querying tx history.
-type TxReader interface {
-	// GetTx returns a detailed description of a tx given its tx hash.
-	GetTx(ctx context.Context, txHash chainhash.Hash) (
-		*TxDetail, error)
+// PrevOut describes a transaction input.
+type PrevOut struct {
+	// OutPoint is the unique reference to the output being spent.
+	OutPoint wire.OutPoint
 
-	// ListTxns returns a list of all txns which are relevant to the wallet
-	// over a given block range.
-	ListTxns(ctx context.Context, startHeight, endHeight int32) (
-		[]*TxDetail, error)
+	// IsOurs is true if the input spends an output controlled by the
+	// wallet.
+	IsOurs bool
 }
 
-// A compile-time assertion to ensure that Wallet implements the TxReader
-// interface.
-var _ TxReader = (*Wallet)(nil)
-
-// Output contains details for a tx output.
+// Output describes a transaction output.
 type Output struct {
 	// Type is the script class of the output.
 	Type txscript.ScriptClass
@@ -59,16 +54,6 @@ type Output struct {
 	Amount btcutil.Amount
 
 	// IsOurs is true if the output is controlled by the wallet.
-	IsOurs bool
-}
-
-// PrevOut describes a tx input.
-type PrevOut struct {
-	// OutPoint is the unique reference to the output being spent.
-	OutPoint wire.OutPoint
-
-	// IsOurs is true if the input spends an output controlled by the
-	// wallet.
 	IsOurs bool
 }
 
@@ -131,22 +116,10 @@ type TxDetail struct {
 	Label string
 }
 
-// FeeRate returns the fee rate of the tx in satoshis per virtual byte.
-func (d *TxDetail) FeeRate() unit.SatPerVByte {
-	return unit.NewSatPerVByte(d.Fee, d.Weight.ToVB())
-}
-
-// GetTx returns a detailed description of a tx given its tx hash.
-//
-// NOTE: This method is part of the TxReader interface.
-//
-// Time complexity: O(1) amortized. The lookup is dominated by a key-based
-// B-tree lookup in the database, which is effectively constant time for any
-// realistic number of transactions.
 func (w *Wallet) GetTx(ctx context.Context, txHash chainhash.Hash) (
 	*TxDetail, error) {
 
-	txDetails, err := w.fetchTxDetails(&txHash)
+	txDetails, err := w.fetchTxDetails(ctx, &txHash)
 	if err != nil {
 		return nil, err
 	}
@@ -155,47 +128,44 @@ func (w *Wallet) GetTx(ctx context.Context, txHash chainhash.Hash) (
 		return nil, ErrTxNotFound
 	}
 
-	bestBlock := w.SyncedTo()
-	currentHeight := bestBlock.Height
+	walletInfo, err := w.store.GetWallet(ctx, w.Name())
+	if err != nil {
+		return nil, err
+	}
+	currentHeight := walletInfo.SyncState.Height
 
 	return w.buildTxDetail(txDetails, currentHeight), nil
 }
 
 // ListTxns returns a list of all txns which are relevant to the
 // wallet over a given block range.
-//
-// NOTE: This method is part of the TxReader interface.
-//
-// Time complexity: O(B + T), where B is the number of blocks in the range and T
-// is the number of transactions in those blocks.
 func (w *Wallet) ListTxns(ctx context.Context, startHeight,
 	endHeight int32) ([]*TxDetail, error) {
 
-	bestBlock := w.SyncedTo()
-	currentHeight := bestBlock.Height
+	walletInfo, err := w.store.GetWallet(ctx, w.Name())
+	if err != nil {
+		return nil, err
+	}
+	currentHeight := walletInfo.SyncState.Height
 
-	var details []*TxDetail
-	err := walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
-		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-
-		err := w.txStore.RangeTransactions(
-			txmgrNs, startHeight, endHeight,
-			func(d []wtxmgr.TxDetails) (bool, error) {
-				for i := range d {
-					detail := &d[i]
-
-					txDetail := w.buildTxDetail(
-						detail, currentHeight,
-					)
-					details = append(details, txDetail)
-				}
-				return false, nil
-			},
-		)
-		return err
+	txs, err := w.store.ListTxs(ctx, db.ListTxsQuery{
+		WalletID:    w.ID(),
+		StartHeight: startHeight,
+		EndHeight:   endHeight,
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	var details []*TxDetail
+	for _, tx := range txs {
+		txDetails, err := w.fetchTxDetails(ctx, &tx.Hash)
+		if err != nil {
+			return nil, err
+		}
+		details = append(details, w.buildTxDetail(
+			txDetails, currentHeight,
+		))
 	}
 
 	return details, nil
@@ -203,19 +173,38 @@ func (w *Wallet) ListTxns(ctx context.Context, startHeight,
 
 // fetchTxDetails fetches the tx details for the given tx hash
 // from the wallet's tx store.
-func (w *Wallet) fetchTxDetails(txHash *chainhash.Hash) (
+func (w *Wallet) fetchTxDetails(ctx context.Context, txHash *chainhash.Hash) (
 	*wtxmgr.TxDetails, error) {
 
-	var txDetails *wtxmgr.TxDetails
-	err := walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
-		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-
-		var err error
-		txDetails, err = w.txStore.TxDetails(txmgrNs, txHash)
-		return err
+	txInfo, err := w.store.GetTx(context.Background(), db.GetTxQuery{
+		WalletID: w.ID(),
+		TxHash:   *txHash,
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	return txDetails, err
+	var msgTx wire.MsgTx
+	err = msgTx.Deserialize(bytes.NewReader(txInfo.SerializedTx))
+	if err != nil {
+		return nil, err
+	}
+
+	details := &wtxmgr.TxDetails{
+		Block: wtxmgr.BlockMeta{
+			Block: wtxmgr.Block{
+				Hash:   txInfo.Block.Hash,
+				Height: txInfo.Block.Height,
+			},
+			Time: txInfo.Block.Time,
+		},
+	}
+	details.MsgTx = msgTx
+	details.Hash = *txHash
+	details.SerializedTx = txInfo.SerializedTx
+	details.Received = txInfo.Received
+
+	return details, nil
 }
 
 // buildTxDetail builds a TxDetail from the given wtxmgr.TxDetails.

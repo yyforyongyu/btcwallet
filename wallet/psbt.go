@@ -6,6 +6,7 @@ package wallet
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 
@@ -15,9 +16,9 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
@@ -180,27 +181,23 @@ func (w *Wallet) FundPsbt(packet *psbt.Packet, keyScope *waddrmgr.KeyScope,
 
 		// We also need a change source which needs to be able to insert
 		// a new change address into the database.
-		err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
-			_, changeSource, err := w.addrMgrWithChangeSource(
-				dbtx, opts.changeKeyScope, account,
-			)
-			if err != nil {
-				return err
-			}
+		changeSource, err := w.addrMgrWithChangeSource(
+			opts.changeKeyScope, account,
+		)
+		if err != nil {
+			return 0, err
+		}
 
-			// Ask the txauthor to create a transaction with our
-			// selected coins. This will perform fee estimation and
-			// add a change output if necessary.
-			tx, err = txauthor.NewUnsignedTransaction(
-				txOut, feeSatPerKB, inputSource, changeSource,
-			)
-			if err != nil {
-				return fmt.Errorf("fee estimation not "+
-					"successful: %w", err)
-			}
-
-			return nil
-		})
+		// Ask the txauthor to create a transaction with our
+		// selected coins. This will perform fee estimation and
+		// add a change output if necessary.
+		tx, err = txauthor.NewUnsignedTransaction(
+			txOut, feeSatPerKB, inputSource, changeSource,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("fee estimation not "+
+				"successful: %w", err)
+		}
 		w.newAddrMtx.Unlock()
 
 		if err != nil {
@@ -491,26 +488,22 @@ func (w *Wallet) FinalizePsbt(keyScope *waddrmgr.KeyScope, account uint32,
 		// Finally, if the input doesn't belong to a watch-only account,
 		// then we'll sign it as is, and populate the input with the
 		// witness and sigScript (if needed).
-		watchOnly := false
-		err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-			ns := tx.ReadBucket(waddrmgrNamespaceKey)
-			var err error
-			if keyScope == nil {
-				// If a key scope wasn't specified, then coin
-				// selection was performed from the default
-				// wallet accounts (NP2WKH, P2WKH, P2TR), so any
-				// key scope provided doesn't impact the result
-				// of this call.
-				watchOnly, err = w.addrStore.IsWatchOnlyAccount(
-					ns, waddrmgr.KeyScopeBIP0084, account,
-				)
-			} else {
-				watchOnly, err = w.addrStore.IsWatchOnlyAccount(
-					ns, *keyScope, account,
-				)
-			}
-			return err
+		accountName, err := w.AccountName(*keyScope, account)
+		if err != nil {
+			return fmt.Errorf("unable to get account name: %w", err)
+		}
+		dbScope := db.KeyScope{
+			Purpose: keyScope.Purpose,
+			Coin:    keyScope.Coin,
+		}
+		info, err := w.store.GetAccount(context.Background(), db.GetAccountQuery{
+			Scope: dbScope,
+			Name:  &accountName,
 		})
+		if err != nil {
+			return fmt.Errorf("unable to get account info: %w", err)
+		}
+		watchOnly := info.IsWatchOnly
 		if err != nil {
 			return fmt.Errorf("unable to determine if account is "+
 				"watch-only: %w", err)
@@ -518,7 +511,6 @@ func (w *Wallet) FinalizePsbt(keyScope *waddrmgr.KeyScope, account uint32,
 		if watchOnly {
 			continue
 		}
-
 		witness, sigScript, err := w.ComputeInputScript(
 			tx, signOutput, idx, sigHashes, in.SighashType, nil,
 		)
@@ -580,3 +572,4 @@ func PsbtPrevOutputFetcher(packet *psbt.Packet) *txscript.MultiPrevOutFetcher {
 
 	return fetcher
 }
+

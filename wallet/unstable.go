@@ -6,8 +6,9 @@
 package wallet
 
 import (
+	"context"
+
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
@@ -22,23 +23,27 @@ type unstableAPI struct {
 // functionality by itself.  New code should not be written using this API.
 func UnstableAPI(w *Wallet) unstableAPI { return unstableAPI{w} } // nolint:golint
 
-// TxDetails calls wtxmgr.Store.TxDetails under a single database view transaction.
-func (u unstableAPI) TxDetails(txHash *chainhash.Hash) (*wtxmgr.TxDetails, error) {
-	var details *wtxmgr.TxDetails
-	err := walletdb.View(u.w.db, func(dbtx walletdb.ReadTx) error {
-		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-		var err error
-		details, err = u.w.txStore.TxDetails(txmgrNs, txHash)
-		return err
-	})
-	return details, err
+func (u unstableAPI) TxDetails(hash *chainhash.Hash) (*wtxmgr.TxDetails, error) {
+	return u.w.fetchTxDetails(context.Background(), hash)
 }
 
-// RangeTransactions calls wtxmgr.Store.RangeTransactions under a single
-// database view tranasction.
 func (u unstableAPI) RangeTransactions(begin, end int32, f func([]wtxmgr.TxDetails) (bool, error)) error {
-	return walletdb.View(u.w.db, func(dbtx walletdb.ReadTx) error {
-		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-		return u.w.txStore.RangeTransactions(txmgrNs, begin, end, f)
-	})
+	txns, err := u.w.ListTxns(context.Background(), begin, end)
+	if err != nil {
+		return err
+	}
+
+	details := make([]wtxmgr.TxDetails, len(txns))
+	for i, tx := range txns {
+		// This is not ideal, but the Unstable API requires
+		// wtxmgr.TxDetails, so we need to fetch them one by one.
+		detail, err := u.w.fetchTxDetails(context.Background(), &tx.Hash)
+		if err != nil {
+			return err
+		}
+		details[i] = *detail
+	}
+
+	_, err = f(details)
+	return err
 }

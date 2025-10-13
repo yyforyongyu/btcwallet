@@ -8,38 +8,40 @@ import (
 	"context"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 )
 
 // TxWriter provides an interface for updating wallet txns.
 type TxWriter interface {
-	// LabelTx adds a label to a tx. If a label already exists, it will be
-	// overwritten.
-	LabelTx(ctx context.Context, hash chainhash.Hash, label string) error
+	// LabelTransaction adds a label to a tx.
+	LabelTransaction(hash chainhash.Hash, label string, overwrite bool) error
 }
 
 // A compile time check to ensure that Wallet implements the interface.
 var _ TxWriter = (*Wallet)(nil)
 
-// LabelTx adds a label to a tx. If a label already exists, it will be
-// overwritten.
-func (w *Wallet) LabelTx(ctx context.Context,
-	hash chainhash.Hash, label string) error {
-
-	err := walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
-		txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-		// Check that the transaction is known to the wallet.
-		details, err := w.txStore.TxDetails(txmgrNs, &hash)
-		if err != nil {
-			return err
-		}
-		if details == nil {
-			return ErrTxNotFound
-		}
-
-		return w.txStore.PutTxLabel(txmgrNs, hash, label)
+// LabelTransaction adds a label to a tx.
+func (w *Wallet) LabelTransaction(hash chainhash.Hash, label string, overwrite bool) error {
+	ctx := context.Background()
+	txInfo, err := w.store.GetTx(ctx, db.GetTxQuery{
+		WalletID: w.ID(),
+		TxHash:   hash,
 	})
+	if err != nil {
+		return ErrUnknownTransaction
+	}
 
-	return err
+	// Return an error if a label already exists and we're not overwriting.
+	if txInfo.Label != "" && !overwrite {
+		return ErrTxLabelExists
+	}
+
+	// Set the label and return.
+	return w.store.UpdateTx(ctx, db.UpdateTxParams{
+		WalletID: w.ID(),
+		TxHash:   hash,
+		Data: db.TxUpdateData{
+			Label: label,
+		},
+	})
 }

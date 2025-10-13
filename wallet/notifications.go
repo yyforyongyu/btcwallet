@@ -6,6 +6,7 @@ package wallet
 
 import (
 	"bytes"
+	"context"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcutil"
@@ -13,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -48,30 +50,40 @@ func newNotificationServer(wallet *Wallet) *NotificationServer {
 }
 
 func lookupInputAccount(dbtx walletdb.ReadTx, w *Wallet, details *wtxmgr.TxDetails, deb wtxmgr.DebitRecord) uint32 {
-	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-
 	// TODO: Debits should record which account(s?) they
 	// debit from so this doesn't need to be looked up.
 	prevOP := &details.MsgTx.TxIn[deb.Index].PreviousOutPoint
-	prev, err := w.txStore.TxDetails(txmgrNs, &prevOP.Hash)
+	prev, err := w.store.GetTx(context.Background(), db.GetTxQuery{
+		WalletID: w.ID(),
+		TxHash:   prevOP.Hash,
+	})
 	if err != nil {
 		log.Errorf("Cannot query previous transaction details for %v: %v", prevOP.Hash, err)
 		return 0
 	}
-	if prev == nil {
+	if prev.SerializedTx == nil {
 		log.Errorf("Missing previous transaction %v", prevOP.Hash)
 		return 0
 	}
-	prevOut := prev.MsgTx.TxOut[prevOP.Index]
+	var msgTx wire.MsgTx
+	err = msgTx.Deserialize(bytes.NewReader(prev.SerializedTx))
+	if err != nil {
+		log.Errorf("Cannot deserialize previous transaction %v: %v", prevOP.Hash, err)
+		return 0
+	}
+	prevOut := msgTx.TxOut[prevOP.Index]
 	_, addrs, _, err := txscript.ExtractPkScriptAddrs(prevOut.PkScript, w.chainParams)
 	var inputAcct uint32
 	if err == nil && len(addrs) > 0 {
-		_, inputAcct, err = w.addrStore.AddrAccount(addrmgrNs, addrs[0])
-	}
-	if err != nil {
-		log.Errorf("Cannot fetch account for previous output %v: %v", prevOP, err)
-		inputAcct = 0
+		addrInfo, err := w.store.GetAddress(context.Background(), db.GetAddressQuery{
+			WalletID: w.ID(),
+			Address:  addrs[0],
+		})
+		if err != nil {
+			log.Errorf("Cannot fetch account for previous output %v: %v", prevOP, err)
+			return 0
+		}
+		inputAcct = addrInfo.Account
 	}
 	return inputAcct
 }
@@ -79,19 +91,19 @@ func lookupInputAccount(dbtx walletdb.ReadTx, w *Wallet, details *wtxmgr.TxDetai
 func lookupOutputChain(dbtx walletdb.ReadTx, w *Wallet, details *wtxmgr.TxDetails,
 	cred wtxmgr.CreditRecord) (account uint32, internal bool) {
 
-	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
-
 	output := details.MsgTx.TxOut[cred.Index]
 	_, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript, w.chainParams)
-	var ma waddrmgr.ManagedAddress
 	if err == nil && len(addrs) > 0 {
-		ma, err = w.addrStore.Address(addrmgrNs, addrs[0])
-	}
-	if err != nil {
-		log.Errorf("Cannot fetch account for wallet output: %v", err)
-	} else {
-		account = ma.InternalAccount()
-		internal = ma.Internal()
+		addrInfo, err := w.store.GetAddress(context.Background(), db.GetAddressQuery{
+			WalletID: w.ID(),
+			Address:  addrs[0],
+		})
+		if err != nil {
+			log.Errorf("Cannot fetch account for wallet output: %v", err)
+		} else {
+			account = addrInfo.Account
+			internal = addrInfo.Internal
+		}
 	}
 	return
 }
@@ -154,8 +166,9 @@ func makeTxSummary(dbtx walletdb.ReadTx, w *Wallet, details *wtxmgr.TxDetails) T
 }
 
 func totalBalances(dbtx walletdb.ReadTx, w *Wallet, m map[uint32]btcutil.Amount) error {
-	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
-	unspent, err := w.txStore.UnspentOutputs(dbtx.ReadBucket(wtxmgrNamespaceKey))
+	unspent, err := w.store.ListUTXOs(context.Background(), db.ListUtxosQuery{
+		WalletID: w.ID(),
+	})
 	if err != nil {
 		return err
 	}
@@ -165,7 +178,15 @@ func totalBalances(dbtx walletdb.ReadTx, w *Wallet, m map[uint32]btcutil.Amount)
 		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
 			output.PkScript, w.chainParams)
 		if err == nil && len(addrs) > 0 {
-			_, outputAcct, err = w.addrStore.AddrAccount(addrmgrNs, addrs[0])
+			addrInfo, err := w.store.GetAddress(context.Background(), db.GetAddressQuery{
+				WalletID: w.ID(),
+				Address:  addrs[0],
+			})
+			if err != nil {
+				log.Errorf("Cannot fetch account for wallet output: %v", err)
+			} else {
+				outputAcct = addrInfo.Account
+			}
 		}
 		if err == nil {
 			_, ok := m[outputAcct]
@@ -215,26 +236,53 @@ func (s *NotificationServer) notifyUnminedTransaction(dbtx walletdb.ReadTx,
 	// TODO(wilmer): ideally we should find the culprit to why we're
 	// receiving an additional unconfirmed chain.RelevantTx notification
 	// from the chain backend.
-	details, err := s.wallet.txStore.UniqueTxDetails(ns, &txHash, nil)
+	details, err := s.wallet.store.GetTx(context.Background(), db.GetTxQuery{
+		WalletID: s.wallet.ID(),
+		TxHash:   txHash,
+	})
 	if err != nil {
 		log.Errorf("Cannot query transaction details for "+
 			"notification: %v", err)
 
 		return
 	}
+	var msgTx wire.MsgTx
+	err = msgTx.Deserialize(bytes.NewReader(details.SerializedTx))
+	if err != nil {
+		log.Errorf("Cannot deserialize transaction for "+
+			"notification: %v", err)
+		return
+	}
+	txDetails := &wtxmgr.TxDetails{
+		TxRecord: wtxmgr.TxRecord{
+			MsgTx:        msgTx,
+			Hash:         txHash,
+			SerializedTx: details.SerializedTx,
+			Received:     details.Received,
+		},
+		Credits: make([]wtxmgr.CreditRecord, len(details.Credits)),
+		Debits:  make([]wtxmgr.DebitRecord, len(details.Debits)),
+	}
 
 	// Sanity check: should not be currently coalescing a notification for
 	// mined transactions at the same time that an unmined tx is notified.
 	if s.currentTxNtfn != nil {
 		log.Errorf("Notifying unmined tx notification (%s) while creating notification for blocks",
-			details.Hash)
+			txDetails.Hash)
 	}
 
-	unminedTxs := []TransactionSummary{makeTxSummary(dbtx, s.wallet, details)}
-	unminedHashes, err := s.wallet.txStore.UnminedTxHashes(dbtx.ReadBucket(wtxmgrNamespaceKey))
+	unminedTxs := []TransactionSummary{makeTxSummary(dbtx, s.wallet, txDetails)}
+	unmined, err := s.wallet.store.ListTxs(context.Background(), db.ListTxsQuery{
+		WalletID:  s.wallet.ID(),
+		EndHeight: -1,
+	})
 	if err != nil {
 		log.Errorf("Cannot fetch unmined transaction hashes: %v", err)
 		return
+	}
+	unminedHashes := make([]*chainhash.Hash, len(unmined))
+	for i, tx := range unmined {
+		unminedHashes[i] = &tx.Hash
 	}
 	bals := make(map[uint32]btcutil.Amount)
 	relevantAccounts(s.wallet, bals, unminedTxs)
@@ -284,14 +332,32 @@ func (s *NotificationServer) notifyMinedTransaction(dbtx walletdb.ReadTx,
 
 	// We'll only notify the transaction if it was found within the
 	// wallet's set of confirmed transactions.
-	details, err := s.wallet.txStore.UniqueTxDetails(
-		ns, &txHash, &block.Block,
-	)
+	details, err := s.wallet.store.GetTx(context.Background(), db.GetTxQuery{
+		WalletID: s.wallet.ID(),
+		TxHash:   txHash,
+	})
 	if err != nil {
 		log.Errorf("Cannot query transaction details for "+
 			"notification: %v", err)
 
 		return
+	}
+	var msgTx wire.MsgTx
+	err = msgTx.Deserialize(bytes.NewReader(details.SerializedTx))
+	if err != nil {
+		log.Errorf("Cannot deserialize transaction for "+
+			"notification: %v", err)
+		return
+	}
+	txDetails := &wtxmgr.TxDetails{
+		TxRecord: wtxmgr.TxRecord{
+			MsgTx:        msgTx,
+			Hash:         txHash,
+			SerializedTx: details.SerializedTx,
+			Received:     details.Received,
+		},
+		Credits: make([]wtxmgr.CreditRecord, len(details.Credits)),
+		Debits:  make([]wtxmgr.DebitRecord, len(details.Debits)),
 	}
 
 	if s.currentTxNtfn == nil {
@@ -308,7 +374,7 @@ func (s *NotificationServer) notifyMinedTransaction(dbtx walletdb.ReadTx,
 	}
 	txs := s.currentTxNtfn.AttachedBlocks[n-1].Transactions
 	s.currentTxNtfn.AttachedBlocks[n-1].Transactions =
-		append(txs, makeTxSummary(dbtx, s.wallet, details)) // nolint:gocritic
+		append(txs, makeTxSummary(dbtx, s.wallet, txDetails)) // nolint:gocritic
 }
 
 func (s *NotificationServer) notifyAttachedBlock(dbtx walletdb.ReadTx, block *wtxmgr.BlockMeta) {
@@ -352,11 +418,17 @@ func (s *NotificationServer) notifyAttachedBlock(dbtx walletdb.ReadTx, block *wt
 	// a mined transaction in the new best chain, there is no possiblity of
 	// a new, previously unseen transaction appearing in unconfirmed.
 
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-	unminedHashes, err := s.wallet.txStore.UnminedTxHashes(txmgrNs)
+	unmined, err := s.wallet.store.ListTxs(context.Background(), db.ListTxsQuery{
+		WalletID:  s.wallet.ID(),
+		EndHeight: -1,
+	})
 	if err != nil {
 		log.Errorf("Cannot fetch unmined transaction hashes: %v", err)
 		return
+	}
+	unminedHashes := make([]*chainhash.Hash, len(unmined))
+	for i, tx := range unmined {
+		unminedHashes[i] = &tx.Hash
 	}
 	s.currentTxNtfn.UnminedTransactionHashes = unminedHashes
 

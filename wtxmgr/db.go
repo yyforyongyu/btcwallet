@@ -116,7 +116,9 @@ func putMinedBalance(ns walletdb.ReadWriteBucket, amt btcutil.Amount) error {
 //
 // The canonical transaction hash serialization is simply the hash.
 
-func canonicalOutPoint(txHash *chainhash.Hash, index uint32) []byte {
+// CanonicalOutPoint returns the canonical byte representation of a transaction
+// outpoint.
+func CanonicalOutPoint(txHash *chainhash.Hash, index uint32) []byte {
 	var k [36]byte
 	copy(k[:32], txHash[:])
 	byteOrder.PutUint32(k[32:36], index)
@@ -378,7 +380,9 @@ func keyTxRecord(txHash *chainhash.Hash, block *Block) []byte {
 	return k
 }
 
-func valueTxRecord(rec *TxRecord) ([]byte, error) {
+// ValueTxRecord creates a new transaction record value from a transaction
+// record.
+func ValueTxRecord(rec *TxRecord) ([]byte, error) {
 	var v []byte
 	if rec.SerializedTx == nil {
 		txSize := rec.MsgTx.SerializeSize()
@@ -399,7 +403,7 @@ func valueTxRecord(rec *TxRecord) ([]byte, error) {
 
 func putTxRecord(ns walletdb.ReadWriteBucket, rec *TxRecord, block *Block) error {
 	k := keyTxRecord(&rec.Hash, block)
-	v, err := valueTxRecord(rec)
+	v, err := ValueTxRecord(rec)
 	if err != nil {
 		return err
 	}
@@ -693,7 +697,7 @@ func deleteRawCredit(ns walletdb.ReadWriteBucket, k []byte) error {
 // The elem's Spent field is not set to true if the credit is spent by an
 // unmined transaction.  To check for this case:
 //
-//	k := canonicalOutPoint(&txHash, it.elem.Index)
+//	k := CanonicalOutPoint(&txHash, it.elem.Index)
 //	it.elem.Spent = existsRawUnminedInput(ns, k) != nil
 type creditIterator struct {
 	c      walletdb.ReadWriteCursor // Set to nil after final iteration
@@ -777,7 +781,7 @@ func valueUnspent(block *Block) []byte {
 }
 
 func putUnspent(ns walletdb.ReadWriteBucket, outPoint *wire.OutPoint, block *Block) error {
-	k := canonicalOutPoint(&outPoint.Hash, outPoint.Index)
+	k := CanonicalOutPoint(&outPoint.Hash, outPoint.Index)
 	v := valueUnspent(block)
 	err := ns.NestedReadWriteBucket(bucketUnspent).Put(k, v)
 	if err != nil {
@@ -810,7 +814,7 @@ func readUnspentBlock(v []byte, block *Block) error {
 // key for the credits bucket.  If there is no unspent output recorded, the
 // credit key is nil.
 func existsUnspent(ns walletdb.ReadBucket, outPoint *wire.OutPoint) (k, credKey []byte) {
-	k = canonicalOutPoint(&outPoint.Hash, outPoint.Index)
+	k = CanonicalOutPoint(&outPoint.Hash, outPoint.Index)
 	credKey = existsRawUnspent(ns, k)
 	return k, credKey
 }
@@ -1037,7 +1041,7 @@ func deleteRawUnmined(ns walletdb.ReadWriteBucket, k []byte) error {
 //   [8]     Flags (1 byte)
 //             0x02: Change
 
-func valueUnminedCredit(amount btcutil.Amount, change bool) []byte {
+func ValueUnminedCredit(amount btcutil.Amount, change bool) []byte {
 	v := make([]byte, 9)
 	byteOrder.PutUint64(v, uint64(amount))
 	if change {
@@ -1193,7 +1197,7 @@ func (it *unminedCreditIterator) next() bool {
 // }
 
 func (it *unminedCreditIterator) reposition(txHash *chainhash.Hash, index uint32) {
-	it.c.Seek(canonicalOutPoint(txHash, index))
+	it.c.Seek(CanonicalOutPoint(txHash, index))
 }
 
 // Outpoints spent by unmined transactions are saved in the unmined inputs
@@ -1319,7 +1323,7 @@ func isLockedOutput(ns walletdb.ReadBucket, op wire.OutPoint,
 	}
 
 	// Retrieve the output lock, if any, and extract the relevant fields.
-	k := canonicalOutPoint(&op.Hash, op.Index)
+	k := CanonicalOutPoint(&op.Hash, op.Index)
 	v := lockedOutputs.Get(k)
 	if v == nil {
 		return LockID{}, time.Time{}, false
@@ -1347,7 +1351,7 @@ func lockOutput(ns walletdb.ReadWriteBucket, id LockID, op wire.OutPoint,
 	}
 
 	// Store a mapping of outpoint -> (id, expiry).
-	k := canonicalOutPoint(&op.Hash, op.Index)
+	k := CanonicalOutPoint(&op.Hash, op.Index)
 	v := serializeLockedOutput(id, expiry)
 
 	if err := lockedOutputs.Put(k, v[:]); err != nil {
@@ -1370,7 +1374,7 @@ func unlockOutput(ns walletdb.ReadWriteBucket, op wire.OutPoint) error {
 	}
 
 	// Delete the key-value pair representing the output lock.
-	k := canonicalOutPoint(&op.Hash, op.Index)
+	k := CanonicalOutPoint(&op.Hash, op.Index)
 	if err := lockedOutputs.Delete(k); err != nil {
 		str := fmt.Sprintf("%s: delete failed for %v",
 			bucketLockedOutputs, op)

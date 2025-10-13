@@ -76,13 +76,11 @@ var rpcHandlers = map[string]struct {
 	"createmultisig":         {handler: createMultiSig},
 	"dumpprivkey":            {handler: dumpPrivKey},
 	"getaccount":             {handler: getAccount},
-	"getaccountaddress":      {handler: getAccountAddress},
 	"getaddressesbyaccount":  {handler: getAddressesByAccount},
 	"getbalance":             {handler: getBalance},
 	"getbestblockhash":       {handler: getBestBlockHash},
 	"getblockcount":          {handler: getBlockCount},
 	"getinfo":                {handlerWithChain: getInfo},
-	"getnewaddress":          {handler: getNewAddress},
 	"getrawchangeaddress":    {handler: getRawChangeAddress},
 	"getreceivedbyaccount":   {handler: getReceivedByAccount},
 	"getreceivedbyaddress":   {handler: getReceivedByAddress},
@@ -302,16 +300,16 @@ func makeMultiSigScript(w *wallet.Wallet, keys []string, nRequired int) ([]byte,
 		case *btcutil.AddressPubKey:
 			keysesPrecious[i] = addr
 		default:
-			pubKey, err := w.PubKeyForAddress(addr)
-			if err != nil {
-				return nil, err
-			}
-			pubKeyAddr, err := btcutil.NewAddressPubKey(
-				pubKey.SerializeCompressed(), w.ChainParams())
-			if err != nil {
-				return nil, err
-			}
-			keysesPrecious[i] = pubKeyAddr
+			// pubKey, err := w.PubKeyForAddress(addr)
+			// if err != nil {
+			// 	return nil, err
+			// }
+			// pubKeyAddr, err := btcutil.NewAddressPubKey(
+			// 	pubKey.SerializeCompressed(), w.ChainParams())
+			// if err != nil {
+			// 	return nil, err
+			// }
+			// keysesPrecious[i] = pubKeyAddr
 		}
 	}
 
@@ -337,12 +335,16 @@ func addMultiSigAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error)
 		secp256k1Addrs[i] = addr
 	}
 
-	script, err := w.MakeMultiSigScript(secp256k1Addrs, cmd.NRequired)
+	keys := make([]string, len(secp256k1Addrs))
+	for i, a := range secp256k1Addrs {
+		keys[i] = a.String()
+	}
+	script, err := makeMultiSigScript(w, keys, cmd.NRequired)
 	if err != nil {
 		return nil, err
 	}
 
-	p2shAddr, err := w.ImportP2SHRedeemScript(script)
+	p2shAddr, err := w.ImportScript(script)
 	if err != nil {
 		return nil, err
 	}
@@ -403,14 +405,14 @@ func getAddressesByAccount(icmd interface{}, w *wallet.Wallet) (interface{}, err
 		return nil, err
 	}
 
-	addrs, err := w.AccountAddresses(account)
+	addrs, err := w.AccountManagedAddresses(waddrmgr.KeyScopeBIP0044, account)
 	if err != nil {
 		return nil, err
 	}
 
 	addrStrs := make([]string, len(addrs))
 	for i, a := range addrs {
-		addrStrs[i] = a.EncodeAddress()
+		addrStrs[i] = a.Address.EncodeAddress()
 	}
 	return addrStrs, nil
 }
@@ -433,16 +435,15 @@ func getBalance(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 			return nil, err
 		}
 	} else {
-		var account uint32
-		account, err = w.AccountNumber(waddrmgr.KeyScopeBIP0044, accountName)
+		_, err = w.AccountNumber(waddrmgr.KeyScopeBIP0044, accountName)
 		if err != nil {
 			return nil, err
 		}
-		bals, err := w.CalculateAccountBalances(account, int32(*cmd.MinConf))
+		bals, err := w.CalculateAccountBalances(int32(*cmd.MinConf))
 		if err != nil {
 			return nil, err
 		}
-		balance = bals.Spendable
+		balance = bals[accountName].Spendable
 	}
 	return balance.ToBTC(), nil
 }
@@ -450,7 +451,7 @@ func getBalance(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 // getBestBlock handles a getbestblock request by returning a JSON object
 // with the height and hash of the most recently processed block.
 func getBestBlock(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
-	blk := w.AddrManager().SyncedTo()
+	blk := w.SyncedTo()
 	result := &btcjson.GetBestBlockResult{
 		Hash:   blk.Hash.String(),
 		Height: blk.Height,
@@ -461,14 +462,14 @@ func getBestBlock(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 // getBestBlockHash handles a getbestblockhash request by returning the hash
 // of the most recently processed block.
 func getBestBlockHash(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
-	blk := w.AddrManager().SyncedTo()
+	blk := w.SyncedTo()
 	return blk.Hash.String(), nil
 }
 
 // getBlockCount handles a getblockcount request by returning the chain height
 // of the most recently processed block.
 func getBlockCount(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
-	blk := w.AddrManager().SyncedTo()
+	blk := w.SyncedTo()
 	return blk.Height, nil
 }
 
@@ -531,38 +532,17 @@ func getAccount(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		return nil, err
 	}
 
-	// Fetch the associated account
-	account, err := w.AccountOfAddress(addr)
+	ainfo, err := w.AddressInfoDeprecated(addr)
 	if err != nil {
 		return nil, &ErrAddressNotInWallet
 	}
+	account := ainfo.InternalAccount()
 
 	acctName, err := w.AccountName(waddrmgr.KeyScopeBIP0044, account)
 	if err != nil {
 		return nil, &ErrAccountNameNotFound
 	}
 	return acctName, nil
-}
-
-// getAccountAddress handles a getaccountaddress by returning the most
-// recently-created chained address that has not yet been used (does not yet
-// appear in the blockchain, or any tx that has arrived in the btcd mempool).
-// If the most recently-requested address has been used, a new address (the
-// next chained address in the keypool) is used.  This can fail if the keypool
-// runs out (and will return btcjson.ErrRPCWalletKeypoolRanOut if that happens).
-func getAccountAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
-	cmd := icmd.(*btcjson.GetAccountAddressCmd)
-
-	account, err := w.AccountNumber(waddrmgr.KeyScopeBIP0044, cmd.Account)
-	if err != nil {
-		return nil, err
-	}
-	addr, err := w.CurrentAddress(account, waddrmgr.KeyScopeBIP0044)
-	if err != nil {
-		return nil, err
-	}
-
-	return addr.EncodeAddress(), err
 }
 
 // getUnconfirmedBalance handles a getunconfirmedbalance extension request
@@ -574,16 +554,13 @@ func getUnconfirmedBalance(icmd interface{}, w *wallet.Wallet) (interface{}, err
 	if cmd.Account != nil {
 		acctName = *cmd.Account
 	}
-	account, err := w.AccountNumber(waddrmgr.KeyScopeBIP0044, acctName)
-	if err != nil {
-		return nil, err
-	}
-	bals, err := w.CalculateAccountBalances(account, 1)
+	bals, err := w.CalculateAccountBalances(1)
 	if err != nil {
 		return nil, err
 	}
 
-	return (bals.Total - bals.Spendable).ToBTC(), nil
+	bal := bals[acctName]
+	return (bal.Total - bal.Spendable).ToBTC(), nil
 }
 
 // importPrivKey handles an importprivkey request by parsing
@@ -672,43 +649,6 @@ func renameAccount(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	}
 
 	return nil, w.RenameAccountDeprecated(waddrmgr.KeyScopeBIP0044, account, cmd.NewAccount)
-}
-
-// getNewAddress handles a getnewaddress request by returning a new
-// address for an account.  If the account does not exist an appropriate
-// error is returned.
-// TODO: Follow BIP 0044 and warn if number of unused addresses exceeds
-// the gap limit.
-func getNewAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
-	cmd := icmd.(*btcjson.GetNewAddressCmd)
-
-	acctName := defaultAccountName
-	if cmd.Account != nil {
-		acctName = *cmd.Account
-	}
-	keyScope := waddrmgr.KeyScopeBIP0044
-	if cmd.AddressType != nil {
-		switch *cmd.AddressType {
-		case "p2sh-segwit":
-			keyScope = waddrmgr.KeyScopeBIP0049Plus
-		case "bech32":
-			keyScope = waddrmgr.KeyScopeBIP0084
-		case "legacy": // default if unset
-		default:
-			return nil, &ErrAddressTypeUnknown
-		}
-	}
-	account, err := w.AccountNumber(keyScope, acctName)
-	if err != nil {
-		return nil, err
-	}
-	addr, err := w.NewAddressDeprecated(account, keyScope)
-	if err != nil {
-		return nil, err
-	}
-
-	// Return the new payment address string.
-	return addr.EncodeAddress(), nil
 }
 
 // getRawChangeAddress handles a getrawchangeaddress request by creating
@@ -812,7 +752,7 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		return nil, &ErrNoTransactionInfo
 	}
 
-	syncBlock := w.AddrManager().SyncedTo()
+	syncBlock := w.SyncedTo()
 
 	// TODO: The serialized transaction is already in the DB, so
 	// reserializing can be avoided here.
@@ -890,7 +830,10 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		ret.Fee = feeF64
 	}
 
-	credCat := wallet.RecvCategory(details, syncBlock.Height, w.ChainParams()).String()
+	credCat := "receive"
+	if details.Block.Height == -1 {
+		credCat = "send"
+	}
 	for _, cred := range details.Credits {
 		// Change is ignored.
 		if cred.Change {
@@ -904,11 +847,14 @@ func getTransaction(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		if err == nil && len(addrs) == 1 {
 			addr := addrs[0]
 			address = addr.EncodeAddress()
-			account, err := w.AccountOfAddress(addr)
+			ainfo, err := w.AddressInfoDeprecated(addr)
 			if err == nil {
-				name, err := w.AccountName(waddrmgr.KeyScopeBIP0044, account)
+				account, err := w.AccountName(
+					waddrmgr.KeyScopeBIP0044,
+					ainfo.InternalAccount(),
+				)
 				if err == nil {
-					accountName = name
+					accountName = account
 				}
 			}
 		}
@@ -1135,19 +1081,17 @@ func listReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, err
 		account string
 	}
 
-	syncBlock := w.AddrManager().SyncedTo()
+	syncBlock := w.SyncedTo()
 
 	// Intermediate data for all addresses.
 	allAddrData := make(map[string]AddrData)
 	// Create an AddrData entry for each active address in the account.
 	// Otherwise we'll just get addresses from transactions later.
-	sortedAddrs, err := w.SortedActivePaymentAddresses()
-	if err != nil {
-		return nil, err
-	}
+	sortedAddrs := w.SortedActivePaymentAddresses()
+
 	for _, address := range sortedAddrs {
 		// There might be duplicates, just overwrite them.
-		allAddrData[address] = AddrData{}
+		allAddrData[address.EncodeAddress()] = AddrData{}
 	}
 
 	minConf := *cmd.MinConf
@@ -1157,7 +1101,7 @@ func listReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, err
 	} else {
 		endHeight = syncBlock.Height - int32(minConf) + 1
 	}
-	err = wallet.UnstableAPI(w).RangeTransactions(0, endHeight, func(details []wtxmgr.TxDetails) (bool, error) {
+	err := wallet.UnstableAPI(w).RangeTransactions(0, endHeight, func(details []wtxmgr.TxDetails) (bool, error) {
 		confirmations := confirms(details[0].Block.Height, syncBlock.Height)
 		for _, tx := range details {
 			for _, cred := range tx.Credits {
@@ -1214,7 +1158,7 @@ func listReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, err
 func listSinceBlock(icmd interface{}, w *wallet.Wallet, chainClient *chain.RPCClient) (interface{}, error) {
 	cmd := icmd.(*btcjson.ListSinceBlockCmd)
 
-	syncBlock := w.AddrManager().SyncedTo()
+	syncBlock := w.SyncedTo()
 	targetConf := int64(*cmd.TargetConfirmations)
 
 	// For the result we need the block hash for the last block counted
@@ -1222,20 +1166,16 @@ func listSinceBlock(icmd interface{}, w *wallet.Wallet, chainClient *chain.RPCCl
 	// it can arrive asynchronously while we figure out the rest.
 	gbh := chainClient.GetBlockHashAsync(int64(syncBlock.Height) + 1 - targetConf)
 
-	var start int32
+	var start *chainhash.Hash
 	if cmd.BlockHash != nil {
 		hash, err := chainhash.NewHashFromStr(*cmd.BlockHash)
 		if err != nil {
 			return nil, DeserializationError{err}
 		}
-		block, err := chainClient.GetBlockVerboseTx(hash)
-		if err != nil {
-			return nil, err
-		}
-		start = int32(block.Height) + 1
+		start = hash
 	}
 
-	txInfoList, err := w.ListSinceBlock(start, -1, syncBlock.Height)
+	txInfoList, err := w.ListSinceBlock(start, int32(*cmd.TargetConfirmations))
 	if err != nil {
 		return nil, err
 	}
@@ -1272,7 +1212,7 @@ func listTransactions(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 		}
 	}
 
-	return w.ListTransactions(*cmd.From, *cmd.Count)
+	return w.ListTransactions(*cmd.From, *cmd.Count, *cmd.Account)
 }
 
 // listAddressTransactions handles a listaddresstransactions request by
@@ -1727,35 +1667,39 @@ func signRawTransaction(icmd interface{}, w *wallet.Wallet, chainClient *chain.R
 	// `complete' denotes that we successfully signed all outputs and that
 	// all scripts will run to completion. This is returned as part of the
 	// reply.
-	signErrs, err := w.SignTransaction(&tx, hashType, inputs, keys, scripts)
+	signedTx, complete, err := w.SignTransaction(&tx, hashType, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	var buf bytes.Buffer
-	buf.Grow(tx.SerializeSize())
+	buf.Grow(signedTx.SerializeSize())
 
 	// All returned errors (not OOM, which panics) encountered during
 	// bytes.Buffer writes are unexpected.
-	if err = tx.Serialize(&buf); err != nil {
+	if err = signedTx.Serialize(&buf); err != nil {
 		panic(err)
 	}
 
-	signErrors := make([]btcjson.SignRawTransactionError, 0, len(signErrs))
-	for _, e := range signErrs {
-		input := tx.TxIn[e.InputIndex]
-		signErrors = append(signErrors, btcjson.SignRawTransactionError{
-			TxID:      input.PreviousOutPoint.Hash.String(),
-			Vout:      input.PreviousOutPoint.Index,
-			ScriptSig: hex.EncodeToString(input.SignatureScript),
-			Sequence:  input.Sequence,
-			Error:     e.Error.Error(),
-		})
+	signErrors := make([]btcjson.SignRawTransactionError, 0)
+	if err != nil {
+		// TODO(jrick): The reference client returns a different error
+		// here.
+		return nil, err
+	}
+
+	var signedBuf bytes.Buffer
+	signedBuf.Grow(signedTx.SerializeSize())
+
+	// All returned errors (not OOM, which panics) encountered during
+	// bytes.Buffer writes are unexpected.
+	if err = signedTx.Serialize(&signedBuf); err != nil {
+		panic(err)
 	}
 
 	return btcjson.SignRawTransactionResult{
-		Hex:      hex.EncodeToString(buf.Bytes()),
-		Complete: len(signErrors) == 0,
+		Hex:      hex.EncodeToString(signedBuf.Bytes()),
+		Complete: complete,
 		Errors:   signErrors,
 	}, nil
 }

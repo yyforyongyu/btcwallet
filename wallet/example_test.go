@@ -45,7 +45,6 @@ func testWallet(t *testing.T) *Wallet {
 
 	// Add the shutdown to the test's cleanup process.
 	t.Cleanup(func() {
-		w.Stop()
 		w.WaitForShutdown()
 	})
 
@@ -64,9 +63,6 @@ type mockers struct {
 
 	// addrStore is the mock address store.
 	addrStore *mockAddrStore
-
-	// txStore is the mock transaction store.
-	txStore *mockTxStore
 
 	// addr is the mock managed address.
 	addr *mockManagedAddress
@@ -99,7 +95,6 @@ func testWalletWithMocks(t *testing.T) (*Wallet, *mockers) {
 	require.NoError(t, err)
 
 	chain := &mockChain{}
-	txStore := &mockTxStore{}
 	addrStore := &mockAddrStore{}
 	addr := &mockManagedAddress{}
 	accountManager := &mockAccountStore{}
@@ -109,7 +104,6 @@ func testWalletWithMocks(t *testing.T) (*Wallet, *mockers) {
 	addrStore.On("Unlock", mock.Anything, mock.Anything).Return(nil)
 
 	w.chainClient = chain
-	w.txStore = txStore
 	w.addrStore = addrStore
 
 	// Start the wallet.
@@ -122,7 +116,6 @@ func testWalletWithMocks(t *testing.T) (*Wallet, *mockers) {
 	// methods.
 	m := &mockers{
 		chain:          chain,
-		txStore:        txStore,
 		addrStore:      addrStore,
 		addr:           addr,
 		accountManager: accountManager,
@@ -133,7 +126,6 @@ func testWalletWithMocks(t *testing.T) (*Wallet, *mockers) {
 	// called or not called as expected.
 	t.Cleanup(func() {
 		chain.AssertExpectations(t)
-		txStore.AssertExpectations(t)
 		addrStore.AssertExpectations(t)
 		addr.AssertExpectations(t)
 		accountManager.AssertExpectations(t)
@@ -179,7 +171,6 @@ func testWalletWatchingOnly(t *testing.T) *Wallet {
 
 	w.Start()
 	t.Cleanup(func() {
-		w.Stop()
 		w.WaitForShutdown()
 	})
 
