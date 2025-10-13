@@ -927,18 +927,15 @@ func (m *Manager) ChainParams() *chaincfg.Params {
 	return m.chainParams
 }
 
-// ChangePassphrase changes either the public or private passphrase to the
-// provided value depending on the private flag.  In order to change the
-// private password, the address manager must not be watching-only.  The new
-// passphrase keys are derived using the scrypt parameters in the options, so
-// changing the passphrase may be used to bump the computational difficulty
-// needed to brute force the passphrase.
-func (m *Manager) ChangePassphrase(ns walletdb.ReadWriteBucket, oldPassphrase,
-	newPassphrase []byte, private bool, config *ScryptOptions) error {
+// PrepareChangePassphrase prepares the database changes for a passphrase change.
+// It returns the new encrypted crypto keys and master key parameters.
+func (m *Manager) PrepareChangePassphrase(oldPassphrase,
+	newPassphrase []byte, private bool, config *ScryptOptions) (
+	[]byte, []byte, []byte, []byte, error) {
 
 	// No private passphrase to change for a watching-only address manager.
 	if private && m.WatchOnly() {
-		return managerError(ErrWatchingOnly, errWatchingOnly, nil)
+		return nil, nil, nil, nil, managerError(ErrWatchingOnly, errWatchingOnly, nil)
 	}
 
 	m.mtx.Lock()
@@ -961,11 +958,11 @@ func (m *Manager) ChangePassphrase(ns walletdb.ReadWriteBucket, oldPassphrase,
 		if err == snacl.ErrInvalidPassword {
 			str := fmt.Sprintf("invalid passphrase for %s master "+
 				"key", keyName)
-			return managerError(ErrWrongPassphrase, str, nil)
+			return nil, nil, nil, nil, managerError(ErrWrongPassphrase, str, nil)
 		}
 
 		str := fmt.Sprintf("failed to derive %s master key", keyName)
-		return managerError(ErrCrypto, str, err)
+		return nil, nil, nil, nil, managerError(ErrCrypto, str, err)
 	}
 	defer secretKey.Zero()
 
@@ -974,25 +971,18 @@ func (m *Manager) ChangePassphrase(ns walletdb.ReadWriteBucket, oldPassphrase,
 	newMasterKey, err := newSecretKey(&newPassphrase, config)
 	if err != nil {
 		str := "failed to create new master private key"
-		return managerError(ErrCrypto, str, err)
+		return nil, nil, nil, nil, managerError(ErrCrypto, str, err)
 	}
 	newKeyParams := newMasterKey.Marshal()
 
 	if private {
-		// Technically, the locked state could be checked here to only
-		// do the decrypts when the address manager is locked as the
-		// clear text keys are already available in memory when it is
-		// unlocked, but this is not a hot path, decryption is quite
-		// fast, and it's less cyclomatic complexity to simply decrypt
-		// in either case.
-
 		// Create a new salt that will be used for hashing the new
 		// passphrase each unlock.
 		var passphraseSalt [saltSize]byte
 		_, err := rand.Read(passphraseSalt[:])
 		if err != nil {
 			str := "failed to read random source for passhprase salt"
-			return managerError(ErrCrypto, str, err)
+			return nil, nil, nil, nil, managerError(ErrCrypto, str, err)
 		}
 
 		// Re-encrypt the crypto private key using the new master
@@ -1000,13 +990,13 @@ func (m *Manager) ChangePassphrase(ns walletdb.ReadWriteBucket, oldPassphrase,
 		decPriv, err := secretKey.Decrypt(m.cryptoKeyPrivEncrypted)
 		if err != nil {
 			str := "failed to decrypt crypto private key"
-			return managerError(ErrCrypto, str, err)
+			return nil, nil, nil, nil, managerError(ErrCrypto, str, err)
 		}
 		encPriv, err := newMasterKey.Encrypt(decPriv)
 		zero.Bytes(decPriv)
 		if err != nil {
 			str := "failed to encrypt crypto private key"
-			return managerError(ErrCrypto, str, err)
+			return nil, nil, nil, nil, managerError(ErrCrypto, str, err)
 		}
 
 		// Re-encrypt the crypto script key using the new master
@@ -1014,13 +1004,13 @@ func (m *Manager) ChangePassphrase(ns walletdb.ReadWriteBucket, oldPassphrase,
 		decScript, err := secretKey.Decrypt(m.cryptoKeyScriptEncrypted)
 		if err != nil {
 			str := "failed to decrypt crypto script key"
-			return managerError(ErrCrypto, str, err)
+			return nil, nil, nil, nil, managerError(ErrCrypto, str, err)
 		}
 		encScript, err := newMasterKey.Encrypt(decScript)
 		zero.Bytes(decScript)
 		if err != nil {
 			str := "failed to encrypt crypto script key"
-			return managerError(ErrCrypto, str, err)
+			return nil, nil, nil, nil, managerError(ErrCrypto, str, err)
 		}
 
 		// When the manager is locked, ensure the new clear text master
@@ -1037,18 +1027,6 @@ func (m *Manager) ChangePassphrase(ns walletdb.ReadWriteBucket, oldPassphrase,
 			zero.Bytes(saltedPassphrase)
 		}
 
-		// Save the new keys and params to the db in a single
-		// transaction.
-		err = putCryptoKeys(ns, nil, encPriv, encScript)
-		if err != nil {
-			return maybeConvertDbError(err)
-		}
-
-		err = putMasterKeyParams(ns, nil, newKeyParams)
-		if err != nil {
-			return maybeConvertDbError(err)
-		}
-
 		// Now that the db has been successfully updated, clear the old
 		// key and set the new one.
 		copy(m.cryptoKeyPrivEncrypted, encPriv)
@@ -1057,34 +1035,24 @@ func (m *Manager) ChangePassphrase(ns walletdb.ReadWriteBucket, oldPassphrase,
 		m.masterKeyPriv = newMasterKey
 		m.privPassphraseSalt = passphraseSalt
 		m.hashedPrivPassphrase = hashedPassphrase
-	} else {
-		// Re-encrypt the crypto public key using the new master public
-		// key.
-		encryptedPub, err := newMasterKey.Encrypt(m.cryptoKeyPub.Bytes())
-		if err != nil {
-			str := "failed to encrypt crypto public key"
-			return managerError(ErrCrypto, str, err)
-		}
 
-		// Save the new keys and params to the the db in a single
-		// transaction.
-		err = putCryptoKeys(ns, encryptedPub, nil, nil)
-		if err != nil {
-			return maybeConvertDbError(err)
-		}
-
-		err = putMasterKeyParams(ns, newKeyParams, nil)
-		if err != nil {
-			return maybeConvertDbError(err)
-		}
-
-		// Now that the db has been successfully updated, clear the old
-		// key and set the new one.
-		m.masterKeyPub.Zero()
-		m.masterKeyPub = newMasterKey
+		return nil, encPriv, encScript, newKeyParams, nil
 	}
 
-	return nil
+	// Re-encrypt the crypto public key using the new master public
+	// key.
+	encryptedPub, err := newMasterKey.Encrypt(m.cryptoKeyPub.Bytes())
+	if err != nil {
+		str := "failed to encrypt crypto public key"
+		return nil, nil, nil, nil, managerError(ErrCrypto, str, err)
+	}
+
+	// Now that the db has been successfully updated, clear the old
+	// key and set the new one.
+	m.masterKeyPub.Zero()
+	m.masterKeyPub = newMasterKey
+
+	return encryptedPub, nil, nil, newKeyParams, nil
 }
 
 // ConvertToWatchingOnly converts the current address manager to a locked

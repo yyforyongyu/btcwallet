@@ -26,6 +26,19 @@ var (
 	// birthdayBlockVerifiedName is the database key for whether the wallet's
 	// birthday block has been verified.
 	birthdayBlockVerifiedName = []byte("birthdayblockverified")
+
+	// mainBucketName is the name of the bucket that stores the encrypted
+	// crypto keys that encrypt all other generated keys, the watch only
+	// flag, the master private key (encrypted), the master HD private key
+	// (encrypted), and also versioning information.
+	mainBucketName = []byte("main")
+
+	// Crypto related key names (main bucket).
+	masterPrivKeyName   = []byte("mpriv")
+	masterPubKeyName    = []byte("mpub")
+	cryptoPrivKeyName   = []byte("cpriv")
+	cryptoPubKeyName    = []byte("cpub")
+	cryptoScriptKeyName = []byte("cscript")
 )
 
 // PutBirthday stores the wallet's birthday in the database.
@@ -142,6 +155,61 @@ func PutSyncedTo(ns walletdb.ReadWriteBucket, bs *waddrmgr.BlockStamp) error {
 	err := syncBucket.Put([]byte("syncedto"), serializedBlock)
 	if err != nil {
 		return newError(ErrDatabase, "failed to store synced to block", err)
+	}
+
+	return nil
+}
+
+// PutCryptoKeys stores the encrypted crypto keys which are in turn used to
+// protect the extended and imported keys.  Either parameter can be nil in
+// which case no value is written for the parameter.
+func PutCryptoKeys(ns walletdb.ReadWriteBucket, pubKeyEncrypted, privKeyEncrypted,
+	scriptKeyEncrypted []byte) error {
+
+	bucket := ns.NestedReadWriteBucket(mainBucketName)
+
+	if pubKeyEncrypted != nil {
+		err := bucket.Put(cryptoPubKeyName, pubKeyEncrypted)
+		if err != nil {
+			return newError(ErrDatabase, "failed to store encrypted crypto public key", err)
+		}
+	}
+
+	if privKeyEncrypted != nil {
+		err := bucket.Put(cryptoPrivKeyName, privKeyEncrypted)
+		if err != nil {
+			return newError(ErrDatabase, "failed to store encrypted crypto private key", err)
+		}
+	}
+
+	if scriptKeyEncrypted != nil {
+		err := bucket.Put(cryptoScriptKeyName, scriptKeyEncrypted)
+		if err != nil {
+			return newError(ErrDatabase, "failed to store encrypted crypto script key", err)
+		}
+	}
+
+	return nil
+}
+
+// PutMasterKeyParams stores the master key parameters needed to derive them to
+// the database.  Either parameter can be nil in which case no value is
+// written for the parameter.
+func PutMasterKeyParams(ns walletdb.ReadWriteBucket, pubParams, privParams []byte) error {
+	bucket := ns.NestedReadWriteBucket(mainBucketName)
+
+	if privParams != nil {
+		err := bucket.Put(masterPrivKeyName, privParams)
+		if err != nil {
+			return newError(ErrDatabase, "failed to store master private key parameters", err)
+		}
+	}
+
+	if pubParams != nil {
+		err := bucket.Put(masterPubKeyName, pubParams)
+		if err != nil {
+			return newError(ErrDatabase, "failed to store master public key parameters", err)
+		}
 	}
 
 	return nil

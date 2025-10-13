@@ -114,10 +114,30 @@ func (d *KvdbStore) GetHDSeed(ctx context.Context, params GetHDSeedParams) ([]by
 func (d *KvdbStore) ChangePassphrase(ctx context.Context, old, new []byte, private bool) error {
 	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		return d.addrStore.ChangePassphrase(
-			addrmgrNs, old, new, private,
-			&waddrmgr.DefaultScryptOptions,
-		)
+
+		// Get the encrypted keys and params from the address manager.
+		encPubKey, encPrivKey, encScriptKey, masterKeyParams, err :=
+			d.addrStore.PrepareChangePassphrase(
+				old, new, private, &waddrmgr.DefaultScryptOptions,
+			)
+		if err != nil {
+			return err
+		}
+
+		// Write the new keys and params to the database.
+		if private {
+			err = PutCryptoKeys(addrmgrNs, nil, encPrivKey, encScriptKey)
+			if err != nil {
+				return err
+			}
+			return PutMasterKeyParams(addrmgrNs, nil, masterKeyParams)
+		}
+
+		err = PutCryptoKeys(addrmgrNs, encPubKey, nil, nil)
+		if err != nil {
+			return err
+		}
+		return PutMasterKeyParams(addrmgrNs, masterKeyParams, nil)
 	})
 }
 
