@@ -6,11 +6,23 @@ package db
 
 import (
 	"encoding/binary"
+	"fmt"
 	"time"
 
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/walletdb"
 )
+
+// scopeToBytes transforms a manager's scope into the form that will be used to
+// retrieve the bucket that all information for a particular scope is stored
+// under
+func scopeToBytes(scope *waddrmgr.KeyScope) [8]byte {
+	var scopeBytes [8]byte
+	binary.LittleEndian.PutUint32(scopeBytes[:], scope.Purpose)
+	binary.LittleEndian.PutUint32(scopeBytes[4:], scope.Coin)
+
+	return scopeBytes
+}
 
 var (
 	// syncBucketName is the name of the bucket that stores the current
@@ -41,6 +53,17 @@ var (
 	cryptoScriptKeyName = []byte("cscript")
 	masterHDPrivName    = []byte("mhdpriv")
 	masterHDPubName     = []byte("mhdpub")
+
+	// scopeBucketName is the name of the top-level bucket within the
+	// hierarchy.
+	scopeBucketName = []byte("scope")
+
+	// metaBucketName is used to store meta-data about the address manager.
+	metaBucketName = []byte("meta")
+
+	// lastAccountName is used to store the metadata - last account
+	// in the manager.
+	lastAccountName = []byte("lastaccount")
 )
 
 // PutBirthday stores the wallet's birthday in the database.
@@ -218,6 +241,40 @@ func PutCryptoKeys(ns walletdb.ReadWriteBucket, pubKeyEncrypted, privKeyEncrypte
 	}
 
 	return nil
+}
+
+// FetchLastAccount retrieves the last account from the database.
+// If no accounts, returns twos-complement representation of -1, so that the next account is zero
+func FetchLastAccount(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope) (uint32, error) {
+	scopedBucket, err := fetchReadScopeBucket(ns, scope)
+	if err != nil {
+		return 0, err
+	}
+
+	metaBucket := scopedBucket.NestedReadBucket(metaBucketName)
+
+	val := metaBucket.Get(lastAccountName)
+	if val == nil {
+		return (1 << 32) - 1, nil
+	}
+	if len(val) != 4 {
+		return 0, newError(ErrDatabase, fmt.Sprintf("malformed metadata '%s' stored in database", lastAccountName), nil)
+	}
+
+	account := binary.LittleEndian.Uint32(val[0:4])
+	return account, nil
+}
+
+func fetchReadScopeBucket(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope) (walletdb.ReadBucket, error) {
+	rootScopeBucket := ns.NestedReadBucket(scopeBucketName)
+
+	scopeKey := scopeToBytes(scope)
+	scopedBucket := rootScopeBucket.NestedReadBucket(scopeKey[:])
+	if scopedBucket == nil {
+		return nil, newError(ErrDatabase, fmt.Sprintf("unable to find scope %v", scope), nil)
+	}
+
+	return scopedBucket, nil
 }
 
 // PutMasterKeyParams stores the master key parameters needed to derive them to
