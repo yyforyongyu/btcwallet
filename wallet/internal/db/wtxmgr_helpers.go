@@ -36,10 +36,6 @@ var ErrData = wtxmgr.Error{
 	Code: wtxmgr.ErrData,
 }
 
-var ErrDatabase = wtxmgr.Error{
-	Code: wtxmgr.ErrDatabase,
-}
-
 func storeError(code wtxmgr.ErrorCode, str string, err error) error {
 	return wtxmgr.Error{
 		Code: code,
