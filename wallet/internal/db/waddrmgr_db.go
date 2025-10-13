@@ -580,6 +580,26 @@ func ScopeSchemaFromBytes(schemaBytes []byte) waddrmgr.ScopeAddrSchema {
 	}
 }
 
+// LastAccount returns the last account number for a given scope.
+func LastAccount(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope) (uint32, error) {
+	scopedBucket, err := fetchReadScopeBucket(ns, scope)
+	if err != nil {
+		return 0, err
+	}
+
+	metaBucket := scopedBucket.NestedReadBucket(metaBucketName)
+	val := metaBucket.Get(lastAccountName)
+	if val == nil {
+		return 0, newError(ErrDatabase, "last account not found", nil)
+	}
+	if len(val) != 4 {
+		return 0, newError(ErrDatabase, fmt.Sprintf("malformed metadata '%s' stored in database", lastAccountName), nil)
+	}
+
+	account := binary.LittleEndian.Uint32(val[0:4])
+	return account, nil
+}
+
 // PutMasterKeyParams stores the master key parameters needed to derive them to
 // the database.  Either parameter can be nil in which case no value is
 // written for the parameter.

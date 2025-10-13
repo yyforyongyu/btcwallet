@@ -968,7 +968,8 @@ func listAccountsWithBalances(scopeMgr waddrmgr.AccountStore,
 	accountBalances map[uint32]balance) ([]AccountInfo, error) {
 
 	var accounts []AccountInfo
-	lastAccount, err := scopeMgr.LastAccount(addrmgrNs)
+	scope := scopeMgr.Scope()
+	lastAccount, err := LastAccount(addrmgrNs, &scope)
 	if err != nil {
 		if waddrmgr.IsError(err, waddrmgr.ErrAccountNotFound) {
 			return nil, nil
