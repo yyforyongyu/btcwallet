@@ -164,7 +164,7 @@ func (d *KvdbStore) SetBirthday(ctx context.Context, birthday time.Time) error {
 func (d *KvdbStore) SetBirthdayBlock(ctx context.Context, block waddrmgr.BlockStamp, verified bool) error {
 	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		return d.addrStore.SetBirthdayBlock(addrmgrNs, block, verified)
+		return PutBirthdayBlock(addrmgrNs, block, verified)
 	})
 }
 
