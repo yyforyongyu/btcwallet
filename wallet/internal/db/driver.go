@@ -146,7 +146,7 @@ func (d *KvdbStore) BirthdayBlock(ctx context.Context) (waddrmgr.BlockStamp, boo
 	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		var err error
-		bs, verified, err = d.addrStore.BirthdayBlock(addrmgrNs)
+		bs, verified, err = BirthdayBlock(addrmgrNs)
 		return err
 	})
 	return bs, verified, err

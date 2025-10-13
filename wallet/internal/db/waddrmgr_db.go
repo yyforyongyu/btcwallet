@@ -85,3 +85,47 @@ func serializeBlockStamp(block *waddrmgr.BlockStamp) []byte {
 	binary.LittleEndian.PutUint64(serialized[36:44], uint64(block.Timestamp.Unix()))
 	return serialized
 }
+
+// BirthdayBlock returns the birthday block of the wallet.
+func BirthdayBlock(ns walletdb.ReadBucket) (waddrmgr.BlockStamp, bool, error) {
+	syncBucket := ns.NestedReadBucket(syncBucketName)
+	if syncBucket == nil {
+		return waddrmgr.BlockStamp{}, false, errNoSyncBucket
+	}
+
+	// Fetch birthday block.
+	serializedBlock := syncBucket.Get(birthdayBlockName)
+	if serializedBlock == nil {
+		return waddrmgr.BlockStamp{}, false, nil
+	}
+	block, err := deserializeBlockStamp(serializedBlock)
+	if err != nil {
+		return waddrmgr.BlockStamp{}, false, err
+	}
+
+	// Fetch birthday block verified flag.
+	verifiedBytes := syncBucket.Get(birthdayBlockVerifiedName)
+	if verifiedBytes == nil {
+		return waddrmgr.BlockStamp{}, false, nil
+	}
+
+	return *block, verifiedBytes[0] == 1, nil
+}
+
+// deserializeBlockStamp deserializes the passed serialized block stamp.
+func deserializeBlockStamp(serializedBlock []byte) (*waddrmgr.BlockStamp, error) {
+	// The serialized block stamp format is:
+	//   <height><hash><timestamp>
+	//
+	// 4 bytes height + 32 bytes hash + 8 bytes timestamp
+	if len(serializedBlock) != 44 {
+		return nil, newError(ErrDatabase, "malformed serialized block stamp", nil)
+	}
+
+	block := waddrmgr.BlockStamp{
+		Height: int32(binary.LittleEndian.Uint32(serializedBlock[0:4])),
+		Timestamp: time.Unix(int64(binary.LittleEndian.Uint64(serializedBlock[36:44])), 0),
+	}
+	copy(block.Hash[:], serializedBlock[4:36])
+	return &block, nil
+}
