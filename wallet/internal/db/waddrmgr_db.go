@@ -39,6 +39,8 @@ var (
 	cryptoPrivKeyName   = []byte("cpriv")
 	cryptoPubKeyName    = []byte("cpub")
 	cryptoScriptKeyName = []byte("cscript")
+	masterHDPrivName    = []byte("mhdpriv")
+	masterHDPubName     = []byte("mhdpub")
 )
 
 // PutBirthday stores the wallet's birthday in the database.
@@ -158,6 +160,32 @@ func PutSyncedTo(ns walletdb.ReadWriteBucket, bs *waddrmgr.BlockStamp) error {
 	}
 
 	return nil
+}
+
+// FetchMasterHDKeys attempts to fetch both the master HD private and public
+// keys from the database. If this is a watch only wallet, then it's possible
+// that the master private key isn't stored.
+func FetchMasterHDKeys(ns walletdb.ReadBucket) ([]byte, []byte) {
+	bucket := ns.NestedReadBucket(mainBucketName)
+
+	var masterHDPrivEnc, masterHDPubEnc []byte
+
+	// First, we'll try to fetch the master private key. If this database
+	// is watch only, or the master has been neutered, then this won't be
+	// found on disk.
+	key := bucket.Get(masterHDPrivName)
+	if key != nil {
+		masterHDPrivEnc = make([]byte, len(key))
+		copy(masterHDPrivEnc, key)
+	}
+
+	key = bucket.Get(masterHDPubName)
+	if key != nil {
+		masterHDPubEnc = make([]byte, len(key))
+		copy(masterHDPubEnc, key)
+	}
+
+	return masterHDPrivEnc, masterHDPubEnc
 }
 
 // PutCryptoKeys stores the encrypted crypto keys which are in turn used to

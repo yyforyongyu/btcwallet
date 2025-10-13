@@ -110,6 +110,20 @@ func (d *KvdbStore) GetHDSeed(ctx context.Context, params GetHDSeedParams) ([]by
 	return nil, nil
 }
 
+// GetEncryptedHDSeed returns the encrypted HD seed of the wallet.
+func (d *KvdbStore) GetEncryptedHDSeed(ctx context.Context) ([]byte, error) {
+	var encryptedSeed []byte
+	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
+		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
+		encryptedSeed, _ = FetchMasterHDKeys(addrmgrNs)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return encryptedSeed, nil
+}
+
 // ChangePassphrase changes the passphrase of the wallet.
 func (d *KvdbStore) ChangePassphrase(ctx context.Context, old, new []byte, private bool) error {
 	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
