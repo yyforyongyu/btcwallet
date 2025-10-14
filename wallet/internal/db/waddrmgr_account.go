@@ -223,6 +223,26 @@ func FetchAccountByName(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope,
 	return binary.LittleEndian.Uint32(val), nil
 }
 
+// ForEachAccount calls the given function with each account stored in the
+// manager, breaking early on error.
+func ForEachAccount(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope,
+	fn func(account uint32) error) error {
+
+	scopedBucket, err := fetchReadScopeBucket(ns, scope)
+	if err != nil {
+		return err
+	}
+
+	acctBucket := scopedBucket.NestedReadBucket(acctBucketName)
+	return acctBucket.ForEach(func(k, v []byte) error {
+		// Skip buckets.
+		if v == nil {
+			return nil
+		}
+		return fn(binary.LittleEndian.Uint32(k))
+	})
+}
+
 // PutDefaultAccountInfo stores the provided default account information to the
 // database.
 func PutDefaultAccountInfo(ns walletdb.ReadWriteBucket, scope *waddrmgr.KeyScope,
