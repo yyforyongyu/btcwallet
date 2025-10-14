@@ -17,6 +17,9 @@ type ErrorCode int
 const (
 	// ErrDatabase indicates a database error.
 	ErrDatabase ErrorCode = iota
+
+	// ErrAccountNotFound is returned when a requesting account is not found.
+	ErrAccountNotFound
 )
 
 // Error identifies a wallet error. It has an error code and a descriptive

@@ -170,6 +170,39 @@ func putLastAccount(ns walletdb.ReadWriteBucket, scope *waddrmgr.KeyScope,
 	return nil
 }
 
+// fetchAccountInfo loads information about the passed account from the
+// database.
+func fetchAccountInfo(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope,
+	account uint32) (interface{}, error) {
+
+	scopedBucket, err := fetchReadScopeBucket(ns, scope)
+	if err != nil {
+		return nil, err
+	}
+
+	acctBucket := scopedBucket.NestedReadBucket(acctBucketName)
+
+	accountID := uint32ToBytes(account)
+	serializedRow := acctBucket.Get(accountID)
+	if serializedRow == nil {
+		return nil, newError(ErrAccountNotFound, fmt.Sprintf("account %d not found", account), nil)
+	}
+
+	row, err := deserializeAccountRow(accountID, serializedRow)
+	if err != nil {
+		return nil, err
+	}
+
+	switch row.acctType {
+	case accountDefault:
+		return deserializeDefaultAccountRow(accountID, row)
+	case accountWatchOnly:
+		return deserializeWatchOnlyAccountRow(accountID, row)
+	}
+
+	return nil, newError(ErrDatabase, fmt.Sprintf("unsupported account type '%d'", row.acctType), nil)
+}
+
 // PutDefaultAccountInfo stores the provided default account information to the
 // database.
 func PutDefaultAccountInfo(ns walletdb.ReadWriteBucket, scope *waddrmgr.KeyScope,
