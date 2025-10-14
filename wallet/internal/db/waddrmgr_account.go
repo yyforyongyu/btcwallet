@@ -151,6 +151,25 @@ const (
 	accountWatchOnly AccountType = 1
 )
 
+// putLastAccount stores the provided metadata - last account - to the
+// database.
+func putLastAccount(ns walletdb.ReadWriteBucket, scope *waddrmgr.KeyScope,
+	account uint32) error {
+
+	scopedBucket, err := fetchWriteScopeBucket(ns, scope)
+	if err != nil {
+		return err
+	}
+
+	bucket := scopedBucket.NestedReadWriteBucket(metaBucketName)
+
+	err = bucket.Put(lastAccountName, uint32ToBytes(account))
+	if err != nil {
+		return newError(ErrDatabase, fmt.Sprintf("failed to update metadata '%s'", lastAccountName), err)
+	}
+	return nil
+}
+
 // PutDefaultAccountInfo stores the provided default account information to the
 // database.
 func PutDefaultAccountInfo(ns walletdb.ReadWriteBucket, scope *waddrmgr.KeyScope,
