@@ -2399,13 +2399,20 @@ func (s *ScopedKeyManager) lookupAccount(ns walletdb.ReadBucket, name string) (u
 	return fetchAccountByName(ns, &s.scope, name)
 }
 
-// LookupAccount loads account number stored in the manager for the given
-// account name
-func (s *ScopedKeyManager) LookupAccount(ns walletdb.ReadBucket, name string) (uint32, error) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
+// LookupAccount returns the account number for the given account name.
+func (s *ScopedKeyManager) LookupAccount(ns walletdb.ReadBucket,
+	name string) (uint32, error) {
 
-	return s.lookupAccount(ns, name)
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	// Look up the account by name.
+	account, err := s.lookupAccount(ns, name)
+	if err != nil {
+		return 0, err
+	}
+
+	return account, nil
 }
 
 // fetchUsed returns true if the provided address id was flagged used.

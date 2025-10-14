@@ -203,6 +203,26 @@ func fetchAccountInfo(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope,
 	return nil, newError(ErrDatabase, fmt.Sprintf("unsupported account type '%d'", row.acctType), nil)
 }
 
+// FetchAccountByName retrieves the account number given an account name from
+// the database.
+func FetchAccountByName(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope,
+	name string) (uint32, error) {
+
+	scopedBucket, err := fetchReadScopeBucket(ns, scope)
+	if err != nil {
+		return 0, err
+	}
+
+	idxBucket := scopedBucket.NestedReadBucket(acctNameIdxBucketName)
+
+	val := idxBucket.Get(stringToBytes(name))
+	if val == nil {
+		return 0, newError(ErrAccountNotFound, fmt.Sprintf("account name '%s' not found", name), nil)
+	}
+
+	return binary.LittleEndian.Uint32(val), nil
+}
+
 // PutDefaultAccountInfo stores the provided default account information to the
 // database.
 func PutDefaultAccountInfo(ns walletdb.ReadWriteBucket, scope *waddrmgr.KeyScope,
