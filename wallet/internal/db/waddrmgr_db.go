@@ -14,17 +14,6 @@ import (
 	"github.com/btcsuite/btcwallet/walletdb"
 )
 
-// scopeToBytes transforms a manager's scope into the form that will be used to
-// retrieve the bucket that all information for a particular scope is stored
-// under
-func scopeToBytes(scope *waddrmgr.KeyScope) [8]byte {
-	var scopeBytes [8]byte
-	binary.LittleEndian.PutUint32(scopeBytes[:], scope.Purpose)
-	binary.LittleEndian.PutUint32(scopeBytes[4:], scope.Coin)
-
-	return scopeBytes
-}
-
 var (
 	// syncBucketName is the name of the bucket that stores the current
 	// sync state of the root manager.
@@ -52,7 +41,7 @@ var (
 	cryptoPrivKeyName   = []byte("cpriv")
 	cryptoPubKeyName    = []byte("cpub")
 	cryptoScriptKeyName = []byte("cscript")
-	masterHDPrivName    = []byte("mhdpriv")
+	masterHDPrivName    = []byte("mhdpriv")	
 	masterHDPubName     = []byte("mhdpub")
 
 	// scopeBucketName is the name of the top-level bucket within the
@@ -61,14 +50,6 @@ var (
 
 	// metaBucketName is used to store meta-data about the address manager.
 	metaBucketName = []byte("meta")
-
-	// lastAccountName is used to store the metadata - last account
-	// in the manager.
-	lastAccountName = []byte("lastaccount")
-
-	// acctBucketName is the bucket directly below the scope bucket in the
-	// hierarchy.
-	acctBucketName = []byte("acct")
 )
 
 // PutBirthday stores the wallet's birthday in the database.
@@ -550,55 +531,7 @@ func fetchReadScopeBucket(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope) (wal
 	return scopedBucket, nil
 }
 
-// uint32ToBytes converts a 32 bit unsigned integer into a 4-byte slice in
-// little-endian order: 1 -> [1 0 0 0].
-func uint32ToBytes(number uint32) []byte {
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, number)
-	return buf
-}
 
-const (
-	// accountDefault is the current "default" account type within the
-	// database. This is an account that re-uses the key derivation schema
-	// of BIP0044-like accounts.
-	accountDefault AccountType = 0 // not iota as they need to be stable
-)
-
-// dbAccountRow houses information stored about an account in the database.
-type dbAccountRow struct {
-	acctType AccountType
-	rawData  []byte // Varies based on account type field.
-}
-
-// ScopeSchemaFromBytes decodes a new scope schema instance from the set of
-// serialized bytes.
-func ScopeSchemaFromBytes(schemaBytes []byte) waddrmgr.ScopeAddrSchema {
-	return waddrmgr.ScopeAddrSchema{
-		InternalAddrType: waddrmgr.AddressType(schemaBytes[0]),
-		ExternalAddrType: waddrmgr.AddressType(schemaBytes[1]),
-	}
-}
-
-// LastAccount returns the last account number for a given scope.
-func LastAccount(ns walletdb.ReadBucket, scope *waddrmgr.KeyScope) (uint32, error) {
-	scopedBucket, err := fetchReadScopeBucket(ns, scope)
-	if err != nil {
-		return 0, err
-	}
-
-	metaBucket := scopedBucket.NestedReadBucket(metaBucketName)
-	val := metaBucket.Get(lastAccountName)
-	if val == nil {
-		return 0, newError(ErrDatabase, "last account not found", nil)
-	}
-	if len(val) != 4 {
-		return 0, newError(ErrDatabase, fmt.Sprintf("malformed metadata '%s' stored in database", lastAccountName), nil)
-	}
-
-	account := binary.LittleEndian.Uint32(val[0:4])
-	return account, nil
-}
 
 // PutMasterKeyParams stores the master key parameters needed to derive them to
 // the database.  Either parameter can be nil in which case no value is
