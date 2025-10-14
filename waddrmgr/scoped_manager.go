@@ -1852,6 +1852,32 @@ func (s *ScopedKeyManager) newAccountWatchingOnly(ns walletdb.ReadWriteBucket,
 	return putLastAccount(ns, &s.scope, account)
 }
 
+// PrepareRenameAccount prepares the database changes for renaming an account.
+// It returns the updated account row information.
+func (s *ScopedKeyManager) PrepareRenameAccount(ns walletdb.ReadBucket,
+	account uint32, name string) (interface{}, error) {
+
+	// Ensure that a reserved account is not being renamed.
+	if isReservedAccountNum(account) {
+		str := "reserved account cannot be renamed"
+		return nil, managerError(ErrInvalidAccount, str, nil)
+	}
+
+	// Check that account with the new name does not exist
+	_, err := s.lookupAccount(ns, name)
+	if err == nil {
+		str := "account with the same name already exists"
+		return nil, managerError(ErrDuplicateAccount, str, err)
+	}
+
+	rowInterface, err := fetchAccountInfo(ns, &s.scope, account)
+	if err != nil {
+		return nil, err
+	}
+
+	return rowInterface, nil
+}
+
 // RenameAccount renames an account stored in the manager based on the given
 // account number with the given name.  If an account with the same name
 // already exists, ErrDuplicateAccount will be returned.
@@ -1861,20 +1887,8 @@ func (s *ScopedKeyManager) RenameAccount(ns walletdb.ReadWriteBucket,
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	// Ensure that a reserved account is not being renamed.
-	if isReservedAccountNum(account) {
-		str := "reserved account cannot be renamed"
-		return managerError(ErrInvalidAccount, str, nil)
-	}
-
-	// Check that account with the new name does not exist
-	_, err := s.lookupAccount(ns, name)
-	if err == nil {
-		str := "account with the same name already exists"
-		return managerError(ErrDuplicateAccount, str, err)
-	}
-
-	rowInterface, err := fetchAccountInfo(ns, &s.scope, account)
+	// Prepare the account rename.
+	rowInterface, err := s.PrepareRenameAccount(ns, account, name)
 	if err != nil {
 		return err
 	}
