@@ -332,14 +332,6 @@ func (w *Wallet) ImportTaprootScriptDeprecated(scope waddrmgr.KeyScope,
 	witnessVersion byte, isSecretScript bool) (waddrmgr.ManagedAddress,
 	error) {
 
-	manager, err := w.store.FetchScopedKeyManager(db.KeyScope{
-		Purpose: scope.Purpose,
-		Coin:    scope.Coin,
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	// The starting block for the key is the genesis block unless otherwise
 	// specified.
 	if bs == nil {
@@ -362,28 +354,40 @@ func (w *Wallet) ImportTaprootScriptDeprecated(scope waddrmgr.KeyScope,
 	}
 
 	// TODO: Perform rescan if requested.
-	var addr waddrmgr.ManagedAddress
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		addr, err = manager.ImportTaprootScript(
-			ns, tapscript, bs, witnessVersion, isSecretScript,
-		)
-		return err
-	})
+	controlBlockBytes, err := tapscript.ControlBlock.ToBytes()
+	if err != nil {
+		return nil, err
+	}
+	params := db.ImportAddressData{
+		Tapscript: &db.Tapscript{
+			ControlBlock: controlBlockBytes,
+			Script:       tapscript.Leaves[0].Script,
+		},
+		Scope: db.KeyScope{
+			Purpose: scope.Purpose,
+			Coin:    scope.Coin,
+		},
+	}
+	addrInfo, err := w.store.ImportAddress(context.Background(), params)
 	if err != nil {
 		return nil, err
 	}
 
-	log.Infof("Imported address %v", addr.Address())
+	log.Infof("Imported address %v", addrInfo.Address)
 
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return nil, err
 	}
-	err = chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
+	err = chainClient.NotifyReceived([]btcutil.Address{addrInfo.Address})
 	if err != nil {
 		return nil, fmt.Errorf("unable to subscribe for address "+
 			"notifications: %w", err)
+	}
+
+	addr, err := w.AddressInfoDeprecated(addrInfo.Address)
+	if err != nil {
+		return nil, err
 	}
 
 	return addr, nil
