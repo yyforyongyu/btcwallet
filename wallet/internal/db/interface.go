@@ -45,7 +45,8 @@ type WalletStore interface {
 // AccountStore defines the database actions for managing accounts.
 type AccountStore interface {
 	CreateAccount(ctx context.Context, params CreateAccountParams) (AccountInfo, error)
-	ImportAccount(ctx context.Context, params ImportAccountParams) (AccountInfo, error)
+	ImportAccount(ctx context.Context, params ImportAccountParams) (*waddrmgr.AccountProperties, error)
+	ImportAccountWithScope(ctx context.Context, params ImportAccountWithScopeParams) (*waddrmgr.AccountProperties, error)
 	GetAccount(ctx context.Context, query GetAccountQuery) (AccountInfo, error)
 	ListAccounts(ctx context.Context, query ListAccountsQuery) ([]AccountInfo, error)
 	UpdateAccountName(ctx context.Context, params UpdateAccountNameParams) error

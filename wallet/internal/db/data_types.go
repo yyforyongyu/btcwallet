@@ -129,7 +129,7 @@ type ImportAccountParams struct {
 	Name                 string
 	AccountKey           *hdkeychain.ExtendedKey
 	MasterKeyFingerprint uint32
-	AddressType          AddressType
+	AddressType          *AddressType
 }
 
 // GetAccountQuery contains the parameters for the GetAccount method.
@@ -161,6 +161,16 @@ type RenameAccountParams struct {
 	Scope         KeyScope
 	AccountNumber uint32
 	NewName       string
+}
+
+// ImportAccountWithScopeParams contains the data required to import an account
+// with a defined scope.
+type ImportAccountWithScopeParams struct {
+	Name                 string
+	AccountKey           *hdkeychain.ExtendedKey
+	MasterKeyFingerprint uint32
+	Scope                KeyScope
+	AddrSchema           waddrmgr.ScopeAddrSchema
 }
 
 // --------------------

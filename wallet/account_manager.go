@@ -294,14 +294,22 @@ func (w *Wallet) ImportAccount(ctx context.Context,
 		Name:                 name,
 		AccountKey:           accountKey,
 		MasterKeyFingerprint: masterKeyFingerprint,
-		AddressType:          addrType,
+		AddressType:          &addrType,
 	}
-	info, err := w.store.ImportAccount(ctx, params)
+	props, err := w.store.ImportAccount(ctx, params)
 	if err != nil {
 		return nil, err
 	}
 
-	return &info, nil
+	info := &db.AccountInfo{
+		AccountNumber:    props.AccountNumber,
+		AccountName:      props.AccountName,
+		ExternalKeyCount: props.ExternalKeyCount,
+		InternalKeyCount: props.InternalKeyCount,
+		ImportedKeyCount: props.ImportedKeyCount,
+	}
+
+	return info, nil
 }
 
 // extractAddrFromPKScript extracts an address from a public key script. If the

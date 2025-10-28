@@ -25,99 +25,7 @@ const (
 	pubKeyDepth = 5
 )
 
-// keyScopeFromPubKey returns the corresponding wallet key scope for the given
-// extended public key. The address type can usually be inferred from the key's
-// version, but may be required for certain keys to map them into the proper
-// scope.
-func keyScopeFromPubKey(pubKey *hdkeychain.ExtendedKey,
-	addrType *waddrmgr.AddressType) (waddrmgr.KeyScope,
-	*waddrmgr.ScopeAddrSchema, error) {
 
-	switch waddrmgr.HDVersion(binary.BigEndian.Uint32(pubKey.Version())) {
-	// For BIP-0044 keys, an address type must be specified as we intend to
-	// not support importing BIP-0044 keys into the wallet using the legacy
-	// pay-to-pubkey-hash (P2PKH) scheme. A nested witness address type will
-	// force the standard BIP-0049 derivation scheme (nested witness pubkeys
-	// everywhere), while a witness address type will force the standard
-	// BIP-0084 derivation scheme.
-	case waddrmgr.HDVersionMainNetBIP0044, waddrmgr.HDVersionTestNetBIP0044,
-		waddrmgr.HDVersionSimNetBIP0044:
-
-		if addrType == nil {
-			return waddrmgr.KeyScope{}, nil, errors.New("address " +
-				"type must be specified for account public " +
-				"key with legacy version")
-		}
-
-		switch *addrType {
-		case waddrmgr.NestedWitnessPubKey:
-			return waddrmgr.KeyScopeBIP0049Plus,
-				&waddrmgr.KeyScopeBIP0049AddrSchema, nil
-
-		case waddrmgr.WitnessPubKey:
-			return waddrmgr.KeyScopeBIP0084, nil, nil
-
-		case waddrmgr.TaprootPubKey:
-			return waddrmgr.KeyScopeBIP0086, nil, nil
-
-		default:
-			return waddrmgr.KeyScope{}, nil,
-				fmt.Errorf("unsupported address type %v",
-					*addrType)
-		}
-
-	// For BIP-0049 keys, we'll need to make a distinction between the
-	// traditional BIP-0049 address schema (nested witness pubkeys
-	// everywhere) and our own BIP-0049Plus address schema (nested
-	// externally, witness internally).
-	case waddrmgr.HDVersionMainNetBIP0049, waddrmgr.HDVersionTestNetBIP0049:
-		if addrType == nil {
-			return waddrmgr.KeyScope{}, nil, errors.New("address " +
-				"type must be specified for account public " +
-				"key with BIP-0049 version")
-		}
-
-		switch *addrType {
-		case waddrmgr.NestedWitnessPubKey:
-			return waddrmgr.KeyScopeBIP0049Plus,
-				&waddrmgr.KeyScopeBIP0049AddrSchema, nil
-
-		case waddrmgr.WitnessPubKey:
-			return waddrmgr.KeyScopeBIP0049Plus, nil, nil
-
-		default:
-			return waddrmgr.KeyScope{}, nil,
-				fmt.Errorf("unsupported address type %v",
-					*addrType)
-		}
-
-	// BIP-0086 does not have its own SLIP-0132 HD version byte set (yet?).
-	// So we either expect a user to import it with a BIP-0084 or BIP-0044
-	// encoding.
-	case waddrmgr.HDVersionMainNetBIP0084, waddrmgr.HDVersionTestNetBIP0084:
-		if addrType == nil {
-			return waddrmgr.KeyScope{}, nil, errors.New("address " +
-				"type must be specified for account public " +
-				"key with BIP-0084 version")
-		}
-
-		switch *addrType {
-		case waddrmgr.WitnessPubKey:
-			return waddrmgr.KeyScopeBIP0084, nil, nil
-
-		case waddrmgr.TaprootPubKey:
-			return waddrmgr.KeyScopeBIP0086, nil, nil
-
-		default:
-			return waddrmgr.KeyScope{}, nil,
-				errors.New("address type mismatch")
-		}
-
-	default:
-		return waddrmgr.KeyScope{}, nil, fmt.Errorf("unknown version %x",
-			pubKey.Version())
-	}
-}
 
 // isPubKeyForNet determines if the given public key is for the current network
 // the wallet is operating under.
@@ -214,16 +122,25 @@ func (w *Wallet) ImportAccountDeprecated(name string, accountPubKey *hdkeychain.
 	masterKeyFingerprint uint32, addrType *waddrmgr.AddressType) (
 	*waddrmgr.AccountProperties, error) {
 
-	var accountProps *waddrmgr.AccountProperties
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		var err error
-		accountProps, err = w.importAccount(
-			ns, name, accountPubKey, masterKeyFingerprint, addrType,
-		)
-		return err
-	})
-	return accountProps, err
+	// Ensure we have a valid account public key.
+	if err := w.validateExtendedPubKey(accountPubKey, true); err != nil {
+		return nil, err
+	}
+
+	var dbAddrType *db.AddressType
+	if addrType != nil {
+		t := db.AddressType(*addrType)
+		dbAddrType = &t
+	}
+
+	params := db.ImportAccountParams{
+		Name:                 name,
+		AccountKey:           accountPubKey,
+		MasterKeyFingerprint: masterKeyFingerprint,
+		AddressType:          dbAddrType,
+	}
+
+	return w.store.ImportAccount(context.Background(), params)
 }
 
 // ImportAccountWithScope imports an account backed by an account extended
@@ -237,70 +154,23 @@ func (w *Wallet) ImportAccountWithScope(name string,
 	keyScope waddrmgr.KeyScope, addrSchema waddrmgr.ScopeAddrSchema) (
 	*waddrmgr.AccountProperties, error) {
 
-	var accountProps *waddrmgr.AccountProperties
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		var err error
-		accountProps, err = w.importAccountScope(
-			ns, name, accountPubKey, masterKeyFingerprint, keyScope,
-			&addrSchema,
-		)
-		return err
-	})
-	return accountProps, err
-}
-
-// importAccount is the internal implementation of ImportAccount -- one should
-// reference its documentation for this method.
-func (w *Wallet) importAccount(ns walletdb.ReadWriteBucket, name string,
-	accountPubKey *hdkeychain.ExtendedKey, masterKeyFingerprint uint32,
-	addrType *waddrmgr.AddressType) (*waddrmgr.AccountProperties, error) {
-
 	// Ensure we have a valid account public key.
 	if err := w.validateExtendedPubKey(accountPubKey, true); err != nil {
 		return nil, err
 	}
 
-	// Determine what key scope the account public key should belong to and
-	// whether it should use a custom address schema.
-	keyScope, addrSchema, err := keyScopeFromPubKey(accountPubKey, addrType)
-	if err != nil {
-		return nil, err
+	params := db.ImportAccountWithScopeParams{
+		Name:                 name,
+		AccountKey:           accountPubKey,
+		MasterKeyFingerprint: masterKeyFingerprint,
+		Scope: db.KeyScope{
+			Purpose: keyScope.Purpose,
+			Coin:    keyScope.Coin,
+		},
+		AddrSchema: addrSchema,
 	}
 
-	return w.importAccountScope(
-		ns, name, accountPubKey, masterKeyFingerprint, keyScope,
-		addrSchema,
-	)
-}
-
-// importAccountScope imports a watch-only account for a given scope.
-func (w *Wallet) importAccountScope(ns walletdb.ReadWriteBucket, name string,
-	accountPubKey *hdkeychain.ExtendedKey, masterKeyFingerprint uint32,
-	keyScope waddrmgr.KeyScope, addrSchema *waddrmgr.ScopeAddrSchema) (
-	*waddrmgr.AccountProperties, error) {
-
-	dbScope := db.KeyScope{
-		Purpose: keyScope.Purpose,
-		Coin:    keyScope.Coin,
-	}
-	scopedMgr, err := w.store.FetchScopedKeyManager(dbScope)
-	if err != nil {
-		scopedMgr, err = w.store.NewScopedKeyManager(
-			dbScope, *addrSchema,
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	account, err := scopedMgr.NewAccountWatchingOnly(
-		ns, name, accountPubKey, masterKeyFingerprint, addrSchema,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return scopedMgr.AccountProperties(ns, account)
+	return w.store.ImportAccountWithScope(context.Background(), params)
 }
 
 // ImportAccountDryRun serves as a dry run implementation of ImportAccount. This
@@ -335,8 +205,13 @@ func (w *Wallet) ImportAccountDryRun(name string,
 
 		// Import the account as usual.
 		var err error
-		accountProps, err = w.importAccount(
-			ns, name, accountPubKey, masterKeyFingerprint, addrType,
+		accountProps, err = w.store.ImportAccount(
+			context.Background(), db.ImportAccountParams{
+				Name:                 name,
+				AccountKey:           accountPubKey,
+				MasterKeyFingerprint: masterKeyFingerprint,
+				AddressType:          (*db.AddressType)(addrType),
+			},
 		)
 		if err != nil {
 			return err

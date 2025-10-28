@@ -14,6 +14,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
@@ -33,6 +34,100 @@ var (
 	bucketUnmined        = []byte("unmined")
 	bucketUnminedCredits = []byte("unminedcredits")
 )
+
+// keyScopeFromPubKey returns the corresponding wallet key scope for the given
+// extended public key. The address type can usually be inferred from the key's
+// version, but may be required for certain keys to map them into the proper
+// scope.
+func keyScopeFromPubKey(pubKey *hdkeychain.ExtendedKey,
+	addrType *waddrmgr.AddressType) (waddrmgr.KeyScope,
+	*waddrmgr.ScopeAddrSchema, error) {
+
+	switch waddrmgr.HDVersion(binary.BigEndian.Uint32(pubKey.Version())) {
+	// For BIP-0044 keys, an address type must be specified as we intend to
+	// not support importing BIP-0044 keys into the wallet using the legacy
+	// pay-to-pubkey-hash (P2PKH) scheme. A nested witness address type will
+	// force the standard BIP-0049 derivation scheme (nested witness pubkeys
+	// everywhere), while a witness address type will force the standard
+	// BIP-0084 derivation scheme.
+	case waddrmgr.HDVersionMainNetBIP0044, waddrmgr.HDVersionTestNetBIP0044,
+		waddrmgr.HDVersionSimNetBIP0044:
+
+		if addrType == nil {
+			return waddrmgr.KeyScope{}, nil, errors.New("address " +
+				"type must be specified for account public " +
+				"key with legacy version")
+		}
+
+		switch *addrType {
+		case waddrmgr.NestedWitnessPubKey:
+			return waddrmgr.KeyScopeBIP0049Plus,
+				&waddrmgr.KeyScopeBIP0049AddrSchema, nil
+
+		case waddrmgr.WitnessPubKey:
+			return waddrmgr.KeyScopeBIP0084, nil, nil
+
+		case waddrmgr.TaprootPubKey:
+			return waddrmgr.KeyScopeBIP0086, nil, nil
+
+		default:
+			return waddrmgr.KeyScope{}, nil,
+				fmt.Errorf("unsupported address type %v",
+					*addrType)
+		}
+
+	// For BIP-0049 keys, we'll need to make a distinction between the
+	// traditional BIP-0049 address schema (nested witness pubkeys
+	// everywhere) and our own BIP-0049Plus address schema (nested
+	// externally, witness internally).
+	case waddrmgr.HDVersionMainNetBIP0049, waddrmgr.HDVersionTestNetBIP0049:
+		if addrType == nil {
+			return waddrmgr.KeyScope{}, nil, errors.New("address " +
+				"type must be specified for account public " +
+				"key with BIP-0049 version")
+		}
+
+		switch *addrType {
+		case waddrmgr.NestedWitnessPubKey:
+			return waddrmgr.KeyScopeBIP0049Plus,
+				&waddrmgr.KeyScopeBIP0049AddrSchema, nil
+
+		case waddrmgr.WitnessPubKey:
+			return waddrmgr.KeyScopeBIP0049Plus, nil, nil
+
+		default:
+			return waddrmgr.KeyScope{}, nil,
+				fmt.Errorf("unsupported address type %v",
+					*addrType)
+		}
+
+	// BIP-0086 does not have its own SLIP-0132 HD version byte set (yet?).
+	// So we either expect a user to import it with a BIP-0084 or BIP-0044
+	// encoding.
+	case waddrmgr.HDVersionMainNetBIP0084, waddrmgr.HDVersionTestNetBIP0084:
+		if addrType == nil {
+			return waddrmgr.KeyScope{}, nil, errors.New("address " +
+				"type must be specified for account public " +
+				"key with BIP-0084 version")
+		}
+
+		switch *addrType {
+		case waddrmgr.WitnessPubKey:
+			return waddrmgr.KeyScopeBIP0084, nil, nil
+
+		case waddrmgr.TaprootPubKey:
+			return waddrmgr.KeyScopeBIP0086, nil, nil
+
+		default:
+			return waddrmgr.KeyScope{}, nil,
+				errors.New("address type mismatch")
+		}
+
+	default:
+		return waddrmgr.KeyScope{}, nil, fmt.Errorf("unknown version %x",
+			pubKey.Version())
+	}
+}
 
 // KvdbStore is the concrete implementation of the Store interface. It acts as an
 // adapter to translate the clean API of the Store into the legacy waddrmgr and
@@ -248,11 +343,85 @@ func (d *KvdbStore) CreateAccount(ctx context.Context, params CreateAccountParam
 }
 
 // ImportAccount imports an account from an extended key.
-func (d *KvdbStore) ImportAccount(ctx context.Context, params ImportAccountParams) (AccountInfo, error) {
-	// TODO(yy): The original implementation called a deprecated method.
-	// We need to re-implement this using the modern waddrmgr functions.
-	// For now, we'll just return a placeholder.
-	return AccountInfo{}, errors.New("ImportAccount not implemented")
+func (d *KvdbStore) ImportAccount(ctx context.Context, params ImportAccountParams) (*waddrmgr.AccountProperties, error) {
+	var accountProps *waddrmgr.AccountProperties
+	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		// Determine what key scope the account public key should belong to and
+		// whether it should use a custom address schema.
+		addrType := (*waddrmgr.AddressType)(params.AddressType)
+		keyScope, addrSchema, err := keyScopeFromPubKey(
+			params.AccountKey, addrType,
+		)
+		if err != nil {
+			return err
+		}
+
+		dbScope := KeyScope{
+			Purpose: keyScope.Purpose,
+			Coin:    keyScope.Coin,
+		}
+		scopedMgr, err := d.FetchScopedKeyManager(dbScope)
+		if err != nil {
+			scopedMgr, err = d.NewScopedKeyManager(
+				dbScope, *addrSchema,
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		account, err := scopedMgr.NewAccountWatchingOnly(
+			ns, params.Name, params.AccountKey,
+			params.MasterKeyFingerprint, addrSchema,
+		)
+		if err != nil {
+			return err
+		}
+
+		accountProps, err = scopedMgr.AccountProperties(ns, account)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return accountProps, nil
+}
+
+// ImportAccountWithScope imports an account with a defined scope.
+func (d *KvdbStore) ImportAccountWithScope(ctx context.Context, params ImportAccountWithScopeParams) (*waddrmgr.AccountProperties, error) {
+	var accountProps *waddrmgr.AccountProperties
+	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		scopedMgr, err := d.FetchScopedKeyManager(params.Scope)
+		if err != nil {
+			scopedMgr, err = d.NewScopedKeyManager(
+				params.Scope, params.AddrSchema,
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		account, err := scopedMgr.NewAccountWatchingOnly(
+			ns, params.Name, params.AccountKey,
+			params.MasterKeyFingerprint, &params.AddrSchema,
+		)
+		if err != nil {
+			return err
+		}
+
+		accountProps, err = scopedMgr.AccountProperties(ns, account)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return accountProps, nil
 }
 
 // GetAccount retrieves the details for a specific account.
