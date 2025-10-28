@@ -47,6 +47,7 @@ type AccountStore interface {
 	CreateAccount(ctx context.Context, params CreateAccountParams) (AccountInfo, error)
 	ImportAccount(ctx context.Context, params ImportAccountParams) (*waddrmgr.AccountProperties, error)
 	ImportAccountWithScope(ctx context.Context, params ImportAccountWithScopeParams) (*waddrmgr.AccountProperties, error)
+	ImportAccountDryRun(ctx context.Context, params ImportAccountDryRunParams) (*waddrmgr.AccountProperties, []waddrmgr.ManagedAddress, []waddrmgr.ManagedAddress, error)
 	GetAccount(ctx context.Context, query GetAccountQuery) (AccountInfo, error)
 	ListAccounts(ctx context.Context, query ListAccountsQuery) ([]AccountInfo, error)
 	UpdateAccountName(ctx context.Context, params UpdateAccountNameParams) error

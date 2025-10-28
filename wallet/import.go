@@ -13,7 +13,6 @@ import (
 	"github.com/btcsuite/btcwallet/netparams"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/waddrmgr"
-	"github.com/btcsuite/btcwallet/walletdb"
 )
 
 const (
@@ -192,82 +191,14 @@ func (w *Wallet) ImportAccountDryRun(name string,
 	w.newAddrMtx.Lock()
 	defer w.newAddrMtx.Unlock()
 
-	var (
-		accountProps  *waddrmgr.AccountProperties
-		externalAddrs []waddrmgr.ManagedAddress
-		internalAddrs []waddrmgr.ManagedAddress
-	)
-
-	// Start a database transaction that we'll never commit and always
-	// rollback because we'll return a specific error in the end.
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// Import the account as usual.
-		var err error
-		accountProps, err = w.store.ImportAccount(
-			context.Background(), db.ImportAccountParams{
-				Name:                 name,
-				AccountKey:           accountPubKey,
-				MasterKeyFingerprint: masterKeyFingerprint,
-				AddressType:          (*db.AddressType)(addrType),
-			},
-		)
-		if err != nil {
-			return err
-		}
-
-		// Derive the external and internal addresses. Note that we
-		// could do this based on the provided accountPubKey alone, but
-		// we go through the ScopedKeyManager instead to ensure
-		// addresses will be derived as expected from the wallet's
-		// point-of-view.
-		manager, err := w.store.FetchScopedKeyManager(
-			db.KeyScope{
-				Purpose: accountProps.KeyScope.Purpose,
-				Coin:    accountProps.KeyScope.Coin,
-			},
-		)
-		if err != nil {
-			return err
-		}
-
-		// The importAccount method above will cache the imported
-		// account within the scoped manager. Since this is a dry-run
-		// attempt, we'll want to invalidate the cache for it.
-		defer manager.InvalidateAccountCache(accountProps.AccountNumber)
-
-		externalAddrs, err = manager.NextExternalAddresses(
-			ns, accountProps.AccountNumber, numAddrs,
-		)
-		if err != nil {
-			return err
-		}
-		internalAddrs, err = manager.NextInternalAddresses(
-			ns, accountProps.AccountNumber, numAddrs,
-		)
-		if err != nil {
-			return err
-		}
-
-		// Refresh the account's properties after generating the
-		// addresses.
-		accountProps, err = manager.AccountProperties(
-			ns, accountProps.AccountNumber,
-		)
-		if err != nil {
-			return err
-		}
-
-		// Make sure we always roll back the dry-run transaction by
-		// returning an error here.
-		return walletdb.ErrDryRunRollBack
-	})
-	if err != nil && err != walletdb.ErrDryRunRollBack {
-		return nil, nil, nil, err
+	params := db.ImportAccountDryRunParams{
+		Name:                 name,
+		AccountKey:           accountPubKey,
+		MasterKeyFingerprint: masterKeyFingerprint,
+		AddressType:          (*db.AddressType)(addrType),
+		NumAddrs:             numAddrs,
 	}
-
-	return accountProps, externalAddrs, internalAddrs, nil
+	return w.store.ImportAccountDryRun(context.Background(), params)
 }
 
 // ImportPublicKey imports a single derived public key into the address manager.

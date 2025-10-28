@@ -424,6 +424,80 @@ func (d *KvdbStore) ImportAccountWithScope(ctx context.Context, params ImportAcc
 	return accountProps, nil
 }
 
+// ImportAccountDryRun performs a dry run of an account import.
+func (d *KvdbStore) ImportAccountDryRun(ctx context.Context, params ImportAccountDryRunParams) (*waddrmgr.AccountProperties, []waddrmgr.ManagedAddress, []waddrmgr.ManagedAddress, error) {
+	var (
+		accountProps  *waddrmgr.AccountProperties
+		externalAddrs []waddrmgr.ManagedAddress
+		internalAddrs []waddrmgr.ManagedAddress
+	)
+
+	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		addrType := (*waddrmgr.AddressType)(params.AddressType)
+		keyScope, addrSchema, err := keyScopeFromPubKey(
+			params.AccountKey, addrType,
+		)
+		if err != nil {
+			return err
+		}
+
+		dbScope := KeyScope{
+			Purpose: keyScope.Purpose,
+			Coin:    keyScope.Coin,
+		}
+		scopedMgr, err := d.FetchScopedKeyManager(dbScope)
+		if err != nil {
+			scopedMgr, err = d.NewScopedKeyManager(
+				dbScope, *addrSchema,
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		account, err := scopedMgr.NewAccountWatchingOnly(
+			ns, params.Name, params.AccountKey,
+			params.MasterKeyFingerprint, addrSchema,
+		)
+		if err != nil {
+			return err
+		}
+
+		// The importAccount method above will cache the imported
+		// account within the scoped manager. Since this is a dry-run
+		// attempt, we'll want to invalidate the cache for it.
+		defer scopedMgr.InvalidateAccountCache(account)
+
+		externalAddrs, err = scopedMgr.NextExternalAddresses(
+			ns, account, params.NumAddrs,
+		)
+		if err != nil {
+			return err
+		}
+
+		internalAddrs, err = scopedMgr.NextInternalAddresses(
+			ns, account, params.NumAddrs,
+		)
+		if err != nil {
+			return err
+		}
+
+		accountProps, err = scopedMgr.AccountProperties(ns, account)
+		if err != nil {
+			return err
+		}
+
+		return walletdb.ErrDryRunRollBack
+	})
+	if err != nil && !errors.Is(err, walletdb.ErrDryRunRollBack) {
+		return nil, nil, nil, err
+	}
+
+	return accountProps, externalAddrs, internalAddrs, nil
+}
+
 // GetAccount retrieves the details for a specific account.
 func (d *KvdbStore) GetAccount(ctx context.Context, query GetAccountQuery) (AccountInfo, error) {
 	var info AccountInfo

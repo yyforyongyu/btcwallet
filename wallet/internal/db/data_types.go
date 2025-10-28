@@ -240,6 +240,16 @@ type ImportPrivateKeyParams struct {
 	Bs     *waddrmgr.BlockStamp
 }
 
+// ImportAccountDryRunParams contains the parameters for the
+// ImportAccountDryRun method.
+type ImportAccountDryRunParams struct {
+	Name                 string
+	AccountKey           *hdkeychain.ExtendedKey
+	MasterKeyFingerprint uint32
+	AddressType          *AddressType
+	NumAddrs             uint32
+}
+
 // GetAddressQuery contains the parameters for the GetAddress method.
 type GetAddressQuery struct {
 	WalletID uint64
