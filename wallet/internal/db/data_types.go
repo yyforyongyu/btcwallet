@@ -231,6 +231,15 @@ type ImportTaprootScriptParams struct {
 	Tapscript Tapscript
 }
 
+// ImportPrivateKeyParams contains the parameters for the ImportPrivateKey
+// method.
+type ImportPrivateKeyParams struct {
+	Scope  KeyScope
+	WIF    *btcutil.WIF
+	Rescan bool
+	Bs     *waddrmgr.BlockStamp
+}
+
 // GetAddressQuery contains the parameters for the GetAddress method.
 type GetAddressQuery struct {
 	WalletID uint64

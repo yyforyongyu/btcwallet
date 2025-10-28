@@ -768,6 +768,62 @@ func (d *KvdbStore) DeriveFromKeyPath(ctx context.Context, scope KeyScope,
 	return addr, err
 }
 
+// ImportPrivateKey imports a private key.
+func (d *KvdbStore) ImportPrivateKey(ctx context.Context, params ImportPrivateKeyParams) (waddrmgr.ManagedAddress, *waddrmgr.AccountProperties, error) {
+	var (
+		addr  waddrmgr.ManagedAddress
+		props *waddrmgr.AccountProperties
+	)
+	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
+		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		manager, err := d.FetchScopedKeyManager(params.Scope)
+		if err != nil {
+			return err
+		}
+
+		maddr, err := manager.ImportPrivateKey(addrmgrNs, params.WIF, params.Bs)
+		if err != nil {
+			return err
+		}
+		addr = maddr
+
+		props, err = manager.AccountProperties(
+			addrmgrNs, waddrmgr.ImportedAddrAccount,
+		)
+		if err != nil {
+			return err
+		}
+
+		// We'll only update our birthday with the new one if it is
+		// before our current one. Otherwise, if we do, we can
+		// potentially miss detecting relevant chain events that
+		// occurred between them while rescanning.
+		birthdayBlock, _, err := BirthdayBlock(addrmgrNs)
+		if err != nil {
+			return err
+		}
+		if params.Bs.Height >= birthdayBlock.Height {
+			return nil
+		}
+
+		err = PutBirthday(addrmgrNs, params.Bs.Timestamp)
+		if err != nil {
+			return err
+		}
+
+		// To ensure this birthday block is correct, we'll mark it as
+		// unverified to prompt a sanity check at the next restart to
+		// ensure it is correct as it was provided by the caller.
+		return PutBirthdayBlock(addrmgrNs, *params.Bs, false)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return addr, props, nil
+}
+
 // NewAddress creates a new address.
 func (d *KvdbStore) NewAddress(ctx context.Context, accountName string,
 	addrType AddressType, withChange bool) (btcutil.Address, error) {

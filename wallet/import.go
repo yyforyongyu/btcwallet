@@ -401,14 +401,6 @@ func (w *Wallet) ImportTaprootScriptDeprecated(scope waddrmgr.KeyScope,
 func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 	bs *waddrmgr.BlockStamp, rescan bool) (string, error) {
 
-	manager, err := w.store.FetchScopedKeyManager(db.KeyScope{
-		Purpose: scope.Purpose,
-		Coin:    scope.Coin,
-	})
-	if err != nil {
-		return "", err
-	}
-
 	// The starting block for the key is the genesis block unless otherwise
 	// specified.
 	if bs == nil {
@@ -431,44 +423,16 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 	}
 
 	// Attempt to import private key into wallet.
-	var addr btcutil.Address
-	var props *waddrmgr.AccountProperties
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		maddr, err := manager.ImportPrivateKey(addrmgrNs, wif, bs)
-		if err != nil {
-			return err
-		}
-		addr = maddr.Address()
-		props, err = manager.AccountProperties(
-			addrmgrNs, waddrmgr.ImportedAddrAccount,
-		)
-		if err != nil {
-			return err
-		}
-
-		// We'll only update our birthday with the new one if it is
-		// before our current one. Otherwise, if we do, we can
-		// potentially miss detecting relevant chain events that
-		// occurred between them while rescanning.
-		birthdayBlock, _, err := w.store.BirthdayBlock(context.Background())
-		if err != nil {
-			return err
-		}
-		if bs.Height >= birthdayBlock.Height {
-			return nil
-		}
-
-		err = w.store.SetBirthday(context.Background(), bs.Timestamp)
-		if err != nil {
-			return err
-		}
-
-		// To ensure this birthday block is correct, we'll mark it as
-		// unverified to prompt a sanity check at the next restart to
-		// ensure it is correct as it was provided by the caller.
-		return w.store.SetBirthdayBlock(context.Background(), *bs, false)
-	})
+	params := db.ImportPrivateKeyParams{
+		Scope: db.KeyScope{
+			Purpose: scope.Purpose,
+			Coin:    scope.Coin,
+		},
+		WIF:    wif,
+		Rescan: rescan,
+		Bs:     bs,
+	}
+	addr, props, err := w.store.ImportPrivateKey(context.Background(), params)
 	if err != nil {
 		return "", err
 	}
@@ -477,7 +441,7 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 	// imported address.
 	if rescan {
 		job := &RescanJob{
-			Addrs:      []btcutil.Address{addr},
+			Addrs:      []btcutil.Address{addr.Address()},
 			OutPoints:  nil,
 			BlockStamp: *bs,
 		}
@@ -492,14 +456,14 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 		if err != nil {
 			return "", err
 		}
-		err = chainClient.NotifyReceived([]btcutil.Address{addr})
+		err = chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
 		if err != nil {
 			return "", fmt.Errorf("failed to subscribe for address ntfns for "+
-				"address %s: %w", addr.EncodeAddress(), err)
+				"address %s: %w", addr.Address().EncodeAddress(), err)
 		}
 	}
 
-	addrStr := addr.EncodeAddress()
+	addrStr := addr.Address().EncodeAddress()
 	log.Infof("Imported payment address %s", addrStr)
 
 	w.NtfnServer.notifyAccountProperties(props)

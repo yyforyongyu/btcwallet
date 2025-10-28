@@ -59,6 +59,7 @@ type AccountStore interface {
 type AddressStore interface {
 	CreateAddress(ctx context.Context, params CreateAddressParams) (AddressInfo, error)
 	ImportAddress(ctx context.Context, params ImportAddressData) (AddressInfo, error)
+	ImportPrivateKey(ctx context.Context, params ImportPrivateKeyParams) (waddrmgr.ManagedAddress, *waddrmgr.AccountProperties, error)
 	GetAddress(ctx context.Context, query GetAddressQuery) (AddressInfo, error)
 	ListAddresses(ctx context.Context, query ListAddressesQuery) ([]AddressInfo, error)
 	MarkAddressAsUsed(ctx context.Context, params MarkAddressAsUsedParams) error
