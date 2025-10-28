@@ -295,32 +295,26 @@ func (w *Wallet) ImportPublicKeyDeprecated(pubKey *btcec.PublicKey,
 		return fmt.Errorf("address type %v is not supported", addrType)
 	}
 
-	scopedKeyManager, err := w.store.FetchScopedKeyManager(db.KeyScope{
-		Purpose: keyScope.Purpose,
-		Coin:    keyScope.Coin,
-	})
+	params := db.ImportAddressData{
+		PubKey: pubKey,
+		Scope: db.KeyScope{
+			Purpose: keyScope.Purpose,
+			Coin:    keyScope.Coin,
+		},
+		Rescan: false, // TODO: Add rescan support.
+	}
+	addr, err := w.store.ImportAddress(context.Background(), params)
 	if err != nil {
 		return err
 	}
 
-	// TODO: Perform rescan if requested.
-	var addr waddrmgr.ManagedAddress
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		addr, err = scopedKeyManager.ImportPublicKey(ns, pubKey, nil)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-
-	log.Infof("Imported address %v", addr.Address())
+	log.Infof("Imported address %v", addr.Address)
 
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return err
 	}
-	err = chainClient.NotifyReceived([]btcutil.Address{addr.Address()})
+	err = chainClient.NotifyReceived([]btcutil.Address{addr.Address})
 	if err != nil {
 		return fmt.Errorf("unable to subscribe for address "+
 			"notifications: %w", err)
