@@ -73,6 +73,8 @@ type TxStore interface {
 	GetTx(ctx context.Context, query GetTxQuery) (TxInfo, error)
 	ListTxs(ctx context.Context, query ListTxsQuery) ([]TxInfo, error)
 	DeleteTx(ctx context.Context, params DeleteTxParams) error
+	AddRelevantTxs(ctx context.Context, recs []*wtxmgr.TxRecord,
+		block *wtxmgr.BlockMeta) error
 	Balance(ctx context.Context, minConfirms int32) (btcutil.Amount, error)
 	Rollback(ctx context.Context, height int32) error
 }

@@ -782,6 +782,90 @@ func (d *KvdbStore) DeleteTx(ctx context.Context, params DeleteTxParams) error {
 	})
 }
 
+// AddRelevantTxs adds new relevant transactions to the store.
+func (d *KvdbStore) AddRelevantTxs(ctx context.Context, recs []*wtxmgr.TxRecord,
+	block *wtxmgr.BlockMeta) error {
+
+	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
+		for _, rec := range recs {
+			// At the moment all notified transactions are assumed to actually be
+			// relevant.  This assumption will not hold true when SPV support is
+			// added, but until then, simply insert the transaction because there
+			// should either be one or more relevant inputs or outputs.
+			_, err := d.GetTx(ctx, GetTxQuery{
+				TxHash: rec.Hash,
+			})
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, ErrNotFound) {
+				return err
+			}
+
+			var credits []CreditData
+			for i, output := range rec.MsgTx.TxOut {
+				_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+					output.PkScript, d.addrStore.ChainParams(),
+				)
+				if err != nil {
+					// Non-standard outputs are skipped.
+					continue
+				}
+
+				for _, addr := range addrs {
+					addrInfo, err := d.GetAddress(ctx, GetAddressQuery{
+						Address: addr,
+					})
+					switch {
+					// Missing addresses are skipped.
+					case errors.Is(err, ErrNotFound):
+						continue
+
+					// Other errors should be propagated.
+					case err != nil:
+						return err
+					}
+
+					// Prevent addresses from non-default scopes to be
+					// detected here. We don't watch funds sent to
+					// non-default scopes in other places either, so
+					// detecting them here would mean we'd also not properly
+					// detect them as spent later.
+					keyScope := waddrmgr.KeyScope{
+						Purpose: addrInfo.DerivationInfo.KeyScope.Purpose,
+						Coin:    addrInfo.DerivationInfo.KeyScope.Coin,
+					}
+					if !waddrmgr.IsDefaultScope(keyScope) {
+						continue
+					}
+
+					credits = append(credits, CreditData{
+						Index:   uint32(i),
+						Address: addr,
+					})
+					err = d.MarkAddressAsUsed(ctx, MarkAddressAsUsedParams{
+						Address: addr,
+					})
+					if err != nil {
+						return err
+					}
+				}
+			}
+
+			if len(credits) > 0 {
+				err = d.CreateTx(ctx, CreateTxParams{
+					Tx:      &rec.MsgTx,
+					Credits: credits,
+				})
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
 // Rollback removes all blocks at height onwards, moving any transactions within
 // each block to the unconfirmed pool.
 func (d *KvdbStore) Rollback(ctx context.Context, height int32) error {

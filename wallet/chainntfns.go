@@ -6,17 +6,13 @@ package wallet
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
-	"github.com/btcsuite/btcwallet/walletdb"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
 const (
@@ -173,18 +169,10 @@ func (w *Wallet) handleChainNotifications() {
 			case chain.FilteredBlockConnected:
 				// Atomically update for the whole block.
 				if len(n.RelevantTxs) > 0 {
-					err = walletdb.Update(w.db, func(
-						tx walletdb.ReadWriteTx) error {
-						var err error
-						for _, rec := range n.RelevantTxs {
-							err = w.addRelevantTx(context.Background(), tx, rec,
-								n.Block)
-							if err != nil {
-								return err
-							}
-						}
-						return nil
-					})
+					err = w.store.AddRelevantTxs(
+						context.Background(),
+						n.RelevantTxs, n.Block,
+					)
 				}
 				notificationName = "filtered block connected"
 
@@ -234,198 +222,7 @@ func (w *Wallet) handleChainNotifications() {
 	}
 }
 
-// addRelevantTx adds a relevant transaction to the wallet's transaction store.
-func (w *Wallet) addRelevantTx(ctx context.Context, dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord,
-	block *wtxmgr.BlockMeta) error {
 
-	txmgrNs := dbtx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-	// At the moment all notified transactions are assumed to actually be
-	// relevant.  This assumption will not hold true when SPV support is
-	// added, but until then, simply insert the transaction because there
-	// should either be one or more relevant inputs or outputs.
-	_, err := w.store.GetTx(ctx, db.GetTxQuery{
-		WalletID: w.ID(),
-		TxHash:   rec.Hash,
-	})
-	if err == nil {
-		return nil
-	}
-
-	// If the transaction has already been recorded, we can return early.
-	// Note: Returning here is safe as we're within the context of an atomic
-	// database transaction, so we don't need to worry about the MarkUsed
-	// calls below.
-	if !errors.Is(err, db.ErrNotFound) {
-		return err
-	}
-
-		var credits []db.CreditData
-
-		for i, output := range rec.MsgTx.TxOut {
-
-			_, addrs, _, err := txscript.ExtractPkScriptAddrs(output.PkScript,
-
-				w.chainParams)
-
-			if err != nil {
-
-				// Non-standard outputs are skipped.
-
-				log.Warnf("Cannot extract non-std pkScript=%x",
-
-					output.PkScript)
-
-	
-
-				continue
-
-			}
-
-	
-
-			for _, addr := range addrs {
-
-				addrInfo, err := w.store.GetAddress(ctx, db.GetAddressQuery{
-
-					WalletID: w.ID(),
-
-					Address:  addr,
-
-				})
-
-	
-
-				switch {
-
-				// Missing addresses are skipped.
-
-				case errors.Is(err, db.ErrNotFound):
-
-					continue
-
-	
-
-				// Other errors should be propagated.
-
-				case err != nil:
-
-					return err
-
-				}
-
-	
-
-				// Prevent addresses from non-default scopes to be
-
-				// detected here. We don't watch funds sent to
-
-				// non-default scopes in other places either, so
-
-				// detecting them here would mean we'd also not properly
-
-				// detect them as spent later.
-
-				keyScope := waddrmgr.KeyScope{
-
-					Purpose: addrInfo.DerivationInfo.KeyScope.Purpose,
-
-					Coin:    addrInfo.DerivationInfo.KeyScope.Coin,
-
-				}
-
-				if !waddrmgr.IsDefaultScope(keyScope) {
-
-					log.Debugf("Skipping non-default scope "+
-
-						"address %v", addr)
-
-	
-
-					continue
-
-				}
-
-	
-
-				credits = append(credits, db.CreditData{
-
-					Index:   uint32(i),
-
-					Address: addr,
-
-				})
-
-				err = w.store.MarkAddressAsUsed(ctx, db.MarkAddressAsUsedParams{
-
-					WalletID: w.ID(),
-
-					Address:  addr,
-
-				})
-
-				if err != nil {
-
-					return err
-
-				}
-
-				log.Debugf("Marked address %v used", addr)
-
-			}
-
-		}
-
-	
-
-		if len(credits) > 0 {
-
-			err = w.store.CreateTx(ctx, db.CreateTxParams{
-
-				WalletID: w.ID(),
-
-				Tx:       &rec.MsgTx,
-
-				Credits:  credits,
-
-			})
-
-			if err != nil {
-
-				return err
-
-			}
-
-		}
-
-	
-
-		// Send notification of mined or unmined transaction to any interested
-
-		// clients.
-
-		//
-
-		// TODO: Avoid the extra db hits.
-
-		if block == nil {
-
-			w.NtfnServer.notifyUnminedTransaction(dbtx, txmgrNs, rec.Hash)
-
-		} else {
-
-			w.NtfnServer.notifyMinedTransaction(
-
-				dbtx, txmgrNs, rec.Hash, block,
-
-			)
-
-		}
-
-	
-
-	return nil
-}
 
 // chainConn is an interface that abstracts the chain connection logic required
 // to perform a wallet's birthday block sanity check.
