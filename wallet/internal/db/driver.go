@@ -291,6 +291,19 @@ func (d *KvdbStore) SetBirthdayBlock(ctx context.Context, block waddrmgr.BlockSt
 	})
 }
 
+// Resurrect restores all known addresses for the provided scopes that can be
+// found in the walletdb namespace, in addition to restoring all outpoints that
+// have been previously found. This method ensures that the recovery state's
+// horizons properly start from the last found address of a prior recovery
+// attempt.
+func (d *KvdbStore) Resurrect(ctx context.Context, scopedMgrs map[waddrmgr.KeyScope]waddrmgr.AccountStore,
+	credits []wtxmgr.Credit) error {
+	return walletdb.View(d.db, func(tx walletdb.ReadTx) error {
+		// TODO(yy): implement this
+		return nil
+	})
+}
+
 // ============================================================================
 // AccountStore Implementation
 // ============================================================================

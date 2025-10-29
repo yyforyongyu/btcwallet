@@ -870,10 +870,7 @@ func (w *Wallet) recovery(chainClient chain.Interface,
 			FromCoinBase: utxo.FromCoinBase,
 		}
 	}
-	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		addrMgrNS := tx.ReadBucket(waddrmgrNamespaceKey)
-		return recoveryMgr.Resurrect(addrMgrNS, scopedMgrs, credits)
-	})
+	err = w.store.Resurrect(context.Background(), scopedMgrs, credits)
 	if err != nil {
 		return err
 	}

@@ -40,6 +40,8 @@ type WalletStore interface {
 	BirthdayBlock(ctx context.Context) (waddrmgr.BlockStamp, bool, error)
 	SetBirthday(ctx context.Context, birthday time.Time) error
 	SetBirthdayBlock(ctx context.Context, block waddrmgr.BlockStamp, verified bool) error
+	Resurrect(ctx context.Context, scopedMgrs map[waddrmgr.KeyScope]waddrmgr.AccountStore,
+		credits []wtxmgr.Credit) error
 }
 
 // AccountStore defines the database actions for managing accounts.
