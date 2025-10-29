@@ -15,7 +15,6 @@ import (
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
@@ -426,48 +425,50 @@ func (w *Wallet) CreateTransaction(ctx context.Context, intent *TxIntent) (
 		inputSource  txauthor.InputSource
 		err          error
 	)
-	err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
-		changeKeyScope := &intent.ChangeSource.KeyScope
-		accountName := intent.ChangeSource.AccountName
 
-		// Query the account's number using the account name.
-		//
-		// TODO(yy): Remove this query in upcoming SQL.
-		account, err := w.AccountNumber(*changeKeyScope, accountName)
-		if err != nil {
-			return fmt.Errorf("%w: %s", ErrAccountNotFound,
-				accountName)
-		}
+	changeKeyScope := &intent.ChangeSource.KeyScope
+	accountName := intent.ChangeSource.AccountName
 
-		// Create the change source, which is a closure that the
-		// txauthor package will use to generate a new change address
-		// when needed.
-		//
-		// TODO(yy): Refactor to ensure atomicity. The underlying
-		// `GetUnusedAddress` call creates its own database
-		// transaction, breaking the atomicity of this
-		// `walletdb.Update` block. A new method should be added to
-		// `AccountStore` that accepts an active database transaction
-		// and returns an unused address. This will allow the address
-		// derivation to occur within the same atomic transaction as
-		// the rest of the tx creation logic. Once fixed, we can remove
-		// the above `w.newAddrMtx` lock.
-		changeSource, err = w.addrMgrWithChangeSource(
-			changeKeyScope, account,
-		)
-		if err != nil {
-			return err
-		}
+	// Query the account's number using the account name.
+	//
+	// TODO(yy): Remove this query in upcoming SQL.
+	account, err := w.AccountNumber(*changeKeyScope, accountName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, accountName)
+	}
 
-		// Create the input source, which is a closure that the
-		// txauthor package will use to select coins.
-		inputSource, err = w.createInputSource(dbtx, intent)
-		if err != nil {
-			return err
-		}
+	// Create the change source, which is a closure that the
+	// txauthor package will use to generate a new change address
+	// when needed.
+	//
+	// TODO(yy): Refactor to ensure atomicity. The underlying
+	// `GetUnusedAddress` call creates its own database
+	// transaction, breaking the atomicity of this
+	// `walletdb.Update` block. A new method should be added to
+	// `AccountStore` that accepts an active database transaction
+	// and returns an unused address. This will allow the address
+	// derivation to occur within the same atomic transaction as
+	// the rest of the tx creation logic. Once fixed, we can remove
+	// the above `w.newAddrMtx` lock.
+	changeSource, err = w.addrMgrWithChangeSource(
+		changeKeyScope, account,
+	)
+	if err != nil {
+		return nil, err
+	}
 
-		return nil
+	// TODO(yy): This is inefficient. We should have a GetUtxo method on the
+	// store.
+	utxos, err := w.store.ListUTXOs(context.Background(), db.ListUtxosQuery{
+		WalletID: w.ID(),
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Create the input source, which is a closure that the
+	// txauthor package will use to select coins.
+	inputSource, err = w.createInputSource(utxos, intent)
 	if err != nil {
 		return nil, err
 	}
@@ -514,19 +515,19 @@ func (w *Wallet) CreateTransaction(ctx context.Context, intent *TxIntent) (
 // instead have methods made on the `txStore`, which takes a db tx and use them
 // here, as the logic will be largely overlapped with the interface methods used
 // in `wallet/utxo_manager.go`.
-func (w *Wallet) createInputSource(dbtx walletdb.ReadTx, intent *TxIntent) (
+func (w *Wallet) createInputSource(utxos []db.UtxoInfo, intent *TxIntent) (
 	txauthor.InputSource, error) {
 
 	switch inputs := intent.Inputs.(type) {
 	// If the inputs are manually specified, we create a "constant" input
 	// source that will only ever return the specified UTXOs.
 	case *InputsManual:
-		return w.createManualInputSource(dbtx, inputs)
+		return w.createManualInputSource(utxos, inputs)
 
 	// If the inputs are policy-based, we create an input source that will
 	// perform coin selection.
 	case *InputsPolicy:
-		return w.createPolicyInputSource(dbtx, inputs, intent.FeeRate)
+		return w.createPolicyInputSource(utxos, inputs, intent.FeeRate)
 
 	// Any other type is unsupported.
 	default:
@@ -537,18 +538,9 @@ func (w *Wallet) createInputSource(dbtx walletdb.ReadTx, intent *TxIntent) (
 // createManualInputSource creates an input source from a list of manually
 // specified UTXOs. It fetches the UTXOs directly from the database and ensures
 // that they are eligible for spending.
-func (w *Wallet) createManualInputSource(dbtx walletdb.ReadTx,
+func (w *Wallet) createManualInputSource(utxos []db.UtxoInfo,
 	inputs *InputsManual) (
 	txauthor.InputSource, error) {
-
-	// TODO(yy): This is inefficient. We should have a GetUtxo method on the
-	// store.
-	utxos, err := w.store.ListUTXOs(context.Background(), db.ListUtxosQuery{
-		WalletID: w.ID(),
-	})
-	if err != nil {
-		return nil, err
-	}
 
 	// Create a slice to hold the eligible UTXOs.
 	var eligibleSelectedUtxo []wtxmgr.Credit
@@ -587,7 +579,7 @@ func (w *Wallet) createManualInputSource(dbtx walletdb.ReadTx,
 
 // createPolicyInputSource creates an input source that will perform automatic
 // coin selection based on the provided policy.
-func (w *Wallet) createPolicyInputSource(dbtx walletdb.ReadTx,
+func (w *Wallet) createPolicyInputSource(utxos []db.UtxoInfo,
 	policy *InputsPolicy, feeRate SatPerKVByte) (
 	txauthor.InputSource, error) {
 
@@ -600,7 +592,7 @@ func (w *Wallet) createPolicyInputSource(dbtx walletdb.ReadTx,
 	// Get the full set of eligible UTXOs based on the policy's source
 	// and confirmation requirements.
 	eligible, err := w.getEligibleUTXOs(
-		dbtx, policy.Source, policy.MinConfs,
+		utxos, policy.Source, policy.MinConfs,
 	)
 	if err != nil {
 		return nil, err
@@ -643,7 +635,7 @@ func (w *Wallet) createPolicyInputSource(dbtx walletdb.ReadTx,
 // getEligibleUTXOs returns a slice of eligible UTXOs that can be used as
 // inputs for a transaction, based on the specified source and confirmation
 // requirements.
-func (w *Wallet) getEligibleUTXOs(dbtx walletdb.ReadTx,
+func (w *Wallet) getEligibleUTXOs(utxos []db.UtxoInfo,
 	source CoinSource, minconf uint32) ([]wtxmgr.Credit, error) {
 
 	// TODO(yy): remove this requireChainClient. The block stamp should be
@@ -672,12 +664,12 @@ func (w *Wallet) getEligibleUTXOs(dbtx walletdb.ReadTx,
 	// If the source is a scoped account, we find all eligible outputs for
 	// that specific account and key scope.
 	case *ScopedAccount:
-		return w.getEligibleUTXOsFromAccount(dbtx, src, minconf, bs)
+		return w.getEligibleUTXOsFromAccount(src, minconf, bs)
 
 	// If the source is a list of UTXOs, we validate and fetch each UTXO
 	// from the provided list.
 	case *CoinSourceUTXOs:
-		return w.getEligibleUTXOsFromList(dbtx, src, minconf, bs)
+		return w.getEligibleUTXOsFromList(utxos, src, minconf, bs)
 
 	// Any other source type is unsupported.
 	default:
@@ -687,8 +679,8 @@ func (w *Wallet) getEligibleUTXOs(dbtx walletdb.ReadTx,
 
 // getEligibleUTXOsFromAccount returns a slice of eligible UTXOs for a specific
 // account and key scope.
-func (w *Wallet) getEligibleUTXOsFromAccount(dbtx walletdb.ReadTx,
-	source *ScopedAccount, minconf uint32, bs *waddrmgr.BlockStamp) (
+func (w *Wallet) getEligibleUTXOsFromAccount(source *ScopedAccount,
+	minconf uint32, bs *waddrmgr.BlockStamp) (
 	[]wtxmgr.Credit, error) {
 
 	keyScope := &source.KeyScope
@@ -705,18 +697,9 @@ func (w *Wallet) getEligibleUTXOsFromAccount(dbtx walletdb.ReadTx,
 
 // getEligibleUTXOsFromList returns a slice of eligible UTXOs from a specified
 // list of outpoints.
-func (w *Wallet) getEligibleUTXOsFromList(dbtx walletdb.ReadTx,
+func (w *Wallet) getEligibleUTXOsFromList(utxos []db.UtxoInfo,
 	source *CoinSourceUTXOs, minconf uint32, bs *waddrmgr.BlockStamp) (
 	[]wtxmgr.Credit, error) {
-
-	// TODO(yy): This is inefficient. We should have a GetUtxo method on the
-	// store.
-	utxos, err := w.store.ListUTXOs(context.Background(), db.ListUtxosQuery{
-		WalletID: w.ID(),
-	})
-	if err != nil {
-		return nil, err
-	}
 
 	// Create a slice to hold the eligible UTXOs.
 	var eligible []wtxmgr.Credit
