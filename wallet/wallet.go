@@ -116,8 +116,6 @@ var (
 type Wallet struct {
 	publicPassphrase []byte
 
-	// Data stores
-	db        walletdb.DB
 	// store is the new database interface.
 	store db.Store
 
@@ -1874,7 +1872,7 @@ func (w *Wallet) DeriveFromKeyPath(scope waddrmgr.KeyScope,
 
 // Database returns the underlying walletdb database.
 func (w *Wallet) Database() walletdb.DB {
-	return w.db
+	return nil
 }
 
 // ChainParams returns the chain parameters for the wallet.
