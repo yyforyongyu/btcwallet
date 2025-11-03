@@ -171,32 +171,10 @@ func (d *KvdbStore) ListWallets(ctx context.Context) ([]WalletInfo, error) {
 	return nil, nil
 }
 
-// UpdateSyncState updates the wallet's sync state. If a birthday block is
-// provided, it will also be updated.
-func (d *KvdbStore) UpdateSyncState(ctx context.Context, params UpdateSyncStateParams) error {
-	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		bs := waddrmgr.BlockStamp{
-			Hash:      params.SyncState.SyncedTo,
-			Height:    params.SyncState.Height,
-			Timestamp: params.SyncState.Timestamp,
-		}
-		err := PutSyncedTo(addrmgrNs, &bs)
-		if err != nil {
-			return err
-		}
-
-		if params.BirthdayBlock != nil {
-			err := PutBirthdayBlock(
-				addrmgrNs, *params.BirthdayBlock, false,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
+// UpdateWallet is a placeholder for the UpdateWallet method.
+func (d *KvdbStore) UpdateWallet(ctx context.Context, params UpdateWalletParams) error {
+	// TODO(yy): implement
+	return nil
 }
 
 // GetEncryptedHDSeed returns the encrypted HD seed of the wallet.
@@ -241,66 +219,6 @@ func (d *KvdbStore) ChangePassphrase(ctx context.Context, old, new []byte, priva
 			return err
 		}
 		return PutMasterKeyParams(addrmgrNs, masterKeyParams, nil)
-	})
-}
-
-// Unlock unlocks the wallet.
-func (d *KvdbStore) Unlock(ctx context.Context, passphrase []byte) error {
-	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		return d.addrStore.Unlock(addrmgrNs, passphrase)
-	})
-}
-
-// Lock locks the wallet.
-func (d *KvdbStore) Lock(ctx context.Context) {
-	d.addrStore.Lock()
-}
-
-// IsLocked returns true if the wallet is locked.
-func (d *KvdbStore) IsLocked(ctx context.Context) bool {
-	return d.addrStore.IsLocked()
-}
-
-// BirthdayBlock returns the birthday block of the wallet.
-func (d *KvdbStore) BirthdayBlock(ctx context.Context) (waddrmgr.BlockStamp, bool, error) {
-	var bs waddrmgr.BlockStamp
-	var verified bool
-	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		var err error
-		bs, verified, err = BirthdayBlock(addrmgrNs)
-		return err
-	})
-	return bs, verified, err
-}
-
-// SetBirthday sets the birthday of the wallet.
-func (d *KvdbStore) SetBirthday(ctx context.Context, birthday time.Time) error {
-	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		return PutBirthday(addrmgrNs, birthday)
-	})
-}
-
-// SetBirthdayBlock sets the birthday block of the wallet.
-func (d *KvdbStore) SetBirthdayBlock(ctx context.Context, block waddrmgr.BlockStamp, verified bool) error {
-	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		return PutBirthdayBlock(addrmgrNs, block, verified)
-	})
-}
-
-// Resurrect restores all known addresses for the provided scopes that can be
-// found in the walletdb namespace, in addition to restoring all outpoints that
-// have been previously found. This method ensures that the recovery state's
-// horizons properly start from the last found address of a prior recovery
-// attempt.
-func (d *KvdbStore) Resurrect(ctx context.Context, scopedMgrs map[waddrmgr.KeyScope]waddrmgr.AccountStore,
-	credits []wtxmgr.Credit) error {
-	return walletdb.View(d.db, func(tx walletdb.ReadTx) error {
-		// TODO(yy): implement this
-		return nil
 	})
 }
 
@@ -355,160 +273,10 @@ func (d *KvdbStore) CreateAccount(ctx context.Context, params CreateAccountParam
 	return info, nil
 }
 
-// ImportAccount imports an account from an extended key.
-func (d *KvdbStore) ImportAccount(ctx context.Context, params ImportAccountParams) (*waddrmgr.AccountProperties, error) {
-	var accountProps *waddrmgr.AccountProperties
-	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// Determine what key scope the account public key should belong to and
-		// whether it should use a custom address schema.
-		addrType := (*waddrmgr.AddressType)(params.AddressType)
-		keyScope, addrSchema, err := keyScopeFromPubKey(
-			params.AccountKey, addrType,
-		)
-		if err != nil {
-			return err
-		}
-
-		dbScope := KeyScope{
-			Purpose: keyScope.Purpose,
-			Coin:    keyScope.Coin,
-		}
-		scopedMgr, err := d.FetchScopedKeyManager(dbScope)
-		if err != nil {
-			scopedMgr, err = d.NewScopedKeyManager(
-				dbScope, *addrSchema,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		account, err := scopedMgr.NewAccountWatchingOnly(
-			ns, params.Name, params.AccountKey,
-			params.MasterKeyFingerprint, addrSchema,
-		)
-		if err != nil {
-			return err
-		}
-
-		accountProps, err = scopedMgr.AccountProperties(ns, account)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return accountProps, nil
-}
-
-// ImportAccountWithScope imports an account with a defined scope.
-func (d *KvdbStore) ImportAccountWithScope(ctx context.Context, params ImportAccountWithScopeParams) (*waddrmgr.AccountProperties, error) {
-	var accountProps *waddrmgr.AccountProperties
-	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		scopedMgr, err := d.FetchScopedKeyManager(params.Scope)
-		if err != nil {
-			scopedMgr, err = d.NewScopedKeyManager(
-				params.Scope, params.AddrSchema,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		account, err := scopedMgr.NewAccountWatchingOnly(
-			ns, params.Name, params.AccountKey,
-			params.MasterKeyFingerprint, &params.AddrSchema,
-		)
-		if err != nil {
-			return err
-		}
-
-		accountProps, err = scopedMgr.AccountProperties(ns, account)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return accountProps, nil
-}
-
-// ImportAccountDryRun performs a dry run of an account import.
-func (d *KvdbStore) ImportAccountDryRun(ctx context.Context, params ImportAccountDryRunParams) (*waddrmgr.AccountProperties, []waddrmgr.ManagedAddress, []waddrmgr.ManagedAddress, error) {
-	var (
-		accountProps  *waddrmgr.AccountProperties
-		externalAddrs []waddrmgr.ManagedAddress
-		internalAddrs []waddrmgr.ManagedAddress
-	)
-
-	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		addrType := (*waddrmgr.AddressType)(params.AddressType)
-		keyScope, addrSchema, err := keyScopeFromPubKey(
-			params.AccountKey, addrType,
-		)
-		if err != nil {
-			return err
-		}
-
-		dbScope := KeyScope{
-			Purpose: keyScope.Purpose,
-			Coin:    keyScope.Coin,
-		}
-		scopedMgr, err := d.FetchScopedKeyManager(dbScope)
-		if err != nil {
-			scopedMgr, err = d.NewScopedKeyManager(
-				dbScope, *addrSchema,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		account, err := scopedMgr.NewAccountWatchingOnly(
-			ns, params.Name, params.AccountKey,
-			params.MasterKeyFingerprint, addrSchema,
-		)
-		if err != nil {
-			return err
-		}
-
-		// The importAccount method above will cache the imported
-		// account within the scoped manager. Since this is a dry-run
-		// attempt, we'll want to invalidate the cache for it.
-		defer scopedMgr.InvalidateAccountCache(account)
-
-		externalAddrs, err = scopedMgr.NextExternalAddresses(
-			ns, account, params.NumAddrs,
-		)
-		if err != nil {
-			return err
-		}
-
-		internalAddrs, err = scopedMgr.NextInternalAddresses(
-			ns, account, params.NumAddrs,
-		)
-		if err != nil {
-			return err
-		}
-
-		accountProps, err = scopedMgr.AccountProperties(ns, account)
-		if err != nil {
-			return err
-		}
-
-		return walletdb.ErrDryRunRollBack
-	})
-	if err != nil && !errors.Is(err, walletdb.ErrDryRunRollBack) {
-		return nil, nil, nil, err
-	}
-
-	return accountProps, externalAddrs, internalAddrs, nil
+// ImportAccount is a placeholder for the ImportAccount method.
+func (d *KvdbStore) ImportAccount(ctx context.Context, params ImportAccountParams) (*ImportAccountResult, error) {
+	// TODO(yy): implement
+	return nil, nil
 }
 
 // GetAccount retrieves the details for a specific account.
@@ -629,133 +397,26 @@ func (d *KvdbStore) ListAccounts(ctx context.Context, query ListAccountsQuery) (
 	return accounts, nil
 }
 
-// UpdateAccountName renames an existing account.
-func (d *KvdbStore) UpdateAccountName(ctx context.Context, params UpdateAccountNameParams) error {
-	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		scope := fromDBKeyScope(params.Scope)
-
-		manager, err := d.addrStore.FetchScopedKeyManager(scope)
-		if err != nil {
-			return err
-		}
-
-		// Look up the account number for the given name.
-		accNum, err := manager.LookupAccount(addrmgrNs, params.OldName)
-		if err != nil {
-			return err
-		}
-
-		// Perform the rename operation.
-		return manager.RenameAccount(addrmgrNs, accNum, params.NewName)
-	})
-}
-
-// RenameAccount renames an account.
+// RenameAccount is a placeholder for the RenameAccount method.
 func (d *KvdbStore) RenameAccount(ctx context.Context, params RenameAccountParams) error {
-	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		scope := fromDBKeyScope(params.Scope)
-
-		manager, err := d.addrStore.FetchScopedKeyManager(scope)
-		if err != nil {
-			return err
-		}
-
-		return manager.RenameAccount(addrmgrNs, params.AccountNumber, params.NewName)
-	})
-}
-
-// FetchScopedKeyManager returns the scoped key manager for the given scope.
-func (d *KvdbStore) FetchScopedKeyManager(scope KeyScope) (waddrmgr.AccountStore, error) {
-	return d.addrStore.FetchScopedKeyManager(fromDBKeyScope(scope))
-}
-
-// NewScopedKeyManager creates a new scoped key manager.
-func (d *KvdbStore) NewScopedKeyManager(scope KeyScope, addrSchema waddrmgr.ScopeAddrSchema) (waddrmgr.AccountStore, error) {
-	var mgr waddrmgr.AccountStore
-	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		var err error
-		mgr, err = d.addrStore.NewScopedKeyManager(addrmgrNs, fromDBKeyScope(scope), addrSchema)
-		return err
-	})
-	return mgr, err
+	// TODO(yy): implement
+	return nil
 }
 
 // ============================================================================
 // AddressStore Implementation
 // ============================================================================
 
-// CreateAddress creates a new address for the given account and address type.
-func (d *KvdbStore) CreateAddress(ctx context.Context, params CreateAddressParams) (AddressInfo, error) {
-	var managedAddr waddrmgr.ManagedAddress
-	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		scope := fromDBKeyScope(params.Scope)
-
-		manager, err := d.addrStore.FetchScopedKeyManager(scope)
-		if err != nil {
-			return err
-		}
-
-		addr, err := manager.NewAddress(addrmgrNs, params.AccountName, params.Change)
-		if err != nil {
-			return err
-		}
-
-		managedAddr, err = d.addrStore.Address(addrmgrNs, addr)
-		return err
-	})
-	if err != nil {
-		return AddressInfo{}, err
-	}
-
-	return toDBAddressInfo(managedAddr), nil
+// NewAddress is a placeholder for the NewAddress method.
+func (d *KvdbStore) NewAddress(ctx context.Context, params NewAddressParams) (btcutil.Address, error) {
+	// TODO(yy): implement
+	return nil, nil
 }
 
-// ImportAddress imports a public key, taproot script, or generic script as a
-// watch-only address.
-func (d *KvdbStore) ImportAddress(ctx context.Context, params ImportAddressData) (AddressInfo, error) {
-	var addr waddrmgr.ManagedAddress
-	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		syncedTo := d.addrStore.SyncedTo()
-		manager, err := d.addrStore.FetchScopedKeyManager(fromDBKeyScope(params.Scope))
-		if err != nil {
-			return err
-		}
-
-		switch {
-		case params.PubKey != nil:
-			addr, err = manager.ImportPublicKey(ns, params.PubKey, &syncedTo)
-			return err
-
-		case params.Tapscript != nil:
-			controlBlock, err := txscript.ParseControlBlock(params.Tapscript.ControlBlock)
-			if err != nil {
-				return err
-			}
-			tapscript := waddrmgr.Tapscript{
-				ControlBlock: controlBlock,
-				Leaves:       []txscript.TapLeaf{{Script: params.Tapscript.Script}},
-			}
-			addr, err = manager.ImportTaprootScript(ns, &tapscript, &syncedTo, 1, false)
-			return err
-
-		case params.Script != nil:
-			addr, err = manager.ImportScript(ns, params.Script, &syncedTo)
-			return err
-
-		default:
-			return errors.New("no import data provided")
-		}
-	})
-	if err != nil {
-		return AddressInfo{}, err
-	}
-
-	return toDBAddressInfo(addr), nil
+// ImportAddress is a placeholder for the ImportAddress method.
+func (d *KvdbStore) ImportAddress(ctx context.Context, params ImportAddressParams) (AddressInfo, error) {
+	// TODO(yy): implement
+	return AddressInfo{}, nil
 }
 
 // GetAddress retrieves the details for a specific address.
@@ -812,12 +473,12 @@ func (d *KvdbStore) MarkAddressAsUsed(ctx context.Context, params MarkAddressAsU
 	})
 }
 
-// GetPrivateKey returns the private key for a given address.
-func (d *KvdbStore) GetPrivateKey(ctx context.Context, addr btcutil.Address) (*btcec.PrivateKey, bool, error) {
-	var (
-		privKey    *btcec.PrivateKey
-		compressed bool
-	)
+// GetPrivateKey retrieves the private key for a given address. This
+// method is ONLY valid for addresses that were imported with a private
+// key. It will return an error for derived HD addresses and watch-only
+// imports.
+func (d *KvdbStore) GetPrivateKey(ctx context.Context, addr btcutil.Address) (*btcec.PrivateKey, error) {
+	var privKey *btcec.PrivateKey
 	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		ma, err := d.addrStore.Address(addrmgrNs, addr)
@@ -832,101 +493,9 @@ func (d *KvdbStore) GetPrivateKey(ctx context.Context, addr btcutil.Address) (*b
 		if err != nil {
 			return err
 		}
-		compressed = ma.Compressed()
 		return nil
 	})
-	return privKey, compressed, err
-}
-
-// DeriveFromKeyPath derives a managed address from a BIP-32 derivation path.
-func (d *KvdbStore) DeriveFromKeyPath(ctx context.Context, scope KeyScope,
-	path waddrmgr.DerivationPath) (waddrmgr.ManagedAddress, error) {
-	var addr waddrmgr.ManagedAddress
-	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		dbScope := fromDBKeyScope(scope)
-		manager, err := d.addrStore.FetchScopedKeyManager(dbScope)
-		if err != nil {
-			return err
-		}
-		addr, err = manager.DeriveFromKeyPath(addrmgrNs, path)
-		return err
-	})
-	return addr, err
-}
-
-// ImportPrivateKey imports a private key.
-func (d *KvdbStore) ImportPrivateKey(ctx context.Context, params ImportPrivateKeyParams) (waddrmgr.ManagedAddress, *waddrmgr.AccountProperties, error) {
-	var (
-		addr  waddrmgr.ManagedAddress
-		props *waddrmgr.AccountProperties
-	)
-	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		manager, err := d.FetchScopedKeyManager(params.Scope)
-		if err != nil {
-			return err
-		}
-
-		maddr, err := manager.ImportPrivateKey(addrmgrNs, params.WIF, params.Bs)
-		if err != nil {
-			return err
-		}
-		addr = maddr
-
-		props, err = manager.AccountProperties(
-			addrmgrNs, waddrmgr.ImportedAddrAccount,
-		)
-		if err != nil {
-			return err
-		}
-
-		// We'll only update our birthday with the new one if it is
-		// before our current one. Otherwise, if we do, we can
-		// potentially miss detecting relevant chain events that
-		// occurred between them while rescanning.
-		birthdayBlock, _, err := BirthdayBlock(addrmgrNs)
-		if err != nil {
-			return err
-		}
-		if params.Bs.Height >= birthdayBlock.Height {
-			return nil
-		}
-
-		err = PutBirthday(addrmgrNs, params.Bs.Timestamp)
-		if err != nil {
-			return err
-		}
-
-		// To ensure this birthday block is correct, we'll mark it as
-		// unverified to prompt a sanity check at the next restart to
-		// ensure it is correct as it was provided by the caller.
-		return PutBirthdayBlock(addrmgrNs, *params.Bs, false)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return addr, props, nil
-}
-
-// NewAddress creates a new address.
-func (d *KvdbStore) NewAddress(ctx context.Context, accountName string,
-	addrType AddressType, withChange bool) (btcutil.Address, error) {
-	var addr btcutil.Address
-	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		// TODO(yy): get scope from somewhere else
-		scope := waddrmgr.KeyScopeBIP0084
-		manager, err := d.addrStore.FetchScopedKeyManager(scope)
-		if err != nil {
-			return err
-		}
-		addr, err = manager.NewAddress(addrmgrNs, accountName, withChange)
-		return err
-	})
-	return addr, err
+	return privKey, err
 }
 
 // ============================================================================
@@ -1044,40 +613,45 @@ func (d *KvdbStore) GetTx(ctx context.Context, query GetTxQuery) (TxInfo, error)
 	return TxInfo{}, nil
 }
 
-// ListTxs is a placeholder for the ListTxs method.
-func (d *KvdbStore) ListTxs(ctx context.Context, query ListTxsQuery) ([]TxInfo, error) {
-	// TODO(yy): implement
-	return nil, nil
-}
-
-// UnminedTxs returns all unmined transactions.
-func (d *KvdbStore) UnminedTxs(ctx context.Context) ([]*wire.MsgTx, error) {
-	var txs []*wire.MsgTx
+// ListTxns is a placeholder for the ListTxns method.
+func (d *KvdbStore) ListTxns(ctx context.Context, query ListTxnsQuery) ([]TxInfo, error) {
+	var txs []TxInfo
 	err := walletdb.View(d.db, func(dbTx walletdb.ReadTx) error {
 		txmgrNs := dbTx.ReadBucket(wtxmgrNamespaceKey)
-		var err error
-		txs, err = UnminedTxs(txmgrNs)
-		return err
+
+		if query.UnminedOnly {
+			unminedBucket := txmgrNs.NestedReadBucket(bucketUnmined)
+			if unminedBucket == nil {
+				return nil
+			}
+
+			return unminedBucket.ForEach(func(k, v []byte) error {
+				var txHash chainhash.Hash
+				copy(txHash[:], k)
+
+				var txRec wtxmgr.TxRecord
+				err := readRawTxRecord(&txHash, v, &txRec)
+				if err != nil {
+					return err
+				}
+
+				txs = append(txs, TxInfo{
+					Hash:       txRec.Hash,
+					SerializedTx: txRec.SerializedTx,
+					Received:   txRec.Received,
+					Block:      BlockMeta{Height: -1},
+				})
+				return nil
+			})
+		}
+
+		// TODO(yy): implement listing mined transactions based on height range
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return txs, nil
-}
-
-// UnminedTxHashes returns the hashes of all unmined transactions.
-func (d *KvdbStore) UnminedTxHashes(ctx context.Context) ([]*chainhash.Hash, error) {
-	var hashes []*chainhash.Hash
-	err := walletdb.View(d.db, func(dbTx walletdb.ReadTx) error {
-		txmgrNs := dbTx.ReadBucket(wtxmgrNamespaceKey)
-		var err error
-		hashes, err = UnminedTxHashes(txmgrNs)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return hashes, nil
 }
 
 // DeleteTx removes an unmined transaction from the store.
@@ -1094,115 +668,24 @@ func (d *KvdbStore) DeleteTx(ctx context.Context, params DeleteTxParams) error {
 	})
 }
 
-// AddRelevantTxs adds new relevant transactions to the store.
-func (d *KvdbStore) AddRelevantTxs(ctx context.Context, recs []*wtxmgr.TxRecord,
-	block *wtxmgr.BlockMeta) error {
-
-	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
-		for _, rec := range recs {
-			// At the moment all notified transactions are assumed to actually be
-			// relevant.  This assumption will not hold true when SPV support is
-			// added, but until then, simply insert the transaction because there
-			// should either be one or more relevant inputs or outputs.
-			_, err := d.GetTx(ctx, GetTxQuery{
-				TxHash: rec.Hash,
-			})
-			if err == nil {
-				continue
-			}
-			if !errors.Is(err, ErrNotFound) {
-				return err
-			}
-
-			var credits []CreditData
-			for i, output := range rec.MsgTx.TxOut {
-				_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-					output.PkScript, d.addrStore.ChainParams(),
-				)
-				if err != nil {
-					// Non-standard outputs are skipped.
-					continue
-				}
-
-				for _, addr := range addrs {
-					addrInfo, err := d.GetAddress(ctx, GetAddressQuery{
-						Address: addr,
-					})
-					switch {
-					// Missing addresses are skipped.
-					case errors.Is(err, ErrNotFound):
-						continue
-
-					// Other errors should be propagated.
-					case err != nil:
-						return err
-					}
-
-					// Prevent addresses from non-default scopes to be
-					// detected here. We don't watch funds sent to
-					// non-default scopes in other places either, so
-					// detecting them here would mean we'd also not properly
-					// detect them as spent later.
-					keyScope := waddrmgr.KeyScope{
-						Purpose: addrInfo.DerivationInfo.KeyScope.Purpose,
-						Coin:    addrInfo.DerivationInfo.KeyScope.Coin,
-					}
-					if !waddrmgr.IsDefaultScope(keyScope) {
-						continue
-					}
-
-					credits = append(credits, CreditData{
-						Index:   uint32(i),
-						Address: addr,
-					})
-					err = d.MarkAddressAsUsed(ctx, MarkAddressAsUsedParams{
-						Address: addr,
-					})
-					if err != nil {
-						return err
-					}
-				}
-			}
-
-			if len(credits) > 0 {
-				err = d.CreateTx(ctx, CreateTxParams{
-					Tx:      &rec.MsgTx,
-					Credits: credits,
-				})
-				if err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	})
-}
-
-// Rollback removes all blocks at height onwards, moving any transactions within
+// RollbackToBlock removes all blocks at height onwards, moving any transactions within
 // each block to the unconfirmed pool.
-func (d *KvdbStore) Rollback(ctx context.Context, height int32) error {
+func (d *KvdbStore) RollbackToBlock(ctx context.Context, height int32) error {
 	return walletdb.Update(d.db, func(dbTx walletdb.ReadWriteTx) error {
 		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
 		return rollback(txmgrNs, height)
 	})
 }
 
-// Balance returns the spendable wallet balance.
-func (d *KvdbStore) Balance(ctx context.Context, minConfirms int32) (btcutil.Amount, error) {
-	var balance btcutil.Amount
-	err := walletdb.View(d.db, func(dbTx walletdb.ReadTx) error {
-		txmgrNs := dbTx.ReadBucket(wtxmgrNamespaceKey)
-		syncBlock := d.addrStore.SyncedTo()
-		var err error
-		balance, err = calculateBalance(txmgrNs, minConfirms, syncBlock.Height, d.addrStore.ChainParams())
-		return err
-	})
-	return balance, err
-}
-
 // ============================================================================
 // UTXOStore Implementation
 // ============================================================================
+
+// GetUtxo is a placeholder for the GetUtxo method.
+func (d *KvdbStore) GetUtxo(ctx context.Context, query GetUtxoQuery) (UtxoInfo, error) {
+	// TODO(yy): implement
+	return UtxoInfo{}, nil
+}
 
 // ListUTXOs returns all unspent transaction outputs.
 func (d *KvdbStore) ListUTXOs(ctx context.Context, query ListUtxosQuery) ([]UtxoInfo, error) {
@@ -1234,36 +717,60 @@ func (d *KvdbStore) ListUTXOs(ctx context.Context, query ListUtxosQuery) ([]Utxo
 }
 
 // LeaseOutput locks an output for a given duration.
-func (d *KvdbStore) LeaseOutput(ctx context.Context, id wtxmgr.LockID, op wire.OutPoint,
+func (d *KvdbStore) LeaseOutput(ctx context.Context, id LockID, op wire.OutPoint,
 	duration time.Duration) (time.Time, error) {
 	var expiration time.Time
 	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 		var err error
-		expiration, err = wtxmgr.LockOutput(txmgrNs, id, op, duration)
+		expiration, err = wtxmgr.LockOutput(txmgrNs, wtxmgr.LockID(id), op, duration)
 		return err
 	})
 	return expiration, err
 }
 
 // ReleaseOutput unlocks a previously leased output.
-func (d *KvdbStore) ReleaseOutput(ctx context.Context, id wtxmgr.LockID, op wire.OutPoint) error {
+func (d *KvdbStore) ReleaseOutput(ctx context.Context, id LockID, op wire.OutPoint) error {
 	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		return wtxmgr.UnlockOutput(txmgrNs, id, op)
+		return wtxmgr.UnlockOutput(txmgrNs, wtxmgr.LockID(id), op)
 	})
 }
 
 // ListLeasedOutputs returns a list of all currently leased outputs.
-func (d *KvdbStore) ListLeasedOutputs(ctx context.Context) ([]*wtxmgr.LockedOutput, error) {
-	var leasedOutputs []*wtxmgr.LockedOutput
+func (d *KvdbStore) ListLeasedOutputs(ctx context.Context) ([]*LeasedOutput, error) {
+	var leasedOutputs []*LeasedOutput
 	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-		var err error
-		leasedOutputs, err = wtxmgr.ListLockedOutputs(txmgrNs)
-		return err
+		wtxLeasedOutputs, err := wtxmgr.ListLockedOutputs(txmgrNs)
+		if err != nil {
+			return err
+		}
+
+		leasedOutputs = make([]*LeasedOutput, len(wtxLeasedOutputs))
+		for i, wtxLeasedOutput := range wtxLeasedOutputs {
+			leasedOutputs[i] = &LeasedOutput{
+				OutPoint:   wtxLeasedOutput.Outpoint,
+				LockID:     LockID(wtxLeasedOutput.LockID),
+				Expiration: wtxLeasedOutput.Expiration,
+			}
+		}
+		return nil
 	})
 	return leasedOutputs, err
+}
+
+// Balance returns the spendable wallet balance.
+func (d *KvdbStore) Balance(ctx context.Context, minConfirms int32) (btcutil.Amount, error) {
+	var balance btcutil.Amount
+	err := walletdb.View(d.db, func(dbTx walletdb.ReadTx) error {
+		txmgrNs := dbTx.ReadBucket(wtxmgrNamespaceKey)
+		syncBlock := d.addrStore.SyncedTo()
+		var err error
+		balance, err = calculateBalance(txmgrNs, minConfirms, syncBlock.Height, d.addrStore.ChainParams())
+		return err
+	})
+	return balance, err
 }
 
 // ============================================================================
