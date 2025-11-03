@@ -18,7 +18,6 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
-	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
@@ -146,23 +145,27 @@ func NewKvdbStore(db walletdb.DB, addrStore *waddrmgr.Manager) *KvdbStore {
 	}
 }
 
-// A compile-time check to ensure that KvdbStore implements the Store interface.
-var _ Store = (*KvdbStore)(nil)
+// A compile-time check to ensure that KvdbStore implements the granular store interfaces.
+var _ WalletStore = (*KvdbStore)(nil)
+var _ AccountStore = (*KvdbStore)(nil)
+var _ AddressStore = (*KvdbStore)(nil)
+var _ TxStore = (*KvdbStore)(nil)
+var _ UTXOStore = (*KvdbStore)(nil)
 
 // ============================================================================
 // WalletStore Implementation
 // ============================================================================
 
 // CreateWallet is a placeholder for the CreateWallet method.
-func (d *KvdbStore) CreateWallet(ctx context.Context, params CreateWalletParams) (uint64, error) {
+func (d *KvdbStore) CreateWallet(ctx context.Context, params CreateWalletParams) (*WalletInfo, error) {
 	// TODO(yy): implement
-	return 0, nil
+	return nil, nil
 }
 
 // GetWallet is a placeholder for the GetWallet method.
-func (d *KvdbStore) GetWallet(ctx context.Context, name string) (WalletInfo, error) {
+func (d *KvdbStore) GetWallet(ctx context.Context, name string) (*WalletInfo, error) {
 	// TODO(yy): implement
-	return WalletInfo{}, nil
+	return nil, nil
 }
 
 // ListWallets is a placeholder for the ListWallets method.
@@ -178,7 +181,7 @@ func (d *KvdbStore) UpdateWallet(ctx context.Context, params UpdateWalletParams)
 }
 
 // GetEncryptedHDSeed returns the encrypted HD seed of the wallet.
-func (d *KvdbStore) GetEncryptedHDSeed(ctx context.Context) ([]byte, error) {
+func (d *KvdbStore) GetEncryptedHDSeed(ctx context.Context, walletID uint64) ([]byte, error) {
 	var encryptedSeed []byte
 	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
@@ -192,21 +195,22 @@ func (d *KvdbStore) GetEncryptedHDSeed(ctx context.Context) ([]byte, error) {
 }
 
 // ChangePassphrase changes the passphrase of the wallet.
-func (d *KvdbStore) ChangePassphrase(ctx context.Context, old, new []byte, private bool) error {
+func (d *KvdbStore) ChangePassphrase(ctx context.Context, params ChangePassphraseParams) error {
 	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 		// Get the encrypted keys and params from the address manager.
 		encPubKey, encPrivKey, encScriptKey, masterKeyParams, err :=
 			d.addrStore.PrepareChangePassphrase(
-				old, new, private, &waddrmgr.DefaultScryptOptions,
+				params.OldPassphrase, params.NewPassphrase,
+				params.IsPrivate, &waddrmgr.DefaultScryptOptions,
 			)
 		if err != nil {
 			return err
 		}
 
 		// Write the new keys and params to the database.
-		if private {
+		if params.IsPrivate {
 			err = PutCryptoKeys(addrmgrNs, nil, encPrivKey, encScriptKey)
 			if err != nil {
 				return err
@@ -227,7 +231,7 @@ func (d *KvdbStore) ChangePassphrase(ctx context.Context, old, new []byte, priva
 // ============================================================================
 
 // CreateAccount creates a new account and returns its properties.
-func (d *KvdbStore) CreateAccount(ctx context.Context, params CreateAccountParams) (AccountInfo, error) {
+func (d *KvdbStore) CreateAccount(ctx context.Context, params CreateAccountParams) (*AccountInfo, error) {
 	var info AccountInfo
 	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
@@ -262,15 +266,16 @@ func (d *KvdbStore) CreateAccount(ctx context.Context, params CreateAccountParam
 			ExternalKeyCount: props.ExternalKeyCount,
 			InternalKeyCount: props.InternalKeyCount,
 			ImportedKeyCount: props.ImportedKeyCount,
+			KeyScope:         toDBKeyScope(scope),
 			// Balances will be zero for a new account.
 		}
 		return nil
 	})
 	if err != nil {
-		return AccountInfo{}, err
+		return nil, err
 	}
 
-	return info, nil
+	return &info, nil
 }
 
 // ImportAccount is a placeholder for the ImportAccount method.
@@ -280,20 +285,24 @@ func (d *KvdbStore) ImportAccount(ctx context.Context, params ImportAccountParam
 }
 
 // GetAccount retrieves the details for a specific account.
-func (d *KvdbStore) GetAccount(ctx context.Context, query GetAccountQuery) (AccountInfo, error) {
+func (d *KvdbStore) GetAccount(ctx context.Context, query GetAccountQuery) (*AccountInfo, error) {
 	var info AccountInfo
 	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		scope := fromDBKeyScope(query.Scope)
 
 		// Look up the account number for the given name and scope.
-		_, accNum, err := d.addrStore.LookupAccount(addrmgrNs, *query.Name)
+		scopedMgr, err := d.addrStore.FetchScopedKeyManager(scope)
+		if err != nil {
+			return err
+		}
+		accNum, err := scopedMgr.LookupAccount(addrmgrNs, *query.Name)
 		if err != nil {
 			return err
 		}
 
 		// Retrieve the static properties for the account.
-		row, err := FetchAccountInfo(addrmgrNs, &scope, accNum)
+		props, err := scopedMgr.AccountProperties(addrmgrNs, accNum)
 		if err != nil {
 			return err
 		}
@@ -306,21 +315,14 @@ func (d *KvdbStore) GetAccount(ctx context.Context, query GetAccountQuery) (Acco
 			return err
 		}
 
-		switch row := row.(type) {
-		case *DbDefaultAccountRow:
-			info = AccountInfo{
-				AccountNumber:    accNum,
-				AccountName:      row.Name,
-				ExternalKeyCount: row.NextExternalIndex,
-				InternalKeyCount: row.NextInternalIndex,
-			}
-		case *DbWatchOnlyAccountRow:
-			info = AccountInfo{
-				AccountNumber:    accNum,
-				AccountName:      row.Name,
-				ExternalKeyCount: row.NextExternalIndex,
-				InternalKeyCount: row.NextInternalIndex,
-			}
+		info = AccountInfo{
+			AccountNumber:    accNum,
+			AccountName:      props.AccountName,
+			ExternalKeyCount: props.ExternalKeyCount,
+			InternalKeyCount: props.InternalKeyCount,
+			ImportedKeyCount: props.ImportedKeyCount,
+			IsWatchOnly:      props.IsWatchOnly,
+			KeyScope:         toDBKeyScope(props.KeyScope),
 		}
 
 		// Assign the balances to the account result.
@@ -332,10 +334,10 @@ func (d *KvdbStore) GetAccount(ctx context.Context, query GetAccountQuery) (Acco
 		return nil
 	})
 	if err != nil {
-		return AccountInfo{}, err
+		return nil, err
 	}
 
-	return info, nil
+	return &info, nil
 }
 
 // ListAccounts retrieves a list of all accounts, optionally filtered by
@@ -378,9 +380,9 @@ func (d *KvdbStore) ListAccounts(ctx context.Context, query ListAccountsQuery) (
 			// If a name filter is provided, only include accounts
 			// that match.
 			if query.Name != nil {
-				for _, acc := range scopedAccounts {
-					if acc.AccountName == *query.Name {
-						accounts = append(accounts, acc)
+				for i := range scopedAccounts {
+					if scopedAccounts[i].AccountName == *query.Name {
+						accounts = append(accounts, scopedAccounts[i])
 					}
 				}
 			} else {
@@ -414,13 +416,13 @@ func (d *KvdbStore) NewAddress(ctx context.Context, params NewAddressParams) (bt
 }
 
 // ImportAddress is a placeholder for the ImportAddress method.
-func (d *KvdbStore) ImportAddress(ctx context.Context, params ImportAddressParams) (AddressInfo, error) {
+func (d *KvdbStore) ImportAddress(ctx context.Context, params ImportAddressParams) (*AddressInfo, error) {
 	// TODO(yy): implement
-	return AddressInfo{}, nil
+	return nil, nil
 }
 
 // GetAddress retrieves the details for a specific address.
-func (d *KvdbStore) GetAddress(ctx context.Context, query GetAddressQuery) (AddressInfo, error) {
+func (d *KvdbStore) GetAddress(ctx context.Context, query GetAddressQuery) (*AddressInfo, error) {
 	var managedAddress waddrmgr.ManagedAddress
 	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
@@ -429,10 +431,11 @@ func (d *KvdbStore) GetAddress(ctx context.Context, query GetAddressQuery) (Addr
 		return err
 	})
 	if err != nil {
-		return AddressInfo{}, err
+		return nil, err
 	}
 
-	return toDBAddressInfo(managedAddress), nil
+	info := toDBAddressInfo(managedAddress)
+	return &info, nil
 }
 
 // ListAddresses lists all addresses for a given account.
@@ -477,17 +480,17 @@ func (d *KvdbStore) MarkAddressAsUsed(ctx context.Context, params MarkAddressAsU
 // method is ONLY valid for addresses that were imported with a private
 // key. It will return an error for derived HD addresses and watch-only
 // imports.
-func (d *KvdbStore) GetPrivateKey(ctx context.Context, addr btcutil.Address) (*btcec.PrivateKey, error) {
+func (d *KvdbStore) GetPrivateKey(ctx context.Context, params GetPrivateKeyParams) (*btcec.PrivateKey, error) {
 	var privKey *btcec.PrivateKey
 	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		ma, err := d.addrStore.Address(addrmgrNs, addr)
+		ma, err := d.addrStore.Address(addrmgrNs, params.Address)
 		if err != nil {
 			return err
 		}
 		mpka, ok := ma.(waddrmgr.ManagedPubKeyAddress)
 		if !ok {
-			return fmt.Errorf("managed address type for %v is `%T` but want waddrmgr.ManagedPubKeyAddress", addr, ma)
+			return fmt.Errorf("managed address type for %v is `%T` but want waddrmgr.ManagedPubKeyAddress", params.Address, ma)
 		}
 		privKey, err = mpka.PrivKey()
 		if err != nil {
@@ -569,13 +572,14 @@ func (d *KvdbStore) CreateTx(ctx context.Context, params CreateTxParams) error {
 
 // UpdateTx is a placeholder for the UpdateTx method.
 func (d *KvdbStore) UpdateTx(ctx context.Context, params UpdateTxParams) error {
-	txHash := params.TxHash
+	txid := params.Txid
 	return walletdb.Update(d.db, func(dbTx walletdb.ReadWriteTx) error {
 		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
 
 		// If a label is provided, update the transaction label.
-		if len(params.Data.Label) != 0 {
-			if len(params.Data.Label) > TxLabelLimit {
+		if params.Label != nil {
+			label := *params.Label
+			if len(label) > TxLabelLimit {
 				return errors.New("label too long")
 			}
 
@@ -586,31 +590,36 @@ func (d *KvdbStore) UpdateTx(ctx context.Context, params UpdateTxParams) error {
 				return err
 			}
 
-			labelLen := uint16(len(params.Data.Label))
+			labelLen := uint16(len(label))
 			var buf bytes.Buffer
 			var b [2]byte
 			binary.BigEndian.PutUint16(b[:], labelLen)
 			if _, err := buf.Write(b[:]); err != nil {
 				return err
 			}
-			if _, err := buf.WriteString(params.Data.Label); err != nil {
+			if _, err := buf.WriteString(label); err != nil {
 				return err
 			}
-			err = labelsBucket.Put(txHash[:], buf.Bytes())
+			err = labelsBucket.Put(txid[:], buf.Bytes())
 			if err != nil {
 				return err
 			}
 		}
 
-		// TODO(yy): update block meta
+		// If block metadata is provided, update the transaction's block
+		// information.
+		if params.Block != nil {
+			// TODO(yy): update block meta
+		}
+
 		return nil
 	})
 }
 
 // GetTx is a placeholder for the GetTx method.
-func (d *KvdbStore) GetTx(ctx context.Context, query GetTxQuery) (TxInfo, error) {
+func (d *KvdbStore) GetTx(ctx context.Context, query GetTxQuery) (*TxInfo, error) {
 	// TODO(yy): implement
-	return TxInfo{}, nil
+	return nil, nil
 }
 
 // ListTxns is a placeholder for the ListTxns method.
@@ -639,7 +648,7 @@ func (d *KvdbStore) ListTxns(ctx context.Context, query ListTxnsQuery) ([]TxInfo
 					Hash:       txRec.Hash,
 					SerializedTx: txRec.SerializedTx,
 					Received:   txRec.Received,
-					Block:      BlockMeta{Height: -1},
+					Block:      Block{Height: -1},
 				})
 				return nil
 			})
@@ -659,12 +668,11 @@ func (d *KvdbStore) DeleteTx(ctx context.Context, params DeleteTxParams) error {
 	return walletdb.Update(d.db, func(dbTx walletdb.ReadWriteTx) error {
 		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
 
-		txRec, err := wtxmgr.NewTxRecordFromMsgTx(params.Tx, time.Now())
-		if err != nil {
-			return err
-		}
-
-		return removeConflict(txmgrNs, txRec)
+		// TODO(yy): The removeConflict function in wtxmgr requires a
+		// full TxRecord. We should consider updating it to accept just
+		// a txid to avoid the need to fetch the full transaction here.
+		// For now, we will just remove the tx from the unmined bucket.
+		return txmgrNs.NestedReadWriteBucket(bucketUnmined).Delete(params.Txid[:])
 	})
 }
 
@@ -682,9 +690,9 @@ func (d *KvdbStore) RollbackToBlock(ctx context.Context, height int32) error {
 // ============================================================================
 
 // GetUtxo is a placeholder for the GetUtxo method.
-func (d *KvdbStore) GetUtxo(ctx context.Context, query GetUtxoQuery) (UtxoInfo, error) {
+func (d *KvdbStore) GetUtxo(ctx context.Context, query GetUtxoQuery) (*UtxoInfo, error) {
 	// TODO(yy): implement
-	return UtxoInfo{}, nil
+	return nil, nil
 }
 
 // ListUTXOs returns all unspent transaction outputs.
@@ -717,29 +725,41 @@ func (d *KvdbStore) ListUTXOs(ctx context.Context, query ListUtxosQuery) ([]Utxo
 }
 
 // LeaseOutput locks an output for a given duration.
-func (d *KvdbStore) LeaseOutput(ctx context.Context, id LockID, op wire.OutPoint,
-	duration time.Duration) (time.Time, error) {
+func (d *KvdbStore) LeaseOutput(ctx context.Context, params LeaseOutputParams) (*LeasedOutput, error) {
 	var expiration time.Time
 	err := walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 		var err error
-		expiration, err = wtxmgr.LockOutput(txmgrNs, wtxmgr.LockID(id), op, duration)
+		expiration, err = wtxmgr.LockOutput(
+			txmgrNs, wtxmgr.LockID(params.ID), params.OutPoint,
+			params.Duration,
+		)
 		return err
 	})
-	return expiration, err
+	if err != nil {
+		return nil, err
+	}
+
+	return &LeasedOutput{
+		OutPoint:   params.OutPoint,
+		LockID:     LockID(params.ID),
+		Expiration: expiration,
+	}, nil
 }
 
 // ReleaseOutput unlocks a previously leased output.
-func (d *KvdbStore) ReleaseOutput(ctx context.Context, id LockID, op wire.OutPoint) error {
+func (d *KvdbStore) ReleaseOutput(ctx context.Context, params ReleaseOutputParams) error {
 	return walletdb.Update(d.db, func(tx walletdb.ReadWriteTx) error {
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		return wtxmgr.UnlockOutput(txmgrNs, wtxmgr.LockID(id), op)
+		return wtxmgr.UnlockOutput(
+			txmgrNs, wtxmgr.LockID(params.ID), params.OutPoint,
+		)
 	})
 }
 
 // ListLeasedOutputs returns a list of all currently leased outputs.
-func (d *KvdbStore) ListLeasedOutputs(ctx context.Context) ([]*LeasedOutput, error) {
-	var leasedOutputs []*LeasedOutput
+func (d *KvdbStore) ListLeasedOutputs(ctx context.Context, walletID uint64) ([]LeasedOutput, error) {
+	var leasedOutputs []LeasedOutput
 	err := walletdb.View(d.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
 		wtxLeasedOutputs, err := wtxmgr.ListLockedOutputs(txmgrNs)
@@ -747,9 +767,9 @@ func (d *KvdbStore) ListLeasedOutputs(ctx context.Context) ([]*LeasedOutput, err
 			return err
 		}
 
-		leasedOutputs = make([]*LeasedOutput, len(wtxLeasedOutputs))
+		leasedOutputs = make([]LeasedOutput, len(wtxLeasedOutputs))
 		for i, wtxLeasedOutput := range wtxLeasedOutputs {
-			leasedOutputs[i] = &LeasedOutput{
+			leasedOutputs[i] = LeasedOutput{
 				OutPoint:   wtxLeasedOutput.Outpoint,
 				LockID:     LockID(wtxLeasedOutput.LockID),
 				Expiration: wtxLeasedOutput.Expiration,
@@ -761,13 +781,16 @@ func (d *KvdbStore) ListLeasedOutputs(ctx context.Context) ([]*LeasedOutput, err
 }
 
 // Balance returns the spendable wallet balance.
-func (d *KvdbStore) Balance(ctx context.Context, minConfirms int32) (btcutil.Amount, error) {
+func (d *KvdbStore) Balance(ctx context.Context, params BalanceParams) (btcutil.Amount, error) {
 	var balance btcutil.Amount
 	err := walletdb.View(d.db, func(dbTx walletdb.ReadTx) error {
 		txmgrNs := dbTx.ReadBucket(wtxmgrNamespaceKey)
 		syncBlock := d.addrStore.SyncedTo()
 		var err error
-		balance, err = calculateBalance(txmgrNs, minConfirms, syncBlock.Height, d.addrStore.ChainParams())
+		balance, err = calculateBalance(
+			txmgrNs, params.MinConfirms, syncBlock.Height,
+			d.addrStore.ChainParams(),
+		)
 		return err
 	})
 	return balance, err
@@ -915,6 +938,8 @@ func listAccountsWithBalances(scopeMgr waddrmgr.AccountStore,
 			ImportedKeyCount:   props.ImportedKeyCount,
 			ConfirmedBalance:   balance.confirmed,
 			UnconfirmedBalance: balance.unconfirmed,
+			IsWatchOnly:        props.IsWatchOnly,
+			KeyScope:           toDBKeyScope(props.KeyScope),
 		})
 	}
 
@@ -950,40 +975,42 @@ func toDBKeyScope(scope waddrmgr.KeyScope) KeyScope {
 }
 
 func toDBAddressInfo(addr waddrmgr.ManagedAddress) AddressInfo {
-	pubKeyAddr, ok := addr.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
-		return AddressInfo{
-			Address:    addr.Address(),
-			Internal:   addr.Internal(),
-			Compressed: addr.Compressed(),
-			Used:       addr.Used(nil), // This is a simplification
-			AddrType:   AddressType(addr.AddrType()),
-		}
-	}
-
-	scope, derivInfo, ok := pubKeyAddr.DerivationInfo()
-	if !ok {
-		return AddressInfo{
-			Address:    addr.Address(),
-			Internal:   addr.Internal(),
-			Compressed: addr.Compressed(),
-			Used:       addr.Used(nil), // This is a simplification
-			AddrType:   AddressType(addr.AddrType()),
-		}
-	}
-
-	return AddressInfo{
+	info := AddressInfo{
 		Address:    addr.Address(),
 		Internal:   addr.Internal(),
 		Compressed: addr.Compressed(),
 		Used:       addr.Used(nil), // This is a simplification
 		AddrType:   AddressType(addr.AddrType()),
-		DerivationInfo: DerivationInfo{
+	}
+
+	// Check if the address is a public key address, which is required for
+	// derivation info and watch-only status.
+	pubKeyAddr, ok := addr.(waddrmgr.ManagedPubKeyAddress)
+	if !ok {
+		// For other address types (like scripts), we can consider them
+		// watch-only by default as they don't have a private key in the
+		// same way.
+		info.IsWatchOnly = true
+		return info
+	}
+
+	// Determine if the address is watch-only by checking for the private
+	// key.
+	_, err := pubKeyAddr.PrivKey()
+	info.IsWatchOnly = err != nil
+
+	// If derivation info is available, populate it. Otherwise, it will
+	// remain nil, correctly indicating an imported address.
+	scope, derivInfo, ok := pubKeyAddr.DerivationInfo()
+	if ok {
+		info.DerivationInfo = &DerivationInfo{
 			KeyScope:             toDBKeyScope(scope),
 			MasterKeyFingerprint: derivInfo.MasterKeyFingerprint,
 			Account:              derivInfo.Account,
 			Branch:               derivInfo.Branch,
 			Index:                derivInfo.Index,
-		},
+		}
 	}
+
+	return info
 }
