@@ -685,26 +685,6 @@ type DeleteTxParams struct {
 	Txid chainhash.Hash
 }
 
-// Credit represents a transaction output that is controlled by the wallet.
-type Credit struct {
-	// OutPoint is the outpoint of the credit.
-	OutPoint wire.OutPoint
-
-	// Amount is the value of the credit.
-	Amount btcutil.Amount
-
-	// PkScript is the public key script of the credit.
-	PkScript []byte
-}
-
-// Debit represents a transaction input that spends a previous wallet output.
-type Debit struct {
-	// TxIn is the transaction input.
-	TxIn wire.TxIn
-
-	// Amount is the value of the input.
-	Amount btcutil.Amount
-}
 
 // --------------------
 // UTXOStore Types
@@ -732,14 +712,6 @@ type UtxoInfo struct {
 	Height int32
 }
 
-// CreateUtxoParams contains the parameters for creating a new UTXO record.
-type CreateUtxoParams struct {
-	// WalletID is the ID of the wallet to create the UTXO in.
-	WalletID uint64
-
-	// Utxo is the UTXO to record.
-	Utxo UtxoInfo
-}
 
 // GetUtxoQuery contains the parameters for querying a UTXO.
 type GetUtxoQuery struct {
@@ -747,15 +719,6 @@ type GetUtxoQuery struct {
 	WalletID uint64
 
 	// OutPoint is the outpoint of the UTXO to query.
-	OutPoint wire.OutPoint
-}
-
-// DeleteUtxoParams contains the parameters for deleting a UTXO record.
-type DeleteUtxoParams struct {
-	// WalletID is the ID of the wallet containing the UTXO.
-	WalletID uint64
-
-	// OutPoint is the outpoint of the UTXO to delete.
 	OutPoint wire.OutPoint
 }
 
