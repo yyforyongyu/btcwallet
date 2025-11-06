@@ -24,6 +24,19 @@ import (
 var (
 	// ErrNoChangeOutput indicates a transaction has no change output.
 	ErrNoChangeOutput = errors.New("transaction has no change output")
+
+	// ErrPsbtInputMismatch indicates that a PSBT input's UTXO information
+	// does not match the wallet's records.
+	ErrPsbtInputMismatch = errors.New("PSBT input UTXO mismatch")
+
+	// ErrInputNotFound indicates that a transaction input was not found.
+	ErrInputNotFound = errors.New("input not found")
+
+	// ErrUnableToDetermineUtxo indicates that the UTXO for a PSBT input
+	// could not be determined.
+	ErrUnableToDetermineUtxo = errors.New(
+		"unable to determine UTXO for input",
+	)
 )
 
 // FundPsbt creates a fully populated PSBT packet that contains enough inputs to
@@ -500,111 +513,15 @@ func (w *Wallet) FinalizePsbt(keyScope *waddrmgr.KeyScope, account uint32,
 	// cannot sign because it's not our UTXO, this will be a hard failure.
 	tx := packet.UnsignedTx
 	sigHashes := txscript.NewTxSigHashes(tx, PsbtPrevOutputFetcher(packet))
-	for idx, txIn := range tx.TxIn {
-		in := packet.Inputs[idx]
-
-		// We can only sign if we have UTXO information available. We
-		// can just continue here as a later step will fail with a more
-		// precise error message.
-		if in.WitnessUtxo == nil && in.NonWitnessUtxo == nil {
-			continue
-		}
-
-		// Skip this input if it's got final witness data attached.
-		if len(in.FinalScriptWitness) > 0 {
-			continue
-		}
-
-		// We can only sign this input if it's ours, so we try to map it
-		// to a coin we own. If we can't, then we'll continue as it
-		// isn't our input.
-		fullTx, txOut, _, _, err := w.FetchInputInfo(
-			&txIn.PreviousOutPoint,
+	for i := range tx.TxIn {
+		err := w.finalizeInput(
+			keyScope, account, tx.TxIn[i], &packet.Inputs[i],
+			tx, sigHashes,
 		)
 		if err != nil {
-			continue
+			return fmt.Errorf("error finalizing input %d: %w",
+				i, err)
 		}
-
-		// Find out what UTXO we are signing. Wallets _should_ always
-		// provide the full non-witness UTXO for segwit v0.
-		var signOutput *wire.TxOut
-		if in.NonWitnessUtxo != nil {
-			prevIndex := txIn.PreviousOutPoint.Index
-			signOutput = in.NonWitnessUtxo.TxOut[prevIndex]
-
-			if !psbt.TxOutsEqual(txOut, signOutput) {
-				return fmt.Errorf("found UTXO %#v but it "+
-					"doesn't match PSBT's input %v", txOut,
-					signOutput)
-			}
-
-			if fullTx.TxHash() != txIn.PreviousOutPoint.Hash {
-				return fmt.Errorf("found UTXO tx %v but it "+
-					"doesn't match PSBT's input %v",
-					fullTx.TxHash(),
-					txIn.PreviousOutPoint.Hash)
-			}
-		}
-
-		// Fall back to witness UTXO only for older wallets.
-		if in.WitnessUtxo != nil {
-			signOutput = in.WitnessUtxo
-
-			if !psbt.TxOutsEqual(txOut, signOutput) {
-				return fmt.Errorf("found UTXO %#v but it "+
-					"doesn't match PSBT's input %v", txOut,
-					signOutput)
-			}
-		}
-
-		// Finally, if the input doesn't belong to a watch-only account,
-		// then we'll sign it as is, and populate the input with the
-		// witness and sigScript (if needed).
-		watchOnly := false
-		err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-			ns := tx.ReadBucket(waddrmgrNamespaceKey)
-			var err error
-			if keyScope == nil {
-				// If a key scope wasn't specified, then coin
-				// selection was performed from the default
-				// wallet accounts (NP2WKH, P2WKH, P2TR), so any
-				// key scope provided doesn't impact the result
-				// of this call.
-				watchOnly, err = w.addrStore.IsWatchOnlyAccount(
-					ns, waddrmgr.KeyScopeBIP0084, account,
-				)
-			} else {
-				watchOnly, err = w.addrStore.IsWatchOnlyAccount(
-					ns, *keyScope, account,
-				)
-			}
-			return err
-		})
-		if err != nil {
-			return fmt.Errorf("unable to determine if account is "+
-				"watch-only: %w", err)
-		}
-		if watchOnly {
-			continue
-		}
-
-		witness, sigScript, err := w.ComputeInputScript(
-			tx, signOutput, idx, sigHashes, in.SighashType, nil,
-		)
-		if err != nil {
-			return fmt.Errorf("error computing input script for "+
-				"input %d: %w", idx, err)
-		}
-
-		// Serialize the witness format from the stack representation to
-		// the wire representation.
-		var witnessBytes bytes.Buffer
-		err = psbt.WriteTxWitness(&witnessBytes, witness)
-		if err != nil {
-			return fmt.Errorf("error serializing witness: %w", err)
-		}
-		packet.Inputs[idx].FinalScriptWitness = witnessBytes.Bytes()
-		packet.Inputs[idx].FinalScriptSig = sigScript
 	}
 
 	// Make sure the PSBT itself thinks it's finalized and ready to be
@@ -615,6 +532,176 @@ func (w *Wallet) FinalizePsbt(keyScope *waddrmgr.KeyScope, account uint32,
 	}
 
 	return nil
+}
+
+// finalizeInput is a helper function that finalizes a single PSBT input.
+func (w *Wallet) finalizeInput(keyScope *waddrmgr.KeyScope, account uint32,
+	txIn *wire.TxIn, pInput *psbt.PInput, tx *wire.MsgTx,
+	sigHashes *txscript.TxSigHashes) error {
+
+	if shouldSkipInput(pInput) {
+		return nil
+	}
+
+	// We can only sign this input if it's ours, so we try to map it
+	// to a coin we own. If we can't, then we'll continue as it
+	// isn't our input.
+	_, txOut, _, _, err := w.FetchInputInfo( //nolint:dogsled
+		&txIn.PreviousOutPoint,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Find out what UTXO we are signing. Wallets _should_ always
+	// provide the full non-witness UTXO for segwit v0.
+	signOutput, err := getSignOutputAndVerify(pInput, txIn, txOut)
+	if err != nil {
+		return err
+	}
+
+	// Finally, if the input doesn't belong to a watch-only account,
+	// then we'll sign it as is, and populate the input with the
+	// witness and sigScript (if needed).
+	watchOnly, err := w.isWatchOnlyAccount(keyScope, account)
+	if err != nil {
+		return err
+	}
+
+	if watchOnly {
+		return nil
+	}
+
+	idx, err := findInputIndex(tx, txIn)
+	if err != nil {
+		return fmt.Errorf("%w: input not found in tx", ErrInputNotFound)
+	}
+
+	witness, sigScript, err := w.ComputeInputScript(
+		tx, signOutput, idx, sigHashes, pInput.SighashType, nil,
+	)
+	if err != nil {
+		return fmt.Errorf("error computing input script for "+
+			"input %d: %w", idx, err)
+	}
+
+	// Serialize the witness format from the stack representation to
+	// the wire representation.
+	var witnessBytes bytes.Buffer
+
+	err = psbt.WriteTxWitness(&witnessBytes, witness)
+	if err != nil {
+		return fmt.Errorf("error serializing witness: %w", err)
+	}
+
+	pInput.FinalScriptWitness = witnessBytes.Bytes()
+	pInput.FinalScriptSig = sigScript
+
+	return nil
+}
+
+// findInputIndex finds the index of a transaction input within a transaction.
+func findInputIndex(tx *wire.MsgTx, txIn *wire.TxIn) (int, error) {
+	idx := -1
+	for i, in := range tx.TxIn {
+		if in.PreviousOutPoint == txIn.PreviousOutPoint {
+			idx = i
+			break
+		}
+	}
+
+	if idx == -1 {
+		return -1, ErrInputNotFound
+	}
+
+	return idx, nil
+}
+
+// isWatchOnlyAccount checks if the given account is a watch-only account.
+func (w *Wallet) isWatchOnlyAccount(keyScope *waddrmgr.KeyScope,
+	account uint32) (bool, error) {
+
+	watchOnly := false
+
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+
+		var err error
+		if keyScope == nil {
+			// If a key scope wasn't specified, then coin
+			// selection was performed from the default
+			// wallet accounts (NP2WKH, P2WKH, P2TR), so any
+			// key scope provided doesn't impact the result
+			// of this call.
+			watchOnly, err = w.addrStore.IsWatchOnlyAccount(
+				ns, waddrmgr.KeyScopeBIP0084, account,
+			)
+		} else {
+			watchOnly, err = w.addrStore.IsWatchOnlyAccount(
+				ns, *keyScope, account,
+			)
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to check if account "+
+				"is watch-only: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("unable to determine if account is "+
+			"watch-only: %w", err)
+	}
+
+	return watchOnly, nil
+}
+
+// getSignOutputAndVerify determines the UTXO to be signed for a PSBT input
+// and verifies it against the wallet's record of the UTXO.
+func getSignOutputAndVerify(pInput *psbt.PInput, txIn *wire.TxIn,
+	txOut *wire.TxOut) (*wire.TxOut, error) {
+
+	var signOutput *wire.TxOut
+	if pInput.NonWitnessUtxo != nil {
+		signOutput = pInput.NonWitnessUtxo.TxOut[
+		txIn.PreviousOutPoint.Index,
+	]
+	} else if pInput.WitnessUtxo != nil {
+		signOutput = pInput.WitnessUtxo
+	}
+
+	if signOutput == nil {
+		return nil, fmt.Errorf("%w for input %v",
+			ErrUnableToDetermineUtxo, txIn.PreviousOutPoint)
+	}
+
+	if !psbt.TxOutsEqual(txOut, signOutput) {
+		return nil, fmt.Errorf("%w: found UTXO %#v but it "+
+			"doesn't match PSBT's input %v",
+			ErrPsbtInputMismatch, txOut, signOutput)
+	}
+
+	return signOutput, nil
+}
+
+// shouldSkipInput determines if a PSBT input should be skipped during
+// finalization. It returns true if the input has no UTXO information or
+// already has final witness data attached.
+func shouldSkipInput(pInput *psbt.PInput) bool {
+	// We can only sign if we have UTXO information available. We
+	// can just continue here as a later step will fail with a more
+	// precise error message.
+	if pInput.WitnessUtxo == nil && pInput.NonWitnessUtxo == nil {
+		return true
+	}
+
+	// Skip this input if it's got final witness data attached.
+	if len(pInput.FinalScriptWitness) > 0 {
+		return true
+	}
+
+	return false
 }
 
 // PsbtPrevOutputFetcher returns a txscript.PrevOutFetcher built from the UTXO
