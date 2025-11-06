@@ -21,6 +21,11 @@ import (
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
+var (
+	// ErrNoChangeOutput indicates a transaction has no change output.
+	ErrNoChangeOutput = errors.New("transaction has no change output")
+)
+
 // FundPsbt creates a fully populated PSBT packet that contains enough inputs to
 // fund the outputs specified in the passed in packet with the specified fee
 // rate. If there is change left, a change output from the wallet is added and
@@ -61,11 +66,8 @@ func (w *Wallet) FundPsbt(packet *psbt.Packet, keyScope *waddrmgr.KeyScope,
 			"input or output")
 	}
 
-	txOut := packet.UnsignedTx.TxOut
-	txIn := packet.UnsignedTx.TxIn
-
 	// Make sure none of the outputs are dust.
-	for _, output := range txOut {
+	for _, output := range packet.UnsignedTx.TxOut {
 		// When checking an output for things like dusty-ness, we'll
 		// use the default mempool relay fee rather than the target
 		// effective fee rate to ensure accuracy. Otherwise, we may
@@ -79,157 +81,39 @@ func (w *Wallet) FundPsbt(packet *psbt.Packet, keyScope *waddrmgr.KeyScope,
 
 	// Let's find out the amount to fund first.
 	amt := int64(0)
-	for _, output := range txOut {
+	for _, output := range packet.UnsignedTx.TxOut {
 		amt += output.Value
 	}
 
 	var tx *txauthor.AuthoredTx
 	switch {
 	// We need to do coin selection.
-	case len(txIn) == 0:
-		// We ask the underlying wallet to fund a TX for us. This
-		// includes everything we need, specifically fee estimation and
-		// change address creation.
-		tx, err = w.CreateSimpleTx(
-			keyScope, account, packet.UnsignedTx.TxOut, minConfs,
-			feeSatPerKB, coinSelectionStrategy, false,
-			optFuncs...,
+	case len(packet.UnsignedTx.TxIn) == 0:
+		tx, err = w.fundPsbtCoinSelect(
+			packet, keyScope, minConfs, account, feeSatPerKB,
+			coinSelectionStrategy, optFuncs...,
 		)
-		if err != nil {
-			return 0, fmt.Errorf("error creating funding TX: %w",
-				err)
-		}
-
-		// Copy over the inputs now then collect all UTXO information
-		// that we can and attach them to the PSBT as well. We don't
-		// include the witness as the resulting PSBT isn't expected not
-		// should be signed yet.
-		packet.UnsignedTx.TxIn = tx.Tx.TxIn
-		packet.Inputs = make([]psbt.PInput, len(packet.UnsignedTx.TxIn))
-
-		for idx := range packet.UnsignedTx.TxIn {
-			// We don't want to include the witness or any script
-			// on the unsigned TX just yet.
-			packet.UnsignedTx.TxIn[idx].Witness = wire.TxWitness{}
-			packet.UnsignedTx.TxIn[idx].SignatureScript = nil
-		}
-
-		err := w.DecorateInputs(packet, true)
-		if err != nil {
-			return 0, err
-		}
 
 	// If there are inputs, we need to check if they're sufficient and add
 	// a change output if necessary.
 	default:
-		// Make sure all inputs provided are actually ours.
-		packet.Inputs = make([]psbt.PInput, len(packet.UnsignedTx.TxIn))
+		tx, err = w.fundPsbtCompleteTx(
+			packet, keyScope, account, feeSatPerKB, optFuncs...,
+		)
+	}
 
-		for idx := range packet.UnsignedTx.TxIn {
-			// We don't want to include the witness or any script
-			// on the unsigned TX just yet.
-			packet.UnsignedTx.TxIn[idx].Witness = wire.TxWitness{}
-			packet.UnsignedTx.TxIn[idx].SignatureScript = nil
-		}
-
-		err := w.DecorateInputs(packet, true)
-		if err != nil {
-			return 0, err
-		}
-
-		// We can leverage the fee calculation of the txauthor package
-		// if we provide the selected UTXOs as a coin source. We just
-		// need to make sure we always return the full list of user-
-		// selected UTXOs rather than a subset, otherwise our change
-		// amount will be off (in case the user selected multiple UTXOs
-		// that are large enough on their own). That's why we use our
-		// own static input source creator instead of the more generic
-		// makeInputSource() that selects a subset that is "large
-		// enough".
-		credits := make([]wtxmgr.Credit, len(txIn))
-		for idx, in := range txIn {
-			utxo := packet.Inputs[idx].WitnessUtxo
-			credits[idx] = wtxmgr.Credit{
-				OutPoint: in.PreviousOutPoint,
-				Amount:   btcutil.Amount(utxo.Value),
-				PkScript: utxo.PkScript,
-			}
-		}
-		inputSource := constantInputSource(credits)
-
-		// Build the TxCreateOption to retrieve the change scope.
-		opts := defaultTxCreateOptions()
-		for _, optFunc := range optFuncs {
-			optFunc(opts)
-		}
-
-		if opts.changeKeyScope == nil {
-			opts.changeKeyScope = keyScope
-		}
-
-		// The addrMgrWithChangeSource function of the wallet creates a
-		// new change address. The address manager uses OnCommit on the
-		// walletdb tx to update the in-memory state of the account
-		// state. But because the commit happens _after_ the account
-		// manager internal lock has been released, there is a chance
-		// for the address index to be accessed concurrently, even
-		// though the closure in OnCommit re-acquires the lock. To avoid
-		// this issue, we surround the whole address creation process
-		// with a lock.
-		w.newAddrMtx.Lock()
-
-		// We also need a change source which needs to be able to insert
-		// a new change address into the database.
-		err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
-			_, changeSource, err := w.addrMgrWithChangeSource(
-				dbtx, opts.changeKeyScope, account,
-			)
-			if err != nil {
-				return err
-			}
-
-			// Ask the txauthor to create a transaction with our
-			// selected coins. This will perform fee estimation and
-			// add a change output if necessary.
-			tx, err = txauthor.NewUnsignedTransaction(
-				txOut, feeSatPerKB, inputSource, changeSource,
-			)
-			if err != nil {
-				return fmt.Errorf("fee estimation not "+
-					"successful: %w", err)
-			}
-
-			return nil
-		})
-		w.newAddrMtx.Unlock()
-
-		if err != nil {
-			return 0, fmt.Errorf("could not add change address to "+
-				"database: %w", err)
-		}
+	if err != nil {
+		return 0, err
 	}
 
 	// If there is a change output, we need to copy it over to the PSBT now.
-	var changeTxOut *wire.TxOut
-	if tx.ChangeIndex >= 0 {
-		changeTxOut = tx.Tx.TxOut[tx.ChangeIndex]
-		packet.UnsignedTx.TxOut = append(
-			packet.UnsignedTx.TxOut, changeTxOut,
-		)
-
-		addr, _, _, err := w.ScriptForOutputDeprecated(changeTxOut)
-		if err != nil {
-			return 0, fmt.Errorf("error querying wallet for "+
-				"change addr: %w", err)
+	changeTxOut, err := w.addChangeToPsbt(packet, tx)
+	if err != nil {
+		if errors.Is(err, ErrNoChangeOutput) {
+			changeTxOut = nil
+		} else {
+			return 0, err
 		}
-
-		changeOutputInfo, err := createOutputInfo(changeTxOut, addr)
-		if err != nil {
-			return 0, fmt.Errorf("error adding output info to "+
-				"change output: %w", err)
-		}
-
-		packet.Outputs = append(packet.Outputs, *changeOutputInfo)
 	}
 
 	// Now that we have the final PSBT ready, we can sort it according to
@@ -253,6 +137,177 @@ func (w *Wallet) FundPsbt(packet *psbt.Packet, keyScope *waddrmgr.KeyScope,
 	}
 
 	return changeIndex, nil
+}
+
+// addChangeToPsbt adds the change output from an authored transaction to a PSBT
+// packet, if a change output exists.
+func (w *Wallet) addChangeToPsbt(packet *psbt.Packet,
+	tx *txauthor.AuthoredTx) (*wire.TxOut, error) {
+
+	if tx.ChangeIndex < 0 {
+		return nil, ErrNoChangeOutput
+	}
+
+	changeTxOut := tx.Tx.TxOut[tx.ChangeIndex]
+	packet.UnsignedTx.TxOut = append(
+		packet.UnsignedTx.TxOut, changeTxOut,
+	)
+
+	addr, _, _, err := w.ScriptForOutputDeprecated(changeTxOut)
+	if err != nil {
+		return nil, fmt.Errorf("error querying wallet for "+
+			"change addr: %w", err)
+	}
+
+	changeOutputInfo, err := createOutputInfo(changeTxOut, addr)
+	if err != nil {
+		return nil, fmt.Errorf("error adding output info to "+
+			"change output: %w", err)
+	}
+
+	packet.Outputs = append(packet.Outputs, *changeOutputInfo)
+
+	return changeTxOut, nil
+}
+
+// fundPsbtCoinSelect is a helper function to fund a PSBT that does not have
+// any inputs yet. It will perform coin selection and add the selected inputs
+// to the PSBT.
+func (w *Wallet) fundPsbtCoinSelect(packet *psbt.Packet,
+	keyScope *waddrmgr.KeyScope, minConfs int32, account uint32,
+	feeSatPerKB btcutil.Amount, coinSelectionStrategy CoinSelectionStrategy,
+	optFuncs ...TxCreateOption) (*txauthor.AuthoredTx, error) {
+
+	// We ask the underlying wallet to fund a TX for us. This includes
+	// everything we need, specifically fee estimation and change address
+	// creation.
+	tx, err := w.CreateSimpleTx(
+		keyScope, account, packet.UnsignedTx.TxOut, minConfs,
+		feeSatPerKB, coinSelectionStrategy, false,
+		optFuncs...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error creating funding TX: %w", err)
+	}
+
+	// Copy over the inputs now then collect all UTXO information that we
+	// can and attach them to the PSBT as well. We don't include the
+	// witness as the resulting PSBT isn't expected not should be signed
+	// yet.
+	packet.UnsignedTx.TxIn = tx.Tx.TxIn
+	packet.Inputs = make([]psbt.PInput, len(packet.UnsignedTx.TxIn))
+
+	for idx := range packet.UnsignedTx.TxIn {
+		// We don't want to include the witness or any script on the
+		// unsigned TX just yet.
+		packet.UnsignedTx.TxIn[idx].Witness = wire.TxWitness{}
+		packet.UnsignedTx.TxIn[idx].SignatureScript = nil
+	}
+
+	err = w.DecorateInputs(packet, true)
+	if err != nil {
+		return nil, err
+	}
+
+	return tx, nil
+}
+
+// fundPsbtCompleteTx is a helper function to fund a PSBT that already has
+// inputs. It will check if the inputs are sufficient and add a change output
+// if necessary.
+func (w *Wallet) fundPsbtCompleteTx(packet *psbt.Packet,
+	keyScope *waddrmgr.KeyScope, account uint32,
+	feeSatPerKB btcutil.Amount,
+	optFuncs ...TxCreateOption) (*txauthor.AuthoredTx, error) {
+
+	// Make sure all inputs provided are actually ours.
+	packet.Inputs = make([]psbt.PInput, len(packet.UnsignedTx.TxIn))
+
+	for idx := range packet.UnsignedTx.TxIn {
+		// We don't want to include the witness or any script on the
+		// unsigned TX just yet.
+		packet.UnsignedTx.TxIn[idx].Witness = wire.TxWitness{}
+		packet.UnsignedTx.TxIn[idx].SignatureScript = nil
+	}
+
+	err := w.DecorateInputs(packet, true)
+	if err != nil {
+		return nil, err
+	}
+
+	// We can leverage the fee calculation of the txauthor package if we
+	// provide the selected UTXOs as a coin source. We just need to make
+	// sure we always return the full list of user-selected UTXOs rather
+	// than a subset, otherwise our change amount will be off (in case the
+	// user selected multiple UTXOs that are large enough on their own).
+	// That's why we use our own static input source creator instead of the
+	// more generic makeInputSource() that selects a subset that is "large
+	// enough".
+	credits := make([]wtxmgr.Credit, len(packet.UnsignedTx.TxIn))
+	for idx, in := range packet.UnsignedTx.TxIn {
+		utxo := packet.Inputs[idx].WitnessUtxo
+		credits[idx] = wtxmgr.Credit{
+			OutPoint: in.PreviousOutPoint,
+			Amount:   btcutil.Amount(utxo.Value),
+			PkScript: utxo.PkScript,
+		}
+	}
+
+	inputSource := constantInputSource(credits)
+
+	// Build the TxCreateOption to retrieve the change scope.
+	opts := defaultTxCreateOptions()
+	for _, optFunc := range optFuncs {
+		optFunc(opts)
+	}
+
+	if opts.changeKeyScope == nil {
+		opts.changeKeyScope = keyScope
+	}
+
+	// The addrMgrWithChangeSource function of the wallet creates a new
+	// change address. The address manager uses OnCommit on the walletdb tx
+	// to update the in-memory state of the account state. But because the
+	// commit happens _after_ the account manager internal lock has been
+	// released, there is a chance for the address index to be accessed
+	// concurrently, even though the closure in OnCommit re-acquires the
+	// lock. To avoid this issue, we surround the whole address creation
+	// process with a lock.
+	w.newAddrMtx.Lock()
+	defer w.newAddrMtx.Unlock()
+
+	// We also need a change source which needs to be able to insert a new
+	// change address into the database.
+	var tx *txauthor.AuthoredTx
+
+	err = walletdb.Update(w.db, func(dbtx walletdb.ReadWriteTx) error {
+		_, changeSource, err := w.addrMgrWithChangeSource(
+			dbtx, opts.changeKeyScope, account,
+		)
+		if err != nil {
+			return err
+		}
+
+		// Ask the txauthor to create a transaction with our selected
+		// coins. This will perform fee estimation and add a change
+		// output if necessary.
+		tx, err = txauthor.NewUnsignedTransaction(
+			packet.UnsignedTx.TxOut, feeSatPerKB, inputSource,
+			changeSource,
+		)
+		if err != nil {
+			return fmt.Errorf("fee estimation not successful: %w",
+				err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not add change address to "+
+			"database: %w", err)
+	}
+
+	return tx, nil
 }
 
 // DecorateInputs fetches the UTXO information of all inputs it can identify and
