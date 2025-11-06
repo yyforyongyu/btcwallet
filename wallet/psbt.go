@@ -315,43 +315,54 @@ func (w *Wallet) fundPsbtCompleteTx(packet *psbt.Packet,
 // boolean controls whether the method should return an error if it cannot
 // identify an input or if it should just skip it.
 func (w *Wallet) DecorateInputs(packet *psbt.Packet, failOnUnknown bool) error {
-	for idx := range packet.Inputs {
-		txIn := packet.UnsignedTx.TxIn[idx]
-
-		tx, utxo, derivationPath, _, err := w.FetchInputInfo(
-			&txIn.PreviousOutPoint,
-		)
-
-		switch {
-		// If the error just means it's not an input our wallet controls
-		// and the user doesn't care about that, then we can just skip
-		// this input and continue.
-		case errors.Is(err, ErrNotMine) && !failOnUnknown:
-			continue
-
-		case err != nil:
-			return fmt.Errorf("error fetching UTXO: %w", err)
-		}
-
-		addr, witnessProgram, _, err := w.ScriptForOutputDeprecated(
-			utxo,
+	for i := range packet.Inputs {
+		err := w.decorateInput(
+			packet.UnsignedTx.TxIn[i], &packet.Inputs[i],
+			failOnUnknown,
 		)
 		if err != nil {
-			return fmt.Errorf("error fetching UTXO script: %w", err)
+			return fmt.Errorf("error decorating input %d: %w",
+				i, err)
 		}
+	}
 
-		switch {
-		case txscript.IsPayToTaproot(utxo.PkScript):
-			addInputInfoSegWitV1(
-				&packet.Inputs[idx], utxo, derivationPath,
-			)
+	return nil
+}
 
-		default:
-			addInputInfoSegWitV0(
-				&packet.Inputs[idx], tx, utxo, derivationPath,
-				addr, witnessProgram,
-			)
-		}
+// decorateInput is a helper function that decorates a single PSBT input with
+// UTXO information from the wallet.
+func (w *Wallet) decorateInput(txIn *wire.TxIn, pInput *psbt.PInput,
+	failOnUnknown bool) error {
+
+	tx, utxo, derivationPath, _, err := w.FetchInputInfo(
+		&txIn.PreviousOutPoint,
+	)
+	switch {
+	case errors.Is(err, ErrNotMine) && !failOnUnknown:
+		return nil
+
+	case err != nil:
+		return fmt.Errorf("error fetching UTXO: %w", err)
+	}
+
+	addr, witnessProgram, _, err := w.ScriptForOutputDeprecated(
+		utxo,
+	)
+	if err != nil {
+		return fmt.Errorf("error fetching UTXO script: %w", err)
+	}
+
+	switch {
+	case txscript.IsPayToTaproot(utxo.PkScript):
+		addInputInfoSegWitV1(
+			pInput, utxo, derivationPath,
+		)
+
+	default:
+		addInputInfoSegWitV0(
+			pInput, tx, utxo, derivationPath,
+			addr, witnessProgram,
+		)
 	}
 
 	return nil
