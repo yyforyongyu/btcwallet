@@ -316,6 +316,30 @@ func (s *ScopedKeyManager) AddrSchema() ScopeAddrSchema {
 	return s.addrSchema
 }
 
+// AcctInfo returns a copy of the account info map.
+func (s *ScopedKeyManager) AcctInfo() map[uint32]*accountInfo {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	acctInfoCopy := make(map[uint32]*accountInfo, len(s.acctInfo))
+	for k, v := range s.acctInfo {
+		acctInfoCopy[k] = v
+	}
+	return acctInfoCopy
+}
+
+// Addrs returns a slice of all managed addresses.
+func (s *ScopedKeyManager) Addrs() []ManagedAddress {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	addrs := make([]ManagedAddress, 0, len(s.addrs))
+	for _, ma := range s.addrs {
+		addrs = append(addrs, ma)
+	}
+	return addrs
+}
+
 // zeroSensitivePublicData performs a best try effort to remove and zero all
 // sensitive public data associated with the address manager such as
 // hierarchical deterministic extended public keys and the crypto public keys.

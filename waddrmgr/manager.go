@@ -431,17 +431,16 @@ func (m *Manager) IsWatchOnlyAccount(ns walletdb.ReadBucket, keyScope KeyScope,
 func (m *Manager) lock() {
 	for _, manager := range m.scopedManagers {
 		// Clear all of the account private keys.
-		for _, acctInfo := range manager.acctInfo {
+		for _, acctInfo := range manager.AcctInfo() {
 			if acctInfo.acctKeyPriv != nil {
 				acctInfo.acctKeyPriv.Zero()
 			}
 			acctInfo.acctKeyPriv = nil
 		}
-	}
 
-	// Remove clear text private keys and scripts from all address entries.
-	for _, manager := range m.scopedManagers {
-		for _, ma := range manager.addrs {
+		// Remove clear text private keys and scripts from all address
+		// entries.
+		for _, ma := range manager.Addrs() {
 			switch addr := ma.(type) {
 			case *managedAddress:
 				addr.lock()
