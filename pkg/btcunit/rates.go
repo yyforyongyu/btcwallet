@@ -27,16 +27,16 @@ const (
 
 var (
 	// ZeroSatPerVByte is a fee rate of 0 sat/vb.
-	ZeroSatPerVByte = NewSatPerVByte(0, NewVByte(1))
+	ZeroSatPerVByte = NewSatPerVByte(0)
 
 	// ZeroSatPerKVByte is a fee rate of 0 sat/kvb.
-	ZeroSatPerKVByte = NewSatPerKVByte(0, NewKVByte(1))
+	ZeroSatPerKVByte = NewSatPerKVByte(0)
 
 	// ZeroSatPerKWeight is a fee rate of 0 sat/kw.
-	ZeroSatPerKWeight = NewSatPerKWeight(0, NewKWeightUnit(1))
+	ZeroSatPerKWeight = NewSatPerKWeight(0)
 
 	// ZeroSatPerWeight is a fee rate of 0 sat/wu.
-	ZeroSatPerWeight = NewSatPerWeight(0, NewWeightUnit(1))
+	ZeroSatPerWeight = NewSatPerWeight(0)
 )
 
 // baseFeeRate stores the canonical representation of a fee rate, which is
@@ -199,9 +199,13 @@ type SatPerVByte struct {
 	baseFeeRate
 }
 
-// NewSatPerVByte creates a new fee rate in sat/vb. The given fee and vbytes
-// are used to calculate the fee rate.
-func NewSatPerVByte(fee btcutil.Amount, vb VByte) SatPerVByte {
+// NewSatPerVByte creates a new fee rate in sat/vb.
+func NewSatPerVByte(rate btcutil.Amount) SatPerVByte {
+	return CalcSatPerVByte(rate, NewVByte(1))
+}
+
+// CalcSatPerVByte calculates the fee rate in sat/vb for a given fee and size.
+func CalcSatPerVByte(fee btcutil.Amount, vb VByte) SatPerVByte {
 	// The fee is provided in satoshis. To convert this to our internal
 	// canonical unit of satoshis per kilo-weight-unit (sat/kwu), we need
 	// to scale the numerator. Multiplying by `kilo` (1000) effectively
@@ -267,9 +271,13 @@ type SatPerKVByte struct {
 	baseFeeRate
 }
 
-// NewSatPerKVByte creates a new fee rate in sat/kvb. The given fee and
-// kvbytes are used to calculate the fee rate.
-func NewSatPerKVByte(fee btcutil.Amount, kvb KVByte) SatPerKVByte {
+// NewSatPerKVByte creates a new fee rate in sat/kvb.
+func NewSatPerKVByte(rate btcutil.Amount) SatPerKVByte {
+	return CalcSatPerKVByte(rate, NewKVByte(1))
+}
+
+// CalcSatPerKVByte calculates the fee rate in sat/kvb for a given fee and size.
+func CalcSatPerKVByte(fee btcutil.Amount, kvb KVByte) SatPerKVByte {
 	// The fee is provided in satoshis. To convert this to our internal
 	// canonical unit of satoshis per kilo-weight-unit (sat/kwu), we need
 	// to scale the numerator. Multiplying by `kilo` (1000) effectively
@@ -337,9 +345,13 @@ type SatPerKWeight struct {
 	baseFeeRate
 }
 
-// NewSatPerKWeight creates a new fee rate in sat/kw. The given fee and
-// kweight units are used to calculate the fee rate.
-func NewSatPerKWeight(fee btcutil.Amount, kwu KWeightUnit) SatPerKWeight {
+// NewSatPerKWeight creates a new fee rate in sat/kw.
+func NewSatPerKWeight(rate btcutil.Amount) SatPerKWeight {
+	return CalcSatPerKWeight(rate, NewKWeightUnit(1))
+}
+
+// CalcSatPerKWeight calculates the fee rate in sat/kw for a given fee and size.
+func CalcSatPerKWeight(fee btcutil.Amount, kwu KWeightUnit) SatPerKWeight {
 	// The fee is provided in satoshis. To convert this to our internal
 	// canonical unit of satoshis per kilo-weight-unit (sat/kwu), we need
 	// to scale the numerator. Multiplying by `kilo` (1000) is consistent
@@ -395,9 +407,13 @@ type SatPerWeight struct {
 	baseFeeRate
 }
 
-// NewSatPerWeight creates a new fee rate in sat/wu. The given fee and
-// weight units are used to calculate the fee rate.
-func NewSatPerWeight(fee btcutil.Amount, wu WeightUnit) SatPerWeight {
+// NewSatPerWeight creates a new fee rate in sat/wu.
+func NewSatPerWeight(rate btcutil.Amount) SatPerWeight {
+	return CalcSatPerWeight(rate, NewWeightUnit(1))
+}
+
+// CalcSatPerWeight calculates the fee rate in sat/wu for a given fee and size.
+func CalcSatPerWeight(fee btcutil.Amount, wu WeightUnit) SatPerWeight {
 	// The fee is provided in satoshis. To convert this to our internal
 	// canonical unit of satoshis per kilo-weight-unit (sat/kwu), we need
 	// to scale the numerator. Multiplying by `kilo` (1000) is consistent
