@@ -570,3 +570,15 @@ func TestSafeUint64ToInt64Overflow(t *testing.T) {
 	require.Zero(t, expectedDenom.Cmp(rateW.satsPerKWU.Denom()))
 }
 
+// TestVal checks that the Val method returns the correct integer fee rate.
+func TestVal(t *testing.T) {
+	t.Parallel()
+
+	// Test SatPerKVByte.Val().
+	rateKVB := NewSatPerKVByte(1000)
+	require.Equal(t, btcutil.Amount(1000), rateKVB.Val())
+
+	// Test SatPerKWeight.Val().
+	rateKW := NewSatPerKWeight(250)
+	require.Equal(t, btcutil.Amount(250), rateKW.Val())
+}
