@@ -23,6 +23,9 @@ var (
 
 	// errDB is used to simulate database operation failures within tests.
 	errDB = errors.New("db error")
+
+	// defaultAccountName is the name of the default account.
+	defaultAccountName = "default"
 )
 
 // TestValidateTxIntent ensures that the validateTxIntent function returns
@@ -37,7 +40,7 @@ func TestValidateTxIntent(t *testing.T) {
 	// cases.
 	validOutput := wire.TxOut{Value: 10000, PkScript: []byte{}}
 	validUTXO := wire.OutPoint{Hash: [32]byte{1}, Index: 0}
-	validAccountName := "default"
+	validAccountName := defaultAccountName
 	validScopedAccount := &ScopedAccount{
 		AccountName: validAccountName,
 		KeyScope:    waddrmgr.KeyScopeBIP0086,
@@ -58,7 +61,7 @@ func TestValidateTxIntent(t *testing.T) {
 					UTXOs: []wire.OutPoint{validUTXO},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -73,7 +76,7 @@ func TestValidateTxIntent(t *testing.T) {
 					Source: validScopedAccount,
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -91,7 +94,7 @@ func TestValidateTxIntent(t *testing.T) {
 					},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -103,7 +106,7 @@ func TestValidateTxIntent(t *testing.T) {
 				Outputs: []wire.TxOut{validOutput},
 				Inputs:  &InputsPolicy{Source: nil},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -115,7 +118,7 @@ func TestValidateTxIntent(t *testing.T) {
 				Outputs: []wire.TxOut{validOutput},
 				Inputs:  nil,
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -129,7 +132,7 @@ func TestValidateTxIntent(t *testing.T) {
 					UTXOs: []wire.OutPoint{validUTXO},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -143,7 +146,7 @@ func TestValidateTxIntent(t *testing.T) {
 					UTXOs: []wire.OutPoint{validUTXO},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -157,7 +160,7 @@ func TestValidateTxIntent(t *testing.T) {
 					UTXOs: []wire.OutPoint{},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -173,7 +176,7 @@ func TestValidateTxIntent(t *testing.T) {
 					},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -187,7 +190,7 @@ func TestValidateTxIntent(t *testing.T) {
 					Source: &ScopedAccount{AccountName: ""},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -203,7 +206,7 @@ func TestValidateTxIntent(t *testing.T) {
 					},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -221,7 +224,7 @@ func TestValidateTxIntent(t *testing.T) {
 					},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -235,7 +238,7 @@ func TestValidateTxIntent(t *testing.T) {
 					Source: &unsupportedCoinSource{},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -247,7 +250,7 @@ func TestValidateTxIntent(t *testing.T) {
 				Outputs: []wire.TxOut{validOutput},
 				Inputs:  &unsupportedInputs{},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 				},
 				FeeRate: 1000,
 			},
@@ -276,7 +279,7 @@ func TestValidateTxIntent(t *testing.T) {
 					UTXOs: []wire.OutPoint{validUTXO},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 					KeyScope:    waddrmgr.KeyScopeBIP0086,
 				},
 				FeeRate: 0,
@@ -291,7 +294,7 @@ func TestValidateTxIntent(t *testing.T) {
 					UTXOs: []wire.OutPoint{validUTXO},
 				},
 				ChangeSource: &ScopedAccount{
-					AccountName: "default",
+					AccountName: defaultAccountName,
 					KeyScope:    waddrmgr.KeyScopeBIP0086,
 				},
 				FeeRate: DefaultMaxFeeRate + 1,
@@ -603,7 +606,7 @@ func TestGetEligibleUTXOs(t *testing.T) {
 	utxo := wire.OutPoint{}
 	credit := &wtxmgr.Credit{}
 	scopedAccount := &ScopedAccount{
-		AccountName: "default",
+		AccountName: defaultAccountName,
 		KeyScope:    waddrmgr.KeyScopeBIP0086,
 	}
 
@@ -1012,7 +1015,7 @@ func TestCreateTransactionSuccessManualInputs(t *testing.T) {
 			UTXOs: []wire.OutPoint{validUTXO},
 		},
 		ChangeSource: &ScopedAccount{
-			AccountName: "default",
+			AccountName: defaultAccountName,
 			KeyScope:    waddrmgr.KeyScopeBIP0086,
 		},
 		FeeRate: 1000,
