@@ -23,6 +23,9 @@ var (
 
 	// errDB is used to simulate database operation failures within tests.
 	errDB = errors.New("db error")
+
+	// defaultAccountName is the name of the default account.
+	defaultAccountName = "default"
 )
 
 // TestValidateTxIntent ensures that the validateTxIntent function returns
@@ -605,7 +608,7 @@ func TestGetEligibleUTXOs(t *testing.T) {
 	utxo := wire.OutPoint{}
 	credit := &wtxmgr.Credit{}
 	scopedAccount := &ScopedAccount{
-		AccountName: "default",
+		AccountName: defaultAccountName,
 		KeyScope:    waddrmgr.KeyScopeBIP0086,
 	}
 
@@ -1014,7 +1017,7 @@ func TestCreateTransactionSuccessManualInputs(t *testing.T) {
 			UTXOs: []wire.OutPoint{validUTXO},
 		},
 		ChangeSource: &ScopedAccount{
-			AccountName: "default",
+			AccountName: defaultAccountName,
 			KeyScope:    waddrmgr.KeyScopeBIP0086,
 		},
 		FeeRate: 1000,
