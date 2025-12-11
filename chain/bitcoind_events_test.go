@@ -20,6 +20,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	// defaultTestTimeout is the default timeout used for tests in this
+	// file. It is set to 10 seconds to allow for slow test environments.
+	defaultTestTimeout = 10 * time.Second
+)
+
 // TestBitcoindEvents ensures that the BitcoindClient correctly delivers tx and
 // block notifications for both the case where a ZMQ subscription is used and
 // for the case where RPC polling is used.
@@ -98,8 +104,13 @@ func testNotifyTx(t *testing.T, miner *rpctest.Harness, client *BitcoindClient) 
 	err = client.NotifyTx([]chainhash.Hash{hash})
 	require.NoError(err)
 
-	_, err = client.SendRawTransaction(tx, true)
-	require.NoError(err)
+	// Send the transaction. This might fail if the bitcoind node hasn't
+	// synced the inputs yet, so we'll retry until it succeeds.
+	require.Eventually(func() bool {
+		_, err = client.SendRawTransaction(tx, true)
+		return err == nil
+	}, defaultTestTimeout, 100*time.Millisecond,
+		"SendRawTransaction failed")
 
 	ntfns := client.Notifications()
 
@@ -109,7 +120,7 @@ func testNotifyTx(t *testing.T, miner *rpctest.Harness, client *BitcoindClient) 
 		_, ok := ntfn.(ClientConnected)
 		require.Truef(ok, "Expected type ClientConnected, got %T", ntfn)
 
-	case <-time.After(time.Second):
+	case <-time.After(defaultTestTimeout):
 		require.Fail("timed out for ClientConnected notification")
 	}
 
@@ -120,7 +131,7 @@ func testNotifyTx(t *testing.T, miner *rpctest.Harness, client *BitcoindClient) 
 		require.Truef(ok, "Expected type RelevantTx, got %T", ntfn)
 		require.True(tx.TxRecord.Hash.IsEqual(&hash))
 
-	case <-time.After(time.Second):
+	case <-time.After(defaultTestTimeout):
 		require.Fail("timed out waiting for RelevantTx notification")
 	}
 }
@@ -146,7 +157,7 @@ func testNotifyBlocks(t *testing.T, miner *rpctest.Harness,
 		_, ok := ntfn.(ClientConnected)
 		require.Truef(ok, "Expected type ClientConnected, got %T", ntfn)
 
-	case <-time.After(time.Second):
+	case <-time.After(defaultTestTimeout):
 		require.Fail("timed out for ClientConnected notification")
 	}
 
@@ -157,7 +168,7 @@ func testNotifyBlocks(t *testing.T, miner *rpctest.Harness,
 		require.Truef(ok, "Expected type FilteredBlockConnected, "+
 			"got %T", ntfn)
 
-	case <-time.After(time.Second):
+	case <-time.After(defaultTestTimeout):
 		require.Fail("timed out for FilteredBlockConnected " +
 			"notification")
 	}
@@ -168,7 +179,7 @@ func testNotifyBlocks(t *testing.T, miner *rpctest.Harness,
 		_, ok := ntfn.(BlockConnected)
 		require.Truef(ok, "Expected type BlockConnected, got %T", ntfn)
 
-	case <-time.After(time.Second):
+	case <-time.After(defaultTestTimeout):
 		require.Fail("timed out for BlockConnected notification")
 	}
 }
@@ -207,7 +218,7 @@ func testNotifySpentMempool(t *testing.T, miner *rpctest.Harness,
 		_, ok := ntfn.(ClientConnected)
 		require.Truef(ok, "Expected type ClientConnected, got %T", ntfn)
 
-	case <-time.After(time.Second):
+	case <-time.After(defaultTestTimeout):
 		require.Fail("timed out for ClientConnected notification")
 	}
 
@@ -218,7 +229,7 @@ func testNotifySpentMempool(t *testing.T, miner *rpctest.Harness,
 		require.Truef(ok, "Expected type RelevantTx, got %T", ntfn)
 		require.True(tx.TxRecord.Hash.IsEqual(&txid))
 
-	case <-time.After(time.Second):
+	case <-time.After(defaultTestTimeout):
 		require.Fail("timed out waiting for RelevantTx notification")
 	}
 }
@@ -257,7 +268,7 @@ func testLookupInputMempoolSpend(t *testing.T, miner *rpctest.Harness,
 	rt.Eventually(func() bool {
 		txid, found = client.LookupInputMempoolSpend(op)
 		return found
-	}, 5*time.Second, 100*time.Millisecond)
+	}, defaultTestTimeout, 100*time.Millisecond)
 
 	// Check the expected txid is returned.
 	rt.Equal(tx.TxHash(), txid)
@@ -288,7 +299,7 @@ func testReorg(t *testing.T, miner1, miner2 *rpctest.Harness,
 		_, ok := ntfn.(ClientConnected)
 		require.Truef(ok, "Expected type ClientConnected, got %T", ntfn)
 
-	case <-time.After(time.Second):
+	case <-time.After(defaultTestTimeout):
 		require.Fail("timed out for ClientConnected notification")
 	}
 
@@ -377,7 +388,7 @@ func testReorg(t *testing.T, miner1, miner2 *rpctest.Harness,
 func waitForBlockNtfn(t *testing.T, ntfns <-chan interface{},
 	expectedHeight int32, connected bool) chainhash.Hash {
 
-	timer := time.NewTimer(2 * time.Second)
+	timer := time.NewTimer(defaultTestTimeout)
 	for {
 		select {
 		case nftn := <-ntfns:
@@ -592,7 +603,8 @@ func testBitcoindClientGetCFilter(t *testing.T, miner *rpctest.Harness,
 		)
 
 		return err == nil
-	}, 5*time.Second, 100*time.Millisecond, "GetCFilter should succeed")
+	}, defaultTestTimeout, 100*time.Millisecond,
+		"GetCFilter should succeed")
 	require.NotNil(gcsFilter, "GCS filter should not be nil")
 	require.IsType(&gcs.Filter{}, gcsFilter)
 
