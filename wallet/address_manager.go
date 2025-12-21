@@ -205,11 +205,6 @@ func (w *Wallet) NewAddress(_ context.Context, accountName string,
 		return nil, err
 	}
 
-	chainClient, err := w.requireChainClient()
-	if err != nil {
-		return nil, err
-	}
-
 	manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
 	if err != nil {
 		return nil, err
@@ -221,7 +216,7 @@ func (w *Wallet) NewAddress(_ context.Context, accountName string,
 	}
 
 	// Notify the rpc server about the newly created address.
-	err = chainClient.NotifyReceived([]btcutil.Address{addr})
+	err = w.cfg.Chain.NotifyReceived([]btcutil.Address{addr})
 	if err != nil {
 		return nil, err
 	}
@@ -602,12 +597,25 @@ func (w *Wallet) ImportPublicKey(_ context.Context, pubKey *btcec.PublicKey,
 		return err
 	}
 
-	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		_, err := manager.ImportPublicKey(addrmgrNs, pubKey, nil)
+	var addr btcutil.Address
 
-		return err
+	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		ma, err := manager.ImportPublicKey(addrmgrNs, pubKey, nil)
+		if err != nil {
+			return err
+		}
+
+		addr = ma.Address()
+
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	return w.cfg.Chain.NotifyReceived([]btcutil.Address{addr})
 }
 
 // ImportTaprootScript imports a taproot script for tracking and spending.
@@ -658,6 +666,11 @@ func (w *Wallet) ImportTaprootScript(_ context.Context,
 
 		return err
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = w.cfg.Chain.NotifyReceived([]btcutil.Address{addr.Address()})
 	if err != nil {
 		return nil, err
 	}
