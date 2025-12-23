@@ -302,6 +302,10 @@ type Wallet struct {
 	// Lifecycle (System), Synchronization (Chain), and Authentication
 	// (Security).
 	state walletState
+
+	// sync is the dedicated synchronization component that manages the
+	// chain loop, scanning, and reorganization handling.
+	sync chainSyncer
 }
 
 // AccountAddresses returns the addresses for every created address for an
@@ -600,4 +604,3 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 
 	return w, nil
 }
-
