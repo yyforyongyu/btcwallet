@@ -420,7 +420,30 @@ func (s *syncer) findForkPoint(localHashes []*chainhash.Hash,
 
 // run executes the main synchronization loop.
 func (s *syncer) run(ctx context.Context) error {
-	return nil
+	// Initialize the chain sync state.
+	err := s.initChainSync(ctx)
+	if err != nil {
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, ErrWalletShuttingDown) {
+
+			return nil
+		}
+
+		return fmt.Errorf("initialize chain sync: %w", err)
+	}
+
+	for {
+		err := s.runSyncStep(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) ||
+				errors.Is(err, ErrWalletShuttingDown) {
+
+				return nil
+			}
+
+			return err
+		}
+	}
 }
 
 // runSyncStep performs a single iteration of the synchronization loop.
@@ -459,6 +482,28 @@ func (s *syncer) requestScan(ctx context.Context, req *scanReq) error {
 	case <-ctx.Done():
 		return fmt.Errorf("context done: %w", ctx.Err())
 	}
+}
+
+// broadcastUnminedTxns retrieves all unmined transactions from the wallet and
+// attempts to re-broadcast them to the network.
+func (s *syncer) broadcastUnminedTxns(ctx context.Context) error {
+	txs, err := s.DBGetUnminedTxns(ctx)
+	if err != nil {
+		log.Errorf("Unable to retrieve unconfirmed transactions to "+
+			"resend: %v", err)
+
+		return fmt.Errorf("failed to retrieve unconfirmed txs: %w", err)
+	}
+
+	for _, tx := range txs {
+		err := s.publisher.Broadcast(ctx, tx, "")
+		if err != nil {
+			log.Warnf("Unable to rebroadcast tx %v: %v",
+				tx.TxHash(), err)
+		}
+	}
+
+	return nil
 }
 
 // scanBatchHeadersOnly performs a lightweight scan by only fetching block
@@ -1148,6 +1193,31 @@ func (s *syncer) handleScanReq(ctx context.Context,
 	}
 
 	return s.scanWithRewind(ctx, req)
+}
+
+// waitForEvent blocks until a notification, rescan job, or context cancellation
+// occurs, processing the event accordingly.
+func (s *syncer) waitForEvent(ctx context.Context) error {
+	select {
+	// Process asynchronous notifications from the chain backend, such as
+	// new blocks or transactions.
+	case n, ok := <-s.cfg.Chain.Notifications():
+		if !ok {
+			return ErrWalletShuttingDown
+		}
+
+		return s.handleChainUpdate(ctx, n)
+
+	// Handle synchronous rescan or resync requests submitted via the
+	// controller.
+	case job := <-s.scanReqChan:
+		return s.handleScanReq(ctx, job)
+
+	// Exit gracefully if the context is canceled or the wallet is
+	// shutting down.
+	case <-ctx.Done():
+		return fmt.Errorf("context done: %w", ctx.Err())
+	}
 }
 
 // scanWithRewind rewinds the wallet's sync status to the requested start block.

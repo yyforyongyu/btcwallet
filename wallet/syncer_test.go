@@ -866,3 +866,221 @@ func TestHandleScanReq(t *testing.T) {
 	err = s.handleScanReq(context.Background(), req)
 	require.NoError(t, err)
 }
+
+// TestWaitForEvent verifies event loop idling and dispatch.
+func TestWaitForEvent(t *testing.T) {
+	t.Parallel()
+
+	mockChain := &mockChain{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(Config{Chain: mockChain}, nil, nil, mockPublisher)
+
+	// Mock Notifications channel.
+	notificationChan := make(chan any, 1)
+	mockChain.On("Notifications").Return((<-chan any)(notificationChan))
+
+	// Case 1: Notification arrives.
+	notificationChan <- chain.BlockConnected{}
+	// handleChainUpdate -> processChainUpdate -> DBPutSyncTip.
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	s.cfg.DB = db
+	mockAddrStore := &mockAddrStore{}
+	s.addrStore = mockAddrStore
+	mockAddrStore.On(
+		"SetSyncedTo", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	err := s.waitForEvent(context.Background())
+	require.NoError(t, err)
+
+	// Case 2: Scan job arrives.
+	s.scanReqChan <- &scanReq{typ: scanTypeRewind}
+
+	mockAddrStore.On("SyncedTo").Return(waddrmgr.BlockStamp{}).Once()
+
+	err = s.waitForEvent(context.Background())
+	require.NoError(t, err)
+}
+
+// TestSyncerFullRun verifies the full run loop coordination.
+func TestSyncerFullRun(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockChain := &mockChain{}
+	mockAddrStore := &mockAddrStore{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{Chain: mockChain, DB: db}, mockAddrStore, nil,
+		mockPublisher,
+	)
+
+	// 1. initChainSync.
+	mockAddrStore.On("Birthday").Return(time.Now()).Once()
+	mockChain.On("IsCurrent").Return(true).Once()
+	mockAddrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
+	).Once()
+	// checkRollback calls DBGetSyncedBlocks.
+	mockAddrStore.On(
+		"BlockHash", mock.Anything, mock.Anything,
+	).Return(&chainhash.Hash{}, nil).Maybe()
+	// Return 10 hashes to match the checkRollback batch size.
+	remoteHashes := make([]chainhash.Hash, 10)
+	mockChain.On(
+		"GetBlockHashes", mock.Anything, mock.Anything,
+	).Return(remoteHashes, nil).Maybe()
+	mockChain.On("NotifyBlocks").Return(nil).Once()
+
+	// 2. advanceChainSync.
+	mockChain.On(
+		"GetBestBlock",
+	).Return(&chainhash.Hash{}, int32(100), nil).Once()
+	// (SyncedTo 100 mocked above or will be called again).
+	mockAddrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
+	).Once()
+
+	// 3. broadcastUnminedTxns.
+	// DBGetUnminedTxns -> UnminedTxs.
+	mockTxStore := &mockTxStore{}
+	s.txStore = mockTxStore
+	mockTxStore.On("UnminedTxs", mock.Anything).Return(
+		[]*wire.MsgTx(nil), nil,
+	).Once()
+
+	// 4. waitForEvent.
+	ctx, cancel := context.WithCancel(context.Background())
+	// Use a goroutine to cancel after a delay to allow loop entry.
+	// waitUntilBackendSynced has a 1s ticker, so we wait 1.5s.
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		cancel()
+	}()
+
+	notificationChan := make(chan any)
+	mockChain.On("Notifications").Return((<-chan any)(notificationChan))
+
+	err := s.run(ctx)
+	require.NoError(t, err)
+}
+
+var (
+	errDBMockSync = errors.New("db error")
+	errCFilter    = errors.New("not supported")
+)
+
+// TestProcessChainUpdate_Disconnect verifies rollback on block disconnect.
+func TestProcessChainUpdate_Disconnect(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockChain := &mockChain{}
+	mockAddrStore := &mockAddrStore{}
+	mockTxStore := &mockTxStore{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{Chain: mockChain, DB: db}, mockAddrStore, mockTxStore,
+		mockPublisher,
+	)
+
+	mockAddrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
+	).Once()
+
+	mockAddrStore.On(
+		"BlockHash", mock.Anything, mock.Anything,
+	).Return(&chainhash.Hash{}, nil).Maybe()
+
+	remoteHashes := make([]chainhash.Hash, 10)
+	mockChain.On("GetBlockHashes", mock.Anything, mock.Anything).Return(
+		remoteHashes, nil,
+	).Once()
+
+	err := s.processChainUpdate(
+		context.Background(), chain.BlockDisconnected{},
+	)
+	require.NoError(t, err)
+}
+
+// TestBroadcastUnminedTxns_Error verifies error handling.
+func TestBroadcastUnminedTxns_Error(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockTxStore := &mockTxStore{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(Config{DB: db}, nil, mockTxStore, mockPublisher)
+
+	mockTxStore.On("UnminedTxs", mock.Anything).Return(
+		([]*wire.MsgTx)(nil), errDBMockSync,
+	).Once()
+
+	err := s.broadcastUnminedTxns(context.Background())
+	require.Error(t, err)
+}
+
+// TestInitChainSync_BackendNotSynced verifies it waits/errors.
+func TestInitChainSync_BackendNotSynced(t *testing.T) {
+	t.Parallel()
+
+	mockChain := &mockChain{}
+	mockAddrStore := &mockAddrStore{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{Chain: mockChain}, mockAddrStore, nil, mockPublisher,
+	)
+
+	mockAddrStore.On("Birthday").Return(time.Now()).Once()
+	mockChain.On("IsCurrent").Return(false)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(), 100*time.Millisecond,
+	)
+	defer cancel()
+
+	err := s.initChainSync(ctx)
+	require.Error(t, err)
+}
+
+// TestDispatchScanStrategy_CFilterFail verifies fallback.
+func TestDispatchScanStrategy_CFilterFail(t *testing.T) {
+	t.Parallel()
+
+	mockChain := &mockChain{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{Chain: mockChain, SyncMethod: SyncMethodAuto}, nil, nil,
+		mockPublisher,
+	)
+	mockAddrStore := &mockAddrStore{}
+	scanState := NewRecoveryState(
+		10, &chaincfg.MainNetParams, mockAddrStore,
+	)
+	hashes := []chainhash.Hash{{0x01}}
+
+	mockChain.On(
+		"GetCFilters", hashes, wire.GCSFilterRegular,
+	).Return(([]*gcs.Filter)(nil), errCFilter).Once()
+
+	msgBlock := wire.NewMsgBlock(wire.NewBlockHeader(
+		1, &chainhash.Hash{}, &chainhash.Hash{}, 0, 0,
+	))
+	mockChain.On(
+		"GetBlocks", hashes,
+	).Return([]*wire.MsgBlock{msgBlock}, nil).Once()
+
+	results, err := s.dispatchScanStrategy(
+		context.Background(), scanState, 10, hashes,
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+}
