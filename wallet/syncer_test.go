@@ -6,11 +6,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/btcutil/gcs"
 	"github.com/btcsuite/btcd/btcutil/gcs/builder"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
@@ -694,4 +697,70 @@ func TestAdvanceChainSync(t *testing.T) {
 	finished, err = s.advanceChainSync(context.Background())
 	require.NoError(t, err)
 	require.False(t, finished)
+}
+
+// TestHandleChainUpdate verifies notification handling.
+func TestHandleChainUpdate(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockChain := &mockChain{}
+	mockAddrStore := &mockAddrStore{}
+	mockTxStore := &mockTxStore{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{Chain: mockChain, DB: db}, mockAddrStore, mockTxStore,
+		mockPublisher,
+	)
+
+	// Case 1: BlockConnected.
+	meta := wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 100}}
+
+	mockAddrStore.On(
+		"SetSyncedTo", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	err := s.handleChainUpdate(
+		context.Background(), chain.BlockConnected(meta),
+	)
+	require.NoError(t, err)
+
+	// Case 2: RelevantTx.
+	tx := wire.NewMsgTx(1)
+	rec, _ := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+
+	mockTxStore.On(
+		"InsertUnconfirmedTx", mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(nil).Once()
+
+	err = s.handleChainUpdate(
+		context.Background(), chain.RelevantTx{TxRecord: rec},
+	)
+	require.NoError(t, err)
+}
+
+// TestExtractAddrEntries verifies address extraction from outputs.
+func TestExtractAddrEntries(t *testing.T) {
+	t.Parallel()
+
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{ChainParams: &chaincfg.MainNetParams}, nil, nil,
+		mockPublisher,
+	)
+
+	// P2PKH output.
+	addr, _ := btcutil.NewAddressPubKeyHash(
+		make([]byte, 20), &chaincfg.MainNetParams,
+	)
+	pkScript, _ := txscript.PayToAddrScript(addr)
+	txOut := &wire.TxOut{Value: 1000, PkScript: pkScript}
+
+	entries := s.extractAddrEntries([]*wire.TxOut{txOut})
+	require.Len(t, entries, 1)
+	require.Equal(t, addr.String(), entries[0].Address.String())
+	require.Equal(t, uint32(0), entries[0].Credit.Index)
 }
