@@ -308,3 +308,62 @@ func TestControllerUnlock(t *testing.T) {
 	w.wg.Wait()
 }
 
+// TestControllerChangePassphrase verifies the ChangePassphrase method.
+func TestControllerChangePassphrase(t *testing.T) {
+	t.Parallel()
+
+	w, deps := createTestWalletWithMocks(t)
+
+	// Setup for Start.
+	deps.addrStore.On(
+		"BirthdayBlock", mock.Anything,
+	).Return(waddrmgr.BlockStamp{}, true, nil).Once()
+	deps.addrStore.On(
+		"ActiveScopedKeyManagers",
+	).Return([]waddrmgr.AccountStore(nil)).Once()
+	deps.txStore.On(
+		"DeleteExpiredLockedOutputs", mock.Anything,
+	).Return(nil).Once()
+	deps.syncer.On("run", mock.Anything).Return(nil).Once()
+
+	// Start.
+	require.NoError(t, w.Start(context.Background()))
+
+	req := ChangePassphraseRequest{
+		ChangePrivate: true,
+		PrivateOld:    []byte("old"),
+		PrivateNew:    []byte("new"),
+	}
+
+	// Expect ChangePassphrase.
+	deps.addrStore.On(
+		"ChangePassphrase", mock.Anything, []byte("old"), []byte("new"),
+		true, mock.Anything,
+	).Return(nil).Once()
+
+	// Act: ChangePassphrase.
+	err := w.ChangePassphrase(context.Background(), req)
+	require.NoError(t, err)
+
+	// Clean up.
+	_ = w.Stop(context.Background())
+	w.wg.Wait()
+}
+
+// TestHandleChangePassphraseReq_Errors verifies error paths.
+func TestHandleChangePassphraseReq_Errors(t *testing.T) {
+	t.Parallel()
+
+	w, _ := createTestWalletWithMocks(t)
+	// Stopped -> canChangePassphrase fails.
+
+	req := changePassphraseReq{
+		req:  ChangePassphraseRequest{},
+		resp: make(chan error, 1),
+	}
+
+	// Act: Stopped.
+	w.handleChangePassphraseReq(req)
+	err := <-req.resp
+	require.ErrorIs(t, err, ErrStateForbidden)
+}
