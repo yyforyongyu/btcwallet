@@ -297,6 +297,11 @@ type Wallet struct {
 	// cfg holds the static configuration parameters provided when the
 	// wallet was created or loaded.
 	cfg Config
+
+	// state maintains the wallet's atomic, three-dimensional status:
+	// Lifecycle (System), Synchronization (Chain), and Authentication
+	// (Security).
+	state walletState
 }
 
 // AccountAddresses returns the addresses for every created address for an
