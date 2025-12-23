@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil/gcs"
+	"github.com/btcsuite/btcd/btcutil/gcs/builder"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
@@ -371,6 +373,64 @@ func TestScanBatchWithFullBlocks(t *testing.T) {
 	).Return(blocks, nil).Once()
 
 	results, err := s.scanBatchWithFullBlocks(
+		context.Background(), scanState, 10, hashes,
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, int32(10), results[0].meta.Height)
+}
+
+// TestScanBatchWithCFilters verifies CFilter-based scan logic.
+func TestScanBatchWithCFilters(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockChain := &mockChain{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{Chain: mockChain, DB: db}, nil, nil, mockPublisher,
+	)
+
+	// Mock recovery state.
+	mockAddrStore := &mockAddrStore{}
+	scanState := NewRecoveryState(
+		10, &chaincfg.MainNetParams, mockAddrStore,
+	)
+
+	hashes := []chainhash.Hash{{0x01}}
+
+	// 1. Mock GetCFilters.
+	filter, err := gcs.BuildGCSFilter(
+		builder.DefaultP, builder.DefaultM, [16]byte{}, nil,
+	)
+	require.NoError(t, err)
+	mockChain.On(
+		"GetCFilters", hashes, wire.GCSFilterRegular,
+	).Return([]*gcs.Filter{filter}, nil).Once()
+
+	// 2. Mock GetBlockHeaders.
+	headers := []*wire.BlockHeader{{Timestamp: time.Unix(100, 0)}}
+	mockChain.On("GetBlockHeaders", hashes).Return(headers, nil).Once()
+
+	// 3. Mock GetBlocks.
+	msgBlock := wire.NewMsgBlock(wire.NewBlockHeader(
+		1, &chainhash.Hash{}, &chainhash.Hash{}, 0, 0,
+	))
+	mockChain.On("GetBlocks", hashes).Return(
+		[]*wire.MsgBlock{msgBlock}, nil,
+	).Once()
+
+	// 4. Mock AddrStore failure paths to avoid deep derivation logic.
+	mockAddrStore.On(
+		"Address", mock.Anything, mock.Anything,
+	).Return(nil, waddrmgr.ErrAddressNotFound).Maybe()
+	mockAddrStore.On(
+		"FetchScopedKeyManager", mock.Anything,
+	).Return(nil, waddrmgr.ErrAddressNotFound).Maybe()
+
+	results, err := s.scanBatchWithCFilters(
 		context.Background(), scanState, 10, hashes,
 	)
 	require.NoError(t, err)
