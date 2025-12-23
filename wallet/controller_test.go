@@ -266,3 +266,45 @@ func TestControllerLock(t *testing.T) {
 	_ = w.Stop(context.Background())
 	w.wg.Wait()
 }
+
+// TestControllerUnlock verifies the Unlock method.
+func TestControllerUnlock(t *testing.T) {
+	t.Parallel()
+
+	w, deps := createTestWalletWithMocks(t)
+
+	// Setup for Start.
+	deps.addrStore.On(
+		"BirthdayBlock", mock.Anything,
+	).Return(waddrmgr.BlockStamp{}, true, nil).Once()
+	deps.addrStore.On(
+		"ActiveScopedKeyManagers",
+	).Return([]waddrmgr.AccountStore(nil)).Once()
+	deps.txStore.On(
+		"DeleteExpiredLockedOutputs", mock.Anything,
+	).Return(nil).Once()
+
+	// Expect run.
+	deps.syncer.On("run", mock.Anything).Return(nil).Once()
+
+	// Start.
+	require.NoError(t, w.Start(context.Background()))
+	require.False(t, w.state.isUnlocked())
+
+	pass := []byte("password")
+
+	// Expect addrStore.Unlock.
+	deps.addrStore.On("Unlock", mock.Anything, pass).Return(nil).Once()
+
+	// Act: Unlock.
+	err := w.Unlock(context.Background(), UnlockRequest{Passphrase: pass})
+	require.NoError(t, err)
+
+	// Assert: State is Unlocked.
+	require.True(t, w.state.isUnlocked())
+
+	// Clean up.
+	_ = w.Stop(context.Background())
+	w.wg.Wait()
+}
+

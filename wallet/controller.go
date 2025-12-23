@@ -254,6 +254,40 @@ func (w *Wallet) Stop(stopCtx context.Context) error {
 	return nil
 }
 
+// Unlock unlocks the wallet with a passphrase.
+//
+// This is part of the Controller interface.
+func (w *Wallet) Unlock(ctx context.Context, req UnlockRequest) error {
+	// Apply default timeout if none specified.
+	if req.Timeout == 0 {
+		req.Timeout = w.cfg.AutoLockDuration
+		log.Infof("Using default auto-lock timeout of %v", req.Timeout)
+	}
+
+	r := newUnlockReq(req)
+
+	select {
+	case w.requestChan <- r:
+	case <-w.lifetimeCtx.Done():
+		return ErrWalletShuttingDown
+
+	case <-ctx.Done():
+		return fmt.Errorf("unlock request cancelled: %w", ctx.Err())
+	}
+
+	// Wait for the result from the mainLoop.
+	select {
+	case err := <-r.resp:
+		return err
+
+	case <-w.lifetimeCtx.Done():
+		return ErrWalletShuttingDown
+
+	case <-ctx.Done():
+		return fmt.Errorf("unlock response cancelled: %w", ctx.Err())
+	}
+}
+
 // Lock locks the wallet.
 //
 // This is part of the Controller interface.
