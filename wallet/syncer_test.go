@@ -764,3 +764,105 @@ func TestExtractAddrEntries(t *testing.T) {
 	require.Equal(t, addr.String(), entries[0].Address.String())
 	require.Equal(t, uint32(0), entries[0].Credit.Index)
 }
+
+// TestHandleScanReq verifies scan request handling.
+func TestHandleScanReq(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockAddrStore := &mockAddrStore{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{DB: db}, mockAddrStore, nil, mockPublisher,
+	)
+
+	// Case 1: Rewind.
+	req := &scanReq{
+		typ:        scanTypeRewind,
+		startBlock: waddrmgr.BlockStamp{Height: 50},
+	}
+	mockAddrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
+	).Once()
+	// Expect DBPutRewind.
+	mockAddrStore.On(
+		"SetSyncedTo", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	mockTxStore := &mockTxStore{}
+	s.txStore = mockTxStore
+	mockTxStore.On("Rollback", mock.Anything, int32(51)).Return(nil).Once()
+
+	err := s.handleScanReq(context.Background(), req)
+	require.NoError(t, err)
+
+	// Case 2: Targeted.
+	req = &scanReq{
+		typ:        scanTypeTargeted,
+		startBlock: waddrmgr.BlockStamp{Height: 100},
+		targets:    []waddrmgr.AccountScope{{Account: 1}},
+	}
+	mockChain := &mockChain{}
+	s.cfg.Chain = mockChain
+	mockChain.On("GetBestBlock").Return(
+		&chainhash.Hash{}, int32(101), nil,
+	).Once()
+
+	// Targeted scan calls loadTargetedScanData.
+	scopedMgr := &mockAccountStore{}
+	mockAddrStore.On(
+		"FetchScopedKeyManager", mock.Anything,
+	).Return(scopedMgr, nil).Maybe()
+
+	// loadTargetedScanState -> Initialize.
+	props := &waddrmgr.AccountProperties{
+		AccountNumber: 1,
+		KeyScope:      waddrmgr.KeyScopeBIP0084,
+	}
+	scopedMgr.On(
+		"AccountProperties", mock.Anything, uint32(1),
+	).Return(props, nil).Maybe()
+	scopedMgr.On("ActiveAccounts").Return([]uint32{1}).Maybe()
+	mockAddrStore.On(
+		"ForEachRelevantActiveAddress", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+	mockTxStore.On(
+		"OutputsToWatch", mock.Anything,
+	).Return([]wtxmgr.Credit(nil), nil).Once()
+
+	scopedMgr.On(
+		"DeriveAddr", mock.Anything, mock.Anything, mock.Anything,
+	).Return(
+		&mockAddress{}, []byte{}, nil,
+	).Maybe()
+
+	// fetchAndFilterBlocks -> GetBlockHashes.
+	mockChain.On(
+		"GetBlockHashes", int64(100), int64(101),
+	).Return([]chainhash.Hash{{0x01}, {0x02}}, nil).Once()
+
+	// dispatchScanStrategy -> scanBatchWithCFilters.
+	mockChain.On(
+		"GetCFilters", mock.Anything, mock.Anything,
+	).Return([]*gcs.Filter{nil, nil}, nil).Once()
+	mockChain.On(
+		"GetBlockHeaders", mock.Anything,
+	).Return([]*wire.BlockHeader{{}, {}}, nil).Once()
+	msgBlock := wire.NewMsgBlock(wire.NewBlockHeader(
+		1, &chainhash.Hash{}, &chainhash.Hash{}, 0, 0,
+	))
+
+	blocks := make([]*wire.MsgBlock, 2)
+	for i := range 2 {
+		blocks[i] = msgBlock
+	}
+
+	mockChain.On(
+		"GetBlocks", mock.Anything,
+	).Return(blocks, nil).Once()
+
+	err = s.handleScanReq(context.Background(), req)
+	require.NoError(t, err)
+}
