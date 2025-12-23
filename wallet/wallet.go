@@ -310,6 +310,11 @@ type Wallet struct {
 	// sync is the dedicated synchronization component that manages the
 	// chain loop, scanning, and reorganization handling.
 	sync chainSyncer
+
+	// state maintains the wallet's atomic, three-dimensional status:
+	// Lifecycle (System), Synchronization (Chain), and Authentication
+	// (Security).
+	state walletState
 }
 
 // AccountAddresses returns the addresses for every created address for an
