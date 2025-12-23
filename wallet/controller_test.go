@@ -367,3 +367,48 @@ func TestHandleChangePassphraseReq_Errors(t *testing.T) {
 	err := <-req.resp
 	require.ErrorIs(t, err, ErrStateForbidden)
 }
+
+// TestControllerInfo verifies the Info method.
+func TestControllerInfo(t *testing.T) {
+	t.Parallel()
+
+	w, deps := createTestWalletWithMocks(t)
+
+	bs := waddrmgr.BlockStamp{Height: 100}
+	deps.addrStore.On(
+		"BirthdayBlock", mock.Anything,
+	).Return(bs, true, nil).Once()
+	deps.addrStore.On(
+		"ActiveScopedKeyManagers",
+	).Return([]waddrmgr.AccountStore(nil)).Once()
+	deps.txStore.On(
+		"DeleteExpiredLockedOutputs", mock.Anything,
+	).Return(nil).Once()
+	deps.syncer.On("run", mock.Anything).Return(nil).Once()
+
+	// Mock Backend.
+	deps.chain.On("BackEnd").Return("mock")
+
+	// Mock SyncedTo.
+	deps.addrStore.On("SyncedTo").Return(bs)
+
+	// Mock syncState for isSynced.
+	deps.syncer.On("syncState").Return(syncStateSynced)
+
+	// Start.
+	require.NoError(t, w.Start(context.Background()))
+
+	// Act: Info.
+	info, err := w.Info(context.Background())
+	require.NoError(t, err)
+
+	// Assert.
+	require.Equal(t, "mock", info.Backend)
+	require.Equal(t, int32(100), info.BirthdayBlock.Height)
+	require.True(t, info.Synced)
+	require.True(t, info.Locked)
+
+	// Clean up.
+	_ = w.Stop(context.Background())
+	w.wg.Wait()
+}
