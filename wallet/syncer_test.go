@@ -437,3 +437,136 @@ func TestScanBatchWithCFilters(t *testing.T) {
 	require.Len(t, results, 1)
 	require.Equal(t, int32(10), results[0].meta.Height)
 }
+
+// TestDispatchScanStrategy verifies strategy selection.
+func TestDispatchScanStrategy(t *testing.T) {
+	t.Parallel()
+
+	mockChain := &mockChain{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(Config{Chain: mockChain}, nil, nil, mockPublisher)
+	scanState := NewRecoveryState(10, &chaincfg.MainNetParams, nil)
+	hashes := []chainhash.Hash{{0x01}}
+
+	// 1. SyncMethodFullBlocks.
+	s.cfg.SyncMethod = SyncMethodFullBlocks
+	msgBlock := wire.NewMsgBlock(wire.NewBlockHeader(
+		1, &chainhash.Hash{}, &chainhash.Hash{}, 0, 0,
+	))
+	mockChain.On(
+		"GetBlocks", hashes,
+	).Return([]*wire.MsgBlock{msgBlock}, nil).Once()
+	results, err := s.dispatchScanStrategy(
+		context.Background(), scanState, 10, hashes,
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	// 2. SyncMethodCFilters.
+	s.cfg.SyncMethod = SyncMethodCFilters
+	filter, _ := gcs.BuildGCSFilter(
+		builder.DefaultP, builder.DefaultM, [16]byte{}, nil,
+	)
+	mockChain.On(
+		"GetCFilters", hashes, wire.GCSFilterRegular,
+	).Return([]*gcs.Filter{filter}, nil).Once()
+	mockChain.On(
+		"GetBlockHeaders", hashes,
+	).Return([]*wire.BlockHeader{{}}, nil).Once()
+	// Filter N=0 forces GetBlocks.
+	mockChain.On(
+		"GetBlocks", hashes,
+	).Return([]*wire.MsgBlock{msgBlock}, nil).Once()
+	results, err = s.dispatchScanStrategy(
+		context.Background(), scanState, 10, hashes,
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+}
+
+// TestScanBatch verifies the batch scanning entry point.
+func TestScanBatch(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockAddrStore := &mockAddrStore{}
+	mockChain := &mockChain{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{Chain: mockChain, DB: db}, mockAddrStore, nil,
+		mockPublisher,
+	)
+
+	// Mock loadFullScanState (needed by scanBatch).
+	scopedMgr := &mockAccountStore{}
+	mockAddrStore.On(
+		"ActiveScopedKeyManagers",
+	).Return([]waddrmgr.AccountStore{scopedMgr}).Once()
+	scopedMgr.On("ActiveAccounts").Return([]uint32{0}).Once()
+	scopedMgr.On("Scope").Return(waddrmgr.KeyScopeBIP0084).Once()
+	mockAddrStore.On(
+		"FetchScopedKeyManager", mock.Anything,
+	).Return(scopedMgr, nil).Maybe()
+	scopedMgr.On(
+		"AccountProperties", mock.Anything, uint32(0),
+	).Return(&waddrmgr.AccountProperties{}, nil).Once()
+	mockAddrStore.On(
+		"ForEachRelevantActiveAddress", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	mockTxStore := &mockTxStore{}
+	s.txStore = mockTxStore
+	mockTxStore.On(
+		"OutputsToWatch", mock.Anything,
+	).Return([]wtxmgr.Credit(nil), nil).Once()
+
+	// Mock fetchAndFilterBlocks (called by scanBatch).
+	// Since scanState.Empty() is true, it calls scanBatchHeadersOnly.
+	hashes := []chainhash.Hash{{0x01}}
+	mockChain.On(
+		"GetBlockHashes", int64(11), int64(11),
+	).Return(hashes, nil).Once()
+	mockChain.On(
+		"GetBlockHeaders", hashes,
+	).Return([]*wire.BlockHeader{{}}, nil).Once()
+
+	// DBPutSyncBatch calls SetSyncedTo.
+	mockAddrStore.On(
+		"SetSyncedTo", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	// Act
+	err := s.scanBatch(
+		context.Background(), waddrmgr.BlockStamp{Height: 10}, 11,
+	)
+	require.NoError(t, err)
+}
+
+// TestFetchAndFilterBlocks verifies the block fetching and filtering helper.
+func TestFetchAndFilterBlocks(t *testing.T) {
+	t.Parallel()
+
+	mockChain := &mockChain{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(Config{Chain: mockChain}, nil, nil, mockPublisher)
+
+	// RecoveryState created here is empty.
+	scanState := NewRecoveryState(10, &chaincfg.MainNetParams, nil)
+	hashes := []chainhash.Hash{{0x01}}
+
+	// Since scanState.Empty() is true, it calls scanBatchHeadersOnly.
+	mockChain.On(
+		"GetBlockHashes", int64(10), int64(11),
+	).Return(hashes, nil).Once()
+	mockChain.On(
+		"GetBlockHeaders", hashes,
+	).Return([]*wire.BlockHeader{{}}, nil).Once()
+
+	results, err := s.fetchAndFilterBlocks(
+		context.Background(), scanState, 10, 11,
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+}
