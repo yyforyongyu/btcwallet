@@ -53,7 +53,9 @@ func NewRecoveryManager(recoveryWindow, batchSize uint32,
 		recoveryWindow: recoveryWindow,
 		blockBatch:     make([]wtxmgr.BlockMeta, 0, batchSize),
 		chainParams:    chainParams,
-		state:          NewRecoveryState(recoveryWindow),
+		state: NewRecoveryState(
+			recoveryWindow, chainParams, nil,
+		),
 	}
 }
 
@@ -222,24 +224,57 @@ type RecoveryState struct {
 	// TODO(yy): Deprecated, remove.
 	scopes map[waddrmgr.KeyScope]*ScopeRecoveryState
 
+	// branchStates maintains the recovery state for every branch (scope +
+	// account + branch). This is the source of truth.
+	branchStates map[waddrmgr.BranchScope]*BranchRecoveryState
+
 	// watchedOutPoints contains the set of all outpoints known to the
 	// wallet. This is updated iteratively as new outpoints are found during
 	// a rescan.
 	//
 	// TODO(yy): Deprecated, remove.
 	watchedOutPoints map[wire.OutPoint]btcutil.Address
+
+	// chainParams are the parameters that describe the chain we're trying
+	// to recover funds on. These are set at initialization and remain
+	// constant.
+	chainParams *chaincfg.Params
+
+	// addrMgr is the address manager used to derive new keys and manage
+	// account state.
+	addrMgr waddrmgr.AddrStore
+
+	// outpoints tracks unspent outpoints to detect spends. The value is
+	// the PkScript of the outpoint. This map is transient, initialized by
+	// InitScanState at the beginning of a batch scan and pruned by Prune()
+	// at the end to manage memory.
+	outpoints map[wire.OutPoint][]byte
+
+	// addrFilters maps encoded addresses to their derivation info for
+	// identifying incoming payments. This map is transient, initialized by
+	// InitScanState at the beginning of a batch scan and pruned by Prune()
+	// at the end to manage memory.
+	addrFilters map[string]AddrEntry
 }
 
 // NewRecoveryState creates a new RecoveryState using the provided
 // recoveryWindow. Each RecoveryState that is subsequently initialized for a
 // particular key scope will receive the same recoveryWindow.
-func NewRecoveryState(recoveryWindow uint32) *RecoveryState {
-	scopes := make(map[waddrmgr.KeyScope]*ScopeRecoveryState)
+func NewRecoveryState(recoveryWindow uint32,
+	chainParams *chaincfg.Params,
+	addrMgr waddrmgr.AddrStore) *RecoveryState {
 
 	return &RecoveryState{
-		recoveryWindow:   recoveryWindow,
-		scopes:           scopes,
+		recoveryWindow: recoveryWindow,
+		scopes: make(
+			map[waddrmgr.KeyScope]*ScopeRecoveryState,
+		),
+		branchStates: make(
+			map[waddrmgr.BranchScope]*BranchRecoveryState,
+		),
 		watchedOutPoints: make(map[wire.OutPoint]btcutil.Address),
+		chainParams:      chainParams,
+		addrMgr:          addrMgr,
 	}
 }
 
@@ -281,6 +316,44 @@ func (rs *RecoveryState) AddWatchedOutPoint(outPoint *wire.OutPoint,
 	rs.watchedOutPoints[*outPoint] = addr
 }
 
+// GetBranchState returns the recovery state for the provided branch scope.
+// It acts as the source of truth for branch states by either retrieving an
+// existing in-memory BranchRecoveryState for the given `bs` (branch scope)
+// or creating a new one if it doesn't already exist.
+//
+// When a new state is created, it fetches the appropriate AccountStore (key
+// manager) from the Address Manager. This ensures that the BranchRecoveryState
+// is correctly linked to its derivation logic and maintains a consistent,
+// up-to-date view of the branch's lookahead horizon and derived addresses
+// throughout the recovery process. This centralization prevents redundant
+// state creation and ensures all recovery operations for a specific branch
+// operate on the same instance.
+func (rs *RecoveryState) GetBranchState(bs waddrmgr.BranchScope) (
+	*BranchRecoveryState, error) {
+
+	if s, ok := rs.branchStates[bs]; ok {
+		return s, nil
+	}
+
+	// We assume the scope is valid and active if we are requesting state
+	// for it.
+	var mgr waddrmgr.AccountStore
+	if rs.addrMgr != nil {
+		var err error
+
+		mgr, err = rs.addrMgr.FetchScopedKeyManager(bs.Scope)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch manager for "+
+				"scope %v: %w", bs.Scope, err)
+		}
+	}
+
+	s := NewBranchRecoveryState(rs.recoveryWindow, mgr)
+	rs.branchStates[bs] = s
+
+	return s, nil
+}
+
 // AddrEntry holds the derivation info for an address to support
 // reverse lookups during filtering.
 type AddrEntry struct {
@@ -298,6 +371,383 @@ type AddrEntry struct {
 
 	// addrScope identifies the specific address derivation path.
 	addrScope waddrmgr.AddrScope
+}
+
+// Initialize prepares the recovery state for a new batch scan by syncing
+// horizons, populating history/UTXOs, and expanding the lookahead window.
+//
+// TODO(yy): Once RecoveryManager is removed, privatize this method and call
+// it directly from NewRecoveryState to simplify the initialization flow.
+func (rs *RecoveryState) Initialize(accounts []*waddrmgr.AccountProperties,
+	initialAddrs []btcutil.Address, initialUnspent []wtxmgr.Credit) error {
+
+	rs.outpoints = make(map[wire.OutPoint][]byte)
+	rs.addrFilters = make(map[string]AddrEntry)
+
+	// 1. Sync Horizons & Derive Lookahead.
+	// We iterate over all accounts loaded from the database (horizonData)
+	// to sync the recovery horizons. This loop will also populate the
+	// rs.branchStates map with all active branches. For each branch, it
+	// will derive addresses up to the recovery window size and add them to
+	// rs.addrFilters.
+	for _, props := range accounts {
+		err := rs.initAccountState(props)
+		if err != nil {
+			return err
+		}
+	}
+
+	// 2. Populate the filter with "History" - addresses that are already
+	// active/used in the wallet database. We monitor these to detect any
+	// new payments to existing keys.
+	for _, addr := range initialAddrs {
+		addrStr := addr.EncodeAddress()
+
+		entry := AddrEntry{
+			Address:     addr,
+			IsLookahead: false,
+		}
+		rs.addrFilters[addrStr] = entry
+	}
+
+	// 3. Populate the set of unspent outputs (UTXOs) to watch. We monitor
+	// these outpoints to detect when they are spent by a transaction in a
+	// block.
+	for _, u := range initialUnspent {
+		rs.outpoints[u.OutPoint] = u.PkScript
+	}
+
+	return nil
+}
+
+// BuildCFilterData constructs the list of scripts (addresses + outpoints) used
+// for CFilter matching. This is an expensive operation (script derivation) and
+// should only be called when filters are actually used.
+func (rs *RecoveryState) BuildCFilterData() ([][]byte, error) {
+	// Calculate size: addrFilters (Addrs) + outpoints (UTXOs).
+	size := len(rs.addrFilters) + len(rs.outpoints)
+	watchList := make([][]byte, 0, size)
+
+	for _, entry := range rs.addrFilters {
+		script, err := txscript.PayToAddrScript(entry.Address)
+		if err != nil {
+			return nil, fmt.Errorf("failed to gen script for %s: "+
+				"%w", entry.Address, err)
+		}
+
+		watchList = append(watchList, script)
+	}
+
+	for _, script := range rs.outpoints {
+		watchList = append(watchList, script)
+	}
+
+	return watchList, nil
+}
+
+// TxEntry pairs a transaction record with its extracted address entries.
+type TxEntry struct {
+	Rec     *wtxmgr.TxRecord
+	Entries []AddrEntry
+}
+
+// TxEntries is a list of matched transaction entries, preserving the order of
+// transactions.
+type TxEntries []TxEntry
+
+// BlockProcessResult contains the results of processing a block for recovery.
+type BlockProcessResult struct {
+	// RelevantTxs is a slice of transactions within the block that are
+	// relevant to the wallet (i.e., they spend one of our watched
+	// outpoints or send funds to one of our addresses).
+	RelevantTxs []*btcutil.Tx
+
+	// FoundHorizons maps the BranchScope to the highest child index found
+	// in this block. This is used for persistent horizon expansion.
+	FoundHorizons map[waddrmgr.BranchScope]uint32
+
+	// RelevantOutputs holds the details of transaction outputs that matched
+	// the wallet's filters. This allows efficient access to derivation
+	// information without re-parsing scripts or re-fetching addresses.
+	RelevantOutputs TxEntries
+
+	// Expanded indicates whether any new addresses were derived and added
+	// to the address filters as a result of processing this block (i.e., a
+	// lookahead horizon expansion was triggered).
+	Expanded bool
+}
+
+// ProcessBlock filters a block for relevant transactions and expands the
+// recovery horizons if new addresses are found. It handles the "Filter ->
+// Expand -> Retry" loop internally and returns the relevant transactions,
+// found horizons (for state update), relevant matches (for efficient
+// ingestion), and a boolean indicating if any expansion occurred.
+func (rs *RecoveryState) ProcessBlock(block *wire.MsgBlock) (
+	*BlockProcessResult, error) {
+
+	var (
+		expanded        bool
+		relevantTxs     []*btcutil.Tx
+		foundScopes     map[waddrmgr.AddrScope]struct{}
+		relevantOutputs TxEntries
+		foundHorizons   map[waddrmgr.BranchScope]uint32
+	)
+	for {
+		relevantTxs, foundScopes, relevantOutputs = rs.filterBlock(
+			block,
+		)
+
+		foundHorizons = rs.reportFound(foundScopes)
+		if len(foundHorizons) == 0 {
+			break
+		}
+
+		expandedNow, err := rs.expandHorizons()
+		if err != nil {
+			return nil, fmt.Errorf("expand horizons: %w", err)
+		}
+
+		if !expandedNow {
+			break
+		}
+
+		expanded = true
+	}
+
+	return &BlockProcessResult{
+		RelevantTxs:     relevantTxs,
+		FoundHorizons:   foundHorizons,
+		RelevantOutputs: relevantOutputs,
+		Expanded:        expanded,
+	}, nil
+}
+
+// String returns a summary of the recovery state.
+func (rs *RecoveryState) String() string {
+	return fmt.Sprintf("RecoveryState(addrs=%d, outpoints=%d)",
+		len(rs.addrFilters), len(rs.outpoints))
+}
+
+// Empty returns true if there are no addresses or outpoints to watch.
+func (rs *RecoveryState) Empty() bool {
+	return len(rs.addrFilters) == 0 && len(rs.outpoints) == 0
+}
+
+// WatchListSize returns the total number of items (addresses + outpoints)
+// in the current watchlist.
+func (rs *RecoveryState) WatchListSize() int {
+	return len(rs.addrFilters) + len(rs.outpoints)
+}
+
+// initAccountState initializes the recovery state for a specific account by
+// setting up branch recovery states for both external and internal branches.
+// It iterates through the known address counts (from the provided account
+// properties) to sync the horizons and populate the address filters with
+// derived addresses up to the recovery window.
+func (rs *RecoveryState) initAccountState(
+	props *waddrmgr.AccountProperties) error {
+
+	initBranch := func(branch uint32, lastKnownIndex uint32) error {
+		bs := waddrmgr.BranchScope{
+			Scope:   props.KeyScope,
+			Account: props.AccountNumber,
+			Branch:  branch,
+		}
+
+		branchState, err := rs.GetBranchState(bs)
+		if err != nil {
+			return err
+		}
+
+		entries, err := branchState.buildAddrFilters(bs, lastKnownIndex)
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			rs.addrFilters[entry.Address.EncodeAddress()] = entry
+		}
+
+		return nil
+	}
+
+	err := initBranch(waddrmgr.ExternalBranch, props.ExternalKeyCount)
+	if err != nil {
+		return fmt.Errorf("derive external addrs for %s/%d': %w",
+			props.KeyScope, props.AccountNumber, err)
+	}
+
+	err = initBranch(waddrmgr.InternalBranch, props.InternalKeyCount)
+	if err != nil {
+		return fmt.Errorf("derive internal addrs for %s/%d': %w",
+			props.KeyScope, props.AccountNumber, err)
+	}
+
+	return nil
+}
+
+// reportFound updates the recovery state with any addresses found in the
+// current block. It returns the set of found horizons (max index per branch).
+func (rs *RecoveryState) reportFound(
+	found map[waddrmgr.AddrScope]struct{}) map[waddrmgr.BranchScope]uint32 {
+
+	foundHorizons := make(map[waddrmgr.BranchScope]uint32)
+
+	// Group by branch and find max index.
+	for addrScope := range found {
+		bs := addrScope.BranchScope
+
+		idx := addrScope.Index
+		if currentMax, ok := foundHorizons[bs]; !ok ||
+			idx > currentMax {
+
+			foundHorizons[bs] = idx
+		}
+	}
+
+	// Update memory state.
+	for bs, maxIdx := range foundHorizons {
+		state, err := rs.GetBranchState(bs)
+		if err != nil {
+			// This should theoretically not happen if the found
+			// map was populated correctly from filters that
+			// correspond to valid branch states. Log this as an
+			// error for debugging.
+			log.Errorf("Failed to get branch state for %v: %v", bs,
+				err)
+
+			continue
+		}
+
+		state.ReportFound(maxIdx)
+	}
+
+	return foundHorizons
+}
+
+// filterBlock checks a block for any transactions relevant to the wallet.
+// It returns the relevant transactions and the set of found addresses (by
+// branch scope and index).
+//
+// NOTE: This method mutates the recovery state's outpoints in-place by
+// removing spent inputs and adding new relevant outputs. This handles
+// intra-block chains correctly.
+func (rs *RecoveryState) filterBlock(block *wire.MsgBlock) ([]*btcutil.Tx,
+	map[waddrmgr.AddrScope]struct{}, TxEntries) {
+
+	var relevant []*btcutil.Tx
+
+	foundScopes := make(map[waddrmgr.AddrScope]struct{})
+
+	var relevantOutputs TxEntries
+	for _, tx := range block.Transactions {
+		isRelevant, entries := rs.filterTx(tx, foundScopes)
+		if isRelevant {
+			relevant = append(relevant, btcutil.NewTx(tx))
+			// We create a temporary record here. The timestamp will
+			// be updated during commitment.
+			rec, _ := wtxmgr.NewTxRecordFromMsgTx(
+				tx, time.Time{},
+			)
+			relevantOutputs = append(relevantOutputs, TxEntry{
+				Rec:     rec,
+				Entries: entries,
+			})
+		}
+	}
+
+	return relevant, foundScopes, relevantOutputs
+}
+
+// filterTx checks a single transaction for relevance and returns any matching
+// address entries.
+func (rs *RecoveryState) filterTx(tx *wire.MsgTx,
+	foundScopes map[waddrmgr.AddrScope]struct{}) (bool, []AddrEntry) {
+
+	var (
+		isRelevant bool
+		entries    []AddrEntry
+	)
+	// Check if the transaction spends any of our watched outpoints.
+	// If so, it's relevant (a debit).
+	for _, txIn := range tx.TxIn {
+		if _, ok := rs.outpoints[txIn.PreviousOutPoint]; ok {
+			isRelevant = true
+
+			delete(rs.outpoints, txIn.PreviousOutPoint)
+		}
+	}
+	// Check if the transaction pays to any of our watched addresses.
+	// If so, it's relevant (a credit).
+	for i, txOut := range tx.TxOut {
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+			txOut.PkScript, rs.chainParams,
+		)
+		if err != nil {
+			log.Debugf("Could not extract addresses from script "+
+				"%x: %v", txOut.PkScript, err)
+
+			continue
+		}
+
+		for _, a := range addrs {
+			entry, ok := rs.addrFilters[a.EncodeAddress()]
+			if !ok {
+				continue
+			}
+
+			isRelevant = true
+
+			if entry.IsLookahead {
+				foundScopes[entry.addrScope] = struct{}{}
+			}
+			//nolint:gosec // Output index fits in uint32.
+			idx := uint32(i)
+			// Create result entry with Credit populated.
+			entry.Credit.Index = idx
+			entries = append(entries, entry)
+			// Add new output to map immediately to catch
+			// intra-block spends.
+			op := wire.OutPoint{Hash: tx.TxHash(), Index: idx}
+			rs.outpoints[op] = txOut.PkScript
+		}
+	}
+
+	return isRelevant, entries
+}
+
+// expandHorizons ensures that the recovery state's lookahead horizon is
+// sufficient by deriving new addresses if needed, and then updates the
+// internal batch artifacts (addrFilters) with the lookahead addresses.
+func (rs *RecoveryState) expandHorizons() (bool, error) {
+	// We iterate over all active branch states and ensure their lookahead
+	// windows are sufficiently expanded.
+	//
+	// NOTE: rs.branchStates contains the set of all active branches
+	// determined at initialization. This set remains static for the
+	// duration of the batch scan, even as the internal state of each
+	// branch (horizon) evolves.
+	var expanded bool
+	for bs, branchState := range rs.branchStates {
+		// Passing 0 for lastKnownIndex means we don't want to update
+		// the found status based on historical data, just ensure the
+		// lookahead is sufficient based on the current state.
+		newEntries, err := branchState.buildAddrFilters(bs, 0)
+		if err != nil {
+			return false, err
+		}
+
+		if len(newEntries) > 0 {
+			expanded = true
+
+			for _, entry := range newEntries {
+				rs.addrFilters[entry.Address.EncodeAddress()] =
+					entry
+			}
+		}
+	}
+
+	return expanded, nil
 }
 
 // ScopeRecoveryState is used to manage the recovery of addresses generated
@@ -337,6 +787,8 @@ func NewScopeRecoveryState(recoveryWindow uint32) *ScopeRecoveryState {
 //   - Reporting that an address has been found.
 //   - Retrieving all currently derived addresses for the branch.
 //   - Looking up a particular address by its child index.
+//
+// TODO(yy): Privatize this struct and all its methods.
 type BranchRecoveryState struct {
 	// recoveryWindow defines the key-derivation lookahead used when
 	// attempting to recover the set of addresses on this branch.
