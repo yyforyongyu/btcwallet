@@ -179,9 +179,48 @@ func TestControllerStart(t *testing.T) {
 	require.True(t, w.state.isStarted())
 
 	// Clean up
-	if w.cancel != nil {
-		w.cancel()
-	}
-
+	_ = w.Stop(context.Background())
 	w.wg.Wait()
+}
+
+// TestControllerStop verifies the Stop method.
+func TestControllerStop(t *testing.T) {
+	t.Parallel()
+
+	w, deps := createTestWalletWithMocks(t)
+
+	// Setup for Start.
+	deps.addrStore.On(
+		"BirthdayBlock", mock.Anything,
+	).Return(waddrmgr.BlockStamp{}, true, nil).Once()
+	deps.addrStore.On(
+		"ActiveScopedKeyManagers",
+	).Return([]waddrmgr.AccountStore(nil)).Once()
+	deps.txStore.On(
+		"DeleteExpiredLockedOutputs", mock.Anything,
+	).Return(nil).Once()
+
+	// Expect run to be called and block until context canceled.
+	deps.syncer.On("run", mock.Anything).Run(func(args mock.Arguments) {
+		ctx, ok := args.Get(0).(context.Context)
+		if !ok {
+			return
+		}
+		<-ctx.Done()
+	}).Return(nil).Once()
+
+	// Start first.
+	require.NoError(t, w.Start(context.Background()))
+	require.True(t, w.state.isStarted())
+
+	// Act: Stop.
+	err := w.Stop(context.Background())
+	require.NoError(t, err)
+
+	// Assert: State is Stopped.
+	require.False(t, w.state.isStarted())
+
+	// Act: Stop again (idempotent/safe).
+	err = w.Stop(context.Background())
+	require.NoError(t, err)
 }
