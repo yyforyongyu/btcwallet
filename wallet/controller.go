@@ -254,6 +254,34 @@ func (w *Wallet) Stop(stopCtx context.Context) error {
 	return nil
 }
 
+// Lock locks the wallet.
+//
+// This is part of the Controller interface.
+func (w *Wallet) Lock(ctx context.Context) error {
+	r := newLockReq()
+
+	select {
+	case w.requestChan <- r:
+	case <-w.lifetimeCtx.Done():
+		return ErrWalletShuttingDown
+
+	case <-ctx.Done():
+		return fmt.Errorf("context cancelled: %w", ctx.Err())
+	}
+
+	// Wait for the result.
+	select {
+	case err := <-r.resp:
+		return err
+
+	case <-w.lifetimeCtx.Done():
+		return ErrWalletShuttingDown
+
+	case <-ctx.Done():
+		return fmt.Errorf("context cancelled: %w", ctx.Err())
+	}
+}
+
 // mainLoop is the central event loop for the wallet, responsible for
 // coordinating and serializing all lifecycle and authentication requests. It
 // manages the transition between locked and unlocked states and handles the
