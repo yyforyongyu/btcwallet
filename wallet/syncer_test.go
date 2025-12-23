@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -250,4 +252,95 @@ func TestInitChainSync(t *testing.T) {
 
 	err := s.initChainSync(context.Background())
 	require.NoError(t, err)
+}
+
+// TestScanBatchHeadersOnly verifies header-only scan logic.
+func TestScanBatchHeadersOnly(t *testing.T) {
+	t.Parallel()
+
+	mockChain := &mockChain{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(Config{Chain: mockChain}, nil, nil, mockPublisher)
+
+	hashes := []chainhash.Hash{{0x01}, {0x02}}
+	mockChain.On(
+		"GetBlockHashes", int64(10), int64(11),
+	).Return(hashes, nil).Once()
+
+	headers := []*wire.BlockHeader{
+		{Timestamp: time.Unix(100, 0)},
+		{Timestamp: time.Unix(200, 0)},
+	}
+	mockChain.On("GetBlockHeaders", hashes).Return(headers, nil).Once()
+
+	results, err := s.scanBatchHeadersOnly(context.Background(), 10, 11)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.Equal(t, int32(10), results[0].meta.Height)
+	require.Equal(t, int32(11), results[1].meta.Height)
+}
+
+// TestSyncerLoadScanState verifies full scan state loading.
+func TestSyncerLoadScanState(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockAddrStore := &mockAddrStore{}
+	mockTxStore := &mockTxStore{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{
+			DB:             db,
+			RecoveryWindow: 10,
+			ChainParams:    &chaincfg.MainNetParams,
+		},
+		mockAddrStore, mockTxStore, mockPublisher,
+	)
+
+	// 1. mock loadWalletScanData.
+	// 1.a. ActiveScopedKeyManagers.
+	scopedMgr := &mockAccountStore{}
+	mockAddrStore.On(
+		"ActiveScopedKeyManagers",
+	).Return([]waddrmgr.AccountStore{scopedMgr}).Once()
+	// 1.b. ActiveAccounts.
+	scopedMgr.On("ActiveAccounts").Return([]uint32{0}).Once()
+	scopedMgr.On("Scope").Return(waddrmgr.KeyScopeBIP0084).Once()
+	// 1.c. DBGetScanData -> FetchScopedKeyManager, AccountProperties,
+	// ForEachRelevantActiveAddress, OutputsToWatch.
+	mockAddrStore.On(
+		"FetchScopedKeyManager", mock.Anything,
+	).Return(scopedMgr, nil).Maybe()
+
+	props := &waddrmgr.AccountProperties{
+		AccountNumber: 0,
+		KeyScope:      waddrmgr.KeyScopeBIP0084,
+	}
+	scopedMgr.On(
+		"AccountProperties", mock.Anything, uint32(0),
+	).Return(props, nil).Once()
+
+	mockAddrStore.On(
+		"ForEachRelevantActiveAddress", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	mockTxStore.On(
+		"OutputsToWatch", mock.Anything,
+	).Return([]wtxmgr.Credit(nil), nil).Once()
+	// Mock DeriveAddr for lookahead (10 addresses for each branch).
+	mockAddr := &mockAddress{}
+	mockAddr.On("EncodeAddress").Return("addr")
+	mockAddr.On("ScriptAddress").Return([]byte{0x00})
+	scopedMgr.On(
+		"DeriveAddr", mock.Anything, mock.Anything, mock.Anything,
+	).Return(
+		mockAddr, []byte{0x00}, nil,
+	).Maybe()
+
+	// Act
+	state, err := s.loadFullScanState(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, state)
 }
