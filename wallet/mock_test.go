@@ -1216,6 +1216,30 @@ func (m *mockController) Rescan(ctx context.Context, startHeight uint32,
 	return args.Error(0)
 }
 
+// mockChainSyncer is a mock implementation of the chainSyncer interface.
+type mockChainSyncer struct {
+	mock.Mock
+}
+
+// A compile-time assertion to ensure that mockChainSyncer implements the
+// chainSyncer interface.
+var _ chainSyncer = (*mockChainSyncer)(nil)
+
+func (m *mockChainSyncer) run(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *mockChainSyncer) requestScan(ctx context.Context, req *scanReq) error {
+	args := m.Called(ctx, req)
+	return args.Error(0)
+}
+
+func (m *mockChainSyncer) syncState() syncState {
+	args := m.Called()
+	return args.Get(0).(syncState)
+}
+
 // mockTxPublisher is a mock implementation of the TxPublisher interface.
 type mockTxPublisher struct {
 	mock.Mock
