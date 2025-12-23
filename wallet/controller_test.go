@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -140,4 +141,47 @@ func TestHandleChangePassphraseReq(t *testing.T) {
 
 	// Act: Call the stub (should not panic).
 	w.handleChangePassphraseReq(req)
+}
+
+// TestControllerStart verifies the Start method.
+func TestControllerStart(t *testing.T) {
+	t.Parallel()
+
+	w, deps := createTestWalletWithMocks(t)
+
+	// Setup mocks for startup sequence.
+	// 1. verifyBirthday -> DBGetBirthdayBlock.
+	bs := waddrmgr.BlockStamp{Height: 100}
+	deps.addrStore.On(
+		"BirthdayBlock", mock.Anything,
+	).Return(bs, true, nil).Once()
+
+	// 2. DBGetAllAccounts -> ActiveScopedKeyManagers.
+	deps.addrStore.On(
+		"ActiveScopedKeyManagers",
+	).Return([]waddrmgr.AccountStore(nil)).Once()
+
+	// 3. deleteExpiredLockedOutputs.
+	deps.txStore.On(
+		"DeleteExpiredLockedOutputs", mock.Anything,
+	).Return(nil).Once()
+
+	// 4. syncer.run.
+	deps.syncer.On(
+		"run", mock.Anything,
+	).Return(nil).Once()
+
+	// Act
+	err := w.Start(context.Background())
+	require.NoError(t, err)
+
+	// Assert
+	require.True(t, w.state.isStarted())
+
+	// Clean up
+	if w.cancel != nil {
+		w.cancel()
+	}
+
+	w.wg.Wait()
 }
