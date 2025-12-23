@@ -570,3 +570,128 @@ func TestFetchAndFilterBlocks(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 }
+
+// TestAdvanceChainSync verifies advancement logic.
+func TestAdvanceChainSync(t *testing.T) {
+	t.Parallel()
+
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	mockChain := &mockChain{}
+	mockAddrStore := &mockAddrStore{}
+	mockTxStore := &mockTxStore{}
+	mockPublisher := &mockTxPublisher{}
+	s := newSyncer(
+		Config{Chain: mockChain, DB: db}, mockAddrStore, mockTxStore,
+		mockPublisher,
+	)
+
+	// Case 1: Already synced.
+	mockChain.On(
+		"GetBestBlock",
+	).Return(&chainhash.Hash{}, int32(100), nil).Once()
+	mockAddrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
+	).Once()
+
+	finished, err := s.advanceChainSync(context.Background())
+	require.NoError(t, err)
+	require.True(t, finished)
+	require.Equal(t, syncStateSynced, s.syncState())
+
+	// Case 2: Behind, trigger scan.
+	mockChain.On("GetBestBlock").Return(
+		&chainhash.Hash{}, int32(105), nil,
+	).Once()
+	mockAddrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
+	).Once()
+
+	// scanBatch calls...
+	// loadFullScanState...
+	scopedMgr := &mockAccountStore{}
+	mockAddrStore.On(
+		"ActiveScopedKeyManagers",
+	).Return([]waddrmgr.AccountStore{scopedMgr}).Once()
+	scopedMgr.On("ActiveAccounts").Return([]uint32{0}).Once()
+	scopedMgr.On("Scope").Return(waddrmgr.KeyScopeBIP0084).Once()
+	mockAddrStore.On(
+		"FetchScopedKeyManager", mock.Anything,
+	).Return(scopedMgr, nil).Maybe()
+
+	props := &waddrmgr.AccountProperties{
+		AccountNumber: 0,
+		KeyScope:      waddrmgr.KeyScopeBIP0084,
+	}
+	scopedMgr.On(
+		"AccountProperties", mock.Anything, uint32(0),
+	).Return(props, nil).Once()
+	mockAddrStore.On(
+		"ForEachRelevantActiveAddress", mock.Anything, mock.Anything,
+	).Return(nil).Once()
+
+	mockTxStore.On(
+		"OutputsToWatch", mock.Anything,
+	).Return([]wtxmgr.Credit(nil), nil).Once()
+
+	scopedMgr.On(
+		"DeriveAddr", mock.Anything, mock.Anything, mock.Anything,
+	).Return(
+		&mockAddress{}, []byte{}, nil,
+	).Maybe()
+
+	// fetchAndFilterBlocks...
+	// Since state is NOT empty (contains target 0), it calls
+	// GetBlockHashes.
+	hashes := []chainhash.Hash{{0x01}, {0x02}, {0x03}, {0x04}, {0x05}}
+	mockChain.On(
+		"GetBlockHashes", int64(101), int64(105),
+	).Return(hashes, nil).Once()
+
+	// dispatchScanStrategy...
+	filter, _ := gcs.BuildGCSFilter(
+		builder.DefaultP, builder.DefaultM, [16]byte{}, nil,
+	)
+
+	filters := make([]*gcs.Filter, 5)
+	for i := range 5 {
+		filters[i] = filter
+	}
+
+	mockChain.On(
+		"GetCFilters", hashes, wire.GCSFilterRegular,
+	).Return(filters, nil).Once()
+
+	headers := make([]*wire.BlockHeader, 5)
+	for i := range 5 {
+		headers[i] = &wire.BlockHeader{}
+	}
+
+	mockChain.On(
+		"GetBlockHeaders", hashes,
+	).Return(headers, nil).Once()
+
+	// Filter N=0 forces download of all 5 blocks.
+	msgBlock := wire.NewMsgBlock(wire.NewBlockHeader(
+		1, &chainhash.Hash{}, &chainhash.Hash{}, 0, 0,
+	))
+
+	blocks := make([]*wire.MsgBlock, 5)
+	for i := range 5 {
+		blocks[i] = msgBlock
+	}
+
+	mockChain.On(
+		"GetBlocks", hashes,
+	).Return(blocks, nil).Once()
+
+	// DBPutSyncBatch...
+	mockAddrStore.On(
+		"SetSyncedTo", mock.Anything, mock.Anything,
+	).Return(nil).Times(5)
+
+	finished, err = s.advanceChainSync(context.Background())
+	require.NoError(t, err)
+	require.False(t, finished)
+}
