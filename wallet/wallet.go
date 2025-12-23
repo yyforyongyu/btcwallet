@@ -184,14 +184,6 @@ type Wallet struct {
 	// these should be phased out as refactoring progresses.
 	*walletDeprecated
 
-	// publicPassphrase is the passphrase used to encrypt and decrypt public
-	// data in the address manager.
-	publicPassphrase []byte
-
-	// db is the underlying key-value database where all wallet data is
-	// persisted.
-	db walletdb.DB
-
 	// addrStore is the address and key manager responsible for hierarchical
 	// deterministic (HD) derivation and storage of cryptographic keys.
 	addrStore waddrmgr.AddrStore
@@ -199,11 +191,6 @@ type Wallet struct {
 	// txStore is the transaction manager responsible for storing and
 	// querying the wallet's transaction history and unspent outputs.
 	txStore wtxmgr.TxStore
-
-	// recoveryWindow specifies the number of additional keys to derive
-	// beyond the last used one to look for previously used addresses
-	// during a rescan or recovery.
-	recoveryWindow uint32
 
 	// NtfnServer handles the delivery of wallet-related events (e.g., new
 	// transactions, block connections) to connected clients.
@@ -477,6 +464,9 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 
 	deprecated := &walletDeprecated{
 		lockedOutpoints:     map[wire.OutPoint]struct{}{},
+		publicPassphrase:    pubPass,
+		db:                  db,
+		recoveryWindow:      recoveryWindow,
 		rescanAddJob:        make(chan *RescanJob),
 		rescanBatch:         make(chan *rescanBatch),
 		rescanNotifications: make(chan interface{}),
@@ -495,11 +485,8 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 	}
 
 	w := &Wallet{
-		publicPassphrase: pubPass,
-		db:               db,
 		addrStore:        addrMgr,
 		txStore:          txMgr,
-		recoveryWindow:   recoveryWindow,
 		walletDeprecated: deprecated,
 	}
 
