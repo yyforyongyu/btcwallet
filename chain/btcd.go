@@ -5,6 +5,7 @@
 package chain
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -207,7 +208,7 @@ func (c *RPCClient) BackEnd() string {
 // sent by the server.  After a limited number of connection attempts, this
 // function gives up, and therefore will not block forever waiting for the
 // connection to be established to a server that may not exist.
-func (c *RPCClient) Start() error {
+func (c *RPCClient) Start(_ context.Context) error {
 	err := c.Connect(c.reconnectAttempts)
 	if err != nil {
 		return err

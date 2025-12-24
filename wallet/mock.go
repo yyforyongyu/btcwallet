@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"context"
 	"time"
 
 	"github.com/btcsuite/btcd/btcjson"
@@ -19,7 +20,7 @@ type mockChainClient struct {
 
 var _ chain.Interface = (*mockChainClient)(nil)
 
-func (m *mockChainClient) Start() error {
+func (m *mockChainClient) Start(_ context.Context) error {
 	return nil
 }
 

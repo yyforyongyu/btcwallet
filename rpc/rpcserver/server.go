@@ -788,7 +788,7 @@ func (s *loaderServer) StartConsensusRpc(ctx context.Context, // nolint:golint
 		return nil, translateError(err)
 	}
 
-	err = rpcClient.Start()
+	err = rpcClient.Start(ctx)
 	if err != nil {
 		if err == rpcclient.ErrInvalidAuth {
 			return nil, status.Errorf(codes.InvalidArgument,

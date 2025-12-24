@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // nolint:gosec
@@ -184,7 +185,8 @@ func rpcClientConnectLoop(legacyRPCServer *legacyrpc.Server, loader *wallet.Load
 				continue
 			}
 			chainClient = chain.NewNeutrinoClient(activeNet.Params, chainService)
-			err = chainClient.Start()
+
+			err = chainClient.Start(context.Background())
 			if err != nil {
 				log.Errorf("Couldn't start Neutrino client: %s", err)
 			}
@@ -273,6 +275,7 @@ func startChainRPC(certs []byte) (*chain.RPCClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = rpcc.Start()
+
+	err = rpcc.Start(context.Background())
 	return rpcc, err
 }

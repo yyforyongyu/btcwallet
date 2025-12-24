@@ -524,7 +524,7 @@ func setupBitcoind(t *testing.T, minerAddr string,
 
 	// Create a bitcoind client.
 	btcClient := chainConn.NewBitcoindClient()
-	require.NoError(t, btcClient.Start())
+	require.NoError(t, btcClient.Start(t.Context()))
 
 	t.Cleanup(func() {
 		btcClient.Stop()
