@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -411,4 +412,65 @@ func TestControllerInfo(t *testing.T) {
 	// Clean up.
 	_ = w.Stop(context.Background())
 	w.wg.Wait()
+}
+
+// TestControllerResync verifies the Resync method.
+func TestControllerResync(t *testing.T) {
+	t.Parallel()
+
+	w, deps := createTestWalletWithMocks(t)
+	w.state.toStarted()
+	deps.syncer.On("syncState").Return(syncStateSynced)
+
+	// 1. Start height too high.
+	deps.chain.On("GetBestBlock").Return(
+		&chainhash.Hash{}, int32(100), nil,
+	).Once()
+
+	err := w.Resync(context.Background(), 101)
+	require.ErrorIs(t, err, ErrStartHeightTooHigh)
+
+	// 2. Success.
+	deps.chain.On(
+		"GetBestBlock",
+	).Return(&chainhash.Hash{}, int32(100), nil).Once()
+	deps.syncer.On("requestScan", mock.Anything, mock.MatchedBy(
+		func(req *scanReq) bool {
+			return req.typ == scanTypeRewind &&
+				req.startBlock.Height == 50
+		},
+	)).Return(nil).Once()
+
+	err = w.Resync(context.Background(), 50)
+	require.NoError(t, err)
+}
+
+// TestControllerRescan verifies the Rescan method.
+func TestControllerRescan(t *testing.T) {
+	t.Parallel()
+
+	w, deps := createTestWalletWithMocks(t)
+	w.state.toStarted()
+	deps.syncer.On("syncState").Return(syncStateSynced)
+
+	targets := []waddrmgr.AccountScope{{Account: 1}}
+
+	// 1. No targets.
+	err := w.Rescan(context.Background(), 50, nil)
+	require.ErrorIs(t, err, ErrNoScanTargets)
+
+	// 2. Success.
+	deps.chain.On(
+		"GetBestBlock",
+	).Return(&chainhash.Hash{}, int32(100), nil).Once()
+	deps.syncer.On("requestScan", mock.Anything, mock.MatchedBy(
+		func(req *scanReq) bool {
+			return req.typ == scanTypeTargeted &&
+				req.startBlock.Height == 50 &&
+				len(req.targets) == 1
+		},
+	)).Return(nil).Once()
+
+	err = w.Rescan(context.Background(), 50, targets)
+	require.NoError(t, err)
 }
