@@ -2,7 +2,10 @@ package wallet_test
 
 import (
 	"testing"
+	"time"
 
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/stretchr/testify/require"
 )
@@ -209,7 +212,7 @@ func TestBranchRecoveryState(t *testing.T) {
 		// Expected horizon: 30.
 	}
 
-	brs := wallet.NewBranchRecoveryState(recoveryWindow)
+	brs := NewBranchRecoveryState(recoveryWindow, nil)
 	harness := &Harness{
 		t:              t,
 		brs:            brs,
@@ -240,4 +243,85 @@ func assertNumInvalid(t *testing.T, i int, have, want uint32) {
 func assertHaveWant(t *testing.T, i int, msg string, have, want uint32) {
 	t.Helper()
 	require.Equal(t, want, have, "[step: %d] %s", i, msg)
+}
+
+// TestRecoveryManagerBatch verifies batch management logic.
+func TestRecoveryManagerBatch(t *testing.T) {
+	t.Parallel()
+
+	// Arrange
+	rm := NewRecoveryManager(10, 5, &chaincfg.MainNetParams)
+
+	// Act
+	hash := chainhash.Hash{0x01}
+	rm.AddToBlockBatch(&hash, 100, time.Now())
+
+	// Assert
+	batch := rm.BlockBatch()
+	require.Len(t, batch, 1)
+	require.Equal(t, int32(100), batch[0].Height)
+
+	// Act
+	rm.ResetBlockBatch()
+
+	// Assert
+	require.Empty(t, rm.BlockBatch())
+}
+
+// TestBranchRecoveryStateHorizon verifies horizon expansion logic.
+func TestBranchRecoveryStateHorizon(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Window 10.
+	brs := NewBranchRecoveryState(10, nil)
+
+	// Act: Initial horizon extend.
+	// Horizon is 0. NextUnfound is 0. MinValid = 0 + 10 = 10.
+	// Delta = 10 - 0 = 10.
+	// Returns current horizon (start index) and delta.
+	horizon, delta := brs.ExtendHorizon()
+	require.Equal(t, uint32(0), horizon)
+	require.Equal(t, uint32(10), delta)
+
+	// Act: Report found at 5.
+	brs.ReportFound(5)
+	// NextUnfound becomes 6.
+	require.Equal(t, uint32(6), brs.NextUnfound())
+
+	// Act: Extend again.
+	// MinValid = 6 + 10 = 16.
+	// Current Horizon = 10.
+	// Delta = 16 - 10 = 6.
+	horizon, delta = brs.ExtendHorizon()
+	require.Equal(t, uint32(10), horizon)
+	require.Equal(t, uint32(6), delta)
+}
+
+// TestBranchRecoveryStateInvalidChild verifies handling of invalid keys.
+func TestBranchRecoveryStateInvalidChild(t *testing.T) {
+	t.Parallel()
+
+	brs := NewBranchRecoveryState(5, nil)
+	// Initial: Horizon 5.
+	brs.ExtendHorizon()
+
+	// Act: Mark index 2 as invalid.
+	brs.MarkInvalidChild(2)
+
+	// Assert: Horizon incremented to 6.
+	require.Equal(t, uint32(1), brs.NumInvalidInHorizon())
+
+	// Act: Extend.
+	// NextUnfound = 0. Window = 5. Invalid = 1.
+	// MinValid = 0 + 5 + 1 = 6.
+	// Current Horizon = 6.
+	// Delta = 0.
+	horizon, delta := brs.ExtendHorizon()
+	require.Equal(t, uint32(6), horizon)
+	require.Equal(t, uint32(0), delta)
+
+	// Act: Found 3.
+	brs.ReportFound(3)
+	// Invalid child 2 is < 3, so it should be pruned.
+	require.Equal(t, uint32(0), brs.NumInvalidInHorizon())
 }
