@@ -9,6 +9,27 @@ import (
 	"time"
 )
 
+type Account struct {
+	ID                 int64
+	ScopeID            int64
+	AccountNumber      sql.NullInt64
+	AccountName        string
+	OriginID           int16
+	IsWatchOnly        bool
+	MasterFingerprint  sql.NullInt64
+	EncryptedPublicKey []byte
+}
+
+type AccountOrigin struct {
+	ID          int16
+	Description string
+}
+
+type AccountSecret struct {
+	AccountID           int64
+	EncryptedPrivateKey []byte
+}
+
 type AddressType struct {
 	ID          int16
 	Description string
@@ -28,6 +49,7 @@ type KeyScope struct {
 	EncryptedCoinPubKey []byte
 	InternalTypeID      int16
 	ExternalTypeID      int16
+	LastAccountNumber   int64
 }
 
 type KeyScopeSecret struct {
