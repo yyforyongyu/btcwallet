@@ -7,10 +7,35 @@ import (
 	"fmt"
 )
 
-func addressTypeInfosFromRows[T any](rows []T,
-	toInfo func(T) (AddressTypeInfo, error)) ([]AddressTypeInfo, error) {
+// errInvalidAddressType is returned when an address type ID from the
+// database does not fit in AddressType (uint8). In practice, this
+// should never happen, but it's possible if the database is modified
+// incorrectly or the query is incorrect.
+var errInvalidAddressType = errors.New("invalid address type")
+
+// idToAddressType safely converts an integer to AddressType. It returns an
+// error if the value does not correspond to a known AddressType value.
+func idToAddressType[T ~int16 | ~int64](v T) (AddressType, error) {
+	if v < 0 || v > T(Anchor) {
+		return 0, fmt.Errorf("%w: %d", errInvalidAddressType, v)
+	}
+
+	return AddressType(v), nil
+}
+
+// listAddressTypes is a generic helper that retrieves all address types from
+// the database and converts them to AddressTypeInfo structs.
+func listAddressTypes[R any](ctx context.Context,
+	list func(context.Context) ([]R, error),
+	toInfo func(R) (AddressTypeInfo, error)) ([]AddressTypeInfo, error) {
+
+	rows, err := list(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list address types: %w", err)
+	}
 
 	types := make([]AddressTypeInfo, len(rows))
+
 	for i, row := range rows {
 		info, err := toInfo(row)
 		if err != nil {
@@ -23,22 +48,12 @@ func addressTypeInfosFromRows[T any](rows []T,
 	return types, nil
 }
 
-func listAddressTypes[T any](ctx context.Context,
-	list func(context.Context) ([]T, error),
-	toInfo func(T) (AddressTypeInfo, error)) ([]AddressTypeInfo, error) {
-
-	rows, err := list(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list address types: %w", err)
-	}
-
-	return addressTypeInfosFromRows(rows, toInfo)
-}
-
-func getAddressTypeByID[T any, ID any](ctx context.Context,
-	get func(context.Context, ID) (T, error), queryID ID,
-	id AddressType, toInfo func(T) (AddressTypeInfo, error)) (
-	AddressTypeInfo, error) {
+// getAddressTypeByID is a generic helper that retrieves a single address type
+// by its ID and converts it to an AddressTypeInfo struct. It returns
+// ErrAddressTypeNotFound if no matching type is found.
+func getAddressTypeByID[R any, ID any](ctx context.Context,
+	get func(context.Context, ID) (R, error), queryID ID, id AddressType,
+	toInfo func(R) (AddressTypeInfo, error)) (AddressTypeInfo, error) {
 
 	row, err := get(ctx, queryID)
 	if err != nil {
@@ -53,11 +68,5 @@ func getAddressTypeByID[T any, ID any](ctx context.Context,
 			err)
 	}
 
-	info, err := toInfo(row)
-	if err != nil {
-		return AddressTypeInfo{}, fmt.Errorf("get address type: %w",
-			err)
-	}
-
-	return info, nil
+	return toInfo(row)
 }
