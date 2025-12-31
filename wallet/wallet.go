@@ -306,6 +306,10 @@ type Wallet struct {
 	// cfg holds the static configuration parameters provided when the
 	// wallet was created or loaded.
 	cfg Config
+
+	// sync is the dedicated synchronization component that manages the
+	// chain loop, scanning, and reorganization handling.
+	sync chainSyncer
 }
 
 // AccountAddresses returns the addresses for every created address for an
@@ -604,4 +608,3 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 
 	return w, nil
 }
-
