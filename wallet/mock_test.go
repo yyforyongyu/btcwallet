@@ -1159,3 +1159,82 @@ func (m *mockSpendDetails) Sign(params *RawSigParams,
 
 // isSpendDetails implements the SpendDetails interface.
 func (m *mockSpendDetails) isSpendDetails() {}
+
+// mockController is a mock implementation of the Controller interface.
+type mockController struct {
+	mock.Mock
+}
+
+// Compile-time check to ensure mockController implements Controller.
+var _ Controller = (*mockController)(nil)
+
+func (m *mockController) Unlock(ctx context.Context, req UnlockRequest) error {
+	args := m.Called(ctx, req)
+	return args.Error(0)
+}
+
+func (m *mockController) Lock(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *mockController) ChangePassphrase(ctx context.Context,
+	req ChangePassphraseRequest) error {
+
+	args := m.Called(ctx, req)
+	return args.Error(0)
+}
+
+func (m *mockController) Info(ctx context.Context) (*Info, error) {
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*Info), args.Error(1)
+}
+
+func (m *mockController) Start(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *mockController) Stop(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *mockController) Resync(ctx context.Context, startHeight uint32) error {
+	args := m.Called(ctx, startHeight)
+	return args.Error(0)
+}
+
+func (m *mockController) Rescan(ctx context.Context, startHeight uint32,
+	targets []waddrmgr.AccountScope) error {
+
+	args := m.Called(ctx, startHeight, targets)
+	return args.Error(0)
+}
+
+// mockTxPublisher is a mock implementation of the TxPublisher interface.
+type mockTxPublisher struct {
+	mock.Mock
+}
+
+// A compile-time check to ensure that mockTxPublisher implements the
+// TxPublisher interface.
+var _ TxPublisher = (*mockTxPublisher)(nil)
+
+func (m *mockTxPublisher) CheckMempoolAcceptance(ctx context.Context,
+	tx *wire.MsgTx) error {
+
+	args := m.Called(ctx, tx)
+	return args.Error(0)
+}
+
+func (m *mockTxPublisher) Broadcast(ctx context.Context, tx *wire.MsgTx,
+	label string) error {
+
+	args := m.Called(ctx, tx, label)
+	return args.Error(0)
+}
