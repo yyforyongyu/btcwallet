@@ -74,7 +74,7 @@ linters:
       line-length: 80
       # Tab width in spaces.
       # Default: 1
-      tab-width: 8
+      tab-width: 4
 
     whitespace:
       multi-func: true
