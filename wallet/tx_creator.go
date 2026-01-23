@@ -521,6 +521,11 @@ func (w *Wallet) prepareTxAuthSources(intent *TxIntent) (
 func (w *Wallet) CreateTransaction(_ context.Context, intent *TxIntent) (
 	*txauthor.AuthoredTx, error) {
 
+	err := w.state.validateSynced()
+	if err != nil {
+		return nil, err
+	}
+
 	// Check that the intent is not nil.
 	if intent == nil {
 		return nil, ErrNilTxIntent
@@ -535,7 +540,7 @@ func (w *Wallet) CreateTransaction(_ context.Context, intent *TxIntent) (
 		intent.Inputs = &InputsPolicy{}
 	}
 
-	err := validateTxIntent(intent)
+	err = validateTxIntent(intent)
 	if err != nil {
 		return nil, err
 	}
