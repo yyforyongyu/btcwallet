@@ -233,7 +233,7 @@ func TestDerivePubKeyNotPubKeyAddr(t *testing.T) {
 
 	// We need a valid address for the error message.
 	addr, err := btcutil.NewAddressWitnessPubKeyHash(
-		make([]byte, 20), w.chainParams,
+		make([]byte, 20), w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
@@ -642,7 +642,8 @@ func TestComputeUnlockingScriptP2PKH(t *testing.T) {
 	// Create a P2PKH address and the corresponding previous output script.
 	// This is the output we want to create an unlocking script for.
 	addr, err := btcutil.NewAddressPubKeyHash(
-		btcutil.Hash160(pubKey.SerializeCompressed()), w.chainParams,
+		btcutil.Hash160(pubKey.SerializeCompressed()),
+		w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 	pkScript, err := txscript.PayToAddrScript(addr)
@@ -714,7 +715,8 @@ func TestComputeUnlockingScriptP2WKH(t *testing.T) {
 
 	// Create a P2WKH address and the corresponding previous output script.
 	addr, err := btcutil.NewAddressWitnessPubKeyHash(
-		btcutil.Hash160(pubKey.SerializeCompressed()), w.chainParams,
+		btcutil.Hash160(pubKey.SerializeCompressed()),
+		w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 	pkScript, err := txscript.PayToAddrScript(addr)
@@ -788,7 +790,7 @@ func TestComputeUnlockingScriptNP2WKH(t *testing.T) {
 		AddData(btcutil.Hash160(pubKey.SerializeCompressed())).
 		Script()
 	require.NoError(t, err)
-	addr, err := btcutil.NewAddressScriptHash(p2sh, w.chainParams)
+	addr, err := btcutil.NewAddressScriptHash(p2sh, w.cfg.ChainParams)
 	require.NoError(t, err)
 	pkScript, err := txscript.PayToAddrScript(addr)
 	require.NoError(t, err)
@@ -864,7 +866,7 @@ func TestComputeUnlockingScriptP2TR(t *testing.T) {
 	addr, err := btcutil.NewAddressTaproot(
 		schnorr.SerializePubKey(
 			txscript.ComputeTaprootOutputKey(pubKey, nil),
-		), w.chainParams,
+		), w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 	pkScript, err := txscript.PayToAddrScript(addr)
@@ -1122,7 +1124,8 @@ func TestComputeUnlockingScriptUnknownAddrType(t *testing.T) {
 	privKey, pubKey := deterministicPrivKey(t)
 	privKeyCopy, _ := btcec.PrivKeyFromBytes(privKey.Serialize())
 	addr, err := btcutil.NewAddressPubKeyHash(
-		btcutil.Hash160(pubKey.SerializeCompressed()), w.chainParams,
+		btcutil.Hash160(pubKey.SerializeCompressed()),
+		w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
@@ -1180,7 +1183,7 @@ func TestComputeRawSigLegacyP2PKH(t *testing.T) {
 	// Create a P2PKH address from the public key.
 	pubKeyHash := btcutil.Hash160(pubKey.SerializeCompressed())
 	addr, err := btcutil.NewAddressPubKeyHash(
-		pubKeyHash, w.chainParams,
+		pubKeyHash, w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
@@ -1266,7 +1269,9 @@ func TestComputeRawSigLegacyP2SH(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create the P2SH address corresponding to the redeem script hash.
-	addr, err := btcutil.NewAddressScriptHash(redeemScript, w.chainParams)
+	addr, err := btcutil.NewAddressScriptHash(
+		redeemScript, w.cfg.ChainParams,
+	)
 	require.NoError(t, err)
 
 	// Create the Pay-To-Addr script (P2SH script) which will be the
@@ -1325,7 +1330,7 @@ func TestComputeRawSigSegwitV0(t *testing.T) {
 	// Create a P2WKH address from the public key.
 	pubKeyHash := btcutil.Hash160(pubKey.SerializeCompressed())
 	addr, err := btcutil.NewAddressWitnessPubKeyHash(
-		pubKeyHash, w.chainParams,
+		pubKeyHash, w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
@@ -1406,7 +1411,7 @@ func TestComputeRawSigTaprootKeySpendPath(t *testing.T) {
 	addr, err := btcutil.NewAddressTaproot(
 		schnorr.SerializePubKey(
 			txscript.ComputeTaprootOutputKey(internalKey, nil),
-		), w.chainParams,
+		), w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
@@ -1491,7 +1496,7 @@ func TestComputeRawSigTaprootScriptPath(t *testing.T) {
 
 	// Create a P2TR address from the output key.
 	addr, err := btcutil.NewAddressTaproot(
-		schnorr.SerializePubKey(outputKey), w.chainParams,
+		schnorr.SerializePubKey(outputKey), w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
@@ -1885,7 +1890,7 @@ func TestGetPrivKeyForAddressSuccess(t *testing.T) {
 	// Create a P2PKH address from the public key.
 	pubKeyHash := btcutil.Hash160(pubKey.SerializeCompressed())
 	addr, err := btcutil.NewAddressPubKeyHash(
-		pubKeyHash, w.chainParams,
+		pubKeyHash, w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
@@ -1914,7 +1919,7 @@ func TestGetPrivKeyForAddressFail(t *testing.T) {
 	// Arrange: Set up the wallet and mocks.
 	w, mocks := testWalletWithMocks(t)
 	addr, err := btcutil.NewAddressPubKeyHash(
-		make([]byte, 20), w.chainParams,
+		make([]byte, 20), w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 

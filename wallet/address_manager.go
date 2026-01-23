@@ -293,7 +293,7 @@ func (w *Wallet) newAddress(manager waddrmgr.AccountStore,
 		err  error
 	)
 
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 		addr, err = manager.NewAddress(addrmgrNs, accountName, change)
@@ -364,7 +364,7 @@ func (w *Wallet) GetUnusedAddress(ctx context.Context, accountName string,
 
 	var unusedAddr btcutil.Address
 
-	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 
 		// First, look up the account number for the passed account
@@ -447,7 +447,7 @@ func (w *Wallet) AddressInfo(_ context.Context,
 		err            error
 	)
 
-	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 
 		managedAddress, err = w.addrStore.Address(addrmgrNs, a)
@@ -498,7 +498,7 @@ func (w *Wallet) ListAddresses(_ context.Context, accountName string,
 
 	var properties []AddressProperty
 
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+	err := walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
 
@@ -513,7 +513,7 @@ func (w *Wallet) ListAddresses(_ context.Context, accountName string,
 
 		for _, utxo := range utxos {
 			addr := extractAddrFromPKScript(
-				utxo.PkScript, w.chainParams,
+				utxo.PkScript, w.cfg.ChainParams,
 			)
 			if addr == nil {
 				continue
@@ -599,7 +599,7 @@ func (w *Wallet) ImportPublicKey(_ context.Context, pubKey *btcec.PublicKey,
 
 	var addr btcutil.Address
 
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 		ma, err := manager.ImportPublicKey(addrmgrNs, pubKey, nil)
@@ -657,7 +657,7 @@ func (w *Wallet) ImportTaprootScript(_ context.Context,
 
 	var addr waddrmgr.ManagedAddress
 
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		syncedTo := w.addrStore.SyncedTo()
 		addr, err = manager.ImportTaprootScript(
@@ -713,7 +713,7 @@ func (w *Wallet) ScriptForOutput(ctx context.Context, output wire.TxOut) (
 	Script, error) {
 
 	// First, we'll extract the address from the output's pkScript.
-	addr := extractAddrFromPKScript(output.PkScript, w.chainParams)
+	addr := extractAddrFromPKScript(output.PkScript, w.cfg.ChainParams)
 	if addr == nil {
 		return Script{}, fmt.Errorf("%w: from pkscript %x",
 			ErrUnableToExtractAddress, output.PkScript)
@@ -734,7 +734,7 @@ func (w *Wallet) ScriptForOutput(ctx context.Context, output wire.TxOut) (
 	}
 
 	witnessProgram, redeemScript, err := buildScriptsForManagedAddress(
-		pubKeyAddr, output.PkScript, w.chainParams,
+		pubKeyAddr, output.PkScript, w.cfg.ChainParams,
 	)
 	if err != nil {
 		return Script{}, err
