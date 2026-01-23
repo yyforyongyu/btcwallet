@@ -190,7 +190,7 @@ func (w *Wallet) ListTxns(_ context.Context, startHeight,
 	// time we hold the database lock.
 	var records []wtxmgr.TxDetails
 
-	err := walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
+	err := walletdb.View(w.cfg.DB, func(dbtx walletdb.ReadTx) error {
 		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
 
 		err := w.txStore.RangeTransactions(
@@ -229,7 +229,7 @@ func (w *Wallet) fetchTxDetails(txHash *chainhash.Hash) (
 
 	var txDetails *wtxmgr.TxDetails
 
-	err := walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
+	err := walletdb.View(w.cfg.DB, func(dbtx walletdb.ReadTx) error {
 		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
 
 		var err error
@@ -355,7 +355,7 @@ func (w *Wallet) populateOutputs(details *TxDetail,
 
 	for i, txOut := range txDetails.MsgTx.TxOut {
 		sc, outAddresses, _, err := txscript.ExtractPkScriptAddrs(
-			txOut.PkScript, w.chainParams,
+			txOut.PkScript, w.cfg.ChainParams,
 		)
 
 		var addresses []btcutil.Address

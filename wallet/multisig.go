@@ -46,7 +46,8 @@ func (w *Wallet) MakeMultiSigScript(addrs []btcutil.Address, nRequired int) ([]b
 		case *btcutil.AddressPubKeyHash:
 			if dbtx == nil {
 				var err error
-				dbtx, err = w.db.BeginReadTx()
+
+				dbtx, err = w.cfg.DB.BeginReadTx()
 				if err != nil {
 					return nil, err
 				}
@@ -61,7 +62,7 @@ func (w *Wallet) MakeMultiSigScript(addrs []btcutil.Address, nRequired int) ([]b
 				PubKey().SerializeCompressed()
 
 			pubKeyAddr, err := btcutil.NewAddressPubKey(
-				serializedPubKey, w.chainParams)
+				serializedPubKey, w.cfg.ChainParams)
 			if err != nil {
 				return nil, err
 			}
@@ -75,7 +76,8 @@ func (w *Wallet) MakeMultiSigScript(addrs []btcutil.Address, nRequired int) ([]b
 // ImportP2SHRedeemScript adds a P2SH redeem script to the wallet.
 func (w *Wallet) ImportP2SHRedeemScript(script []byte) (*btcutil.AddressScriptHash, error) {
 	var p2shAddr *btcutil.AddressScriptHash
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+
+	err := walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 		// TODO(oga) blockstamp current block?
@@ -102,7 +104,7 @@ func (w *Wallet) ImportP2SHRedeemScript(script []byte) (*btcutil.AddressScriptHa
 				// This function will never error as it always
 				// hashes the script to the correct length.
 				p2shAddr, _ = btcutil.NewAddressScriptHash(script,
-					w.chainParams)
+					w.cfg.ChainParams)
 				return nil
 			}
 			return err

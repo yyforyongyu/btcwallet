@@ -356,7 +356,7 @@ func TestBalance(t *testing.T) {
 	}, time.Now())
 	require.NoError(t, err)
 
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
 		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
 
 		err := w.txStore.InsertTx(ns, rec, &wtxmgr.BlockMeta{
@@ -377,7 +377,7 @@ func TestBalance(t *testing.T) {
 	require.NoError(t, err)
 
 	// Now, we'll update the wallet's sync state.
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 		return w.addrStore.SetSyncedTo(addrmgrNs, &waddrmgr.BlockStamp{
@@ -467,20 +467,20 @@ func TestExtractAddrFromPKScript(t *testing.T) {
 
 	w := testWallet(t)
 
-	w.chainParams = &chaincfg.MainNetParams
+	w.cfg.ChainParams = &chaincfg.MainNetParams
 
 	p2pkhAddr, err := btcutil.DecodeAddress(
-		"17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem", w.chainParams,
+		"17VZNX1SN5NtKa8UQFxwQbFeFc3iqRYhem", w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
 	p2shAddr, err := btcutil.DecodeAddress(
-		"347N1Thc213QqfYCz3PZkjoJpNv5b14kBd", w.chainParams,
+		"347N1Thc213QqfYCz3PZkjoJpNv5b14kBd", w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
 	p2wpkhAddr, err := btcutil.DecodeAddress(
-		"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", w.chainParams,
+		"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
 
@@ -550,7 +550,7 @@ func TestExtractAddrFromPKScript(t *testing.T) {
 			t.Parallel()
 
 			addr := extractAddrFromPKScript(
-				testCase.script(), w.chainParams,
+				testCase.script(), w.cfg.ChainParams,
 			)
 			if addr == nil {
 				require.Empty(t, testCase.addr)
@@ -676,7 +676,7 @@ func TestFetchAccountBalances(t *testing.T) {
 
 		// Update sync state.
 		err = walletdb.Update(
-			w.db, func(tx walletdb.ReadWriteTx) error {
+			w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
 				addrmgrNs := tx.ReadWriteBucket(
 					waddrmgrNamespaceKey,
 				)
@@ -744,7 +744,7 @@ func TestFetchAccountBalances(t *testing.T) {
 			var balances scopedBalances
 
 			err := walletdb.View(
-				w.db, func(tx walletdb.ReadTx) error {
+				w.cfg.DB, func(tx walletdb.ReadTx) error {
 					var err error
 
 					balances, err = w.fetchAccountBalances(
@@ -789,7 +789,7 @@ func TestListAccountsWithBalances(t *testing.T) {
 
 	// Now, we'll call listAccountsWithBalances within a read transaction
 	// and verify the results.
-	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		scopedMgr, err := w.addrStore.FetchScopedKeyManager(scope)
 		require.NoError(t, err)
