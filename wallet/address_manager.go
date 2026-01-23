@@ -195,6 +195,11 @@ var _ AddressManager = (*Wallet)(nil)
 func (w *Wallet) NewAddress(_ context.Context, accountName string,
 	addrType waddrmgr.AddressType, change bool) (btcutil.Address, error) {
 
+	err := w.state.validateStarted()
+	if err != nil {
+		return nil, err
+	}
+
 	// Addresses cannot be derived from the catch-all imported accounts.
 	if accountName == waddrmgr.ImportedAddrAccountName {
 		return nil, ErrImportedAccountNoAddrGen
@@ -348,6 +353,11 @@ func (w *Wallet) newAddress(manager waddrmgr.AccountStore,
 func (w *Wallet) GetUnusedAddress(ctx context.Context, accountName string,
 	addrType waddrmgr.AddressType, change bool) (btcutil.Address, error) {
 
+	err := w.state.validateStarted()
+	if err != nil {
+		return nil, err
+	}
+
 	if accountName == waddrmgr.ImportedAddrAccountName {
 		return nil, ErrImportedAccountNoAddrGen
 	}
@@ -442,10 +452,12 @@ func (w *Wallet) GetUnusedAddress(ctx context.Context, accountName string,
 func (w *Wallet) AddressInfo(_ context.Context,
 	a btcutil.Address) (waddrmgr.ManagedAddress, error) {
 
-	var (
-		managedAddress waddrmgr.ManagedAddress
-		err            error
-	)
+	err := w.state.validateStarted()
+	if err != nil {
+		return nil, err
+	}
+
+	var managedAddress waddrmgr.ManagedAddress
 
 	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
@@ -496,9 +508,14 @@ func (w *Wallet) AddressInfo(_ context.Context,
 func (w *Wallet) ListAddresses(_ context.Context, accountName string,
 	addrType waddrmgr.AddressType) ([]AddressProperty, error) {
 
+	err := w.state.validateStarted()
+	if err != nil {
+		return nil, err
+	}
+
 	var properties []AddressProperty
 
-	err := walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
+	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
 
@@ -587,6 +604,11 @@ func (w *Wallet) ListAddresses(_ context.Context, accountName string,
 func (w *Wallet) ImportPublicKey(_ context.Context, pubKey *btcec.PublicKey,
 	addrType waddrmgr.AddressType) error {
 
+	err := w.state.validateStarted()
+	if err != nil {
+		return err
+	}
+
 	keyScope, err := w.keyScopeFromAddrType(addrType)
 	if err != nil {
 		return err
@@ -647,6 +669,11 @@ func (w *Wallet) ImportPublicKey(_ context.Context, pubKey *btcec.PublicKey,
 //     write, making it a fast operation with a complexity of roughly O(1).
 func (w *Wallet) ImportTaprootScript(_ context.Context,
 	tapscript waddrmgr.Tapscript) (waddrmgr.ManagedAddress, error) {
+
+	err := w.state.validateStarted()
+	if err != nil {
+		return nil, err
+	}
 
 	manager, err := w.addrStore.FetchScopedKeyManager(
 		waddrmgr.KeyScopeBIP0086,
@@ -711,6 +738,11 @@ func (w *Wallet) ImportTaprootScript(_ context.Context,
 //     generation is a constant-time operation.
 func (w *Wallet) ScriptForOutput(ctx context.Context, output wire.TxOut) (
 	Script, error) {
+
+	err := w.state.validateStarted()
+	if err != nil {
+		return Script{}, err
+	}
 
 	// First, we'll extract the address from the output's pkScript.
 	addr := extractAddrFromPKScript(output.PkScript, w.cfg.ChainParams)
@@ -803,6 +835,11 @@ func buildScriptsForManagedAddress(pubKeyAddr waddrmgr.ManagedPubKeyAddress,
 // GetDerivationInfo returns the BIP-32 derivation path for a given address.
 func (w *Wallet) GetDerivationInfo(ctx context.Context,
 	addr btcutil.Address) (*psbt.Bip32Derivation, error) {
+
+	err := w.state.validateStarted()
+	if err != nil {
+		return nil, err
+	}
 
 	// We'll use the address to look up the derivation path.
 	managedAddr, err := w.AddressInfo(ctx, addr)
