@@ -81,11 +81,16 @@ func TestFindCredit(t *testing.T) {
 
 			// Act: Call findCredit with the configured TxDetails
 			// and index.
-			found := findCredit(txDetails, tc.index)
+			cred := findCredit(txDetails, tc.index)
 
-			// Assert: Verify that the returned boolean matches the
-			// expected outcome.
-			require.Equal(t, tc.expectedFound, found)
+			// Assert: Verify that the returned credit record
+			// matches the expected outcome.
+			if tc.expectedFound {
+				require.NotNil(t, cred)
+				require.Equal(t, tc.index, cred.Index)
+			} else {
+				require.Nil(t, cred)
+			}
 		})
 	}
 }
@@ -115,7 +120,7 @@ func TestFetchAndValidateUtxoSuccess(t *testing.T) {
 		},
 	}
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Mock the transaction store to return the details for our txHash.
 	mocks.txStore.On(
@@ -177,6 +182,14 @@ func TestFetchAndValidateUtxoError(t *testing.T) {
 		Credits:  []wtxmgr.CreditRecord{},
 	}
 
+	lockedDetails := &wtxmgr.TxDetails{
+		TxRecord: txDetails.TxRecord,
+		Credits: []wtxmgr.CreditRecord{
+			{Index: 0},
+			{Index: 1, Locked: true},
+		},
+	}
+
 	testCases := []struct {
 		name          string
 		txIn          *wire.TxIn
@@ -208,7 +221,7 @@ func TestFetchAndValidateUtxoError(t *testing.T) {
 		{
 			name:          "utxo locked",
 			txIn:          txInLocked,
-			mockTxDetails: txDetails,
+			mockTxDetails: lockedDetails,
 			mockErr:       nil,
 			expectedErr:   ErrUtxoLocked,
 		},
@@ -218,11 +231,7 @@ func TestFetchAndValidateUtxoError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			w, mocks := testWalletWithMocks(t)
-
-			// Arrange: Lock the "locked" outpoint to simulate a
-			// locked UTXO scenario.
-			w.LockOutpoint(txInLocked.PreviousOutPoint)
+			w, mocks := createStartedWalletWithMocks(t)
 
 			// Arrange: Mock the transaction store to return the
 			// configured details or error for the specific test
@@ -277,7 +286,7 @@ func TestDecorateInputSegWitV0(t *testing.T) {
 		Index:   0,
 	}
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock the address manager to return our P2WKH address as a
 	// ManagedPubKeyAddress when `Address` is called with the P2WKH
@@ -352,7 +361,7 @@ func TestDecorateInputTaproot(t *testing.T) {
 		Index:   0,
 	}
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock the address manager to return our Taproot address as a
 	// ManagedPubKeyAddress when `Address` is called with the Taproot
@@ -405,7 +414,7 @@ func TestDecorateInputTaproot(t *testing.T) {
 func TestDecorateInputErrExtractAddr(t *testing.T) {
 	t.Parallel()
 
-	w, _ := testWalletWithMocks(t)
+	w, _ := createStartedWalletWithMocks(t)
 
 	// Arrange: Create a UTXO with an OP_RETURN script, which cannot be
 	// parsed into a valid address.
@@ -442,7 +451,7 @@ func TestDecorateInputErrAddrInfo(t *testing.T) {
 	p2wkhScript, err := txscript.PayToAddrScript(p2wkhAddr)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock AddressInfo to return an error.
 	mocks.addrStore.On(
@@ -482,7 +491,7 @@ func TestDecorateInputErrNotPubKey(t *testing.T) {
 	p2wkhScript, err := txscript.PayToAddrScript(p2wkhAddr)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock AddressInfo to return a generic ManagedAddress
 	// (mocks.addr) instead of a ManagedPubKeyAddress (mocks.pubKeyAddr).
@@ -525,7 +534,7 @@ func TestDecorateInputErrImported(t *testing.T) {
 	p2wkhScript, err := txscript.PayToAddrScript(p2wkhAddr)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock AddressInfo to return a ManagedPubKeyAddress that is
 	// marked as imported.
@@ -569,7 +578,7 @@ func TestDecorateInputErrDerivationMissing(t *testing.T) {
 	p2wkhScript, err := txscript.PayToAddrScript(p2wkhAddr)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock AddressInfo to return a ManagedPubKeyAddress that has
 	// no derivation info.
@@ -662,7 +671,7 @@ func TestDecorateInputsSuccess(t *testing.T) {
 		Credits: []wtxmgr.CreditRecord{{Index: 0}},
 	}
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock TxDetails lookups.
 	// Input 0 -> Found
@@ -742,7 +751,7 @@ func TestDecorateInputsErrUnknownRequired(t *testing.T) {
 	packet, err := psbt.NewFromUnsignedTx(unsignedTx)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock TxDetails to return ErrTxNotFound.
 	mocks.txStore.On(
@@ -773,7 +782,7 @@ func TestDecorateInputsErrFetchFailed(t *testing.T) {
 	packet, err := psbt.NewFromUnsignedTx(unsignedTx)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock TxDetails to return a database error.
 	mocks.txStore.On(
@@ -828,7 +837,7 @@ func TestDecorateInputsErrDecorationFailed(t *testing.T) {
 		Credits: []wtxmgr.CreditRecord{{Index: 0}},
 	}
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock TxDetails success.
 	mocks.txStore.On(
@@ -852,7 +861,7 @@ func TestDecorateInputsErrDecorationFailed(t *testing.T) {
 func TestValidateFundIntentSuccess(t *testing.T) {
 	t.Parallel()
 
-	w, _ := testWalletWithMocks(t)
+	w, _ := createStartedWalletWithMocks(t)
 
 	// Arrange: Create a valid PSBT packet with one output (for auto
 	// selection).
@@ -895,7 +904,7 @@ func TestValidateFundIntentSuccess(t *testing.T) {
 func TestValidateFundIntentError(t *testing.T) {
 	t.Parallel()
 
-	w, _ := testWalletWithMocks(t)
+	w, _ := createStartedWalletWithMocks(t)
 
 	// Arrange: Helper function to create a PSBT packet with specified
 	// inputs and outputs.
@@ -965,7 +974,7 @@ func TestValidateFundIntentError(t *testing.T) {
 func TestCreateTxIntentAuto(t *testing.T) {
 	t.Parallel()
 
-	w, _ := testWalletWithMocks(t)
+	w, _ := createStartedWalletWithMocks(t)
 
 	// Arrange: Create a PSBT packet with two outputs and no inputs,
 	// which signals automatic coin selection.
@@ -1015,7 +1024,7 @@ func TestCreateTxIntentAuto(t *testing.T) {
 func TestCreateTxIntentManual(t *testing.T) {
 	t.Parallel()
 
-	w, _ := testWalletWithMocks(t)
+	w, _ := createStartedWalletWithMocks(t)
 
 	// Arrange: Create a PSBT packet with two inputs and one output,
 	// which signals manual coin selection.
@@ -1146,7 +1155,7 @@ func TestAddChangeOutputInfoSuccess(t *testing.T) {
 	packet, err := psbt.NewFromUnsignedTx(authoredTx.Tx)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock Address lookup.
 	mocks.addrStore.On(
@@ -1206,7 +1215,7 @@ func TestAddChangeOutputInfoErrScriptFail(t *testing.T) {
 	packet, err := psbt.NewFromUnsignedTx(authoredTx.Tx)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock Address lookup to fail.
 	mocks.addrStore.On(
@@ -1248,7 +1257,7 @@ func TestAddChangeOutputInfoErrNotPubKey(t *testing.T) {
 	packet, err := psbt.NewFromUnsignedTx(authoredTx.Tx)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock Address lookup to return a generic address.
 	mocks.addrStore.On(
@@ -1292,7 +1301,7 @@ func TestAddChangeOutputInfoErrDerivationUnknown(t *testing.T) {
 	packet, err := psbt.NewFromUnsignedTx(authoredTx.Tx)
 	require.NoError(t, err)
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock Address lookup.
 	mocks.addrStore.On(
@@ -1360,7 +1369,7 @@ func TestPopulatePsbtPacketErrors(t *testing.T) {
 
 	t.Run("DecorateInputs fails", func(t *testing.T) {
 		t.Parallel()
-		w, mocks := testWalletWithMocks(t)
+		w, mocks := createStartedWalletWithMocks(t)
 		packet := &psbt.Packet{}
 
 		// Mock TxDetails failure (DecorateInputs ->
@@ -1376,7 +1385,7 @@ func TestPopulatePsbtPacketErrors(t *testing.T) {
 
 	t.Run("addChangeOutputInfo fails", func(t *testing.T) {
 		t.Parallel()
-		w, mocks := testWalletWithMocks(t)
+		w, mocks := createStartedWalletWithMocks(t)
 		packet := &psbt.Packet{}
 
 		// Mock TxDetails success (DecorateInputs)
@@ -1472,7 +1481,7 @@ func TestPopulatePsbtPacketSuccess(t *testing.T) {
 	// Arrange: Create empty packet (will be overwritten).
 	packet := &psbt.Packet{}
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
 
 	// Arrange: Mock TxDetails for input decoration.
 	txDetails := &wtxmgr.TxDetails{
@@ -1608,86 +1617,67 @@ func TestFundPsbtWorkflow(t *testing.T) {
 		},
 	}
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
+	mocks.syncer.On("syncState").Return(syncStateSynced).Times(2)
 
 	// Arrange: Mock the internal dependencies for the FundPsbt workflow.
-	// 1. Mock `txStore.GetUtxo` for `createManualInputSource`:
-	//    Expect a call with any context and the specified outpoint,
-	//    returning our predefined credit and no error.
-	mocks.txStore.On("GetUtxo", mock.Anything, outPoint).Return(credit, nil)
 
+	// --- Mock txStore ---
+	// 1. Mock `txStore.GetUtxo` for `createManualInputSource`:
+	mocks.txStore.On("GetUtxo", mock.Anything, outPoint).
+		Return(credit, nil).
+		Once()
+
+	// 7. Mock `txStore.TxDetails` for `fetchAndValidateUtxo` during
+	//    `DecorateInputs`:
+	mocks.txStore.On("TxDetails", mock.Anything,
+		mock.MatchedBy(func(h *chainhash.Hash) bool {
+			return h.IsEqual(&txHash)
+		}),
+	).Return(txDetails, nil).Once()
+
+	// --- Mock addrStore ---
 	// 2. Mock `addrStore.FetchScopedKeyManager` to retrieve the account
 	//    manager:
-	//    Expect a call with the BIP0084 key scope, returning the mock
-	//    account manager and no error.
-	mocks.addrStore.On(
-		"FetchScopedKeyManager", waddrmgr.KeyScopeBIP0084,
-	).Return(mocks.accountManager, nil)
+	mocks.addrStore.On("FetchScopedKeyManager", waddrmgr.KeyScopeBIP0084).
+		Return(mocks.accountManager, nil).Times(3)
 
+	// 8. Mock `addrStore.Address` for `decorateInput` during
+	//    `DecorateInputs`:
+	mocks.addrStore.On("Address", mock.Anything,
+		mock.MatchedBy(func(addr btcutil.Address) bool {
+			return addr.String() == p2wkhAddr.String()
+		}),
+	).Return(mocks.pubKeyAddr, nil).Times(3)
+
+	// --- Mock accountManager ---
 	// 3. Mock `accountManager.LookupAccount` for the default account:
-	//    Expect a call with any context and "default" account name,
-	//    returning the default account number and no error.
 	mocks.accountManager.On("LookupAccount", mock.Anything, "default").
-		Return(uint32(waddrmgr.DefaultAccountNum), nil)
+		Return(uint32(waddrmgr.DefaultAccountNum), nil).
+		Once()
 
 	// 4. Mock `accountManager.AccountProperties` to return properties for
 	//    the default account:
-	//    Expect a call with any context and the default account number,
-	//    returning predefined account properties and no error.
-	mocks.accountManager.On(
-		"AccountProperties",
-		mock.Anything,
+	mocks.accountManager.On("AccountProperties", mock.Anything,
 		uint32(waddrmgr.DefaultAccountNum),
 	).Return(&waddrmgr.AccountProperties{
 		AccountName: "default",
 		KeyScope:    waddrmgr.KeyScopeBIP0084,
-	}, nil)
+	}, nil).Once()
 
 	// 5. Mock `accountManager.NextInternalAddresses` to generate a change
 	//    address:
-	//    Expect a call to generate one internal address for the default
-	//    account, returning our mock managed address and no error.
 	changeAddr := p2wkhAddr // Reusing p2wkhAddr for simplicity as change
 	mockManagedAddr := mocks.pubKeyAddr
-	mocks.accountManager.On(
-		"NextInternalAddresses",
-		mock.Anything,
-		uint32(waddrmgr.DefaultAccountNum),
-		uint32(1),
-	).Return([]waddrmgr.ManagedAddress{mockManagedAddr}, nil)
+	mocks.accountManager.On("NextInternalAddresses", mock.Anything,
+		uint32(waddrmgr.DefaultAccountNum), uint32(1),
+	).Return([]waddrmgr.ManagedAddress{mockManagedAddr}, nil).Once()
 
+	// --- Mock pubKeyAddr (and ManagedAddress) ---
 	// 6. Mock `mockManagedAddr.Address` to return the change address:
-	//    Expect a call to get the address from the mock managed address,
-	//    returning our predefined P2WKH address.
 	mockManagedAddr.On("Address").Return(changeAddr)
 
-	// 7. Mock `txStore.TxDetails` for `fetchAndValidateUtxo` during
-	//    `DecorateInputs`:
-	//    Expect a call to retrieve transaction details for the input's
-	//    hash, returning our predefined `txDetails` and no error.
-	mocks.txStore.On(
-		"TxDetails",
-		mock.Anything,
-		mock.MatchedBy(func(h *chainhash.Hash) bool {
-			return h.IsEqual(&txHash)
-		}),
-	).Return(txDetails, nil)
-
-	// 8. Mock `addrStore.Address` for `decorateInput` during
-	//    `DecorateInputs`:
-	//    Expect a call to look up the address by script, returning our
-	//    mock managed public key address and no error.
-	mocks.addrStore.On(
-		"Address",
-		mock.Anything,
-		mock.MatchedBy(func(addr btcutil.Address) bool {
-			return addr.String() == p2wkhAddr.String()
-		}),
-	).Return(mocks.pubKeyAddr, nil)
-
 	// 9. Mock `ManagedPubKeyAddress` methods for `decorateInput`:
-	//    Expect calls to get imported status, derivation info, public key,
-	//    and address type, returning predefined values.
 	mocks.pubKeyAddr.On("Imported").Return(false)
 	mocks.pubKeyAddr.On("DerivationInfo").Return(
 		waddrmgr.KeyScopeBIP0084, waddrmgr.DerivationPath{}, true,
@@ -1738,9 +1728,11 @@ func TestFundPsbtDecorateFailure(t *testing.T) {
 		},
 	}
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createStartedWalletWithMocks(t)
+	mocks.syncer.On("syncState").Return(syncStateSynced).Times(2)
 
 	// Arrange: Mock GetUtxo for CreateTransaction (Success).
+
 	credit := &wtxmgr.Credit{
 		OutPoint: outPoint,
 		Amount:   100000,
@@ -1750,8 +1742,7 @@ func TestFundPsbtDecorateFailure(t *testing.T) {
 
 	// Arrange: Mock TxDetails for DecorateInputs (Failure).
 	// This triggers the error in populatePsbtPacket -> DecorateInputs.
-	mocks.txStore.On(
-		"TxDetails", mock.Anything,
+	mocks.txStore.On("TxDetails", mock.Anything,
 		mock.MatchedBy(func(h *chainhash.Hash) bool {
 			return h.IsEqual(&txHash)
 		}),
@@ -1761,15 +1752,16 @@ func TestFundPsbtDecorateFailure(t *testing.T) {
 	// required because the input (100k) exceeds the output (90k) + fees.
 	mocks.addrStore.On("FetchScopedKeyManager", mock.Anything).
 		Return(mocks.accountManager, nil)
+
 	mocks.accountManager.On("LookupAccount", mock.Anything, "default").
 		Return(uint32(waddrmgr.DefaultAccountNum), nil)
-	mocks.accountManager.On(
-		"AccountProperties", mock.Anything,
+	mocks.accountManager.On("AccountProperties", mock.Anything,
 		uint32(waddrmgr.DefaultAccountNum),
 	).Return(&waddrmgr.AccountProperties{
 		AccountName: "default",
 		KeyScope:    waddrmgr.KeyScopeBIP0084,
 	}, nil)
+
 	// Change address generation.
 	mocks.accountManager.On(
 		"NextInternalAddresses", mock.Anything, mock.Anything,
@@ -1808,7 +1800,8 @@ func TestFundPsbtErrors(t *testing.T) {
 
 	t.Run("validate intent fails", func(t *testing.T) {
 		t.Parallel()
-		w, _ := testWalletWithMocks(t)
+		w, mocks := createStartedWalletWithMocks(t)
+		mocks.syncer.On("syncState").Return(syncStateSynced).Once()
 		// Invalid intent (nil packet)
 		_, _, err := w.FundPsbt(t.Context(), &FundIntent{})
 		require.ErrorIs(t, err, ErrNilTxIntent)
@@ -1816,13 +1809,15 @@ func TestFundPsbtErrors(t *testing.T) {
 
 	t.Run("CreateTransaction fails", func(t *testing.T) {
 		t.Parallel()
-		w, mocks := testWalletWithMocks(t)
+		w, mocks := createStartedWalletWithMocks(t)
+		mocks.syncer.On("syncState").Return(syncStateSynced).Times(2)
 
 		// Mock CreateTransaction failure via Account lookup failure
 		mocks.addrStore.On("FetchScopedKeyManager", mock.Anything).
 			Return(nil, errDb)
 
 		_, _, err := w.FundPsbt(t.Context(), intent)
+
 		// AccountNumber failure is wrapped in ErrAccountNotFound by
 		// prepareTxAuthSources.
 		require.ErrorIs(t, err, ErrAccountNotFound)
@@ -1838,6 +1833,9 @@ func TestParseBip32Path(t *testing.T) {
 	// Use mainnet params for testing (HDCoinType = 0).
 	chainParams := &chaincfg.MainNetParams
 	w := &Wallet{
+		cfg: Config{
+			ChainParams: chainParams,
+		},
 		walletDeprecated: &walletDeprecated{
 			chainParams: chainParams,
 		},
@@ -2917,7 +2915,7 @@ func TestSignTaprootPsbtInput(t *testing.T) {
 	packet.Inputs[0].TaprootBip32Derivation = tapDerivations
 	packet.Inputs[0].SighashType = txscript.SigHashDefault
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createUnlockedWalletWithMocks(t)
 
 	// Arrange: Mock address lookup flow.
 	// 1. FetchScopedKeyManager
@@ -2999,7 +2997,7 @@ func TestSignBip32PsbtInput(t *testing.T) {
 	packet.Inputs[0].SighashType = txscript.SigHashAll
 	packet.Inputs[0].WitnessScript = p2wkhScript
 
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createUnlockedWalletWithMocks(t)
 
 	// Arrange: Mock address lookup flow.
 	mocks.addrStore.On("FetchScopedKeyManager", mock.Anything).
@@ -3033,7 +3031,7 @@ func TestSignPsbtFailNilParams(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Create a mock wallet.
-	w, _ := testWalletWithMocks(t)
+	w, _ := createUnlockedWalletWithMocks(t)
 
 	// Act: Call SignPsbt with nil params.
 	_, err := w.SignPsbt(t.Context(), nil)
@@ -3094,12 +3092,9 @@ func TestSignPsbt(t *testing.T) {
 	packet.Inputs[0].Bip32Derivation = []*psbt.Bip32Derivation{derivation}
 	packet.Inputs[0].SighashType = txscript.SigHashAll
 
+	signParams := &SignPsbtParams{Packet: packet}
 	// Arrange: Wrap the packet in SignPsbtParams.
-	signParams := &SignPsbtParams{
-		Packet: packet,
-	}
-
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createUnlockedWalletWithMocks(t)
 
 	// Arrange: Configure mock expectations for key derivation and private
 	// key retrieval.
@@ -3135,7 +3130,7 @@ func TestSignPsbtInputsNotReady(t *testing.T) {
 	require.NoError(t, err)
 
 	signParams := &SignPsbtParams{Packet: packet}
-	w, _ := testWalletWithMocks(t)
+	w, _ := createUnlockedWalletWithMocks(t)
 
 	// Act.
 	_, err = w.SignPsbt(t.Context(), signParams)
@@ -3167,7 +3162,7 @@ func TestSignPsbtInvalidDerivationPath(t *testing.T) {
 	}}
 
 	signParams := &SignPsbtParams{Packet: packet}
-	w, _ := testWalletWithMocks(t)
+	w, _ := createUnlockedWalletWithMocks(t)
 
 	// Act.
 	_, err = w.SignPsbt(t.Context(), signParams)
@@ -3208,7 +3203,7 @@ func TestSignPsbtSignErrorSkippable(t *testing.T) {
 	packet.Inputs[0].SighashType = txscript.SigHashAll
 
 	signParams := &SignPsbtParams{Packet: packet}
-	w, mocks := testWalletWithMocks(t)
+	w, mocks := createUnlockedWalletWithMocks(t)
 
 	// Arrange: Mocks to simulate signing failure.
 	mocks.addrStore.On("FetchScopedKeyManager", mock.Anything).
@@ -3233,7 +3228,7 @@ func TestSignPsbtSignErrorSkippable(t *testing.T) {
 func TestSignTaprootPsbtInputErrors(t *testing.T) {
 	t.Parallel()
 
-	w, _ := testWalletWithMocks(t)
+	w, _ := createUnlockedWalletWithMocks(t)
 	tx := wire.NewMsgTx(2)
 	tx.AddTxIn(&wire.TxIn{})
 	packet, err := psbt.NewFromUnsignedTx(tx)
@@ -3267,7 +3262,7 @@ func TestSignTaprootPsbtInputErrors(t *testing.T) {
 func TestSignBip32PsbtInputErrors(t *testing.T) {
 	t.Parallel()
 
-	w, _ := testWalletWithMocks(t)
+	w, _ := createUnlockedWalletWithMocks(t)
 	tx := wire.NewMsgTx(2)
 	tx.AddTxIn(&wire.TxIn{})
 	packet, err := psbt.NewFromUnsignedTx(tx)
@@ -3403,7 +3398,7 @@ func TestFinalizeInput(t *testing.T) {
 		}
 		packet.Inputs[0].SighashType = txscript.SigHashAll
 
-		w, mocks := testWalletWithMocks(t)
+		w, mocks := createUnlockedWalletWithMocks(t)
 
 		// Arrange: Mock dependencies.
 		mocks.addrStore.On(
@@ -3437,7 +3432,7 @@ func TestFinalizeInput(t *testing.T) {
 
 		packet.Inputs[0].FinalScriptWitness = []byte{0x01}
 
-		w, _ := testWalletWithMocks(t)
+		w, _ := createUnlockedWalletWithMocks(t)
 
 		// Act.
 		err = w.finalizeInput(t.Context(), packet, 0, nil)
@@ -3454,7 +3449,7 @@ func TestFinalizeInput(t *testing.T) {
 		packet, err := psbt.NewFromUnsignedTx(tx)
 		require.NoError(t, err)
 
-		w, _ := testWalletWithMocks(t)
+		w, _ := createUnlockedWalletWithMocks(t)
 
 		// Act.
 		err = w.finalizeInput(t.Context(), packet, 0, nil)
@@ -3477,7 +3472,7 @@ func TestFinalizeInput(t *testing.T) {
 			PkScript: []byte{0x6a},
 		}
 
-		w, _ := testWalletWithMocks(t)
+		w, _ := createUnlockedWalletWithMocks(t)
 
 		// Act.
 		err = w.finalizeInput(t.Context(), packet, 0, nil)
@@ -3550,7 +3545,7 @@ func TestFinalizePsbtSuccess(t *testing.T) {
 			}
 			packet.Inputs[0].SighashType = txscript.SigHashDefault
 
-			w, mocks := testWalletWithMocks(t)
+			w, mocks := createUnlockedWalletWithMocks(t)
 
 			// Arrange: Mock address lookup.
 			mocks.addrStore.On(
@@ -3596,7 +3591,7 @@ func TestFinalizePsbtErrors(t *testing.T) {
 		packet, err := psbt.NewFromUnsignedTx(tx)
 		require.NoError(t, err)
 
-		w, _ := testWalletWithMocks(t)
+		w, _ := createUnlockedWalletWithMocks(t)
 
 		// Act.
 		err = w.FinalizePsbt(t.Context(), packet)
@@ -3628,7 +3623,7 @@ func TestFinalizePsbtErrors(t *testing.T) {
 			PkScript: dummyScript,
 		}
 
-		w, mocks := testWalletWithMocks(t)
+		w, mocks := createUnlockedWalletWithMocks(t)
 
 		// Arrange: Mock Address lookup to return error (or watch only).
 		// Simulating "Address not found" or "Key not found".
@@ -4550,7 +4545,7 @@ func TestCombinePsbt(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		t.Parallel()
-		w, _ := testWalletWithMocks(t)
+		w, _ := createStartedWalletWithMocks(t)
 
 		// Arrange: Create a base transaction with 1 input and 1 output.
 		tx := wire.NewMsgTx(2)
@@ -4589,7 +4584,7 @@ func TestCombinePsbt(t *testing.T) {
 
 	t.Run("empty inputs", func(t *testing.T) {
 		t.Parallel()
-		w, _ := testWalletWithMocks(t)
+		w, _ := createStartedWalletWithMocks(t)
 
 		// Act: Attempt to combine with no packets.
 		_, err := w.CombinePsbt(t.Context())
@@ -4600,7 +4595,7 @@ func TestCombinePsbt(t *testing.T) {
 
 	t.Run("mismatch tx", func(t *testing.T) {
 		t.Parallel()
-		w, _ := testWalletWithMocks(t)
+		w, _ := createStartedWalletWithMocks(t)
 
 		// Arrange: Create two packets with DIFFERENT transactions.
 		tx1 := wire.NewMsgTx(2)
@@ -4692,4 +4687,32 @@ func TestDeduplicateUnknowns(t *testing.T) {
 			require.Equal(t, tc.expected, got)
 		})
 	}
+}
+
+// TestSignPsbtLocked tests that SignPsbt fails when the wallet is locked.
+func TestSignPsbtLocked(t *testing.T) {
+	t.Parallel()
+
+	w, _ := createStartedWalletWithMocks(t)
+	// Minimal packet.
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(&wire.TxIn{})
+	packet, _ := psbt.NewFromUnsignedTx(tx)
+
+	_, err := w.SignPsbt(t.Context(), &SignPsbtParams{Packet: packet})
+	require.ErrorIs(t, err, ErrStateForbidden)
+}
+
+// TestFinalizePsbtLocked tests that FinalizePsbt fails when the wallet is
+// locked.
+func TestFinalizePsbtLocked(t *testing.T) {
+	t.Parallel()
+
+	w, _ := createStartedWalletWithMocks(t)
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(&wire.TxIn{})
+	packet, _ := psbt.NewFromUnsignedTx(tx)
+
+	err := w.FinalizePsbt(t.Context(), packet)
+	require.ErrorIs(t, err, ErrStateForbidden)
 }
