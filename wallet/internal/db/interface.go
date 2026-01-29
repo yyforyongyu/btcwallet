@@ -99,6 +99,7 @@ type WalletStore interface {
 // new database layer. For now, it only embeds AccountStore, which is the first
 // component being migrated.
 type Store interface {
+	WalletStore
 	AccountStore
 }
 

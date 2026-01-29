@@ -91,6 +91,64 @@ func (m *mockDBStore) RenameAccount(ctx context.Context,
 	return args.Error(0)
 }
 
+func (m *mockDBStore) CreateWallet(ctx context.Context,
+	params db.CreateWalletParams) (*db.WalletInfo, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.WalletInfo), args.Error(1)
+}
+
+func (m *mockDBStore) GetWallet(ctx context.Context,
+	name string) (*db.WalletInfo, error) {
+
+	args := m.Called(ctx, name)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.WalletInfo), args.Error(1)
+}
+
+func (m *mockDBStore) ListWallets(ctx context.Context) ([]db.WalletInfo,
+	error) {
+
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]db.WalletInfo), args.Error(1)
+}
+
+func (m *mockDBStore) UpdateWallet(ctx context.Context,
+	params db.UpdateWalletParams) error {
+
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+func (m *mockDBStore) GetEncryptedHDSeed(ctx context.Context,
+	walletID uint32) ([]byte, error) {
+
+	args := m.Called(ctx, walletID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]byte), args.Error(1)
+}
+
+func (m *mockDBStore) UpdateWalletSecrets(ctx context.Context,
+	params db.UpdateWalletSecretsParams) error {
+
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
 // mockTxStore is a mock implementation of the wtxmgr.TxStore interface.
 type mockTxStore struct {
 	mock.Mock

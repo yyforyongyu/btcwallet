@@ -1,3 +1,5 @@
+// Package kvdb provides a walletdb (kvdb) backed implementation of the
+// wallet/internal/db store interfaces.
 package kvdb
 
 import (
@@ -15,6 +17,17 @@ var (
 	// errNotImplemented is returned for unimplemented kvdb store methods.
 	errNotImplemented = errors.New("not implemented")
 
+	// ErrUnsupportedAddressType is returned when an address type cannot be
+	// translated to a waddrmgr.AddressType.
+	ErrUnsupportedAddressType = errors.New("unsupported address type")
+
+	// ErrUnknownAddressType is returned when an address type is not recognized.
+	ErrUnknownAddressType = errors.New("unknown address type")
+
+	// errMissingAddrMgrNamespace is returned when the waddrmgr top-level bucket
+	// is missing.
+	errMissingAddrMgrNamespace = errors.New("missing address manager namespace")
+
 	// waddrmgrNamespaceKey is the top-level bucket key for the address manager.
 	//
 	// NOTE: This MUST match wallet.waddrmgrNamespaceKey.
@@ -30,6 +43,8 @@ type WalletDB struct {
 	addrStore waddrmgr.AddrStore
 }
 
+var _ db.Store = (*WalletDB)(nil)
+
 // NewWalletDB creates a new kvdb-backed wallet store.
 func NewWalletDB(dbConn walletdb.DB, addrStore waddrmgr.AddrStore) *WalletDB {
 	return &WalletDB{
@@ -40,10 +55,17 @@ func NewWalletDB(dbConn walletdb.DB, addrStore waddrmgr.AddrStore) *WalletDB {
 
 // CreateDerivedAccount creates a new derived account for the given wallet.
 //
-// This is the kvdb backend implementation of db.AccountStore.CreateDerivedAccount.
-// The logic is copied from the legacy implementation in wallet/account_manager.go.
+// This is the kvdb backend implementation of
+// db.AccountStore.CreateDerivedAccount.
+// The logic is copied from the legacy implementation in
+// wallet/account_manager.go.
 func (w *WalletDB) CreateDerivedAccount(ctx context.Context,
 	params db.CreateDerivedAccountParams) (*db.AccountInfo, error) {
+
+	err := ctx.Err()
+	if err != nil {
+		return nil, err
+	}
 
 	if params.WalletID != 0 {
 		return nil, fmt.Errorf("wallet %d: %w", params.WalletID,
@@ -59,57 +81,9 @@ func (w *WalletDB) CreateDerivedAccount(ctx context.Context,
 		Coin:    params.Scope.Coin,
 	}
 
-	var (
-		accountNum uint32
-		watchOnly  bool
+	accountNum, watchOnly, err := w.createDerivedAccountTx(
+		scope, params.Scope, params.Name,
 	)
-
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		if ns == nil {
-			return errors.New("missing address manager namespace")
-		}
-
-		// Fetch the scoped manager for this scope, creating it if missing.
-		scopedMgr, err := w.addrStore.FetchScopedKeyManager(scope)
-		if err != nil {
-			if !waddrmgr.IsError(err, waddrmgr.ErrScopeNotFound) {
-				return err
-			}
-
-			addrSchema, err := addrSchemaForScope(params.Scope)
-			if err != nil {
-				return err
-			}
-
-			scopedMgr, err = w.addrStore.NewScopedKeyManager(
-				ns, scope, addrSchema,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		// Validate that the scope manager can add a new derived account.
-		err = scopedMgr.CanAddAccount()
-		if err != nil {
-			return err
-		}
-
-		accountNum, err = scopedMgr.NewAccount(ns, params.Name)
-		if err != nil {
-			return err
-		}
-
-		props, err := scopedMgr.AccountProperties(ns, accountNum)
-		if err != nil {
-			return err
-		}
-
-		watchOnly = props.IsWatchOnly
-
-		return nil
-	})
 	if err != nil {
 		return nil, err
 	}
@@ -127,6 +101,40 @@ func (w *WalletDB) CreateDerivedAccount(ctx context.Context,
 		CreatedAt:          time.Now().UTC(),
 		KeyScope:           params.Scope,
 	}, nil
+}
+
+// CreateWallet is not yet implemented for kvdb.
+func (w *WalletDB) CreateWallet(context.Context,
+	db.CreateWalletParams) (*db.WalletInfo, error) {
+
+	return nil, errNotImplemented
+}
+
+// GetWallet is not yet implemented for kvdb.
+func (w *WalletDB) GetWallet(context.Context, string) (*db.WalletInfo, error) {
+	return nil, errNotImplemented
+}
+
+// ListWallets is not yet implemented for kvdb.
+func (w *WalletDB) ListWallets(context.Context) ([]db.WalletInfo, error) {
+	return nil, errNotImplemented
+}
+
+// UpdateWallet is not yet implemented for kvdb.
+func (w *WalletDB) UpdateWallet(context.Context, db.UpdateWalletParams) error {
+	return errNotImplemented
+}
+
+// GetEncryptedHDSeed is not yet implemented for kvdb.
+func (w *WalletDB) GetEncryptedHDSeed(context.Context, uint32) ([]byte, error) {
+	return nil, errNotImplemented
+}
+
+// UpdateWalletSecrets is not yet implemented for kvdb.
+func (w *WalletDB) UpdateWalletSecrets(context.Context,
+	db.UpdateWalletSecretsParams) error {
+
+	return errNotImplemented
 }
 
 // CreateImportedAccount is not yet implemented for kvdb.
@@ -155,6 +163,77 @@ func (w *WalletDB) RenameAccount(context.Context,
 	db.RenameAccountParams) error {
 
 	return errNotImplemented
+}
+
+func (w *WalletDB) createDerivedAccountTx(scope waddrmgr.KeyScope,
+	keyScope db.KeyScope, name string) (uint32, bool, error) {
+
+	var (
+		accountNum uint32
+		watchOnly  bool
+	)
+
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errMissingAddrMgrNamespace
+		}
+
+		scopedMgr, err := w.fetchOrCreateScopedMgr(ns, scope, keyScope)
+		if err != nil {
+			return err
+		}
+
+		err = scopedMgr.CanAddAccount()
+		if err != nil {
+			return fmt.Errorf("can add account: %w", err)
+		}
+
+		accountNum, err = scopedMgr.NewAccount(ns, name)
+		if err != nil {
+			return fmt.Errorf("new account: %w", err)
+		}
+
+		props, err := scopedMgr.AccountProperties(ns, accountNum)
+		if err != nil {
+			return fmt.Errorf("account properties: %w", err)
+		}
+
+		watchOnly = props.IsWatchOnly
+
+		return nil
+	})
+	if err != nil {
+		return 0, false, fmt.Errorf("create derived account: %w", err)
+	}
+
+	return accountNum, watchOnly, nil
+}
+
+func (w *WalletDB) fetchOrCreateScopedMgr(ns walletdb.ReadWriteBucket,
+	scope waddrmgr.KeyScope, keyScope db.KeyScope) (waddrmgr.AccountStore,
+	error) {
+
+	scopedMgr, err := w.addrStore.FetchScopedKeyManager(scope)
+	if err == nil {
+		return scopedMgr, nil
+	}
+
+	if !waddrmgr.IsError(err, waddrmgr.ErrScopeNotFound) {
+		return nil, fmt.Errorf("fetch scoped key manager: %w", err)
+	}
+
+	addrSchema, err := addrSchemaForScope(keyScope)
+	if err != nil {
+		return nil, err
+	}
+
+	scopedMgr, err = w.addrStore.NewScopedKeyManager(ns, scope, addrSchema)
+	if err != nil {
+		return nil, fmt.Errorf("new scoped key manager: %w", err)
+	}
+
+	return scopedMgr, nil
 }
 
 func addrSchemaForScope(scope db.KeyScope) (waddrmgr.ScopeAddrSchema, error) {
@@ -199,8 +278,8 @@ func toWaddrmgrAddrType(t db.AddressType) (waddrmgr.AddressType, error) {
 	case db.TaprootPubKey:
 		return waddrmgr.TaprootPubKey, nil
 	case db.Anchor:
-		return 0, fmt.Errorf("unsupported address type %d", t)
+		return 0, fmt.Errorf("%w: %d", ErrUnsupportedAddressType, t)
 	default:
-		return 0, fmt.Errorf("unknown address type %d", t)
+		return 0, fmt.Errorf("%w: %d", ErrUnknownAddressType, t)
 	}
 }
