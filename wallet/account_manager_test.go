@@ -14,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
@@ -87,12 +88,18 @@ func TestNewAccount(t *testing.T) {
 	// expect this to succeed.
 	scope := waddrmgr.KeyScopeBIP0084
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: testAccountName,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
+
 	deps.addrStore.On("FetchScopedKeyManager", scope).
 		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, testAccountName).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -127,14 +134,17 @@ func TestNewAccount(t *testing.T) {
 	require.Equal(t, testAccountName, account2.AccountName)
 
 	// We should not be able to create a new account with the same name.
-	deps.addrStore.On("FetchScopedKeyManager", scope).
-		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, testAccountName).
-		Return(uint32(0), waddrmgr.ManagerError{
-			ErrorCode: waddrmgr.ErrDuplicateAccount,
-		}).Once()
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: testAccountName,
+		}).Return((*db.AccountInfo)(nil), waddrmgr.ManagerError{
+		ErrorCode: waddrmgr.ErrDuplicateAccount,
+	}).Once()
 
 	_, err = w.NewAccount(t.Context(), scope, testAccountName)
 	require.Error(t, err, "expected error when creating duplicate account")
@@ -150,13 +160,17 @@ func TestNewAccount(t *testing.T) {
 	err = w.Lock(t.Context())
 	require.NoError(t, err)
 
-	deps.addrStore.On("FetchScopedKeyManager", scope).
-		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("CanAddAccount").
-		Return(waddrmgr.ManagerError{
-			ErrorCode: waddrmgr.ErrLocked,
-		}).Once()
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: "test2",
+		}).Return((*db.AccountInfo)(nil), waddrmgr.ManagerError{
+		ErrorCode: waddrmgr.ErrLocked,
+	}).Once()
 
 	_, err = w.NewAccount(t.Context(), scope, "test2")
 	require.Error(
@@ -174,12 +188,18 @@ func TestListAccounts(t *testing.T) {
 
 	// We'll start by creating a new account under the BIP0084 scope.
 	scope := waddrmgr.KeyScopeBIP0084
+
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: testAccountName,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scope).
 		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, testAccountName).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -256,12 +276,17 @@ func TestListAccountsByScope(t *testing.T) {
 	scopeBIP84 := waddrmgr.KeyScopeBIP0084
 	accBIP84Name := "test bip84"
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scopeBIP84.Purpose,
+				Coin:    scopeBIP84.Coin,
+			},
+			Name: accBIP84Name,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scopeBIP84).
 		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, accBIP84Name).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -274,12 +299,17 @@ func TestListAccountsByScope(t *testing.T) {
 	scopeBIP49 := waddrmgr.KeyScopeBIP0049Plus
 	accBIP49Name := "test bip49"
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scopeBIP49.Purpose,
+				Coin:    scopeBIP49.Coin,
+			},
+			Name: accBIP49Name,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scopeBIP49).
 		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, accBIP49Name).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -375,11 +405,17 @@ func TestListAccountsByName(t *testing.T) {
 	scopeBIP84 := waddrmgr.KeyScopeBIP0084
 	accBIP84Name := "test bip84"
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scopeBIP84.Purpose,
+				Coin:    scopeBIP84.Coin,
+			},
+			Name: accBIP84Name,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scopeBIP84).
 		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, accBIP84Name).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -392,11 +428,17 @@ func TestListAccountsByName(t *testing.T) {
 	scopeBIP49 := waddrmgr.KeyScopeBIP0049Plus
 	accBIP49Name := "test bip49"
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scopeBIP49.Purpose,
+				Coin:    scopeBIP49.Coin,
+			},
+			Name: accBIP49Name,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scopeBIP49).
 		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, accBIP49Name).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -482,11 +524,18 @@ func TestGetAccount(t *testing.T) {
 
 	// We'll create a new account under the BIP0084 scope.
 	scope := waddrmgr.KeyScopeBIP0084
+
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: testAccountName,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scope).
 		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, testAccountName).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -564,11 +613,17 @@ func TestRenameAccount(t *testing.T) {
 	oldName := "old name"
 	newName := "new name"
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: oldName,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scope).
 		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, oldName).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -672,13 +727,18 @@ func TestBalance(t *testing.T) {
 	// We'll create a new account under the BIP0084 scope.
 	scope := waddrmgr.KeyScopeBIP0084
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: testAccountName,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scope).
 		Return(deps.accountManager, nil).
 		Once()
-
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, testAccountName).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -990,12 +1050,17 @@ func TestFetchAccountBalances(t *testing.T) {
 		w, deps := createStartedWalletWithMocks(t)
 
 		// Create accounts.
+		deps.store.On("CreateDerivedAccount", mock.Anything,
+			db.CreateDerivedAccountParams{
+				WalletID: 0,
+				Scope: db.KeyScope{
+					Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+					Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+				},
+				Name: "acc1-bip84",
+			}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 		deps.addrStore.On("FetchScopedKeyManager", waddrmgr.KeyScopeBIP0084).
 			Return(deps.accountManager, nil).
-			Once()
-		deps.accountManager.On("CanAddAccount").Return(nil).Once()
-		deps.accountManager.On("NewAccount", mock.Anything, "acc1-bip84").
-			Return(uint32(1), nil).
 			Once()
 		deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 			Return(&waddrmgr.AccountProperties{
@@ -1009,14 +1074,18 @@ func TestFetchAccountBalances(t *testing.T) {
 		)
 		require.NoError(t, err)
 
+		deps.store.On("CreateDerivedAccount", mock.Anything,
+			db.CreateDerivedAccountParams{
+				WalletID: 0,
+				Scope: db.KeyScope{
+					Purpose: waddrmgr.KeyScopeBIP0049Plus.Purpose,
+					Coin:    waddrmgr.KeyScopeBIP0049Plus.Coin,
+				},
+				Name: "acc1-bip49",
+			}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 		deps.addrStore.On(
 			"FetchScopedKeyManager", waddrmgr.KeyScopeBIP0049Plus,
 		).Return(deps.accountManager, nil).Once()
-
-		deps.accountManager.On("CanAddAccount").Return(nil).Once()
-		deps.accountManager.On("NewAccount", mock.Anything, "acc1-bip49").
-			Return(uint32(1), nil).
-			Once()
 		deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 			Return(&waddrmgr.AccountProperties{
 				AccountNumber: 1,
@@ -1150,13 +1219,19 @@ func TestFetchAccountBalances(t *testing.T) {
 					Return(waddrmgr.KeyScopeBIP0084).
 					Times(2)
 
+				deps.store.On("CreateDerivedAccount", mock.Anything,
+					db.CreateDerivedAccountParams{
+						WalletID: 0,
+						Scope: db.KeyScope{
+							Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+							Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+						},
+						Name: "no-balance",
+					}).Return(&db.AccountInfo{AccountNumber: 2}, nil).Once()
+
 				deps.addrStore.On(
 					"FetchScopedKeyManager", waddrmgr.KeyScopeBIP0084,
 				).Return(deps.accountManager, nil).Once()
-				deps.accountManager.On("CanAddAccount").Return(nil).Once()
-				deps.accountManager.On(
-					"NewAccount", mock.Anything, "no-balance",
-				).Return(uint32(2), nil).Once()
 				deps.accountManager.On(
 					"AccountProperties", mock.Anything, uint32(2),
 				).Return(&waddrmgr.AccountProperties{
@@ -1225,12 +1300,17 @@ func TestListAccountsWithBalances(t *testing.T) {
 	scope := waddrmgr.KeyScopeBIP0084
 	acc1Name := "test account"
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: acc1Name,
+		}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scope).
 		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, acc1Name).
-		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 1,
@@ -1242,12 +1322,17 @@ func TestListAccountsWithBalances(t *testing.T) {
 
 	acc2Name := "no balance account"
 
+	deps.store.On("CreateDerivedAccount", mock.Anything,
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: acc2Name,
+		}).Return(&db.AccountInfo{AccountNumber: 2}, nil).Once()
 	deps.addrStore.On("FetchScopedKeyManager", scope).
 		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("CanAddAccount").Return(nil).Once()
-	deps.accountManager.On("NewAccount", mock.Anything, acc2Name).
-		Return(uint32(2), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(2)).
 		Return(&waddrmgr.AccountProperties{
 			AccountNumber: 2,

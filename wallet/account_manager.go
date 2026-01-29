@@ -23,6 +23,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/netparams"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -114,7 +115,7 @@ var _ AccountManager = (*Wallet)(nil)
 // restoring, new accounts may not be created when all of the previous 100
 // accounts have no transaction history (this is a deviation from the BIP0044
 // spec, which allows no unused account gaps).
-func (w *Wallet) NewAccount(_ context.Context, scope waddrmgr.KeyScope,
+func (w *Wallet) NewAccount(ctx context.Context, scope waddrmgr.KeyScope,
 	name string) (*waddrmgr.AccountProperties, error) {
 
 	err := w.state.validateStarted()
@@ -122,31 +123,34 @@ func (w *Wallet) NewAccount(_ context.Context, scope waddrmgr.KeyScope,
 		return nil, err
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(scope)
+	if w.store == nil {
+		return nil, errors.New("wallet store not initialized")
+	}
+
+	// First, create the derived account via the Store interface.
+	info, err := w.store.CreateDerivedAccount(ctx, db.CreateDerivedAccountParams{
+		WalletID: 0,
+		Scope: db.KeyScope{
+			Purpose: scope.Purpose,
+			Coin:    scope.Coin,
+		},
+		Name: name,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Validate that the scope manager can add this new account.
-	err = manager.CanAddAccount()
+	// Then, fetch the full account properties from the address manager.
+	manager, err := w.addrStore.FetchScopedKeyManager(scope)
 	if err != nil {
 		return nil, err
 	}
 
 	var props *waddrmgr.AccountProperties
 
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// Create a new account under the current key scope.
-		accNum, err := manager.NewAccount(addrmgrNs, name)
-		if err != nil {
-			return err
-		}
-
-		// Get the account's properties.
-		props, err = manager.AccountProperties(addrmgrNs, accNum)
-
+	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		props, err = manager.AccountProperties(ns, info.AccountNumber)
 		return err
 	})
 
