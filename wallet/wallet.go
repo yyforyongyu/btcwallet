@@ -340,15 +340,15 @@ type Wallet struct {
 	// addrStore is the address and key manager responsible for hierarchical
 	// deterministic (HD) derivation and storage of cryptographic keys.
 	//
-	// Deprecated: New code should prefer the db.Store interface. This field will
-	// be removed once the store migration is complete.
+	// Deprecated: New code should prefer the db.Store interface. This field
+	// will be removed once the store migration is complete.
 	addrStore waddrmgr.AddrStore
 
 	// txStore is the transaction manager responsible for storing and
 	// querying the wallet's transaction history and unspent outputs.
 	//
-	// Deprecated: New code should prefer the db.Store interface. This field will
-	// be removed once the store migration is complete.
+	// Deprecated: New code should prefer the db.Store interface. This field
+	// will be removed once the store migration is complete.
 	txStore wtxmgr.TxStore
 
 	// NtfnServer handles the delivery of wallet-related events (e.g., new

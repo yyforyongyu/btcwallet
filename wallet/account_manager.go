@@ -110,6 +110,8 @@ type AccountManager interface {
 // A compile time check to ensure that Wallet implements the interface.
 var _ AccountManager = (*Wallet)(nil)
 
+var errWalletStoreNotInitialized = errors.New("wallet store not initialized")
+
 // NewAccount creates the next account and returns its account number. The name
 // must be unique under the kep scope. In order to support automatic seed
 // restoring, new accounts may not be created when all of the previous 100
@@ -124,18 +126,20 @@ func (w *Wallet) NewAccount(ctx context.Context, scope waddrmgr.KeyScope,
 	}
 
 	if w.store == nil {
-		return nil, errors.New("wallet store not initialized")
+		return nil, errWalletStoreNotInitialized
 	}
 
 	// First, create the derived account via the Store interface.
-	info, err := w.store.CreateDerivedAccount(ctx, db.CreateDerivedAccountParams{
-		WalletID: 0,
-		Scope: db.KeyScope{
-			Purpose: scope.Purpose,
-			Coin:    scope.Coin,
+	info, err := w.store.CreateDerivedAccount(
+		ctx, db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope: db.KeyScope{
+				Purpose: scope.Purpose,
+				Coin:    scope.Coin,
+			},
+			Name: name,
 		},
-		Name: name,
-	})
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +155,7 @@ func (w *Wallet) NewAccount(ctx context.Context, scope waddrmgr.KeyScope,
 	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
 		ns := tx.ReadBucket(waddrmgrNamespaceKey)
 		props, err = manager.AccountProperties(ns, info.AccountNumber)
+
 		return err
 	})
 
