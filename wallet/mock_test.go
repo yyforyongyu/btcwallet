@@ -22,6 +22,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightninglabs/neutrino"
@@ -29,6 +30,66 @@ import (
 	"github.com/lightninglabs/neutrino/headerfs"
 	"github.com/stretchr/testify/mock"
 )
+
+// mockDBStore is a mock implementation of the db.Store interface.
+type mockDBStore struct {
+	mock.Mock
+}
+
+// A compile-time assertion to ensure that mockDBStore implements the Store
+// interface.
+var _ db.Store = (*mockDBStore)(nil)
+
+func (m *mockDBStore) CreateDerivedAccount(ctx context.Context,
+	params db.CreateDerivedAccountParams) (*db.AccountInfo, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountInfo), args.Error(1)
+}
+
+func (m *mockDBStore) CreateImportedAccount(ctx context.Context,
+	params db.CreateImportedAccountParams) (*db.AccountProperties, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountProperties), args.Error(1)
+}
+
+func (m *mockDBStore) GetAccount(ctx context.Context,
+	query db.GetAccountQuery) (*db.AccountInfo, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountInfo), args.Error(1)
+}
+
+func (m *mockDBStore) ListAccounts(ctx context.Context,
+	query db.ListAccountsQuery) ([]db.AccountInfo, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]db.AccountInfo), args.Error(1)
+}
+
+func (m *mockDBStore) RenameAccount(ctx context.Context,
+	params db.RenameAccountParams) error {
+
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
 
 // mockTxStore is a mock implementation of the wtxmgr.TxStore interface.
 type mockTxStore struct {
