@@ -19,6 +19,8 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
+	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -484,7 +486,7 @@ func (w *Wallet) LeaseOutput(_ context.Context, id wtxmgr.LockID,
 // perform this check.
 //
 // NOTE: This is part of the UtxoManager interface implementation.
-func (w *Wallet) ReleaseOutput(_ context.Context, id wtxmgr.LockID,
+func (w *Wallet) ReleaseOutput(ctx context.Context, id wtxmgr.LockID,
 	op wire.OutPoint) error {
 
 	err := w.state.validateStarted()
@@ -492,10 +494,17 @@ func (w *Wallet) ReleaseOutput(_ context.Context, id wtxmgr.LockID,
 		return err
 	}
 
-	return walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		return w.txStore.UnlockOutput(txmgrNs, id, op)
-	})
+	if w.utxoStore == nil {
+		w.utxoStore = kvdb.NewStore(w.cfg.DB, w.txStore)
+	}
+
+	params := db.ReleaseOutputParams{
+		WalletID: 0,
+		ID:       [32]byte(id),
+		OutPoint: op,
+	}
+
+	return w.utxoStore.ReleaseOutput(ctx, params)
 }
 
 // ListLeasedOutputs returns a list of all currently leased outputs.
