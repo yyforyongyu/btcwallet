@@ -10,6 +10,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 )
 
 var (
@@ -292,13 +293,14 @@ func (m *Manager) Load(cfg Config) (*Wallet, error) {
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
 
 	w := &Wallet{
-		cfg:         cfg,
-		addrStore:   addrMgr,
-		txStore:     txMgr,
-		requestChan: make(chan any),
-		lifetimeCtx: lifetimeCtx,
-		cancel:      cancel,
-		lockTimer:   lockTimer,
+		cfg:          cfg,
+		addressStore: kvdb.NewStore(cfg.DB, addrMgr),
+		addrStore:    addrMgr,
+		txStore:      txMgr,
+		requestChan:  make(chan any),
+		lifetimeCtx:  lifetimeCtx,
+		cancel:       cancel,
+		lockTimer:    lockTimer,
 	}
 
 	w.sync = newSyncer(cfg, w.addrStore, w.txStore, w)
