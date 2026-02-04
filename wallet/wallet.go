@@ -24,6 +24,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -332,12 +333,24 @@ type Wallet struct {
 	// these should be phased out as refactoring progresses.
 	*walletDeprecated
 
+	// store provides access to database operations abstracted behind the
+	// db.Store interface.
+	//
+	// TODO: Implement db.Store methods and migrate callers.
+	store db.Store
+
 	// addrStore is the address and key manager responsible for hierarchical
 	// deterministic (HD) derivation and storage of cryptographic keys.
+	//
+	// NOTE: New code should prefer the db.Store interface. This field will be
+	// removed once the store migration is complete.
 	addrStore waddrmgr.AddrStore
 
 	// txStore is the transaction manager responsible for storing and
 	// querying the wallet's transaction history and unspent outputs.
+	//
+	// NOTE: New code should prefer the db.Store interface. This field will be
+	// removed once the store migration is complete.
 	txStore wtxmgr.TxStore
 
 	// NtfnServer handles the delivery of wallet-related events (e.g., new

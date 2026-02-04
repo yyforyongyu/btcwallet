@@ -38,6 +38,7 @@ type mockDBStore struct {
 
 // A compile-time assertion to ensure that mockDBStore implements the wallet
 // store interfaces.
+var _ db.Store = (*mockDBStore)(nil)
 var _ db.WalletStore = (*mockDBStore)(nil)
 var _ db.AccountStore = (*mockDBStore)(nil)
 
