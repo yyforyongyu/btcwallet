@@ -94,6 +94,7 @@ func setupTestDB(t *testing.T) (walletdb.DB, func()) {
 // mockWalletDeps holds the mocked dependencies for the Wallet.
 type mockWalletDeps struct {
 	addrStore      *mockAddrStore
+	addressStore   *mockDBStore
 	txStore        *mockTxStore
 	syncer         *mockChainSyncer
 	chain          *mockChain
@@ -113,6 +114,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 	t.Cleanup(cleanup)
 
 	mockAddrStore := &mockAddrStore{}
+	mockAddressStore := &mockDBStore{}
 	mockTxStore := &mockTxStore{}
 	mockSyncer := &mockChainSyncer{}
 	mockChain := &mockChain{}
@@ -124,14 +126,15 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	w := &Wallet{
-		addrStore:   mockAddrStore,
-		txStore:     mockTxStore,
-		sync:        mockSyncer,
-		state:       newWalletState(mockSyncer),
-		lifetimeCtx: ctx,
-		cancel:      cancel,
-		requestChan: make(chan any, 1),
-		lockTimer:   time.NewTimer(time.Hour),
+		addressStore: mockAddressStore,
+		addrStore:    mockAddrStore,
+		txStore:      mockTxStore,
+		sync:         mockSyncer,
+		state:        newWalletState(mockSyncer),
+		lifetimeCtx:  ctx,
+		cancel:       cancel,
+		requestChan:  make(chan any, 1),
+		lockTimer:    time.NewTimer(time.Hour),
 		birthdayBlock: waddrmgr.BlockStamp{
 			Height: 100,
 		},
@@ -147,6 +150,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 
 	deps := &mockWalletDeps{
 		addrStore:      mockAddrStore,
+		addressStore:   mockAddressStore,
 		txStore:        mockTxStore,
 		syncer:         mockSyncer,
 		chain:          mockChain,
@@ -158,6 +162,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 
 	t.Cleanup(func() {
 		mockAddrStore.AssertExpectations(t)
+		mockAddressStore.AssertExpectations(t)
 		mockTxStore.AssertExpectations(t)
 		mockSyncer.AssertExpectations(t)
 		mockChain.AssertExpectations(t)

@@ -24,6 +24,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -331,6 +332,11 @@ type Wallet struct {
 	// walletDeprecated embeds the legacy state and channels. Access to
 	// these should be phased out as refactoring progresses.
 	*walletDeprecated
+
+	// addressStore provides access to address-related database operations.
+	//
+	// TODO: Migrate address-related callers behind db.AddressStore.
+	addressStore db.AddressStore
 
 	// addrStore is the address and key manager responsible for hierarchical
 	// deterministic (HD) derivation and storage of cryptographic keys.
