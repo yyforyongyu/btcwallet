@@ -2,9 +2,8 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
-// This file contains a mock implementation of the wtxmgr.TxStore interface.
-// It is used in various tests to isolate wallet logic from the underlying
-// database.
+// This file contains mock implementations of wallet dependencies used in tests
+// to isolate wallet logic from underlying database backends.
 
 package wallet
 
@@ -22,6 +21,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightninglabs/neutrino"
@@ -29,6 +29,108 @@ import (
 	"github.com/lightninglabs/neutrino/headerfs"
 	"github.com/stretchr/testify/mock"
 )
+
+// mockDBStore is a mock implementation of the wallet/internal/db store
+// interfaces.
+type mockDBStore struct {
+	mock.Mock
+}
+
+// A compile-time assertion to ensure that mockDBStore implements the
+// db.AddressStore interface.
+var _ db.AddressStore = (*mockDBStore)(nil)
+
+// NewAddress implements the db.AddressStore interface.
+func (m *mockDBStore) NewAddress(ctx context.Context,
+	params db.NewAddressParams) (btcutil.Address, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(btcutil.Address), args.Error(1)
+}
+
+// ImportAddress implements the db.AddressStore interface.
+func (m *mockDBStore) ImportAddress(ctx context.Context,
+	params db.ImportAddressParams) (*db.AddressInfo, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AddressInfo), args.Error(1)
+}
+
+// GetAddress implements the db.AddressStore interface.
+func (m *mockDBStore) GetAddress(ctx context.Context,
+	query db.GetAddressQuery) (*db.AddressInfo, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AddressInfo), args.Error(1)
+}
+
+// ListAddresses implements the db.AddressStore interface.
+func (m *mockDBStore) ListAddresses(ctx context.Context,
+	query db.ListAddressesQuery) ([]db.AddressInfo, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]db.AddressInfo), args.Error(1)
+}
+
+// MarkAddressAsUsed implements the db.AddressStore interface.
+func (m *mockDBStore) MarkAddressAsUsed(ctx context.Context,
+	params db.MarkAddressAsUsedParams) error {
+
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+// GetPrivateKey implements the db.AddressStore interface.
+func (m *mockDBStore) GetPrivateKey(ctx context.Context,
+	params db.GetPrivateKeyParams) (*btcec.PrivateKey, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*btcec.PrivateKey), args.Error(1)
+}
+
+// ListAddressTypes implements the db.AddressStore interface.
+func (m *mockDBStore) ListAddressTypes(ctx context.Context) (
+	[]db.AddressTypeInfo, error) {
+
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]db.AddressTypeInfo), args.Error(1)
+}
+
+// GetAddressType implements the db.AddressStore interface.
+func (m *mockDBStore) GetAddressType(ctx context.Context,
+	id db.AddressType) (db.AddressTypeInfo, error) {
+
+	args := m.Called(ctx, id)
+	if args.Get(0) == nil {
+		return db.AddressTypeInfo{}, args.Error(1)
+	}
+
+	return args.Get(0).(db.AddressTypeInfo), args.Error(1)
+}
 
 // mockTxStore is a mock implementation of the wtxmgr.TxStore interface.
 type mockTxStore struct {
