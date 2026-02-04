@@ -2,9 +2,8 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
-// This file contains a mock implementation of the wtxmgr.TxStore interface.
-// It is used in various tests to isolate wallet logic from the underlying
-// database.
+// This file contains mock implementations of wallet dependencies used in tests
+// to isolate wallet logic from underlying database backends.
 
 package wallet
 
@@ -22,6 +21,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/lightninglabs/neutrino"
@@ -29,6 +29,126 @@ import (
 	"github.com/lightninglabs/neutrino/headerfs"
 	"github.com/stretchr/testify/mock"
 )
+
+// mockDBStore is a mock implementation of the wallet/internal/db store
+// interfaces.
+type mockDBStore struct {
+	mock.Mock
+}
+
+// A compile-time assertion to ensure that mockDBStore implements the wallet
+// store interfaces.
+var _ db.WalletStore = (*mockDBStore)(nil)
+var _ db.AccountStore = (*mockDBStore)(nil)
+
+func (m *mockDBStore) CreateWallet(ctx context.Context,
+	params db.CreateWalletParams) (*db.WalletInfo, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.WalletInfo), args.Error(1)
+}
+
+func (m *mockDBStore) GetWallet(ctx context.Context,
+	name string) (*db.WalletInfo, error) {
+
+	args := m.Called(ctx, name)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.WalletInfo), args.Error(1)
+}
+
+func (m *mockDBStore) ListWallets(ctx context.Context) ([]db.WalletInfo,
+	error) {
+
+	args := m.Called(ctx)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]db.WalletInfo), args.Error(1)
+}
+
+func (m *mockDBStore) UpdateWallet(ctx context.Context,
+	params db.UpdateWalletParams) error {
+
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+func (m *mockDBStore) GetEncryptedHDSeed(ctx context.Context,
+	walletID uint32) ([]byte, error) {
+
+	args := m.Called(ctx, walletID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]byte), args.Error(1)
+}
+
+func (m *mockDBStore) UpdateWalletSecrets(ctx context.Context,
+	params db.UpdateWalletSecretsParams) error {
+
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
+func (m *mockDBStore) CreateDerivedAccount(ctx context.Context,
+	params db.CreateDerivedAccountParams) (*db.AccountInfo, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountInfo), args.Error(1)
+}
+
+func (m *mockDBStore) CreateImportedAccount(ctx context.Context,
+	params db.CreateImportedAccountParams) (*db.AccountProperties, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountProperties), args.Error(1)
+}
+
+func (m *mockDBStore) GetAccount(ctx context.Context,
+	query db.GetAccountQuery) (*db.AccountInfo, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountInfo), args.Error(1)
+}
+
+func (m *mockDBStore) ListAccounts(ctx context.Context,
+	query db.ListAccountsQuery) ([]db.AccountInfo, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]db.AccountInfo), args.Error(1)
+}
+
+func (m *mockDBStore) RenameAccount(ctx context.Context,
+	params db.RenameAccountParams) error {
+
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
 
 // mockTxStore is a mock implementation of the wtxmgr.TxStore interface.
 type mockTxStore struct {
