@@ -93,6 +93,16 @@ type WalletStore interface {
 		params UpdateWalletSecretsParams) error
 }
 
+// Store defines the database actions supported by a wallet backend.
+//
+// NOTE: This interface will expand as additional managers are migrated to the
+// new database layer. AccountStore is the first component being migrated, but
+// Store also includes wallet-level operations via WalletStore.
+type Store interface {
+	WalletStore
+	AccountStore
+}
+
 // AccountStore defines the database actions for managing accounts.
 type AccountStore interface {
 	// CreateDerivedAccount creates a new derived account with the given name
