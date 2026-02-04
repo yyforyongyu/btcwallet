@@ -16,76 +16,101 @@ import (
 var (
 	// errNotImplemented is returned for unimplemented kvdb store methods.
 	errNotImplemented = errors.New("not implemented")
+
+	// errMissingTxmgrNamespace is returned when the `wtxmgr` namespace bucket
+	// cannot be found in a walletdb transaction.
+	errMissingTxmgrNamespace = errors.New("missing wtxmgr namespace")
+
+	// errUnsupportedWalletID is returned when a db operation is attempted
+	// with a wallet ID that is not supported by the kvdb backend.
+	errUnsupportedWalletID = errors.New("unsupported wallet ID")
+
+	// wtxmgrNamespaceKey is the walletdb top-level bucket key used by the
+	// transaction manager.
+	//
+	// NOTE: This must match the namespace used by the wallet package.
+	wtxmgrNamespaceKey = []byte("wtxmgr")
 )
 
-// UTXOStore is the kvdb (walletdb) implementation of the db.UTXOStore
-// interface.
-//
-// NOTE: This is a partial implementation that will be expanded as the wallet
-// UTXO manager migrates to the new db interfaces.
-type UTXOStore struct {
-	db      walletdb.DB
-	txStore wtxmgr.TxStore
-}
-
-// A compile-time assertion to ensure that UTXOStore implements the
-// db.UTXOStore interface.
-var _ db.UTXOStore = (*UTXOStore)(nil)
-
-// NewUTXOStore creates a new kvdb-backed UTXO store.
-func NewUTXOStore(dbConn walletdb.DB, txStore wtxmgr.TxStore) *UTXOStore {
-	return &UTXOStore{
-		db:      dbConn,
-		txStore: txStore,
-	}
-}
-
-func notImplemented(ctx context.Context, method string) error {
-	err := ctx.Err()
-	if err != nil {
-		return err
-	}
-
-	return fmt.Errorf("kvdb.UTXOStore.%s: %w", method, errNotImplemented)
+func notImplemented(_ context.Context, method string) error {
+	return fmt.Errorf("kvdb.Store.%s: %w", method, errNotImplemented)
 }
 
 // GetUtxo is not yet implemented for kvdb.
-func (s *UTXOStore) GetUtxo(ctx context.Context,
+func (s *Store) GetUtxo(ctx context.Context,
 	_ db.GetUtxoQuery) (*db.UtxoInfo, error) {
 
 	return nil, notImplemented(ctx, "GetUtxo")
 }
 
 // ListUTXOs is not yet implemented for kvdb.
-func (s *UTXOStore) ListUTXOs(ctx context.Context,
+func (s *Store) ListUTXOs(ctx context.Context,
 	_ db.ListUtxosQuery) ([]db.UtxoInfo, error) {
 
 	return nil, notImplemented(ctx, "ListUTXOs")
 }
 
 // LeaseOutput is not yet implemented for kvdb.
-func (s *UTXOStore) LeaseOutput(ctx context.Context,
+func (s *Store) LeaseOutput(ctx context.Context,
 	_ db.LeaseOutputParams) (*db.LeasedOutput, error) {
 
 	return nil, notImplemented(ctx, "LeaseOutput")
 }
 
-// ReleaseOutput is not yet implemented for kvdb.
-func (s *UTXOStore) ReleaseOutput(ctx context.Context,
-	_ db.ReleaseOutputParams) error {
+// ReleaseOutput releases a previously leased output.
+//
+// How it works:
+// The method executes a single walletdb update transaction that deletes the
+// lock record associated with the specified outpoint.
+//
+// Database Actions:
+//   - Performs exactly one write transaction (walletdb.Update).
+//   - Writes to the `wtxmgr` namespace.
+//
+// NOTE: Multi-wallet support is not yet implemented. For now, this method only
+// supports the default wallet ID (0).
+func (s *Store) ReleaseOutput(_ context.Context,
+	params db.ReleaseOutputParams) error {
 
-	return notImplemented(ctx, "ReleaseOutput")
+	if params.WalletID != 0 {
+		return fmt.Errorf(
+			"kvdb.Store.ReleaseOutput: %w: %d", errUnsupportedWalletID,
+			params.WalletID,
+		)
+	}
+
+	lockID := wtxmgr.LockID(params.ID)
+	op := params.OutPoint
+
+	err := walletdb.Update(s.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+		if ns == nil {
+			return errMissingTxmgrNamespace
+		}
+
+		unlockErr := s.txStore.UnlockOutput(ns, lockID, op)
+		if unlockErr != nil {
+			return fmt.Errorf("unlock output: %w", unlockErr)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("kvdb.Store.ReleaseOutput: %w", err)
+	}
+
+	return nil
 }
 
 // ListLeasedOutputs is not yet implemented for kvdb.
-func (s *UTXOStore) ListLeasedOutputs(ctx context.Context,
+func (s *Store) ListLeasedOutputs(ctx context.Context,
 	_ uint32) ([]db.LeasedOutput, error) {
 
 	return nil, notImplemented(ctx, "ListLeasedOutputs")
 }
 
 // Balance is not yet implemented for kvdb.
-func (s *UTXOStore) Balance(ctx context.Context,
+func (s *Store) Balance(ctx context.Context,
 	_ db.BalanceParams) (btcutil.Amount, error) {
 
 	return 0, notImplemented(ctx, "Balance")

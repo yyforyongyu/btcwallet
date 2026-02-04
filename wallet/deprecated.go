@@ -6715,7 +6715,7 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 
 	w := &Wallet{
 		addrStore:        addrMgr,
-		utxoStore:        kvdb.NewUTXOStore(db, txMgr),
+		utxoStore:        kvdb.NewStore(db, txMgr),
 		txStore:          txMgr,
 		walletDeprecated: deprecated,
 	}

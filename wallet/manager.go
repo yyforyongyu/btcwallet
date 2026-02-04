@@ -295,7 +295,7 @@ func (m *Manager) Load(cfg Config) (*Wallet, error) {
 	w := &Wallet{
 		cfg:         cfg,
 		addrStore:   addrMgr,
-		utxoStore:   kvdb.NewUTXOStore(cfg.DB, txMgr),
+		utxoStore:   kvdb.NewStore(cfg.DB, txMgr),
 		txStore:     txMgr,
 		requestChan: make(chan any),
 		lifetimeCtx: lifetimeCtx,
