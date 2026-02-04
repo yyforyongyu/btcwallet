@@ -16,6 +16,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/require"
@@ -308,6 +309,10 @@ func setupBenchmarkWallet(tb testing.TB,
 
 	if w.sync == nil {
 		w.sync = newSyncer(w.cfg, w.addrStore, w.txStore, w)
+	}
+
+	if w.addressStore == nil {
+		w.addressStore = kvdb.NewStore(w.cfg.DB, w.addrStore)
 	}
 
 	// Initialize controller channels and timer.

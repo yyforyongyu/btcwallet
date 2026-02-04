@@ -17,6 +17,14 @@ import (
 var (
 	// errNotImplemented is returned for unimplemented kvdb store methods.
 	errNotImplemented = errors.New("not implemented")
+
+	errMissingWaddrmgrNamespace = errors.New("missing waddrmgr namespace")
+
+	// waddrmgrNamespaceKey is the walletdb top-level bucket key used by the
+	// address manager.
+	//
+	// NOTE: This must match the namespace used by the wallet package.
+	waddrmgrNamespaceKey = []byte("waddrmgr")
 )
 
 // Store is the kvdb (walletdb) implementation of the db.AddressStore interface.
@@ -47,11 +55,56 @@ func notImplemented(ctx context.Context, method string) error {
 	return fmt.Errorf("kvdb.Store.%s: %w", method, errNotImplemented)
 }
 
-// NewAddress is not yet implemented for kvdb.
+// NewAddress creates and persists a new derived address for an account.
 func (s *Store) NewAddress(ctx context.Context,
-	_ db.NewAddressParams) (btcutil.Address, error) {
+	params db.NewAddressParams) (btcutil.Address, error) {
 
-	return nil, notImplemented(ctx, "NewAddress")
+	err := ctx.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	keyScope := waddrmgr.KeyScope{
+		Purpose: params.Scope.Purpose,
+		Coin:    params.Scope.Coin,
+	}
+
+	manager, err := s.addrStore.FetchScopedKeyManager(keyScope)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"kvdb.Store.NewAddress: fetch scoped manager: %w", err,
+		)
+	}
+
+	var addr btcutil.Address
+
+	err = walletdb.Update(s.db, func(tx walletdb.ReadWriteTx) error {
+		ctxErr := ctx.Err()
+		if ctxErr != nil {
+			return ctxErr
+		}
+
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errMissingWaddrmgrNamespace
+		}
+
+		var addrErr error
+
+		addr, addrErr = manager.NewAddress(
+			ns, params.AccountName, params.Change,
+		)
+		if addrErr != nil {
+			return fmt.Errorf("new address: %w", addrErr)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kvdb.Store.NewAddress: %w", err)
+	}
+
+	return addr, nil
 }
 
 // ImportAddress is not yet implemented for kvdb.

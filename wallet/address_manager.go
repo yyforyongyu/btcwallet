@@ -23,6 +23,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 )
 
@@ -51,6 +52,10 @@ var (
 	// ErrUnableToExtractAddress is returned when an address cannot be
 	// extracted from a pkscript.
 	ErrUnableToExtractAddress = errors.New("unable to extract address")
+
+	errAddressStoreNotInitialized = errors.New(
+		"address store not initialized",
+	)
 
 	// errStopIteration is a special error used to stop the iteration in
 	// ForEachAccountAddress.
@@ -192,7 +197,7 @@ var _ AddressManager = (*Wallet)(nil)
 //     transaction to persist the new address.
 //     This ensures that we only save an address after we are confident that
 //     it is being watched by the backend, preventing fund loss.
-func (w *Wallet) NewAddress(_ context.Context, accountName string,
+func (w *Wallet) NewAddress(ctx context.Context, accountName string,
 	addrType waddrmgr.AddressType, change bool) (btcutil.Address, error) {
 
 	err := w.state.validateStarted()
@@ -210,12 +215,21 @@ func (w *Wallet) NewAddress(_ context.Context, accountName string,
 		return nil, err
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
-	if err != nil {
-		return nil, err
+	if w.addressStore == nil {
+		return nil, errAddressStoreNotInitialized
 	}
 
-	addr, err := w.newAddress(manager, accountName, change)
+	params := db.NewAddressParams{
+		WalletID:    0,
+		AccountName: accountName,
+		Scope: db.KeyScope{
+			Purpose: keyScope.Purpose,
+			Coin:    keyScope.Coin,
+		},
+		Change: change,
+	}
+
+	addr, err := w.addressStore.NewAddress(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -272,36 +286,6 @@ func (w *Wallet) keyScopeFromAddrType(
 	}
 
 	return addrKeyScope, nil
-}
-
-// newAddress returns the next external chained address for a wallet. It
-// wraps the database transaction and the call to the scoped key manager's
-// NewAddress method. The underlying address manager handles its own
-// synchronization to ensure that in-memory state remains consistent with the
-// database, preventing race conditions during address creation.
-func (w *Wallet) newAddress(manager waddrmgr.AccountStore,
-	accountName string, change bool) (btcutil.Address, error) {
-
-	var (
-		addr btcutil.Address
-		err  error
-	)
-
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		addr, err = manager.NewAddress(addrmgrNs, accountName, change)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return addr, nil
 }
 
 // GetUnusedAddress returns the first, oldest, unused address by scanning

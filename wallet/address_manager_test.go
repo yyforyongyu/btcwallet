@@ -15,6 +15,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
@@ -156,20 +157,36 @@ func TestNewAddress(t *testing.T) {
 				return
 			}
 
-			var addr btcutil.Address
+			var (
+				addr  btcutil.Address
+				scope db.KeyScope
+			)
+
 			switch tc.addrType {
 			case waddrmgr.WitnessPubKey:
 				addr, _ = btcutil.NewAddressWitnessPubKeyHash(
 					make([]byte, 20), w.cfg.ChainParams,
 				)
+				scope = db.KeyScope{
+					Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+					Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+				}
 			case waddrmgr.NestedWitnessPubKey:
 				addr, _ = btcutil.NewAddressScriptHash(
 					make([]byte, 20), w.cfg.ChainParams,
 				)
+				scope = db.KeyScope{
+					Purpose: waddrmgr.KeyScopeBIP0049Plus.Purpose,
+					Coin:    waddrmgr.KeyScopeBIP0049Plus.Coin,
+				}
 			case waddrmgr.TaprootPubKey:
 				addr, _ = btcutil.NewAddressTaproot(
 					make([]byte, 32), w.cfg.ChainParams,
 				)
+				scope = db.KeyScope{
+					Purpose: waddrmgr.KeyScopeBIP0086.Purpose,
+					Coin:    waddrmgr.KeyScopeBIP0086.Coin,
+				}
 			case waddrmgr.PubKeyHash, waddrmgr.Script,
 				waddrmgr.RawPubKey, waddrmgr.WitnessScript,
 				waddrmgr.TaprootScript:
@@ -180,15 +197,17 @@ func TestNewAddress(t *testing.T) {
 				require.FailNow(t, "unknown address type", tc.addrType)
 			}
 
-			deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-				Return(deps.accountManager, nil).
-				Once()
 			deps.addrStore.On("Address", mock.Anything, addr).
 				Return(deps.addr, nil).
 				Once()
 
-			deps.accountManager.On(
-				"NewAddress", mock.Anything, tc.accountName, tc.change,
+			deps.addressStore.On(
+				"NewAddress", mock.Anything, db.NewAddressParams{
+					WalletID:    0,
+					AccountName: tc.accountName,
+					Scope:       scope,
+					Change:      tc.change,
+				},
 			).Return(addr, nil).Once()
 
 			deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
@@ -231,10 +250,15 @@ func TestGetUnusedAddress(t *testing.T) {
 		make([]byte, 20), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(mockAddr, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: false,
+	}).Return(mockAddr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
 		Return(nil).Once()
 
@@ -322,7 +346,7 @@ func TestGetUnusedAddress(t *testing.T) {
 	// then we mock it returning nil for any more existing addresses,
 	// triggering a NewAddress call.
 	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Twice()
+		Return(deps.accountManager, nil).Once()
 
 	deps.accountManager.On("LookupAccount", mock.Anything, "default").
 		Return(uint32(0), nil).Once()
@@ -345,8 +369,15 @@ func TestGetUnusedAddress(t *testing.T) {
 			11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 		}, w.cfg.ChainParams,
 	)
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(nextAddrVal, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: false,
+	}).Return(nextAddrVal, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{nextAddrVal}).
 		Return(nil).Once()
 
@@ -366,10 +397,15 @@ func TestGetUnusedAddress(t *testing.T) {
 		}, w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", true).
-		Return(changeAddrVal, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: true,
+	}).Return(changeAddrVal, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{changeAddrVal}).
 		Return(nil).Once()
 
@@ -424,10 +460,15 @@ func TestAddressInfo(t *testing.T) {
 		make([]byte, 20), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(addr, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: false,
+	}).Return(addr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
 		Return(nil).Once()
 
@@ -460,10 +501,15 @@ func TestAddressInfo(t *testing.T) {
 		make([]byte, 20), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", true).
-		Return(addr, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: true,
+	}).Return(addr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
 		Return(nil).Once()
 
@@ -504,10 +550,15 @@ func TestGetDerivationInfoExternalAddressSuccess(t *testing.T) {
 		make([]byte, 20), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(mockAddr, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: false,
+	}).Return(mockAddr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
 		Return(nil).Once()
 
@@ -566,10 +617,15 @@ func TestGetDerivationInfoInternalAddressSuccess(t *testing.T) {
 		make([]byte, 20), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", true).
-		Return(mockAddr, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: true,
+	}).Return(mockAddr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
 		Return(nil).Once()
 
@@ -675,10 +731,15 @@ func TestListAddresses(t *testing.T) {
 		make([]byte, 20), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(mockAddr, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: false,
+	}).Return(mockAddr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
 		Return(nil).Once()
 
@@ -876,10 +937,15 @@ func TestScriptForOutput(t *testing.T) {
 		make([]byte, 20), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(mockAddr, nil).Once()
+	deps.addressStore.On("NewAddress", mock.Anything, db.NewAddressParams{
+		WalletID:    0,
+		AccountName: "default",
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Change: false,
+	}).Return(mockAddr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
 		Return(nil).Once()
 
