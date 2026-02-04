@@ -94,6 +94,7 @@ func setupTestDB(t *testing.T) (walletdb.DB, func()) {
 // mockWalletDeps holds the mocked dependencies for the Wallet.
 type mockWalletDeps struct {
 	addrStore      *mockAddrStore
+	utxoStore      *mockUTXOStore
 	txStore        *mockTxStore
 	syncer         *mockChainSyncer
 	chain          *mockChain
@@ -113,6 +114,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 	t.Cleanup(cleanup)
 
 	mockAddrStore := &mockAddrStore{}
+	mockUTXOStore := &mockUTXOStore{}
 	mockTxStore := &mockTxStore{}
 	mockSyncer := &mockChainSyncer{}
 	mockChain := &mockChain{}
@@ -125,6 +127,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 
 	w := &Wallet{
 		addrStore:   mockAddrStore,
+		utxoStore:   mockUTXOStore,
 		txStore:     mockTxStore,
 		sync:        mockSyncer,
 		state:       newWalletState(mockSyncer),
@@ -147,6 +150,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 
 	deps := &mockWalletDeps{
 		addrStore:      mockAddrStore,
+		utxoStore:      mockUTXOStore,
 		txStore:        mockTxStore,
 		syncer:         mockSyncer,
 		chain:          mockChain,
@@ -158,6 +162,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 
 	t.Cleanup(func() {
 		mockAddrStore.AssertExpectations(t)
+		mockUTXOStore.AssertExpectations(t)
 		mockTxStore.AssertExpectations(t)
 		mockSyncer.AssertExpectations(t)
 		mockChain.AssertExpectations(t)
