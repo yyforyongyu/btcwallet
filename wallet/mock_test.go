@@ -30,20 +30,20 @@ import (
 	"github.com/stretchr/testify/mock"
 )
 
-// mockUTXOStore is a mock implementation of the db.UTXOStore interface.
+// mockStore is a mock implementation of the db.Store interface.
 //
 // It is used to unit test wallet UTXO manager public methods without
 // exercising a real database backend.
-type mockUTXOStore struct {
+type mockStore struct {
 	mock.Mock
 }
 
-// A compile-time assertion to ensure that mockUTXOStore implements the
-// db.UTXOStore interface.
-var _ db.UTXOStore = (*mockUTXOStore)(nil)
+// A compile-time assertion to ensure that mockStore implements the db.Store
+// interface.
+var _ db.Store = (*mockStore)(nil)
 
 // GetUtxo implements the db.UTXOStore interface.
-func (m *mockUTXOStore) GetUtxo(ctx context.Context,
+func (m *mockStore) GetUtxo(ctx context.Context,
 	query db.GetUtxoQuery) (*db.UtxoInfo, error) {
 
 	args := m.Called(ctx, query)
@@ -55,7 +55,7 @@ func (m *mockUTXOStore) GetUtxo(ctx context.Context,
 }
 
 // ListUTXOs implements the db.UTXOStore interface.
-func (m *mockUTXOStore) ListUTXOs(ctx context.Context,
+func (m *mockStore) ListUTXOs(ctx context.Context,
 	query db.ListUtxosQuery) ([]db.UtxoInfo, error) {
 
 	args := m.Called(ctx, query)
@@ -67,7 +67,7 @@ func (m *mockUTXOStore) ListUTXOs(ctx context.Context,
 }
 
 // LeaseOutput implements the db.UTXOStore interface.
-func (m *mockUTXOStore) LeaseOutput(ctx context.Context,
+func (m *mockStore) LeaseOutput(ctx context.Context,
 	params db.LeaseOutputParams) (*db.LeasedOutput, error) {
 
 	args := m.Called(ctx, params)
@@ -79,7 +79,7 @@ func (m *mockUTXOStore) LeaseOutput(ctx context.Context,
 }
 
 // ReleaseOutput implements the db.UTXOStore interface.
-func (m *mockUTXOStore) ReleaseOutput(ctx context.Context,
+func (m *mockStore) ReleaseOutput(ctx context.Context,
 	params db.ReleaseOutputParams) error {
 
 	args := m.Called(ctx, params)
@@ -87,7 +87,7 @@ func (m *mockUTXOStore) ReleaseOutput(ctx context.Context,
 }
 
 // ListLeasedOutputs implements the db.UTXOStore interface.
-func (m *mockUTXOStore) ListLeasedOutputs(ctx context.Context,
+func (m *mockStore) ListLeasedOutputs(ctx context.Context,
 	walletID uint32) ([]db.LeasedOutput, error) {
 
 	args := m.Called(ctx, walletID)
@@ -99,7 +99,7 @@ func (m *mockUTXOStore) ListLeasedOutputs(ctx context.Context,
 }
 
 // Balance implements the db.UTXOStore interface.
-func (m *mockUTXOStore) Balance(ctx context.Context,
+func (m *mockStore) Balance(ctx context.Context,
 	params db.BalanceParams) (btcutil.Amount, error) {
 
 	args := m.Called(ctx, params)
