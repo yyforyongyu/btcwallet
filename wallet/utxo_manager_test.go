@@ -321,7 +321,7 @@ func TestReleaseOutput(t *testing.T) {
 	}
 
 	// Mock the UTXOStore ReleaseOutput method to return nil.
-	mocks.utxoStore.On("ReleaseOutput", mock.Anything, db.ReleaseOutputParams{
+	mocks.store.On("ReleaseOutput", mock.Anything, db.ReleaseOutputParams{
 		WalletID: 0,
 		ID:       [32]byte{1},
 		OutPoint: utxo,

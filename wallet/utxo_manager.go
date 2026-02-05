@@ -494,8 +494,8 @@ func (w *Wallet) ReleaseOutput(ctx context.Context, id wtxmgr.LockID,
 		return err
 	}
 
-	if w.utxoStore == nil {
-		w.utxoStore = kvdb.NewStore(w.cfg.DB, w.txStore)
+	if w.store == nil {
+		w.store = kvdb.NewStore(w.cfg.DB, w.txStore)
 	}
 
 	params := db.ReleaseOutputParams{
@@ -504,7 +504,7 @@ func (w *Wallet) ReleaseOutput(ctx context.Context, id wtxmgr.LockID,
 		OutPoint: op,
 	}
 
-	return w.utxoStore.ReleaseOutput(ctx, params)
+	return w.store.ReleaseOutput(ctx, params)
 }
 
 // ListLeasedOutputs returns a list of all currently leased outputs.

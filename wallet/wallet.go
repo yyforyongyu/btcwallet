@@ -341,10 +341,10 @@ type Wallet struct {
 	// querying the wallet's transaction history and unspent outputs.
 	txStore wtxmgr.TxStore
 
-	// utxoStore provides access to UTXO-related database operations.
+	// store provides access to database operations used by wallet managers.
 	//
-	// TODO: Migrate UTXO-related callers behind db.UTXOStore.
-	utxoStore db.UTXOStore
+	// TODO(yy): Migrate UTXO-related callers behind db.UTXOStore.
+	store db.Store
 
 	// NtfnServer handles the delivery of wallet-related events (e.g., new
 	// transactions, block connections) to connected clients.

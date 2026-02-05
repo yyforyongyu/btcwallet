@@ -311,8 +311,8 @@ func setupBenchmarkWallet(tb testing.TB,
 		w.sync = newSyncer(w.cfg, w.addrStore, w.txStore, w)
 	}
 
-	if w.utxoStore == nil {
-		w.utxoStore = kvdb.NewStore(w.cfg.DB, w.txStore)
+	if w.store == nil {
+		w.store = kvdb.NewStore(w.cfg.DB, w.txStore)
 	}
 
 	// Initialize controller channels and timer.
