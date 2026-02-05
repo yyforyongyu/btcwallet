@@ -452,40 +452,9 @@ func (w *Wallet) LeaseOutput(_ context.Context, id wtxmgr.LockID,
 }
 
 // ReleaseOutput unlocks a previously leased output, making it available for
-// use.
+// coin selection again.
 //
-// This method allows a caller to manually release a lock on a UTXO before its
-// expiration time. This is useful when a transaction-building process is
-// aborted and the reserved inputs need to be returned to the pool of available
-// UTXOs.
-//
-// How it works:
-// The method delegates the unlocking operation to the underlying transaction
-// store (`wtxmgr`), which removes the lock record for the specified outpoint.
-//
-// Logical Steps:
-//  1. Initiate a read-write database transaction.
-//  2. Call the `wtxmgr.UnlockOutput` method with the provided `LockID` and
-//     outpoint.
-//  3. The `wtxmgr` verifies that the output is indeed locked by the same
-//     `LockID` before removing the lock.
-//
-// Database Actions:
-//   - This method performs a single read-write database transaction
-//     (`walletdb.Update`).
-//   - It deletes from the `wtxmgr` namespace to remove the output lock.
-//
-// Time Complexity:
-//   - The complexity is O(1) as it involves a direct lookup and delete in the
-//     database.
-//
-// TODO(yy): The current `wtxmgr.UnlockOutput` implementation does not validate
-// that the `LockID` matches the one that currently holds the lock. This could
-// allow any caller to unlock an output, which could be a potential security
-// risk in a multi-user environment. The implementation should be improved to
-// perform this check.
-//
-// NOTE: This is part of the UtxoManager interface implementation.
+// The lock is released by delegating to the wallet's db.Store implementation.
 func (w *Wallet) ReleaseOutput(ctx context.Context, id wtxmgr.LockID,
 	op wire.OutPoint) error {
 
