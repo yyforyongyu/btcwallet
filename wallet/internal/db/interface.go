@@ -58,6 +58,22 @@ var (
 	ErrMaxAccountNumberReached = errors.New("max account number reached")
 )
 
+// Store defines the set of database operations used by the wallet.
+//
+// NOTE: Ideally each wallet component/manager should depend on a small,
+// purpose-built interface (for example, the UtxoManager should only depend on
+// UTXOStore). However, the wallet is still a monolithic struct and its managers
+// are currently only separated by files, all implemented as methods on Wallet.
+// Until we break the wallet into independent components, we use this monolithic
+// Store abstraction as a transitional step.
+//
+// For this PR, Store is an alias of UTXOStore. Over time it is expected to grow
+// to include WalletStore, AccountStore, AddressStore, and TxStore as those
+// callers migrate to the new internal db interfaces.
+//
+// TODO(yy): Break down wallet managers into independent components.
+type Store = UTXOStore
+
 // WalletStore defines the methods for wallet-level operations.
 type WalletStore interface {
 	// CreateWallet creates a new wallet in the database with the provided
