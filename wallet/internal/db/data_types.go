@@ -588,8 +588,7 @@ type AddressInfo struct {
 	// addresses.
 	Index uint32
 
-	// ScriptPubKey is the script pubkey (plaintext). Zero value for
-	// derived addresses.
+	// ScriptPubKey is the script pubkey (plaintext).
 	ScriptPubKey []byte
 
 	// PubKey is the public key (plaintext). Zero value for derived
@@ -680,9 +679,7 @@ type GetAddressQuery struct {
 	// databases (signed 64-bit integers).
 	WalletID uint32
 
-	// ScriptPubKey is the script pubkey. If provided, the query will be
-	// performed using this value. Only applicable to imported addresses,
-	// as derived addresses have NULL script pubkeys.
+	// ScriptPubKey is the script pubkey to be fetched.
 	ScriptPubKey []byte
 }
 
