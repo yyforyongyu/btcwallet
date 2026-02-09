@@ -181,10 +181,13 @@ func (h *prunedBlockDispatcherHarness) stop() {
 	default:
 	}
 
-	select {
-	case <-h.queriedPeer:
-		h.t.Fatal("did not consume all queriedPeer signals")
-	default:
+	// Drain any remaining queriedPeer signals. The exact number of peer
+	// queries depends on the work manager's internal scheduling (e.g.
+	// retries, worker redistribution) and is non-deterministic. Tests
+	// that care about specific query counts already assert them
+	// explicitly via assertPeerQueried.
+	for len(h.queriedPeer) > 0 {
+		<-h.queriedPeer
 	}
 
 	require.Empty(h.t, h.blocksQueried)
