@@ -22,7 +22,7 @@ CP := cp
 MAKE := make
 XARGS := xargs -L 1
 
-include config/testing_flags.mk
+include make/testing_flags.mk
 
 # Linting uses a lot of memory, so keep it under control by limiting the number
 # of workers if requested.
@@ -30,10 +30,22 @@ ifneq ($(workers),)
 LINT_WORKERS = --concurrency=$(workers)
 endif
 
+# Detect if we're in a git worktree. Use git rev-parse --git-common-dir to get
+# the path to the main git directory for the linter's diff processor to work
+# correctly with the new-from-rev setting.
+GIT_COMMON_DIR := $(shell \
+  common_dir="$$(git rev-parse --git-common-dir 2>/dev/null)"; \
+  if [ "$$common_dir" != ".git" ] && [ -n "$$common_dir" ]; then \
+    echo "$$common_dir"; \
+  fi)
+GIT_VOLUME := $(if $(GIT_COMMON_DIR),-v "$(GIT_COMMON_DIR):$(GIT_COMMON_DIR):ro",)
+
 DOCKER_TOOLS = docker run \
   --rm \
   -v $(shell bash -c "mkdir -p /tmp/go-build-cache; echo /tmp/go-build-cache"):/root/.cache/go-build \
-  -v $$(pwd):/build btcwallet-tools
+  -v $$(pwd):/build \
+  $(GIT_VOLUME) \
+  btcwallet-tools
 
 SQLFLUFF = docker run \
 	--rm \
@@ -124,6 +136,22 @@ itest-db-race:
 	@$(call print, "Running $(IT_DB_LABEL) integration tests (race).")
 	env CGO_ENABLED=1 GORACE="history_size=7 halt_on_errors=1" $(ITEST_DB_RACE)
 
+#? itest: Run integration tests
+#? itest (vars): chain=btcd|bitcoind|neutrino db=kvdb|sqlite|postgres
+#? itest (vars): icase=<regex> (filter itest cases)
+#? itest (vars): timeout=<duration> verbose=1 nocache=1
+#? itest (ex): make itest icase=manager
+#? itest (ex): make itest chain=btcd db=kvdb
+itest:
+	@$(call print, "Running integration tests.")
+	@$(GOTEST) -v ./itest \
+		-tags="itest $(DEV_TAGS) nolog" \
+		$(if $(icase),-test.run="TestBtcWallet/.*/$(icase)",) \
+		$(filter-out -test.run=%,$(TEST_FLAGS)) \
+		-args \
+		-chain="$(if $(chain),$(chain),btcd)" \
+		-db="$(if $(db),$(db),kvdb)"
+
 # =========
 # UTILITIES
 # =========
@@ -148,17 +176,17 @@ rpc-format:
 #? lint-config-check: Verify golangci-lint configuration
 lint-config-check: docker-tools
 	@$(call print, "Verifying golangci-lint configuration.")
-	$(DOCKER_TOOLS) golangci-lint config verify -v --config config/.golangci.yml
+	$(DOCKER_TOOLS) golangci-lint config verify -v --config .golangci.yml
 
 #? lint: Lint source and check errors
 lint-check: lint-config-check
 	@$(call print, "Linting source.")
-	$(DOCKER_TOOLS) golangci-lint run -v --config config/.golangci.yml $(LINT_WORKERS)
+	$(DOCKER_TOOLS) golangci-lint run -v --config .golangci.yml $(LINT_WORKERS)
 
 #? lint: Lint source and fix
 lint: lint-config-check
 	@$(call print, "Linting source.")
-	$(DOCKER_TOOLS) golangci-lint run -v --fix --config config/.golangci.yml $(LINT_WORKERS)
+	$(DOCKER_TOOLS) golangci-lint run -v --fix --config .golangci.yml $(LINT_WORKERS)
 
 #? docker-tools: Build tools docker image
 docker-tools:
@@ -178,7 +206,7 @@ rpc-check: rpc
 #? protolint: Lint proto files using protolint
 protolint:
 	@$(call print, "Linting proto files.")
-	$(DOCKER_TOOLS) protolint lint -config_dir_path=config rpc/
+	$(DOCKER_TOOLS) protolint lint -config_dir_path=. rpc/
 
 #? sample-conf-check: Make sure default values in the sample-btcwallet.conf file are set correctly
 sample-conf-check: install
@@ -202,18 +230,18 @@ tidy-module-check: tidy-module
 #? sql-parse: Ensures SQL files are syntactically valid
 sql-parse:
 	@$(call print, "Validating SQL files (postgres migrations).")
-	$(SQLFLUFF) parse --config /sql/config/sqlfluff.cfg --dialect postgres $(SQL_POSTGRES_MIGRATIONS)
+	$(SQLFLUFF) parse --config /sql/.sqlfluff --dialect postgres $(SQL_POSTGRES_MIGRATIONS) --format none
 	@$(call print, "Validating SQL files (postgres queries).")
-	$(SQLFLUFF) parse --config /sql/config/sqlfluff.cfg --dialect postgres $(SQL_POSTGRES_QUERIES)
+	$(SQLFLUFF) parse --config /sql/.sqlfluff --dialect postgres $(SQL_POSTGRES_QUERIES) --format none
 	@$(call print, "Validating SQL files (sqlite migrations).")
-	$(SQLFLUFF) parse --config /sql/config/sqlfluff.cfg --dialect sqlite $(SQL_SQLITE_MIGRATIONS)
+	$(SQLFLUFF) parse --config /sql/.sqlfluff --dialect sqlite $(SQL_SQLITE_MIGRATIONS) --format none
 	@$(call print, "Validating SQL files (sqlite queries).")
-	$(SQLFLUFF) parse --config /sql/config/sqlfluff.cfg --dialect sqlite $(SQL_SQLITE_QUERIES)
+	$(SQLFLUFF) parse --config /sql/.sqlfluff --dialect sqlite $(SQL_SQLITE_QUERIES) --format none
 
 #? sqlc: Generate Go code from SQL queries and migrations
 sqlc: sql-parse docker-tools
 	@$(call print, "Generating sql models and queries in Go")
-	$(DOCKER_TOOLS) sqlc generate -f config/sqlc.yaml
+	$(DOCKER_TOOLS) sqlc generate -f sqlc.yaml
 
 #? sqlc-check: Verify generated Go SQL queries and migrations are up-to-date
 sqlc-check: sqlc
@@ -223,13 +251,13 @@ sqlc-check: sqlc
 #? sql-format: Format SQL migration and query files (like 'make fmt')
 sql-format:
 	@$(call print, "Formatting SQL files (postgres migrations).")
-	$(SQLFLUFF) format --config /sql/config/sqlfluff.cfg --dialect postgres $(SQL_POSTGRES_MIGRATIONS)
+	$(SQLFLUFF) format --config /sql/.sqlfluff --dialect postgres $(SQL_POSTGRES_MIGRATIONS)
 	@$(call print, "Formatting SQL files (postgres queries).")
-	$(SQLFLUFF) format --config /sql/config/sqlfluff.cfg --dialect postgres $(SQL_POSTGRES_QUERIES)
+	$(SQLFLUFF) format --config /sql/.sqlfluff --dialect postgres $(SQL_POSTGRES_QUERIES)
 	@$(call print, "Formatting SQL files (sqlite migrations).")
-	$(SQLFLUFF) format --config /sql/config/sqlfluff.cfg --dialect sqlite $(SQL_SQLITE_MIGRATIONS)
+	$(SQLFLUFF) format --config /sql/.sqlfluff --dialect sqlite $(SQL_SQLITE_MIGRATIONS)
 	@$(call print, "Formatting SQL files (sqlite queries).")
-	$(SQLFLUFF) format --config /sql/config/sqlfluff.cfg --dialect sqlite $(SQL_SQLITE_QUERIES)
+	$(SQLFLUFF) format --config /sql/.sqlfluff --dialect sqlite $(SQL_SQLITE_QUERIES)
 
 #? sql-check: Verify SQL migration and query files are formatted correctly (like 'make fmt-check')
 sql-format-check: sql-format
@@ -239,24 +267,24 @@ sql-format-check: sql-format
 #? sql-lint: Lint SQL migration and query files and fix issues (like 'make lint')
 sql-lint:
 	@$(call print, "Linting SQL files (postgres migrations).")
-	$(SQLFLUFF) fix --config /sql/config/sqlfluff.cfg --dialect postgres $(SQL_POSTGRES_MIGRATIONS)
+	$(SQLFLUFF) fix --config /sql/.sqlfluff --dialect postgres $(SQL_POSTGRES_MIGRATIONS)
 	@$(call print, "Linting SQL files (postgres queries).")
-	$(SQLFLUFF) fix --config /sql/config/sqlfluff.cfg --dialect postgres $(SQL_POSTGRES_QUERIES)
+	$(SQLFLUFF) fix --config /sql/.sqlfluff --dialect postgres $(SQL_POSTGRES_QUERIES)
 	@$(call print, "Linting SQL files (sqlite migrations).")
-	$(SQLFLUFF) fix --config /sql/config/sqlfluff.cfg --dialect sqlite $(SQL_SQLITE_MIGRATIONS)
+	$(SQLFLUFF) fix --config /sql/.sqlfluff --dialect sqlite $(SQL_SQLITE_MIGRATIONS)
 	@$(call print, "Linting SQL files (sqlite queries).")
-	$(SQLFLUFF) fix --config /sql/config/sqlfluff.cfg --dialect sqlite $(SQL_SQLITE_QUERIES)
+	$(SQLFLUFF) fix --config /sql/.sqlfluff --dialect sqlite $(SQL_SQLITE_QUERIES)
 
 #? sql-lint-check: Lint SQL files and report errors (like 'make lint-check')
 sql-lint-check:
 	@$(call print, "Linting SQL files (postgres migrations).")
-	$(SQLFLUFF) lint --config /sql/config/sqlfluff.cfg --dialect postgres $(SQL_POSTGRES_MIGRATIONS)
+	$(SQLFLUFF) lint --config /sql/.sqlfluff --dialect postgres $(SQL_POSTGRES_MIGRATIONS)
 	@$(call print, "Linting SQL files (postgres queries).")
-	$(SQLFLUFF) lint --config /sql/config/sqlfluff.cfg --dialect postgres $(SQL_POSTGRES_QUERIES)
+	$(SQLFLUFF) lint --config /sql/.sqlfluff --dialect postgres $(SQL_POSTGRES_QUERIES)
 	@$(call print, "Linting SQL files (sqlite migrations).")
-	$(SQLFLUFF) lint --config /sql/config/sqlfluff.cfg --dialect sqlite $(SQL_SQLITE_MIGRATIONS)
+	$(SQLFLUFF) lint --config /sql/.sqlfluff --dialect sqlite $(SQL_SQLITE_MIGRATIONS)
 	@$(call print, "Linting SQL files (sqlite queries).")
-	$(SQLFLUFF) lint --config /sql/config/sqlfluff.cfg --dialect sqlite $(SQL_SQLITE_QUERIES)
+	$(SQLFLUFF) lint --config /sql/.sqlfluff --dialect sqlite $(SQL_SQLITE_QUERIES)
 
 .PHONY: all \
 	default \
@@ -267,6 +295,7 @@ sql-lint-check:
 	unit-race \
 	unit-debug \
 	unit-bench \
+	itest \
 	itest-db \
 	itest-db-race \
 	fmt \

@@ -19,6 +19,9 @@ type Account struct {
 	MasterFingerprint  sql.NullInt64
 	EncryptedPublicKey []byte
 	CreatedAt          time.Time
+	NextExternalIndex  int64
+	NextInternalIndex  int64
+	ImportedKeyCount   int64
 }
 
 type AccountOrigin struct {
@@ -29,6 +32,23 @@ type AccountOrigin struct {
 type AccountSecret struct {
 	AccountID           int64
 	EncryptedPrivateKey []byte
+}
+
+type Address struct {
+	ID            int64
+	AccountID     int64
+	ScriptPubKey  []byte
+	TypeID        int64
+	AddressBranch sql.NullInt64
+	AddressIndex  sql.NullInt64
+	PubKey        []byte
+	CreatedAt     time.Time
+}
+
+type AddressSecret struct {
+	AddressID        int64
+	EncryptedPrivKey []byte
+	EncryptedScript  []byte
 }
 
 type AddressType struct {

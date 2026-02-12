@@ -64,6 +64,24 @@ CREATE TABLE accounts (
     -- Timestamp when the account was created. Automatically set by the database.
     created_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
 
+    -- Next index to use for external addresses (branch 0)
+    next_external_index BIGINT NOT NULL DEFAULT 0,
+
+    -- Next index to use for internal/change addresses (branch 1)
+    next_internal_index BIGINT NOT NULL DEFAULT 0,
+
+    -- Number of imported addresses in this account.
+    imported_key_count BIGINT NOT NULL DEFAULT 0,
+
+    -- External derivation index must be non-negative.
+    CHECK (next_external_index >= 0),
+
+    -- Internal derivation index must be non-negative.
+    CHECK (next_internal_index >= 0),
+
+    -- Imported address counter must be non-negative.
+    CHECK (imported_key_count >= 0),
+
     -- Foreign key constraints to key scope. Using ON DELETE RESTRICT to ensure
     -- that the key scope cannot be deleted if accounts still exist.
     FOREIGN KEY (scope_id) REFERENCES key_scopes (id) ON DELETE RESTRICT,
@@ -90,8 +108,9 @@ ON accounts (scope_id, account_name);
 
 -- Account Secrets table to hold encrypted account-level secrets.
 CREATE TABLE account_secrets (
-    -- Reference to the account these keys belong to.
-    account_id BIGINT NOT NULL,
+    -- Reference to the account these keys belong to. Also serves as the
+    -- primary key, enforcing one-to-one relationship.
+    account_id BIGINT PRIMARY KEY,
 
     -- Encrypted private key for the account. Watch-only accounts may have
     -- no row in this table.
@@ -101,7 +120,3 @@ CREATE TABLE account_secrets (
     -- that the account cannot be deleted if secrets still exist.
     FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE RESTRICT
 );
-
--- Unique index to ensure one-to-one relationship between account and its secrets.
-CREATE UNIQUE INDEX uidx_account_secrets_account
-ON account_secrets (account_id);

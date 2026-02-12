@@ -3,7 +3,9 @@
 package itest
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
@@ -47,6 +49,53 @@ func CreateAccountWithNumber(t *testing.T, queries *sqlcpg.Queries,
 	require.NoError(t, err)
 }
 
+// CreateAddressWithIndex creates a derived address with a specific address
+// index. Used to test address index overflow without creating billions of
+// addresses.
+func CreateAddressWithIndex(t *testing.T, queries *sqlcpg.Queries,
+	accountID int64, branch int16, index uint32) {
+	t.Helper()
+
+	_, err := queries.CreateDerivedAddress(
+		t.Context(), sqlcpg.CreateDerivedAddressParams{
+			AccountID:     accountID,
+			ScriptPubKey:  RandomBytes(20),
+			TypeID:        int16(db.WitnessPubKey),
+			AddressBranch: sql.NullInt16{Int16: branch, Valid: true},
+			AddressIndex:  sql.NullInt64{Int64: int64(index), Valid: true},
+			PubKey:        nil,
+		},
+	)
+	require.NoError(t, err)
+}
+
+// UpdateAccountNextExternalIndex updates the account's external index counter.
+func UpdateAccountNextExternalIndex(t *testing.T, dbConn *sql.DB,
+	accountID int64, nextIndex uint32) {
+	t.Helper()
+
+	_, err := dbConn.ExecContext(
+		t.Context(),
+		"UPDATE accounts SET next_external_index = $1 WHERE id = $2",
+		int64(nextIndex), accountID,
+	)
+	require.NoError(t, err)
+}
+
+// UpdateAccountNextInternalIndex updates the account's internal index counter.
+func UpdateAccountNextInternalIndex(t *testing.T, dbConn *sql.DB,
+	accountID int64, nextIndex uint32) {
+
+	t.Helper()
+
+	_, err := dbConn.ExecContext(
+		t.Context(),
+		"UPDATE accounts SET next_internal_index = $1 WHERE id = $2",
+		int64(nextIndex), accountID,
+	)
+	require.NoError(t, err)
+}
+
 // GetKeyScopeID retrieves the scope ID for a given wallet and key scope.
 func GetKeyScopeID(t *testing.T, queries *sqlcpg.Queries,
 	walletID uint32, scope db.KeyScope) int64 {
@@ -62,4 +111,74 @@ func GetKeyScopeID(t *testing.T, queries *sqlcpg.Queries,
 	require.NoError(t, err)
 
 	return row.ID
+}
+
+// GetAccountID retrieves the account ID for a given scope and account name.
+func GetAccountID(t *testing.T, queries *sqlcpg.Queries,
+	scopeID int64, accountName string) int64 {
+	t.Helper()
+
+	row, err := queries.GetAccountByScopeAndName(
+		t.Context(),
+		sqlcpg.GetAccountByScopeAndNameParams{
+			ScopeID:     scopeID,
+			AccountName: accountName,
+		},
+	)
+	require.NoError(t, err)
+
+	return row.ID
+}
+
+func getAddressID(t *testing.T, queries *sqlcpg.Queries, scriptPubKey []byte,
+	walletID uint32) int64 {
+	t.Helper()
+
+	addr, err := queries.GetAddressByScriptPubKey(
+		t.Context(), sqlcpg.GetAddressByScriptPubKeyParams{
+			ScriptPubKey: scriptPubKey,
+			WalletID:     int64(walletID),
+		},
+	)
+	require.NoError(t, err)
+
+	return addr.ID
+}
+
+func getAddressSecret(t *testing.T, queries *sqlcpg.Queries,
+	addressID int64) (sqlcpg.GetAddressSecretRow, error) {
+	t.Helper()
+
+	return queries.GetAddressSecret(t.Context(), addressID)
+}
+
+// MustDeleteAddress deletes an address by ID for test scenarios.
+func MustDeleteAddress(t *testing.T, dbConn *sql.DB, addressID uint32) {
+	t.Helper()
+
+	err := deleteAddress(t.Context(), dbConn, addressID)
+	require.NoError(t, err)
+}
+
+// deleteAddress removes a single address row by ID and validates row count.
+func deleteAddress(ctx context.Context, dbConn *sql.DB,
+	addressID uint32) error {
+
+	result, err := dbConn.ExecContext(
+		ctx, "DELETE FROM addresses WHERE id = $1", int64(addressID),
+	)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rows != 1 {
+		return fmt.Errorf("expected 1 deleted row, got %d", rows)
+	}
+
+	return nil
 }

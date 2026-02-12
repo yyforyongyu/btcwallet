@@ -78,13 +78,17 @@ INSERT INTO account_secrets (
 -- name: GetAccountByScopeAndName :one
 -- Returns a single account by scope id and account name.
 SELECT
+    a.id,
     a.account_number,
     a.account_name,
     a.origin_id,
     a.is_watch_only,
     a.created_at,
     ks.purpose,
-    ks.coin_type
+    ks.coin_type,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE a.scope_id = $1 AND a.account_name = $2;
@@ -92,13 +96,17 @@ WHERE a.scope_id = $1 AND a.account_name = $2;
 -- name: GetAccountByScopeAndNumber :one
 -- Returns a single account by scope id and account number.
 SELECT
+    a.id,
     a.account_number,
     a.account_name,
     a.origin_id,
     a.is_watch_only,
     a.created_at,
     ks.purpose,
-    ks.coin_type
+    ks.coin_type,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE a.scope_id = $1 AND a.account_number = $2;
@@ -106,13 +114,17 @@ WHERE a.scope_id = $1 AND a.account_number = $2;
 -- name: GetAccountByWalletScopeAndName :one
 -- Returns a single account by wallet id, scope tuple, and account name.
 SELECT
+    a.id,
     a.account_number,
     a.account_name,
     a.origin_id,
     a.is_watch_only,
     a.created_at,
     ks.purpose,
-    ks.coin_type
+    ks.coin_type,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE
@@ -124,13 +136,17 @@ WHERE
 -- name: GetAccountByWalletScopeAndNumber :one
 -- Returns a single account by wallet id, scope tuple, and account number.
 SELECT
+    a.id,
     a.account_number,
     a.account_name,
     a.origin_id,
     a.is_watch_only,
     a.created_at,
     ks.purpose,
-    ks.coin_type
+    ks.coin_type,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE
@@ -152,7 +168,10 @@ SELECT
     ks.purpose,
     ks.coin_type,
     ks.internal_type_id,
-    ks.external_type_id
+    ks.external_type_id,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE a.id = $1;
@@ -161,13 +180,17 @@ WHERE a.id = $1;
 -- Lists all accounts in a scope, ordered by account number. Imported accounts
 -- (with NULL account_number) appear last.
 SELECT
+    a.id,
     a.account_number,
     a.account_name,
     a.origin_id,
     a.is_watch_only,
     a.created_at,
     ks.purpose,
-    ks.coin_type
+    ks.coin_type,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE a.scope_id = $1
@@ -177,13 +200,17 @@ ORDER BY a.account_number NULLS LAST;
 -- Lists all accounts for a wallet and scope tuple, ordered by account number.
 -- Imported accounts (with NULL account_number) appear last.
 SELECT
+    a.id,
     a.account_number,
     a.account_name,
     a.origin_id,
     a.is_watch_only,
     a.created_at,
     ks.purpose,
-    ks.coin_type
+    ks.coin_type,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE
@@ -196,13 +223,17 @@ ORDER BY a.account_number NULLS LAST;
 -- Lists all accounts for a wallet filtered by account name, ordered by account
 -- number. Imported accounts (with NULL account_number) appear last.
 SELECT
+    a.id,
     a.account_number,
     a.account_name,
     a.origin_id,
     a.is_watch_only,
     a.created_at,
     ks.purpose,
-    ks.coin_type
+    ks.coin_type,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE ks.wallet_id = $1 AND a.account_name = $2
@@ -212,13 +243,17 @@ ORDER BY a.account_number NULLS LAST;
 -- Lists all accounts for a wallet, ordered by account number. Imported
 -- accounts (with NULL account_number) appear last.
 SELECT
+    a.id,
     a.account_number,
     a.account_name,
     a.origin_id,
     a.is_watch_only,
     a.created_at,
     ks.purpose,
-    ks.coin_type
+    ks.coin_type,
+    a.next_external_index AS external_key_count,
+    a.next_internal_index AS internal_key_count,
+    a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE ks.wallet_id = $1
@@ -266,3 +301,19 @@ INSERT INTO accounts (
 )
 VALUES ($1, $2, $3, $4, $5)
 RETURNING id, account_number, created_at;
+
+-- name: GetAndIncrementNextExternalIndex :one
+-- Atomically gets the next external address index and increments the counter.
+-- Returns the current index value (before incrementing) for the address derivation.
+UPDATE accounts
+SET next_external_index = next_external_index + 1
+WHERE id = $1
+RETURNING (next_external_index - 1)::BIGINT AS address_index;
+
+-- name: GetAndIncrementNextInternalIndex :one
+-- Atomically gets the next internal/change address index and increments the counter.
+-- Returns the current index value (before incrementing) for the address derivation.
+UPDATE accounts
+SET next_internal_index = next_internal_index + 1
+WHERE id = $1
+RETURNING (next_internal_index - 1)::BIGINT AS address_index;
