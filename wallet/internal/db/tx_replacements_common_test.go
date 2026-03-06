@@ -123,7 +123,9 @@ func TestValidateFailureAndOrphanPlans(t *testing.T) {
 	}
 
 	require.NoError(t, validateFailurePlan(winner, []txChainMeta{failedRoot}))
-	require.ErrorIs(t, validateFailurePlan(winner, nil), errFailureRequiresRoots)
+	require.ErrorIs(
+		t, validateFailurePlan(winner, nil), errFailureRequiresRoots,
+	)
 	require.NoError(t, validateOrphanPlan([]txChainMeta{orphanRoot}))
 	require.NoError(t, validateCoinbaseReconfirmation(orphanRoot))
 

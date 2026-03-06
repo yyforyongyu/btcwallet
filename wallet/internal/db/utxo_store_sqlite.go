@@ -74,55 +74,49 @@ func (s *SqliteStore) ListUTXOs(ctx context.Context,
 func (s *SqliteStore) LeaseOutput(ctx context.Context,
 	params LeaseOutputParams) (*LeasedOutput, error) {
 
-	expiresAt := time.Now().UTC().Add(params.Duration)
-
 	var lease *LeasedOutput
-	err := s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		expiration, err := qtx.AcquireUtxoLease(
-			ctx, sqlcsqlite.AcquireUtxoLeaseParams{
-				WalletID:    int64(params.WalletID),
-				LockID:      params.ID[:],
-				ExpiresAt:   expiresAt,
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: int64(params.OutPoint.Index),
+
+	execErr := s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
+		acquiredLease, err := acquireLeaseCommon(
+			ctx, params.OutPoint, params.ID, utxoLeaseHooks{
+				AcquireLease: func(ctx context.Context) (time.Time, error) {
+					return qtx.AcquireUtxoLease(
+						ctx, sqlcsqlite.AcquireUtxoLeaseParams{
+							WalletID:    int64(params.WalletID),
+							LockID:      params.ID[:],
+							ExpiresAt:   time.Now().UTC().Add(params.Duration),
+							TxHash:      params.OutPoint.Hash[:],
+							OutputIndex: int64(params.OutPoint.Index),
+						},
+					)
+				},
+				LookupUtxoID: func(ctx context.Context) (int64, error) {
+					return qtx.GetUtxoIDByOutpoint(
+						ctx, sqlcsqlite.GetUtxoIDByOutpointParams{
+							WalletID:    int64(params.WalletID),
+							TxHash:      params.OutPoint.Hash[:],
+							OutputIndex: int64(params.OutPoint.Index),
+						},
+					)
+				},
 			},
 		)
-		if err == nil {
-			lease = &LeasedOutput{
-				OutPoint:   params.OutPoint,
-				LockID:     LockID(params.ID),
-				Expiration: expiration.UTC(),
+		if err != nil {
+			if errors.Is(err, errOutputAlreadyLeased) ||
+				errors.Is(err, ErrUtxoNotFound) {
+
+				return err
 			}
 
-			return nil
-		}
-
-		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("acquire utxo lease: %w", err)
 		}
 
-		_, lookupErr := qtx.GetUtxoIDByOutpoint(
-			ctx, sqlcsqlite.GetUtxoIDByOutpointParams{
-				WalletID:    int64(params.WalletID),
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: int64(params.OutPoint.Index),
-			},
-		)
-		if lookupErr != nil {
-			if errors.Is(lookupErr, sql.ErrNoRows) {
-				return fmt.Errorf("utxo %s: %w", params.OutPoint,
-					ErrUtxoNotFound)
-			}
+		lease = acquiredLease
 
-			return fmt.Errorf("lookup utxo before lease conflict: %w",
-				lookupErr)
-		}
-
-		return fmt.Errorf("utxo %s: %w", params.OutPoint,
-			errOutputAlreadyLeased)
+		return nil
 	})
-	if err != nil {
-		return nil, err
+	if execErr != nil {
+		return nil, execErr
 	}
 
 	return lease, nil
@@ -133,36 +127,41 @@ func (s *SqliteStore) ReleaseOutput(ctx context.Context,
 	params ReleaseOutputParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		utxoID, err := qtx.GetUtxoIDByOutpoint(
-			ctx, sqlcsqlite.GetUtxoIDByOutpointParams{
-				WalletID:    int64(params.WalletID),
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: int64(params.OutPoint.Index),
+		err := releaseLeaseCommon(ctx, params.OutPoint, utxoLeaseHooks{
+			LookupUtxoID: func(ctx context.Context) (int64, error) {
+				return qtx.GetUtxoIDByOutpoint(
+					ctx, sqlcsqlite.GetUtxoIDByOutpointParams{
+						WalletID:    int64(params.WalletID),
+						TxHash:      params.OutPoint.Hash[:],
+						OutputIndex: int64(params.OutPoint.Index),
+					},
+				)
 			},
-		)
+			ReleaseLease: func(ctx context.Context,
+				utxoID int64) (int64, error) {
+
+				rows, err := qtx.ReleaseUtxoLease(
+					ctx, sqlcsqlite.ReleaseUtxoLeaseParams{
+						WalletID: int64(params.WalletID),
+						UtxoID:   utxoID,
+						LockID:   params.ID[:],
+					},
+				)
+				if err != nil {
+					return 0, fmt.Errorf("release utxo lease: %w", err)
+				}
+
+				return rows, nil
+			},
+		})
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("utxo %s: %w", params.OutPoint,
-					ErrUtxoNotFound)
+			if errors.Is(err, errOutputUnlockNotAllowed) ||
+				errors.Is(err, ErrUtxoNotFound) {
+
+				return err
 			}
 
 			return fmt.Errorf("lookup utxo for release: %w", err)
-		}
-
-		rows, err := qtx.ReleaseUtxoLease(
-			ctx, sqlcsqlite.ReleaseUtxoLeaseParams{
-				WalletID: int64(params.WalletID),
-				UtxoID:   utxoID,
-				LockID:   params.ID[:],
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("release utxo lease: %w", err)
-		}
-
-		if rows == 0 {
-			return fmt.Errorf("utxo %s: %w", params.OutPoint,
-				errOutputUnlockNotAllowed)
 		}
 
 		return nil

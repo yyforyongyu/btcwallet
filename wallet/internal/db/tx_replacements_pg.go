@@ -18,44 +18,19 @@ func (s *PostgresStore) ApplyTxReplacement(ctx context.Context,
 	params ApplyTxReplacementParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
-		winner, err := loadTxChainMetaPg(
-			ctx, qtx, params.WalletID, params.ReplacementTxid,
-		)
-		if err != nil {
-			return err
-		}
+		return applyTxReplacementCommon(
+			ctx, params,
+			func(ctx context.Context,
+				txid chainhash.Hash) (txChainMeta, error) {
 
-		victims, err := loadTxChainMetasPg(
-			ctx, qtx, params.WalletID, params.ReplacedTxids,
-		)
-		if err != nil {
-			return err
-		}
+				return loadTxChainMetaPg(ctx, qtx, params.WalletID, txid)
+			},
+			func(ctx context.Context,
+				txids []chainhash.Hash) ([]txChainMeta, error) {
 
-		err = validateReplacementPlan(winner, victims)
-		if err != nil {
-			return err
-		}
-
-		for _, victim := range victims {
-			err := recordReplacementEdgePg(
-				ctx, qtx, params.WalletID, victim.ID, winner.ID,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		err = applyTxChainInvalidation(
-			ctx, txIDsFromMetas(victims), TxStatusReplaced,
+				return loadTxChainMetasPg(ctx, qtx, params.WalletID, txids)
+			},
 			buildTxChainHooksPg(qtx, params.WalletID),
-		)
-		if err != nil {
-			return err
-		}
-
-		return reclaimInputsByTxidPg(
-			ctx, qtx, params.WalletID, params.ReplacementTxid, winner.ID,
 		)
 	})
 }
@@ -67,35 +42,19 @@ func (s *PostgresStore) ApplyTxFailure(ctx context.Context,
 	params ApplyTxFailureParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
-		winner, err := loadTxChainMetaPg(
-			ctx, qtx, params.WalletID, params.ConflictingTxid,
-		)
-		if err != nil {
-			return err
-		}
+		return applyTxFailureCommon(
+			ctx, params,
+			func(ctx context.Context,
+				txid chainhash.Hash) (txChainMeta, error) {
 
-		roots, err := loadTxChainMetasPg(
-			ctx, qtx, params.WalletID, params.FailedTxids,
-		)
-		if err != nil {
-			return err
-		}
+				return loadTxChainMetaPg(ctx, qtx, params.WalletID, txid)
+			},
+			func(ctx context.Context,
+				txids []chainhash.Hash) ([]txChainMeta, error) {
 
-		err = validateFailurePlan(winner, roots)
-		if err != nil {
-			return err
-		}
-
-		err = applyTxChainInvalidation(
-			ctx, txIDsFromMetas(roots), TxStatusFailed,
+				return loadTxChainMetasPg(ctx, qtx, params.WalletID, txids)
+			},
 			buildTxChainHooksPg(qtx, params.WalletID),
-		)
-		if err != nil {
-			return err
-		}
-
-		return reclaimInputsByTxidPg(
-			ctx, qtx, params.WalletID, params.ConflictingTxid, winner.ID,
 		)
 	})
 }
@@ -106,7 +65,9 @@ func (s *PostgresStore) OrphanTxChain(ctx context.Context,
 	params OrphanTxChainParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
-		roots, err := loadTxChainMetasPg(ctx, qtx, params.WalletID, params.Txids)
+		roots, err := loadTxChainMetasPg(
+			ctx, qtx, params.WalletID, params.Txids,
+		)
 		if err != nil {
 			return err
 		}
@@ -169,23 +130,38 @@ func (s *PostgresStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	})
 }
 
+// buildTxChainHooksPg binds the shared replacement helpers to the postgres
+// query set active for the surrounding SQL transaction.
 func buildTxChainHooksPg(qtx *sqlcpg.Queries, walletID uint32) txChainHooks {
-	return txChainHooks{
-		ListChildren: func(ctx context.Context, parentID int64) ([]int64, error) {
+	return buildTxChainHooks(
+		func(ctx context.Context, parentID int64) ([]int64, error) {
 			return listChildTxIDsPg(ctx, qtx, walletID, parentID)
 		},
-		ClearSpentByTx: func(ctx context.Context, txID int64) error {
+		func(ctx context.Context, txID int64) error {
 			return clearSpentByTxIDPg(ctx, qtx, walletID, txID)
 		},
-		UpdateStatus: func(ctx context.Context, status TxStatus,
+		func(ctx context.Context, status TxStatus,
 			txIDs []int64) error {
 
 			return updateTxStatusPg(ctx, qtx, walletID, status, txIDs)
 		},
-	}
+		func(ctx context.Context, txid chainhash.Hash,
+			txID int64) error {
+
+			return reclaimInputsByTxidPg(ctx, qtx, walletID, txid, txID)
+		},
+		func(ctx context.Context, replacedTxID int64,
+			replacementTxID int64) error {
+
+			return recordReplacementEdgePg(
+				ctx, qtx, walletID, replacedTxID, replacementTxID,
+			)
+		},
+	)
 }
 
-func loadTxChainMetasPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint32,
+func loadTxChainMetasPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32,
 	txids []chainhash.Hash) ([]txChainMeta, error) {
 
 	metas := make([]txChainMeta, len(txids))
@@ -201,7 +177,8 @@ func loadTxChainMetasPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint3
 	return metas, nil
 }
 
-func loadTxChainMetaPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint32,
+func loadTxChainMetaPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32,
 	txid chainhash.Hash) (txChainMeta, error) {
 
 	row, err := qtx.GetTransactionMetaByHash(
@@ -259,7 +236,8 @@ func listChildTxIDsPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint32,
 	return childIDs, nil
 }
 
-func clearSpentByTxIDPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint32,
+func clearSpentByTxIDPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32,
 	txID int64) error {
 
 	_, err := qtx.ClearUtxosSpentByTxID(
@@ -354,7 +332,8 @@ func reclaimInputsByTxidPg(ctx context.Context, qtx *sqlcpg.Queries,
 	return nil
 }
 
-func ensureWalletOwnedInputsReclaimedPg(ctx context.Context, qtx *sqlcpg.Queries,
+func ensureWalletOwnedInputsReclaimedPg(ctx context.Context,
+	qtx *sqlcpg.Queries,
 	walletID uint32, tx *wire.MsgTx, txID int64) error {
 
 	for inputIndex, txIn := range tx.TxIn {

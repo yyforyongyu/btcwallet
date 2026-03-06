@@ -49,12 +49,7 @@ func (s *PostgresStore) GetUtxo(ctx context.Context,
 func (s *PostgresStore) ListUTXOs(ctx context.Context,
 	query ListUtxosQuery) ([]UtxoInfo, error) {
 
-	params, err := buildListUtxosParamsPg(query)
-	if err != nil {
-		return nil, err
-	}
-
-	rows, err := s.queries.ListUtxos(ctx, params)
+	rows, err := s.queries.ListUtxos(ctx, buildListUtxosParamsPg(query))
 	if err != nil {
 		return nil, fmt.Errorf("list utxos: %w", err)
 	}
@@ -79,52 +74,49 @@ func (s *PostgresStore) ListUTXOs(ctx context.Context,
 func (s *PostgresStore) LeaseOutput(ctx context.Context,
 	params LeaseOutputParams) (*LeasedOutput, error) {
 
-	expiresAt := time.Now().UTC().Add(params.Duration)
+	outputIndex, err := uint32ToInt32(params.OutPoint.Index)
+	if err != nil {
+		return nil, fmt.Errorf("convert output index: %w", err)
+	}
 
 	var lease *LeasedOutput
-	err := s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
-		expiration, err := qtx.AcquireUtxoLease(
-			ctx, sqlcpg.AcquireUtxoLeaseParams{
-				WalletID:    int64(params.WalletID),
-				LockID:      params.ID[:],
-				ExpiresAt:   expiresAt,
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: mustUint32ToInt32(params.OutPoint.Index),
+
+	err = s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
+		lease, err = acquireLeaseCommon(
+			ctx, params.OutPoint, params.ID, utxoLeaseHooks{
+				AcquireLease: func(ctx context.Context) (time.Time, error) {
+					return qtx.AcquireUtxoLease(
+						ctx, sqlcpg.AcquireUtxoLeaseParams{
+							WalletID:    int64(params.WalletID),
+							LockID:      params.ID[:],
+							ExpiresAt:   time.Now().UTC().Add(params.Duration),
+							TxHash:      params.OutPoint.Hash[:],
+							OutputIndex: outputIndex,
+						},
+					)
+				},
+				LookupUtxoID: func(ctx context.Context) (int64, error) {
+					return qtx.GetUtxoIDByOutpoint(
+						ctx, sqlcpg.GetUtxoIDByOutpointParams{
+							WalletID:    int64(params.WalletID),
+							TxHash:      params.OutPoint.Hash[:],
+							OutputIndex: outputIndex,
+						},
+					)
+				},
 			},
 		)
-		if err == nil {
-			lease = &LeasedOutput{
-				OutPoint:   params.OutPoint,
-				LockID:     LockID(params.ID),
-				Expiration: expiration.UTC(),
+		if err != nil {
+			if errors.Is(err, errOutputAlreadyLeased) ||
+				errors.Is(err, ErrUtxoNotFound) {
+
+				return err
 			}
 
-			return nil
-		}
-
-		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("acquire utxo lease: %w", err)
 		}
 
-		_, lookupErr := qtx.GetUtxoIDByOutpoint(
-			ctx, sqlcpg.GetUtxoIDByOutpointParams{
-				WalletID:    int64(params.WalletID),
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: mustUint32ToInt32(params.OutPoint.Index),
-			},
-		)
-		if lookupErr != nil {
-			if errors.Is(lookupErr, sql.ErrNoRows) {
-				return fmt.Errorf("utxo %s: %w", params.OutPoint,
-					ErrUtxoNotFound)
-			}
-
-			return fmt.Errorf("lookup utxo before lease conflict: %w",
-				lookupErr)
-		}
-
-		return fmt.Errorf("utxo %s: %w", params.OutPoint,
-			errOutputAlreadyLeased)
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -137,37 +129,47 @@ func (s *PostgresStore) LeaseOutput(ctx context.Context,
 func (s *PostgresStore) ReleaseOutput(ctx context.Context,
 	params ReleaseOutputParams) error {
 
+	outputIndex, err := uint32ToInt32(params.OutPoint.Index)
+	if err != nil {
+		return fmt.Errorf("convert output index: %w", err)
+	}
+
 	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
-		utxoID, err := qtx.GetUtxoIDByOutpoint(
-			ctx, sqlcpg.GetUtxoIDByOutpointParams{
-				WalletID:    int64(params.WalletID),
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: mustUint32ToInt32(params.OutPoint.Index),
+		err := releaseLeaseCommon(ctx, params.OutPoint, utxoLeaseHooks{
+			LookupUtxoID: func(ctx context.Context) (int64, error) {
+				return qtx.GetUtxoIDByOutpoint(
+					ctx, sqlcpg.GetUtxoIDByOutpointParams{
+						WalletID:    int64(params.WalletID),
+						TxHash:      params.OutPoint.Hash[:],
+						OutputIndex: outputIndex,
+					},
+				)
 			},
-		)
+			ReleaseLease: func(ctx context.Context,
+				utxoID int64) (int64, error) {
+
+				rows, err := qtx.ReleaseUtxoLease(
+					ctx, sqlcpg.ReleaseUtxoLeaseParams{
+						WalletID: int64(params.WalletID),
+						UtxoID:   utxoID,
+						LockID:   params.ID[:],
+					},
+				)
+				if err != nil {
+					return 0, fmt.Errorf("release utxo lease: %w", err)
+				}
+
+				return rows, nil
+			},
+		})
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("utxo %s: %w", params.OutPoint,
-					ErrUtxoNotFound)
+			if errors.Is(err, errOutputUnlockNotAllowed) ||
+				errors.Is(err, ErrUtxoNotFound) {
+
+				return err
 			}
 
 			return fmt.Errorf("lookup utxo for release: %w", err)
-		}
-
-		rows, err := qtx.ReleaseUtxoLease(
-			ctx, sqlcpg.ReleaseUtxoLeaseParams{
-				WalletID: int64(params.WalletID),
-				UtxoID:   utxoID,
-				LockID:   params.ID[:],
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("release utxo lease: %w", err)
-		}
-
-		if rows == 0 {
-			return fmt.Errorf("utxo %s: %w", params.OutPoint,
-				errOutputUnlockNotAllowed)
 		}
 
 		return nil
@@ -222,15 +224,13 @@ func (s *PostgresStore) Balance(ctx context.Context,
 	return btcutil.Amount(balance), nil
 }
 
-func buildListUtxosParamsPg(query ListUtxosQuery) (sqlcpg.ListUtxosParams,
-	error) {
-
+func buildListUtxosParamsPg(query ListUtxosQuery) sqlcpg.ListUtxosParams {
 	return sqlcpg.ListUtxosParams{
 		WalletID:      int64(query.WalletID),
 		AccountNumber: nullableUint32Int64(query.Account),
 		MinConfirms:   sql.NullInt32{Int32: query.MinConfs, Valid: true},
 		MaxConfirms:   sql.NullInt32{Int32: query.MaxConfs, Valid: true},
-	}, nil
+	}
 }
 
 func utxoInfoFromPgRow(hash []byte, outputIndex int32, amount int64,
@@ -255,15 +255,6 @@ func utxoInfoFromPgRow(hash []byte, outputIndex int32, amount int64,
 	return buildUtxoInfo(
 		hash, index, amount, pkScript, received, isCoinbase, height,
 	)
-}
-
-func mustUint32ToInt32(value uint32) int32 {
-	converted, err := uint32ToInt32(value)
-	if err != nil {
-		panic(err)
-	}
-
-	return converted
 }
 
 func optionalUint32Int64(value *uint32) interface{} {

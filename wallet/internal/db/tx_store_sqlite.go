@@ -41,19 +41,24 @@ func (s *SqliteStore) CreateTx(ctx context.Context,
 				return fmt.Errorf("ensure block exists: %w", err)
 			}
 
-			blockHeight = sql.NullInt64{Int64: int64(params.Block.Height), Valid: true}
+			blockHeight = sql.NullInt64{
+				Int64: int64(params.Block.Height),
+				Valid: true,
+			}
 		}
 
-		txID, err := qtx.InsertTransaction(ctx, sqlcsqlite.InsertTransactionParams{
-			WalletID:     int64(params.WalletID),
-			TxHash:       txHash[:],
-			RawTx:        rawTx,
-			BlockHeight:  blockHeight,
-			Status:       string(params.Status),
-			ReceivedTime: received,
-			IsCoinbase:   isCoinbase,
-			Label:        params.Label,
-		})
+		txID, err := qtx.InsertTransaction(
+			ctx, sqlcsqlite.InsertTransactionParams{
+				WalletID:     int64(params.WalletID),
+				TxHash:       txHash[:],
+				RawTx:        rawTx,
+				BlockHeight:  blockHeight,
+				Status:       string(params.Status),
+				ReceivedTime: received,
+				IsCoinbase:   isCoinbase,
+				Label:        params.Label,
+			},
+		)
 		if err != nil {
 			return fmt.Errorf("insert transaction: %w", err)
 		}
@@ -151,9 +156,15 @@ func (s *SqliteStore) ListTxns(ctx context.Context,
 
 	rows, err := s.queries.ListTransactionsByHeightRange(
 		ctx, sqlcsqlite.ListTransactionsByHeightRangeParams{
-			WalletID:    int64(query.WalletID),
-			StartHeight: sql.NullInt64{Int64: int64(query.StartHeight), Valid: true},
-			EndHeight:   sql.NullInt64{Int64: int64(query.EndHeight), Valid: true},
+			WalletID: int64(query.WalletID),
+			StartHeight: sql.NullInt64{
+				Int64: int64(query.StartHeight),
+				Valid: true,
+			},
+			EndHeight: sql.NullInt64{
+				Int64: int64(query.EndHeight),
+				Valid: true,
+			},
 		},
 	)
 	if err != nil {
@@ -189,85 +200,88 @@ func (s *SqliteStore) DeleteTx(ctx context.Context,
 	params DeleteTxParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		meta, err := qtx.GetTransactionMetaByHash(
-			ctx, sqlcsqlite.GetTransactionMetaByHashParams{
-				WalletID: int64(params.WalletID),
-				TxHash:   params.Txid[:],
-			},
+		return deleteTxCommon(
+			ctx, params.Txid, buildTxDeleteHooksSqlite(qtx, params),
 		)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("transaction %s: %w", params.Txid,
-					ErrTxNotFound)
-			}
-
-			return fmt.Errorf("get transaction metadata: %w", err)
-		}
-
-		status, err := parseTxStatus(meta.Status)
-		if err != nil {
-			return err
-		}
-
-		if meta.BlockHeight.Valid || !isLiveUnconfirmedStatus(status) {
-			return fmt.Errorf("transaction %s: %w", params.Txid,
-				errDeleteLiveUnconfirmedTxRequired)
-		}
-
-		childIDs, err := listChildTxIDsSqlite(
-			ctx, qtx, params.WalletID, meta.ID,
-		)
-		if err != nil {
-			return err
-		}
-
-		if len(childIDs) > 0 {
-			return fmt.Errorf("transaction %s: %w", params.Txid,
-				errDeleteTxHasDependents)
-		}
-
-		_, err = qtx.ClearUtxosSpentByTxID(
-			ctx, sqlcsqlite.ClearUtxosSpentByTxIDParams{
-				WalletID:    int64(params.WalletID),
-				SpentByTxID: sql.NullInt64{Int64: meta.ID, Valid: true},
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("clear spent utxos: %w", err)
-		}
-
-		_, err = qtx.DeleteUtxosByTxID(
-			ctx, sqlcsqlite.DeleteUtxosByTxIDParams{
-				WalletID: int64(params.WalletID),
-				TxID:     meta.ID,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("delete created utxos: %w", err)
-		}
-
-		rows, err := qtx.DeleteUnminedTransactionByHash(
-			ctx, sqlcsqlite.DeleteUnminedTransactionByHashParams{
-				WalletID: int64(params.WalletID),
-				TxHash:   params.Txid[:],
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("delete unmined transaction: %w", err)
-		}
-
-		if rows == 0 {
-			return fmt.Errorf("transaction %s: %w", params.Txid,
-				ErrTxNotFound)
-		}
-
-		return nil
 	})
 }
 
-// RollbackToBlock removes every block at or above the provided height and
-// rewrites wallet sync-state references so the block delete can succeed.
-func (s *SqliteStore) RollbackToBlock(ctx context.Context, height uint32) error {
+// buildTxDeleteHooksSqlite binds the shared delete flow to the sqlite query
+// set active for the surrounding SQL transaction.
+func buildTxDeleteHooksSqlite(qtx *sqlcsqlite.Queries,
+	params DeleteTxParams) txDeleteHooks {
+
+	return buildTxDeleteHooks(
+		func(ctx context.Context) (txChainMeta, error) {
+			return loadTxChainMetaSqlite(
+				ctx, qtx, params.WalletID, params.Txid,
+			)
+		},
+		func(ctx context.Context, txID int64) ([]int64, error) {
+			return listChildTxIDsSqlite(
+				ctx, qtx, params.WalletID, txID,
+			)
+		},
+		func(ctx context.Context, txID int64) error {
+			return clearSpentByTxIDSqlite(
+				ctx, qtx, params.WalletID, txID,
+			)
+		},
+		func(ctx context.Context, txID int64) error {
+			return deleteUtxosByTxIDSqlite(
+				ctx, qtx, params.WalletID, txID,
+			)
+		},
+		func(ctx context.Context) (int64, error) {
+			return deleteUnminedTxByHashSqlite(
+				ctx, qtx, params.WalletID, params.Txid,
+			)
+		},
+	)
+}
+
+// deleteUtxosByTxIDSqlite removes the wallet-owned outputs created by one
+// transaction before its row is pruned from the live graph.
+func deleteUtxosByTxIDSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries, walletID uint32, txID int64) error {
+
+	_, err := qtx.DeleteUtxosByTxID(
+		ctx, sqlcsqlite.DeleteUtxosByTxIDParams{
+			WalletID: int64(walletID),
+			TxID:     txID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("delete created utxos: %w", err)
+	}
+
+	return nil
+}
+
+// deleteUnminedTxByHashSqlite removes the unconfirmed transaction row after
+// its dependent UTXO edges have already been cleared.
+func deleteUnminedTxByHashSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries, walletID uint32, txid [32]byte) (int64, error) {
+
+	rows, err := qtx.DeleteUnminedTransactionByHash(
+		ctx, sqlcsqlite.DeleteUnminedTransactionByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   txid[:],
+		},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete unmined transaction: %w", err)
+	}
+
+	return rows, nil
+}
+
+// RollbackToBlock removes every block at or above the provided
+// height and rewrites wallet sync-state references so the block
+// delete can succeed.
+func (s *SqliteStore) RollbackToBlock(ctx context.Context,
+	height uint32) error {
+
 	rollbackArg := sql.NullInt64{Int64: int64(height), Valid: true}
 
 	newHeight := sql.NullInt64{}
@@ -342,11 +356,14 @@ func markInputsSpentSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 
 	for inputIndex, txIn := range params.Tx.TxIn {
 		_, err := qtx.MarkUtxoSpent(ctx, sqlcsqlite.MarkUtxoSpentParams{
-			WalletID:        int64(params.WalletID),
-			TxHash:          txIn.PreviousOutPoint.Hash[:],
-			OutputIndex:     int64(txIn.PreviousOutPoint.Index),
-			SpentByTxID:     sql.NullInt64{Int64: txID, Valid: true},
-			SpentInputIndex: sql.NullInt64{Int64: int64(inputIndex), Valid: true},
+			WalletID:    int64(params.WalletID),
+			TxHash:      txIn.PreviousOutPoint.Hash[:],
+			OutputIndex: int64(txIn.PreviousOutPoint.Index),
+			SpentByTxID: sql.NullInt64{Int64: txID, Valid: true},
+			SpentInputIndex: sql.NullInt64{
+				Int64: int64(inputIndex),
+				Valid: true,
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("mark spent input %d: %w", inputIndex, err)
@@ -360,7 +377,9 @@ func txInfoFromSqliteRow(hash []byte, rawTx []byte, received time.Time,
 	blockHeight sql.NullInt64, blockHash []byte, blockTimestamp sql.NullInt64,
 	status string, label string) (*TxInfo, error) {
 
-	block, err := buildSqliteOptionalBlock(blockHeight, blockHash, blockTimestamp)
+	block, _, err := buildSqliteOptionalBlock(
+		blockHeight, blockHash, blockTimestamp,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -371,17 +390,24 @@ func txInfoFromSqliteRow(hash []byte, rawTx []byte, received time.Time,
 }
 
 func buildSqliteOptionalBlock(height sql.NullInt64, hash []byte,
-	timestamp sql.NullInt64) (*Block, error) {
+	timestamp sql.NullInt64) (*Block, bool, error) {
 
 	if !height.Valid {
-		return nil, nil
+		return nil, false, nil
 	}
 
-	return buildSqliteBlock(height, hash, timestamp)
+	block, err := buildSqliteBlock(height, hash, timestamp)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return block, true, nil
 }
 
 func buildSqliteConfirmedBlock(height sql.NullInt64, hash []byte,
 	timestamp int64) (*Block, error) {
 
-	return buildSqliteBlock(height, hash, sql.NullInt64{Int64: timestamp, Valid: true})
+	return buildSqliteBlock(
+		height, hash, sql.NullInt64{Int64: timestamp, Valid: true},
+	)
 }

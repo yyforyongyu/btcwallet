@@ -18,44 +18,23 @@ func (s *SqliteStore) ApplyTxReplacement(ctx context.Context,
 	params ApplyTxReplacementParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		winner, err := loadTxChainMetaSqlite(
-			ctx, qtx, params.WalletID, params.ReplacementTxid,
-		)
-		if err != nil {
-			return err
-		}
+		return applyTxReplacementCommon(
+			ctx, params,
+			func(ctx context.Context,
+				txid chainhash.Hash) (txChainMeta, error) {
 
-		victims, err := loadTxChainMetasSqlite(
-			ctx, qtx, params.WalletID, params.ReplacedTxids,
-		)
-		if err != nil {
-			return err
-		}
+				return loadTxChainMetaSqlite(
+					ctx, qtx, params.WalletID, txid,
+				)
+			},
+			func(ctx context.Context,
+				txids []chainhash.Hash) ([]txChainMeta, error) {
 
-		err = validateReplacementPlan(winner, victims)
-		if err != nil {
-			return err
-		}
-
-		for _, victim := range victims {
-			err := recordReplacementEdgeSqlite(
-				ctx, qtx, params.WalletID, victim.ID, winner.ID,
-			)
-			if err != nil {
-				return err
-			}
-		}
-
-		err = applyTxChainInvalidation(
-			ctx, txIDsFromMetas(victims), TxStatusReplaced,
+				return loadTxChainMetasSqlite(
+					ctx, qtx, params.WalletID, txids,
+				)
+			},
 			buildTxChainHooksSqlite(qtx, params.WalletID),
-		)
-		if err != nil {
-			return err
-		}
-
-		return reclaimInputsByTxidSqlite(
-			ctx, qtx, params.WalletID, params.ReplacementTxid, winner.ID,
 		)
 	})
 }
@@ -67,35 +46,23 @@ func (s *SqliteStore) ApplyTxFailure(ctx context.Context,
 	params ApplyTxFailureParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		winner, err := loadTxChainMetaSqlite(
-			ctx, qtx, params.WalletID, params.ConflictingTxid,
-		)
-		if err != nil {
-			return err
-		}
+		return applyTxFailureCommon(
+			ctx, params,
+			func(ctx context.Context,
+				txid chainhash.Hash) (txChainMeta, error) {
 
-		roots, err := loadTxChainMetasSqlite(
-			ctx, qtx, params.WalletID, params.FailedTxids,
-		)
-		if err != nil {
-			return err
-		}
+				return loadTxChainMetaSqlite(
+					ctx, qtx, params.WalletID, txid,
+				)
+			},
+			func(ctx context.Context,
+				txids []chainhash.Hash) ([]txChainMeta, error) {
 
-		err = validateFailurePlan(winner, roots)
-		if err != nil {
-			return err
-		}
-
-		err = applyTxChainInvalidation(
-			ctx, txIDsFromMetas(roots), TxStatusFailed,
+				return loadTxChainMetasSqlite(
+					ctx, qtx, params.WalletID, txids,
+				)
+			},
 			buildTxChainHooksSqlite(qtx, params.WalletID),
-		)
-		if err != nil {
-			return err
-		}
-
-		return reclaimInputsByTxidSqlite(
-			ctx, qtx, params.WalletID, params.ConflictingTxid, winner.ID,
 		)
 	})
 }
@@ -131,7 +98,9 @@ func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	params ReconfirmOrphanedCoinbaseParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		meta, err := loadTxChainMetaSqlite(ctx, qtx, params.WalletID, params.Txid)
+		meta, err := loadTxChainMetaSqlite(
+			ctx, qtx, params.WalletID, params.Txid,
+		)
 		if err != nil {
 			return err
 		}
@@ -169,22 +138,36 @@ func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	})
 }
 
+// buildTxChainHooksSqlite binds the shared replacement helpers to the sqlite
+// query set active for the surrounding SQL transaction.
 func buildTxChainHooksSqlite(qtx *sqlcsqlite.Queries,
 	walletID uint32) txChainHooks {
 
-	return txChainHooks{
-		ListChildren: func(ctx context.Context, parentID int64) ([]int64, error) {
+	return buildTxChainHooks(
+		func(ctx context.Context, parentID int64) ([]int64, error) {
 			return listChildTxIDsSqlite(ctx, qtx, walletID, parentID)
 		},
-		ClearSpentByTx: func(ctx context.Context, txID int64) error {
+		func(ctx context.Context, txID int64) error {
 			return clearSpentByTxIDSqlite(ctx, qtx, walletID, txID)
 		},
-		UpdateStatus: func(ctx context.Context, status TxStatus,
+		func(ctx context.Context, status TxStatus,
 			txIDs []int64) error {
 
 			return updateTxStatusSqlite(ctx, qtx, walletID, status, txIDs)
 		},
-	}
+		func(ctx context.Context, txid chainhash.Hash,
+			txID int64) error {
+
+			return reclaimInputsByTxidSqlite(ctx, qtx, walletID, txid, txID)
+		},
+		func(ctx context.Context, replacedTxID int64,
+			replacementTxID int64) error {
+
+			return recordReplacementEdgeSqlite(
+				ctx, qtx, walletID, replacedTxID, replacementTxID,
+			)
+		},
+	)
 }
 
 func loadTxChainMetasSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,

@@ -25,6 +25,7 @@ func TestSerializeDeserializeMsgTx(t *testing.T) {
 	require.NoError(t, err)
 
 	var got bytes.Buffer
+
 	err = decoded.Serialize(&got)
 	require.NoError(t, err)
 

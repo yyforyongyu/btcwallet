@@ -131,28 +131,38 @@ func (s *PostgresStore) ListTxns(ctx context.Context,
 	query ListTxnsQuery) ([]TxInfo, error) {
 
 	if query.UnminedOnly {
-		rows, err := s.queries.ListUnminedTransactions(
-			ctx, int64(query.WalletID),
+		return s.listUnminedTxns(ctx, query.WalletID)
+	}
+
+	return s.listConfirmedTxns(ctx, query)
+}
+
+func (s *PostgresStore) listUnminedTxns(ctx context.Context,
+	walletID uint32) ([]TxInfo, error) {
+
+	rows, err := s.queries.ListUnminedTransactions(ctx, int64(walletID))
+	if err != nil {
+		return nil, fmt.Errorf("list unmined transactions: %w", err)
+	}
+
+	infos := make([]TxInfo, len(rows))
+	for i, row := range rows {
+		info, err := txInfoFromPgRow(
+			row.TxHash, row.RawTx, row.ReceivedTime, row.BlockHeight,
+			row.BlockHash, row.BlockTimestamp, row.Status, row.Label,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("list unmined transactions: %w", err)
+			return nil, err
 		}
 
-		infos := make([]TxInfo, len(rows))
-		for i, row := range rows {
-			info, err := txInfoFromPgRow(
-				row.TxHash, row.RawTx, row.ReceivedTime, row.BlockHeight,
-				row.BlockHash, row.BlockTimestamp, row.Status, row.Label,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			infos[i] = *info
-		}
-
-		return infos, nil
+		infos[i] = *info
 	}
+
+	return infos, nil
+}
+
+func (s *PostgresStore) listConfirmedTxns(ctx context.Context,
+	query ListTxnsQuery) ([]TxInfo, error) {
 
 	startHeight, err := uint32ToInt32(query.StartHeight)
 	if err != nil {
@@ -203,83 +213,80 @@ func (s *PostgresStore) DeleteTx(ctx context.Context,
 	params DeleteTxParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
-		meta, err := qtx.GetTransactionMetaByHash(
-			ctx, sqlcpg.GetTransactionMetaByHashParams{
-				WalletID: int64(params.WalletID),
-				TxHash:   params.Txid[:],
-			},
+		return deleteTxCommon(
+			ctx, params.Txid, buildTxDeleteHooksPg(qtx, params),
 		)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("transaction %s: %w", params.Txid,
-					ErrTxNotFound)
-			}
-
-			return fmt.Errorf("get transaction metadata: %w", err)
-		}
-
-		status, err := parseTxStatus(meta.Status)
-		if err != nil {
-			return err
-		}
-
-		if meta.BlockHeight.Valid || !isLiveUnconfirmedStatus(status) {
-			return fmt.Errorf("transaction %s: %w", params.Txid,
-				errDeleteLiveUnconfirmedTxRequired)
-		}
-
-		childIDs, err := listChildTxIDsPg(ctx, qtx, params.WalletID, meta.ID)
-		if err != nil {
-			return err
-		}
-
-		if len(childIDs) > 0 {
-			return fmt.Errorf("transaction %s: %w", params.Txid,
-				errDeleteTxHasDependents)
-		}
-
-		_, err = qtx.ClearUtxosSpentByTxID(
-			ctx, sqlcpg.ClearUtxosSpentByTxIDParams{
-				WalletID:    int64(params.WalletID),
-				SpentByTxID: sql.NullInt64{Int64: meta.ID, Valid: true},
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("clear spent utxos: %w", err)
-		}
-
-		_, err = qtx.DeleteUtxosByTxID(
-			ctx, sqlcpg.DeleteUtxosByTxIDParams{
-				WalletID: int64(params.WalletID),
-				TxID:     meta.ID,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("delete created utxos: %w", err)
-		}
-
-		rows, err := qtx.DeleteUnminedTransactionByHash(
-			ctx, sqlcpg.DeleteUnminedTransactionByHashParams{
-				WalletID: int64(params.WalletID),
-				TxHash:   params.Txid[:],
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("delete unmined transaction: %w", err)
-		}
-
-		if rows == 0 {
-			return fmt.Errorf("transaction %s: %w", params.Txid,
-				ErrTxNotFound)
-		}
-
-		return nil
 	})
 }
 
-// RollbackToBlock removes every block at or above the provided height and
-// rewrites wallet sync-state references so the block delete can succeed.
-func (s *PostgresStore) RollbackToBlock(ctx context.Context, height uint32) error {
+// buildTxDeleteHooksPg binds the shared delete flow to the postgres query set
+// active for the surrounding SQL transaction.
+func buildTxDeleteHooksPg(qtx *sqlcpg.Queries,
+	params DeleteTxParams) txDeleteHooks {
+
+	return buildTxDeleteHooks(
+		func(ctx context.Context) (txChainMeta, error) {
+			return loadTxChainMetaPg(ctx, qtx, params.WalletID, params.Txid)
+		},
+		func(ctx context.Context, txID int64) ([]int64, error) {
+			return listChildTxIDsPg(ctx, qtx, params.WalletID, txID)
+		},
+		func(ctx context.Context, txID int64) error {
+			return clearSpentByTxIDPg(ctx, qtx, params.WalletID, txID)
+		},
+		func(ctx context.Context, txID int64) error {
+			return deleteUtxosByTxIDPg(ctx, qtx, params.WalletID, txID)
+		},
+		func(ctx context.Context) (int64, error) {
+			return deleteUnminedTxByHashPg(
+				ctx, qtx, params.WalletID, params.Txid,
+			)
+		},
+	)
+}
+
+// deleteUtxosByTxIDPg removes the wallet-owned outputs created by one
+// transaction before its row is pruned from the live graph.
+func deleteUtxosByTxIDPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, txID int64) error {
+
+	_, err := qtx.DeleteUtxosByTxID(
+		ctx, sqlcpg.DeleteUtxosByTxIDParams{
+			WalletID: int64(walletID),
+			TxID:     txID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("delete created utxos: %w", err)
+	}
+
+	return nil
+}
+
+// deleteUnminedTxByHashPg removes the unconfirmed transaction row after its
+// dependent UTXO edges have already been cleared.
+func deleteUnminedTxByHashPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, txid [32]byte) (int64, error) {
+
+	rows, err := qtx.DeleteUnminedTransactionByHash(
+		ctx, sqlcpg.DeleteUnminedTransactionByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   txid[:],
+		},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete unmined transaction: %w", err)
+	}
+
+	return rows, nil
+}
+
+// RollbackToBlock removes every block at or above the provided
+// height and rewrites wallet sync-state references so the block
+// delete can succeed.
+func (s *PostgresStore) RollbackToBlock(ctx context.Context,
+	height uint32) error {
+
 	rollbackHeight, err := uint32ToInt32(height)
 	if err != nil {
 		return fmt.Errorf("convert rollback height: %w", err)
@@ -399,7 +406,9 @@ func txInfoFromPgRow(hash []byte, rawTx []byte, received time.Time,
 	blockHeight sql.NullInt32, blockHash []byte, blockTimestamp sql.NullInt64,
 	status string, label string) (*TxInfo, error) {
 
-	block, err := buildPgOptionalBlock(blockHeight, blockHash, blockTimestamp)
+	block, _, err := buildPgOptionalBlock(
+		blockHeight, blockHash, blockTimestamp,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -410,26 +419,24 @@ func txInfoFromPgRow(hash []byte, rawTx []byte, received time.Time,
 }
 
 func buildPgOptionalBlock(height sql.NullInt32, hash []byte,
-	timestamp sql.NullInt64) (*Block, error) {
+	timestamp sql.NullInt64) (*Block, bool, error) {
 
 	if !height.Valid {
-		return nil, nil
+		return nil, false, nil
 	}
 
-	return buildPgBlock(height, hash, timestamp)
+	block, err := buildPgBlock(height, hash, timestamp)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return block, true, nil
 }
 
 func buildPgConfirmedBlock(height sql.NullInt32, hash []byte,
 	timestamp int64) (*Block, error) {
 
-	return buildPgBlock(height, hash, sql.NullInt64{Int64: timestamp, Valid: true})
-}
-
-func isLiveUnconfirmedStatus(status TxStatus) bool {
-	switch status {
-	case TxStatusPending, TxStatusPublished:
-		return true
-	default:
-		return false
-	}
+	return buildPgBlock(
+		height, hash, sql.NullInt64{Int64: timestamp, Valid: true},
+	)
 }

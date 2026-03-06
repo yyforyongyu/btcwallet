@@ -9,8 +9,8 @@ import (
 )
 
 var (
-	// errReplacementRequiresVictims indicates that a replacement flow was called
-	// without any direct victim transactions.
+	// errReplacementRequiresVictims indicates that a replacement flow
+	// was called without any direct victim transactions.
 	errReplacementRequiresVictims = errors.New(
 		"replacement requires at least one victim transaction",
 	)
@@ -27,8 +27,9 @@ var (
 		"replacement transaction must be live and non-coinbase",
 	)
 
-	// errReplacementVictimInvalid indicates that a direct replacement victim was
-	// not an unconfirmed regular transaction.
+	// errReplacementVictimInvalid indicates that a direct
+	// replacement victim was not an unconfirmed regular
+	// transaction.
 	errReplacementVictimInvalid = errors.New(
 		"replacement victim must be unconfirmed and non-coinbase",
 	)
@@ -63,8 +64,9 @@ var (
 		"coinbase reconfirmation requires an orphaned coinbase transaction",
 	)
 
-	// errCoinbaseReconfirmationStateChanged indicates that the row stopped being
-	// an orphaned coinbase before the reconfirmation update was applied.
+	// errCoinbaseReconfirmationStateChanged indicates that the row
+	// stopped being an orphaned coinbase before the
+	// reconfirmation update was applied.
 	errCoinbaseReconfirmationStateChanged = errors.New(
 		"orphaned coinbase state changed before reconfirmation",
 	)
@@ -80,12 +82,14 @@ type ApplyTxReplacementParams struct {
 	// WalletID scopes the replacement flow to one wallet.
 	WalletID uint32
 
-	// ReplacementTxid identifies the transaction that wins the conflict and must
-	// own the spent-input edges after the flow completes.
+	// ReplacementTxid identifies the transaction that wins the
+	// conflict and must own the spent-input edges after the flow
+	// completes.
 	ReplacementTxid chainhash.Hash
 
-	// ReplacedTxids lists the direct victim transactions that lose the conflict.
-	// Descendants are discovered automatically from the stored spend graph.
+	// ReplacedTxids lists the direct victim transactions that lose
+	// the conflict. Descendants are discovered automatically from
+	// the stored spend graph.
 	ReplacedTxids []chainhash.Hash
 }
 
@@ -95,12 +99,14 @@ type ApplyTxFailureParams struct {
 	// WalletID scopes the failure flow to one wallet.
 	WalletID uint32
 
-	// ConflictingTxid identifies the transaction that wins the conflict and must
-	// own the affected spent-input edges after the flow completes.
+	// ConflictingTxid identifies the transaction that wins the
+	// conflict and must own the affected spent-input edges after
+	// the flow completes.
 	ConflictingTxid chainhash.Hash
 
-	// FailedTxids lists the direct loser transactions. Descendants are discovered
-	// automatically from the stored spend graph.
+	// FailedTxids lists the direct loser transactions.
+	// Descendants are discovered automatically from the stored
+	// spend graph.
 	FailedTxids []chainhash.Hash
 }
 
@@ -110,8 +116,8 @@ type OrphanTxChainParams struct {
 	// WalletID scopes the orphan propagation to one wallet.
 	WalletID uint32
 
-	// Txids lists the already-orphaned coinbase transactions that form the roots
-	// of the invalidation walk.
+	// Txids lists the already-orphaned coinbase transactions that
+	// form the roots of the invalidation walk.
 	Txids []chainhash.Hash
 }
 
@@ -157,16 +163,112 @@ type txChainHooks struct {
 	// transaction ID so invalidated rows release their inputs.
 	ClearSpentByTx func(context.Context, int64) error
 
-	// UpdateStatus rewrites one batch of wallet-scoped transaction row IDs to the
-	// provided status.
+	// UpdateStatus rewrites one batch of wallet-scoped
+	// transaction row IDs to the provided status.
 	UpdateStatus func(context.Context, TxStatus, []int64) error
 
-	// ReclaimInputsByTxid replays the winner transaction's spent-input edges after
-	// invalid roots release their prior claims.
-	ReclaimInputsByTxid func(context.Context, chainhash.Hash) error
+	// ReclaimInputsByTxid replays the winner transaction's
+	// spent-input edges after invalid roots release their prior
+	// claims.
+	ReclaimInputsByTxid func(context.Context, chainhash.Hash, int64) error
 
 	// RecordReplacementEdge records one directed victim -> winner edge.
 	RecordReplacementEdge func(context.Context, int64, int64) error
+}
+
+// buildTxChainHooks wires backend-specific replacement callbacks
+// into the shared txChainHooks container.
+func buildTxChainHooks(
+	listChildren func(context.Context, int64) ([]int64, error),
+	clearSpentByTx func(context.Context, int64) error,
+	updateStatus func(context.Context, TxStatus, []int64) error,
+	reclaimInputsByTxid func(context.Context, chainhash.Hash, int64) error,
+	recordReplacementEdge func(context.Context, int64, int64) error,
+) txChainHooks {
+
+	return txChainHooks{
+		ListChildren:          listChildren,
+		ClearSpentByTx:        clearSpentByTx,
+		UpdateStatus:          updateStatus,
+		ReclaimInputsByTxid:   reclaimInputsByTxid,
+		RecordReplacementEdge: recordReplacementEdge,
+	}
+}
+
+// applyTxReplacementCommon executes the shared replacement flow once the caller
+// has bound backend-specific metadata and query hooks.
+func applyTxReplacementCommon(ctx context.Context,
+	params ApplyTxReplacementParams,
+	loadWinner func(context.Context, chainhash.Hash) (txChainMeta, error),
+	loadVictims func(context.Context, []chainhash.Hash) ([]txChainMeta, error),
+	hooks txChainHooks) error {
+
+	winner, err := loadWinner(ctx, params.ReplacementTxid)
+	if err != nil {
+		return err
+	}
+
+	victims, err := loadVictims(ctx, params.ReplacedTxids)
+	if err != nil {
+		return err
+	}
+
+	err = validateReplacementPlan(winner, victims)
+	if err != nil {
+		return err
+	}
+
+	for _, victim := range victims {
+		err = hooks.RecordReplacementEdge(ctx, victim.ID, winner.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = applyTxChainInvalidation(
+		ctx, txIDsFromMetas(victims), TxStatusReplaced, hooks,
+	)
+	if err != nil {
+		return err
+	}
+
+	return hooks.ReclaimInputsByTxid(
+		ctx, params.ReplacementTxid, winner.ID,
+	)
+}
+
+// applyTxFailureCommon executes the shared direct-conflict failure flow once
+// the caller has bound backend-specific metadata and query hooks.
+func applyTxFailureCommon(ctx context.Context, params ApplyTxFailureParams,
+	loadWinner func(context.Context, chainhash.Hash) (txChainMeta, error),
+	loadRoots func(context.Context, []chainhash.Hash) ([]txChainMeta, error),
+	hooks txChainHooks) error {
+
+	winner, err := loadWinner(ctx, params.ConflictingTxid)
+	if err != nil {
+		return err
+	}
+
+	roots, err := loadRoots(ctx, params.FailedTxids)
+	if err != nil {
+		return err
+	}
+
+	err = validateFailurePlan(winner, roots)
+	if err != nil {
+		return err
+	}
+
+	err = applyTxChainInvalidation(
+		ctx, txIDsFromMetas(roots), TxStatusFailed, hooks,
+	)
+	if err != nil {
+		return err
+	}
+
+	return hooks.ReclaimInputsByTxid(
+		ctx, params.ConflictingTxid, winner.ID,
+	)
 }
 
 // validateReplacementPlan checks the root invariants for a replacement flow.
@@ -292,7 +394,8 @@ func validateOrphanRoot(meta txChainMeta) error {
 // collectDescendantTxIDs performs an application-side breadth-first walk over
 // the spend graph and returns each discovered descendant exactly once.
 func collectDescendantTxIDs(ctx context.Context, rootIDs []int64,
-	listChildren func(context.Context, int64) ([]int64, error)) ([]int64, error) {
+	listChildren func(context.Context, int64) ([]int64, error),
+) ([]int64, error) {
 
 	visited := make(map[int64]struct{}, len(rootIDs))
 

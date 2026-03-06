@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -11,12 +13,13 @@ import (
 )
 
 var (
-	// errInvalidLockID indicates that a lease row contained bytes that cannot be
-	// represented as a fixed-size LockID.
+	// errInvalidLockID indicates that a lease row contained bytes
+	// that cannot be represented as a fixed-size LockID.
 	errInvalidLockID = errors.New("invalid lock id length")
 
-	// errOutputAlreadyLeased indicates that a UTXO lease request conflicted with
-	// an existing active lease held by another lock ID.
+	// errOutputAlreadyLeased indicates that a UTXO lease request
+	// conflicted with an existing active lease held by another
+	// lock ID.
 	errOutputAlreadyLeased = errors.New("output already leased")
 
 	// errOutputUnlockNotAllowed indicates that a lease release request used a
@@ -24,10 +27,17 @@ var (
 	errOutputUnlockNotAllowed = errors.New("output unlock not allowed")
 )
 
+// utxoLeaseHooks bundles the backend-specific lease queries used by
+// the shared acquire and release flows.
+type utxoLeaseHooks struct {
+	AcquireLease func(context.Context) (time.Time, error)
+	LookupUtxoID func(context.Context) (int64, error)
+	ReleaseLease func(context.Context, int64) (int64, error)
+}
+
 // buildOutPoint converts database tx-hash and output-index fields into a
 // wire.OutPoint.
 func buildOutPoint(hash []byte, outputIndex uint32) (wire.OutPoint, error) {
-
 	txHash, err := chainhash.NewHash(hash)
 	if err != nil {
 		return wire.OutPoint{}, fmt.Errorf("utxo hash: %w", err)
@@ -84,4 +94,62 @@ func buildLeasedOutput(hash []byte, outputIndex uint32, lockID []byte,
 		LockID:     id,
 		Expiration: expiration.UTC(),
 	}, nil
+}
+
+// acquireLeaseCommon applies the shared lease acquisition rules.
+// Callers may renew their own lease, reclaim an expired lease,
+// but must fail if another active lock still owns the UTXO.
+func acquireLeaseCommon(ctx context.Context, outPoint wire.OutPoint, id LockID,
+	hooks utxoLeaseHooks) (*LeasedOutput, error) {
+
+	expiration, err := hooks.AcquireLease(ctx)
+	if err == nil {
+		return &LeasedOutput{
+			OutPoint:   outPoint,
+			LockID:     id,
+			Expiration: expiration.UTC(),
+		}, nil
+	}
+
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	_, lookupErr := hooks.LookupUtxoID(ctx)
+	if lookupErr != nil {
+		if errors.Is(lookupErr, sql.ErrNoRows) {
+			return nil, fmt.Errorf("utxo %s: %w", outPoint, ErrUtxoNotFound)
+		}
+
+		return nil, lookupErr
+	}
+
+	return nil, fmt.Errorf("utxo %s: %w", outPoint, errOutputAlreadyLeased)
+}
+
+// releaseLeaseCommon applies the shared release rules. The target
+// UTXO must exist and the caller's lock ID must match the active
+// lease row.
+func releaseLeaseCommon(ctx context.Context, outPoint wire.OutPoint,
+	hooks utxoLeaseHooks) error {
+
+	utxoID, err := hooks.LookupUtxoID(ctx)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("utxo %s: %w", outPoint, ErrUtxoNotFound)
+		}
+
+		return err
+	}
+
+	rows, err := hooks.ReleaseLease(ctx, utxoID)
+	if err != nil {
+		return err
+	}
+
+	if rows == 0 {
+		return fmt.Errorf("utxo %s: %w", outPoint, errOutputUnlockNotAllowed)
+	}
+
+	return nil
 }
