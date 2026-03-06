@@ -135,8 +135,8 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published')
     AND (
-        sqlc.narg('account_number') IS NULL
-        OR acc.account_number = sqlc.narg('account_number')
+        sqlc.narg('account_number')::BIGINT IS NULL
+        OR acc.account_number = sqlc.narg('account_number')::BIGINT
     )
     AND (
         CASE
@@ -185,11 +185,11 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published')
     AND (
-        sqlc.narg('account_number') IS NULL
-        OR acc.account_number = sqlc.narg('account_number')
+        sqlc.narg('account_number')::BIGINT IS NULL
+        OR acc.account_number = sqlc.narg('account_number')::BIGINT
     )
     AND (
-        sqlc.narg('min_confirms') IS NULL
+        sqlc.narg('min_confirms')::INTEGER IS NULL
         OR (
             CASE
                 WHEN t.block_height IS NULL THEN 0
@@ -197,10 +197,10 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) >= sqlc.narg('min_confirms')
+        ) >= sqlc.narg('min_confirms')::INTEGER
     )
     AND (
-        sqlc.narg('max_confirms') IS NULL
+        sqlc.narg('max_confirms')::INTEGER IS NULL
         OR (
             CASE
                 WHEN t.block_height IS NULL THEN 0
@@ -208,7 +208,7 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) <= sqlc.narg('max_confirms')
+        ) <= sqlc.narg('max_confirms')::INTEGER
     )
     AND (
         sqlc.arg('exclude_leased') = FALSE
@@ -222,7 +222,7 @@ WHERE
         )
     )
     AND (
-        sqlc.narg('coinbase_maturity') IS NULL
+        sqlc.narg('coinbase_maturity')::INTEGER IS NULL
         OR NOT t.is_coinbase
         OR (
             CASE
@@ -231,7 +231,7 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) >= sqlc.narg('coinbase_maturity')
+        ) >= sqlc.narg('coinbase_maturity')::INTEGER
     );
 
 -- name: ListSpendingTxIDsByParentTxID :many

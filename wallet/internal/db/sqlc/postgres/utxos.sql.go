@@ -26,11 +26,11 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published')
     AND (
-        $2 IS NULL
-        OR acc.account_number = $2
+        $2::BIGINT IS NULL
+        OR acc.account_number = $2::BIGINT
     )
     AND (
-        $3 IS NULL
+        $3::INTEGER IS NULL
         OR (
             CASE
                 WHEN t.block_height IS NULL THEN 0
@@ -38,10 +38,10 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) >= $3
+        ) >= $3::INTEGER
     )
     AND (
-        $4 IS NULL
+        $4::INTEGER IS NULL
         OR (
             CASE
                 WHEN t.block_height IS NULL THEN 0
@@ -49,7 +49,7 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) <= $4
+        ) <= $4::INTEGER
     )
     AND (
         $5 = FALSE
@@ -63,7 +63,7 @@ WHERE
         )
     )
     AND (
-        $6 IS NULL
+        $6::INTEGER IS NULL
         OR NOT t.is_coinbase
         OR (
             CASE
@@ -72,17 +72,17 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) >= $6
+        ) >= $6::INTEGER
     )
 `
 
 type BalanceParams struct {
 	WalletID         int64
-	AccountNumber    interface{}
-	MinConfirms      interface{}
-	MaxConfirms      interface{}
+	AccountNumber    sql.NullInt64
+	MinConfirms      sql.NullInt32
+	MaxConfirms      sql.NullInt32
 	ExcludeLeased    interface{}
-	CoinbaseMaturity interface{}
+	CoinbaseMaturity sql.NullInt32
 }
 
 // Returns the total value represented by the wallet's current unspent UTXO set.
@@ -410,8 +410,8 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published')
     AND (
-        $2 IS NULL
-        OR acc.account_number = $2
+        $2::BIGINT IS NULL
+        OR acc.account_number = $2::BIGINT
     )
     AND (
         CASE
@@ -434,7 +434,7 @@ ORDER BY u.amount, t.tx_hash, u.output_index
 
 type ListUtxosParams struct {
 	WalletID      int64
-	AccountNumber interface{}
+	AccountNumber sql.NullInt64
 	MinConfirms   sql.NullInt32
 	MaxConfirms   sql.NullInt32
 }
