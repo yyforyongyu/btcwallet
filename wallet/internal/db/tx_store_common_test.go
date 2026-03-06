@@ -34,6 +34,7 @@ func TestSerializeDeserializeMsgTx(t *testing.T) {
 	require.NoError(t, err)
 
 	var got bytes.Buffer
+
 	err = decoded.Serialize(&got)
 	require.NoError(t, err)
 
@@ -136,6 +137,22 @@ func TestValidateCreateTxParams(t *testing.T) {
 				Status: TxStatusOrphaned,
 			},
 			wantErr: errCreateTxOrphanedStatus,
+		},
+		{
+			name: "failed status rejected on create",
+			params: CreateTxParams{
+				Tx:     testRegularMsgTx(),
+				Status: TxStatusFailed,
+			},
+			wantErr: errCreateTxTerminalStatus,
+		},
+		{
+			name: "replaced status rejected on create",
+			params: CreateTxParams{
+				Tx:     testRegularMsgTx(),
+				Status: TxStatusReplaced,
+			},
+			wantErr: errCreateTxTerminalStatus,
 		},
 		{
 			name: "credit index out of range",
@@ -322,6 +339,8 @@ func TestBuildTxInfo_InvalidStatus(t *testing.T) {
 	require.ErrorIs(t, err, errInvalidTxStatus)
 }
 
+// testRegularMsgTx builds a minimal non-coinbase transaction fixture for the
+// shared TxStore helper tests.
 func testRegularMsgTx() *wire.MsgTx {
 	tx := wire.NewMsgTx(wire.TxVersion)
 
@@ -339,6 +358,8 @@ func testRegularMsgTx() *wire.MsgTx {
 	return tx
 }
 
+// testCoinbaseMsgTx builds a minimal coinbase transaction fixture for the
+// shared TxStore helper tests.
 func testCoinbaseMsgTx() *wire.MsgTx {
 	tx := wire.NewMsgTx(wire.TxVersion)
 

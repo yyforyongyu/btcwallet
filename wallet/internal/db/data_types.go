@@ -923,9 +923,12 @@ type ListTxnsQuery struct {
 	// EndHeight is the ending block height for the query.
 	EndHeight uint32
 
-	// UnminedOnly, if true, will return only unmined (unconfirmed)
-	// transactions. If this is set, StartHeight and EndHeight will be
-	// ignored.
+	// UnminedOnly, if true, switches ListTxns onto the dedicated blockless read
+	// path that returns only unmined transactions.
+	//
+	// This is not equivalent to using zero confirmations. The confirmed height
+	// range query cannot express "only rows with no block", so StartHeight and
+	// EndHeight are ignored when this flag is set.
 	UnminedOnly bool
 }
 
