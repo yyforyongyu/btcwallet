@@ -192,6 +192,78 @@ func TestTxStoreLifecycle(t *testing.T) {
 	require.Len(t, unminedTxs, 2)
 }
 
+// TestDeleteTxRejectsNonLeafTransaction verifies that DeleteTx refuses to erase
+// an unconfirmed transaction that still has direct child spenders.
+func TestDeleteTxRejectsNonLeafTransaction(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-delete-non-leaf")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+
+	parentTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{
+			Value:    5000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       parentTx,
+		Received: time.Unix(1710000300, 0),
+		Status:   db.TxStatusPending,
+		Credits: []db.CreditData{{
+			Index: 0,
+		}},
+	})
+	require.NoError(t, err)
+
+	childTx := newRegularTx(
+		[]wire.OutPoint{{Hash: parentTx.TxHash(), Index: 0}},
+		[]*wire.TxOut{{
+			Value:    4000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       childTx,
+		Received: time.Unix(1710000310, 0),
+		Status:   db.TxStatusPending,
+		Credits: []db.CreditData{{
+			Index: 0,
+		}},
+	})
+	require.NoError(t, err)
+
+	err = store.DeleteTx(t.Context(), db.DeleteTxParams{
+		WalletID: walletID,
+		Txid:     parentTx.TxHash(),
+	})
+	require.ErrorContains(t, err, "delete requires a leaf transaction")
+
+	parentInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     parentTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, parentInfo.Status)
+
+	childInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     childTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, childInfo.Status)
+}
+
 // TestUtxoStoreLeaseAndBalance verifies listing, leasing, releasing, and
 // balance filtering across confirmed, unconfirmed, and coinbase outputs.
 func TestUtxoStoreLeaseAndBalance(t *testing.T) {

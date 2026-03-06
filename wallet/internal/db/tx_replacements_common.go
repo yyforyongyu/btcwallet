@@ -39,6 +39,12 @@ var (
 		"conflicting transaction must be live and non-coinbase",
 	)
 
+	// errFailureRequiresRoots indicates that a failure flow was called without
+	// any direct loser transactions.
+	errFailureRequiresRoots = errors.New(
+		"failure requires at least one loser transaction",
+	)
+
 	// errFailureRootInvalid indicates that a failure flow tried to invalidate a
 	// transaction that is not eligible for direct conflict failure.
 	errFailureRootInvalid = errors.New(
@@ -56,6 +62,16 @@ var (
 	errCoinbaseReconfirmationInvalid = errors.New(
 		"coinbase reconfirmation requires an orphaned coinbase transaction",
 	)
+
+	// errCoinbaseReconfirmationStateChanged indicates that the row stopped being
+	// an orphaned coinbase before the reconfirmation update was applied.
+	errCoinbaseReconfirmationStateChanged = errors.New(
+		"orphaned coinbase state changed before reconfirmation",
+	)
+
+	// errWinnerInputNotReclaimed indicates that a winner transaction still does
+	// not own one of its wallet-owned inputs after invalidation completed.
+	errWinnerInputNotReclaimed = errors.New("winner input was not reclaimed")
 )
 
 // ApplyTxReplacementParams describes one replacement winner and the direct
@@ -155,12 +171,12 @@ type txChainHooks struct {
 
 // validateReplacementPlan checks the root invariants for a replacement flow.
 func validateReplacementPlan(winner txChainMeta, victims []txChainMeta) error {
-
 	if len(victims) == 0 {
 		return errReplacementRequiresVictims
 	}
 
-	if err := validateReplacementWinner(winner); err != nil {
+	err := validateReplacementWinner(winner)
+	if err != nil {
 		return err
 	}
 
@@ -170,7 +186,8 @@ func validateReplacementPlan(winner txChainMeta, victims []txChainMeta) error {
 				errSelfReplacement)
 		}
 
-		if err := validateReplacementVictim(victim); err != nil {
+		err := validateReplacementVictim(victim)
+		if err != nil {
 			return err
 		}
 	}
@@ -180,8 +197,12 @@ func validateReplacementPlan(winner txChainMeta, victims []txChainMeta) error {
 
 // validateFailurePlan checks the root invariants for a direct conflict failure.
 func validateFailurePlan(winner txChainMeta, failed []txChainMeta) error {
+	if len(failed) == 0 {
+		return errFailureRequiresRoots
+	}
 
-	if err := validateFailureWinner(winner); err != nil {
+	err := validateFailureWinner(winner)
+	if err != nil {
 		return err
 	}
 
@@ -191,7 +212,8 @@ func validateFailurePlan(winner txChainMeta, failed []txChainMeta) error {
 				errSelfReplacement)
 		}
 
-		if err := validateFailureRoot(root); err != nil {
+		err := validateFailureRoot(root)
+		if err != nil {
 			return err
 		}
 	}
@@ -202,7 +224,8 @@ func validateFailurePlan(winner txChainMeta, failed []txChainMeta) error {
 // validateOrphanPlan checks the root invariants for orphan descendant failure.
 func validateOrphanPlan(roots []txChainMeta) error {
 	for _, root := range roots {
-		if err := validateOrphanRoot(root); err != nil {
+		err := validateOrphanRoot(root)
+		if err != nil {
 			return err
 		}
 	}
@@ -272,6 +295,7 @@ func collectDescendantTxIDs(ctx context.Context, rootIDs []int64,
 	listChildren func(context.Context, int64) ([]int64, error)) ([]int64, error) {
 
 	visited := make(map[int64]struct{}, len(rootIDs))
+
 	queue := make([]int64, 0, len(rootIDs))
 	for _, rootID := range rootIDs {
 		if _, ok := visited[rootID]; ok {
@@ -284,7 +308,8 @@ func collectDescendantTxIDs(ctx context.Context, rootIDs []int64,
 
 	descendants := make([]int64, 0)
 	for len(queue) > 0 {
-		if err := ctx.Err(); err != nil {
+		err := ctx.Err()
+		if err != nil {
 			return nil, err
 		}
 
@@ -369,25 +394,34 @@ func isLiveTxStatus(status TxStatus) bool {
 	switch status {
 	case TxStatusPending, TxStatusPublished:
 		return true
-	default:
+
+	case TxStatusReplaced, TxStatusFailed, TxStatusOrphaned:
 		return false
 	}
+
+	return false
 }
 
 func isReplaceableStatus(status TxStatus) bool {
 	switch status {
 	case TxStatusPending, TxStatusPublished, TxStatusReplaced:
 		return true
-	default:
+
+	case TxStatusFailed, TxStatusOrphaned:
 		return false
 	}
+
+	return false
 }
 
 func isFailureRootStatus(status TxStatus) bool {
 	switch status {
 	case TxStatusPending, TxStatusPublished, TxStatusFailed:
 		return true
-	default:
+
+	case TxStatusReplaced, TxStatusOrphaned:
 		return false
 	}
+
+	return false
 }

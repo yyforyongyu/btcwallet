@@ -96,6 +96,34 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published');
 
+-- name: GetUtxoSpenderByOutpoint :one
+-- Retrieves the current spender for a wallet-owned outpoint, if any.
+--
+-- How:
+-- - Resolves the outpoint through transactions so callers can address a UTXO by
+--   tx hash plus output index instead of the internal row ID.
+-- - Rejoins addresses -> accounts -> key_scopes so the lookup only reports
+--   outputs that still belong to the requested wallet.
+-- - Keeps the parent transaction in a live state (`pending` or `published`) so
+--   callers only verify claims on outputs that remain part of the live wallet
+--   graph.
+-- Performance:
+-- - Uses the wallet-scoped tx hash lookup and unique outpoint constraint to
+--   bound the read to at most one credited output.
+SELECT u.spent_by_tx_id
+FROM utxos AS u
+INNER JOIN transactions AS t
+    ON u.wallet_id = t.wallet_id AND u.tx_id = t.id
+INNER JOIN addresses AS a ON u.address_id = a.id
+INNER JOIN accounts AS acc ON a.account_id = acc.id
+INNER JOIN key_scopes AS ks ON acc.scope_id = ks.id
+WHERE
+    u.wallet_id = $1
+    AND ks.wallet_id = $1
+    AND t.tx_hash = $2
+    AND u.output_index = $3
+    AND t.status IN ('pending', 'published');
+
 -- name: ListUtxos :many
 -- Lists unspent UTXOs that match the provided filters.
 --
@@ -171,7 +199,7 @@ ORDER BY u.amount, t.tx_hash, u.output_index;
 -- Performance:
 -- - Executes as one aggregate over wallet-scoped live outputs, with an
 --   anti-join against utxo_leases only when requested.
-SELECT cast(coalesce(sum(u.amount), 0) AS BIGINT) AS balance
+SELECT (coalesce(sum(u.amount), 0))::BIGINT AS balance
 FROM utxos AS u
 INNER JOIN transactions AS t
     ON u.wallet_id = t.wallet_id AND u.tx_id = t.id

@@ -224,10 +224,18 @@ func (s *PostgresStore) DeleteTx(ctx context.Context,
 		}
 
 		if meta.BlockHeight.Valid || !isLiveUnconfirmedStatus(status) {
-			return fmt.Errorf(
-				"delete transaction %s: live unconfirmed transaction required",
-				params.Txid,
-			)
+			return fmt.Errorf("transaction %s: %w", params.Txid,
+				errDeleteLiveUnconfirmedTxRequired)
+		}
+
+		childIDs, err := listChildTxIDsPg(ctx, qtx, params.WalletID, meta.ID)
+		if err != nil {
+			return err
+		}
+
+		if len(childIDs) > 0 {
+			return fmt.Errorf("transaction %s: %w", params.Txid,
+				errDeleteTxHasDependents)
 		}
 
 		_, err = qtx.ClearUtxosSpentByTxID(
@@ -272,13 +280,13 @@ func (s *PostgresStore) DeleteTx(ctx context.Context,
 // RollbackToBlock removes every block at or above the provided height and
 // rewrites wallet sync-state references so the block delete can succeed.
 func (s *PostgresStore) RollbackToBlock(ctx context.Context, height uint32) error {
-
 	rollbackHeight, err := uint32ToInt32(height)
 	if err != nil {
 		return fmt.Errorf("convert rollback height: %w", err)
 	}
 
 	rollbackArg := sql.NullInt32{Int32: rollbackHeight, Valid: true}
+
 	newHeight := sql.NullInt32{}
 	if height > 0 {
 		clampedHeight, err := uint32ToInt32(height - 1)
@@ -367,7 +375,7 @@ func markInputsSpentPg(ctx context.Context, qtx *sqlcpg.Queries,
 				inputIndex, err)
 		}
 
-		spentInputIndex, err := uint32ToInt32(uint32(inputIndex))
+		spentInputIndex, err := intToInt32(inputIndex)
 		if err != nil {
 			return fmt.Errorf("convert input index %d: %w", inputIndex, err)
 		}

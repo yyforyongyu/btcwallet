@@ -217,6 +217,20 @@ type Querier interface {
 	// - Uses the wallet-scoped transaction hash lookup first, then narrows to the
 	//   unique `(wallet_id, tx_id, output_index)` outpoint.
 	GetUtxoIDByOutpoint(ctx context.Context, arg GetUtxoIDByOutpointParams) (int64, error)
+	// Retrieves the current spender for a wallet-owned outpoint, if any.
+	//
+	// How:
+	// - Resolves the outpoint through transactions so callers can address a UTXO by
+	//   tx hash plus output index instead of the internal row ID.
+	// - Rejoins addresses -> accounts -> key_scopes so the lookup only reports
+	//   outputs that still belong to the requested wallet.
+	// - Keeps the parent transaction in a live state (`pending` or `published`) so
+	//   callers only verify claims on outputs that remain part of the live wallet
+	//   graph.
+	// Performance:
+	// - Uses the wallet-scoped tx hash lookup and unique outpoint constraint to
+	//   bound the read to at most one credited output.
+	GetUtxoSpenderByOutpoint(ctx context.Context, arg GetUtxoSpenderByOutpointParams) (sql.NullInt64, error)
 	GetWalletByID(ctx context.Context, id int64) (GetWalletByIDRow, error)
 	GetWalletByName(ctx context.Context, walletName string) (GetWalletByNameRow, error)
 	GetWalletSecrets(ctx context.Context, walletID int64) (WalletSecret, error)

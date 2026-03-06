@@ -315,6 +315,238 @@ func TestApplyTxFailure(t *testing.T) {
 	require.ErrorIs(t, err, db.ErrUtxoNotFound)
 }
 
+// TestApplyTxReplacementRejectsIncompleteVictimSet verifies that replacement
+// flows fail when the caller omits a conflicting loser for another wallet-owned
+// input of the winner transaction.
+func TestApplyTxReplacementRejectsIncompleteVictimSet(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-replacement-incomplete")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+
+	tipBlock := CreateBlockFixture(t, queries, 95)
+	err := store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+		WalletID: walletID,
+		SyncedTo: &tipBlock,
+	})
+	require.NoError(t, err)
+
+	fundingBlockOne := CreateBlockFixture(t, queries, 90)
+	fundingTxOne := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 11000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       fundingTxOne,
+		Received: time.Unix(1710005000, 0),
+		Block:    &fundingBlockOne,
+		Status:   db.TxStatusPublished,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	fundingBlockTwo := CreateBlockFixture(t, queries, 91)
+	fundingTxTwo := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 12000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       fundingTxTwo,
+		Received: time.Unix(1710005010, 0),
+		Block:    &fundingBlockTwo,
+		Status:   db.TxStatusPublished,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	victimOne := newRegularTx(
+		[]wire.OutPoint{{Hash: fundingTxOne.TxHash(), Index: 0}},
+		[]*wire.TxOut{{Value: 6000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       victimOne,
+		Received: time.Unix(1710005020, 0),
+		Status:   db.TxStatusPending,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	victimTwo := newRegularTx(
+		[]wire.OutPoint{{Hash: fundingTxTwo.TxHash(), Index: 0}},
+		[]*wire.TxOut{{Value: 7000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       victimTwo,
+		Received: time.Unix(1710005030, 0),
+		Status:   db.TxStatusPending,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	winnerTx := newRegularTx(
+		[]wire.OutPoint{
+			{Hash: fundingTxOne.TxHash(), Index: 0},
+			{Hash: fundingTxTwo.TxHash(), Index: 0},
+		},
+		[]*wire.TxOut{{Value: 15000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       winnerTx,
+		Received: time.Unix(1710005040, 0),
+		Status:   db.TxStatusPublished,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	err = store.ApplyTxReplacement(t.Context(), db.ApplyTxReplacementParams{
+		WalletID:        walletID,
+		ReplacementTxid: winnerTx.TxHash(),
+		ReplacedTxids:   []chainhash.Hash{victimOne.TxHash()},
+	})
+	require.ErrorContains(t, err, "winner input was not reclaimed")
+
+	victimOneInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     victimOne.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, victimOneInfo.Status)
+
+	victimTwoInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     victimTwo.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, victimTwoInfo.Status)
+}
+
+// TestApplyTxFailureRejectsIncompleteLoserSet verifies that failure flows fail
+// when a winner has another wallet-owned input still claimed by an omitted
+// loser transaction.
+func TestApplyTxFailureRejectsIncompleteLoserSet(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-failure-incomplete")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+
+	tipBlock := CreateBlockFixture(t, queries, 105)
+	err := store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+		WalletID: walletID,
+		SyncedTo: &tipBlock,
+	})
+	require.NoError(t, err)
+
+	fundingBlockOne := CreateBlockFixture(t, queries, 100)
+	fundingTxOne := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 13000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       fundingTxOne,
+		Received: time.Unix(1710005100, 0),
+		Block:    &fundingBlockOne,
+		Status:   db.TxStatusPublished,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	fundingBlockTwo := CreateBlockFixture(t, queries, 101)
+	fundingTxTwo := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 14000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       fundingTxTwo,
+		Received: time.Unix(1710005110, 0),
+		Block:    &fundingBlockTwo,
+		Status:   db.TxStatusPublished,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	loserOne := newRegularTx(
+		[]wire.OutPoint{{Hash: fundingTxOne.TxHash(), Index: 0}},
+		[]*wire.TxOut{{Value: 8000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       loserOne,
+		Received: time.Unix(1710005120, 0),
+		Status:   db.TxStatusPending,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	loserTwo := newRegularTx(
+		[]wire.OutPoint{{Hash: fundingTxTwo.TxHash(), Index: 0}},
+		[]*wire.TxOut{{Value: 9000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       loserTwo,
+		Received: time.Unix(1710005130, 0),
+		Status:   db.TxStatusPending,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	winnerTx := newRegularTx(
+		[]wire.OutPoint{
+			{Hash: fundingTxOne.TxHash(), Index: 0},
+			{Hash: fundingTxTwo.TxHash(), Index: 0},
+		},
+		[]*wire.TxOut{{Value: 18000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       winnerTx,
+		Received: time.Unix(1710005140, 0),
+		Status:   db.TxStatusPublished,
+		Credits:  []db.CreditData{{Index: 0}},
+	})
+	require.NoError(t, err)
+
+	err = store.ApplyTxFailure(t.Context(), db.ApplyTxFailureParams{
+		WalletID:        walletID,
+		ConflictingTxid: winnerTx.TxHash(),
+		FailedTxids:     []chainhash.Hash{loserOne.TxHash()},
+	})
+	require.ErrorContains(t, err, "winner input was not reclaimed")
+
+	loserOneInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     loserOne.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, loserOneInfo.Status)
+
+	loserTwoInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     loserTwo.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, loserTwoInfo.Status)
+}
+
 // TestOrphanTxChainAndReconfirmOrphanedCoinbase verifies that rollback-created
 // orphaned coinbase roots fail their descendants and can later be restored to a
 // new confirming block atomically.

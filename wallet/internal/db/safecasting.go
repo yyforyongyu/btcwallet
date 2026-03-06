@@ -39,6 +39,18 @@ func int64ToInt32(v int64) (int32, error) {
 	return int32(v), nil
 }
 
+// intToInt32 safely casts an int to an int32, returning an error if the value
+// is out of range.
+func intToInt32(v int) (int32, error) {
+	return int64ToInt32(int64(v))
+}
+
+// intToUint32 safely casts an int to a uint32, returning an error if the value
+// is out of range.
+func intToUint32(v int) (uint32, error) {
+	return int64ToUint32(int64(v))
+}
+
 // int64ToUint8 safely casts an int64 to an uint8, returning an error
 // if the value is out of range.
 func int64ToUint8(v int64) (uint8, error) {

@@ -210,10 +210,20 @@ func (s *SqliteStore) DeleteTx(ctx context.Context,
 		}
 
 		if meta.BlockHeight.Valid || !isLiveUnconfirmedStatus(status) {
-			return fmt.Errorf(
-				"delete transaction %s: live unconfirmed transaction required",
-				params.Txid,
-			)
+			return fmt.Errorf("transaction %s: %w", params.Txid,
+				errDeleteLiveUnconfirmedTxRequired)
+		}
+
+		childIDs, err := listChildTxIDsSqlite(
+			ctx, qtx, params.WalletID, meta.ID,
+		)
+		if err != nil {
+			return err
+		}
+
+		if len(childIDs) > 0 {
+			return fmt.Errorf("transaction %s: %w", params.Txid,
+				errDeleteTxHasDependents)
 		}
 
 		_, err = qtx.ClearUtxosSpentByTxID(
@@ -258,8 +268,8 @@ func (s *SqliteStore) DeleteTx(ctx context.Context,
 // RollbackToBlock removes every block at or above the provided height and
 // rewrites wallet sync-state references so the block delete can succeed.
 func (s *SqliteStore) RollbackToBlock(ctx context.Context, height uint32) error {
-
 	rollbackArg := sql.NullInt64{Int64: int64(height), Valid: true}
+
 	newHeight := sql.NullInt64{}
 	if height > 0 {
 		newHeight = sql.NullInt64{Int64: int64(height - 1), Valid: true}

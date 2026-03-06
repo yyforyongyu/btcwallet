@@ -45,12 +45,23 @@ var (
 	// errDuplicateCreditIndex indicates that CreateTx received the same credit
 	// output index more than once.
 	errDuplicateCreditIndex = errors.New("duplicate credit index")
+
+	// errDeleteLiveUnconfirmedTxRequired indicates that DeleteTx was called for a
+	// transaction that is not part of the live unconfirmed set.
+	errDeleteLiveUnconfirmedTxRequired = errors.New(
+		"delete requires a live unconfirmed transaction",
+	)
+
+	// errDeleteTxHasDependents indicates that DeleteTx was called for a
+	// transaction that still has direct child spenders.
+	errDeleteTxHasDependents = errors.New(
+		"delete requires a leaf transaction",
+	)
 )
 
 // serializeMsgTx serializes a wire.MsgTx so it can be stored in the
 // transactions table.
 func serializeMsgTx(tx *wire.MsgTx) ([]byte, error) {
-
 	var buf bytes.Buffer
 
 	err := tx.Serialize(&buf)
@@ -64,7 +75,6 @@ func serializeMsgTx(tx *wire.MsgTx) ([]byte, error) {
 // deserializeMsgTx deserializes a stored transaction payload back into a
 // wire.MsgTx.
 func deserializeMsgTx(rawTx []byte) (*wire.MsgTx, error) {
-
 	var tx wire.MsgTx
 
 	err := tx.Deserialize(bytes.NewReader(rawTx))
@@ -78,7 +88,6 @@ func deserializeMsgTx(rawTx []byte) (*wire.MsgTx, error) {
 // parseTxStatus converts a stored status string into the strongly typed
 // TxStatus enum used by the public db API.
 func parseTxStatus(status string) (TxStatus, error) {
-
 	switch TxStatus(status) {
 	case TxStatusPending,
 		TxStatusPublished,
@@ -96,7 +105,6 @@ func parseTxStatus(status string) (TxStatus, error) {
 // validateCreateTxParams enforces the API invariants shared by both SQL
 // backends before a transaction write begins.
 func validateCreateTxParams(params CreateTxParams) error {
-
 	if params.Tx == nil {
 		return errNilTransaction
 	}
@@ -109,7 +117,10 @@ func validateCreateTxParams(params CreateTxParams) error {
 	}
 
 	seenCredits := make(map[uint32]struct{}, len(params.Credits))
-	maxIndex := uint32(len(params.Tx.TxOut))
+	maxIndex, err := intToUint32(len(params.Tx.TxOut))
+	if err != nil {
+		return fmt.Errorf("convert tx output count: %w", err)
+	}
 
 	for _, credit := range params.Credits {
 		if credit.Index >= maxIndex {
@@ -135,7 +146,6 @@ func validateCreateTxParams(params CreateTxParams) error {
 // validateCreateTxStatus enforces the combinations of block assignment,
 // wallet-visible status, and coinbase semantics that CreateTx accepts.
 func validateCreateTxStatus(status TxStatus, block *Block, isCoinbase bool) error {
-
 	_, err := parseTxStatus(string(status))
 	if err != nil {
 		return err

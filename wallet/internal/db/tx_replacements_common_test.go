@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var errUnexpectedTraversalCall = errors.New("unexpected traversal call")
+
 // TestCollectDescendantTxIDs verifies that the shared graph walk visits each
 // descendant once and preserves breadth-first discovery order.
 func TestCollectDescendantTxIDs(t *testing.T) {
@@ -39,6 +41,7 @@ func TestApplyTxChainInvalidation(t *testing.T) {
 	t.Parallel()
 
 	var cleared []int64
+
 	statusUpdates := make(map[TxStatus][]int64)
 
 	err := applyTxChainInvalidation(
@@ -120,6 +123,7 @@ func TestValidateFailureAndOrphanPlans(t *testing.T) {
 	}
 
 	require.NoError(t, validateFailurePlan(winner, []txChainMeta{failedRoot}))
+	require.ErrorIs(t, validateFailurePlan(winner, nil), errFailureRequiresRoots)
 	require.NoError(t, validateOrphanPlan([]txChainMeta{orphanRoot}))
 	require.NoError(t, validateCoinbaseReconfirmation(orphanRoot))
 
@@ -148,7 +152,7 @@ func TestCollectDescendantTxIDsContext(t *testing.T) {
 	_, err := collectDescendantTxIDs(
 		ctx, []int64{1},
 		func(_ context.Context, _ int64) ([]int64, error) {
-			return nil, errors.New("unexpected call")
+			return nil, errUnexpectedTraversalCall
 		},
 	)
 	require.ErrorIs(t, err, context.Canceled)

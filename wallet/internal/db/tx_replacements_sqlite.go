@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	sqlcsqlite "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/sqlite"
 )
 
@@ -160,8 +161,8 @@ func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 		}
 
 		if rows == 0 {
-			return fmt.Errorf("transaction %s: orphaned coinbase state changed",
-				params.Txid)
+			return fmt.Errorf("transaction %s: %w", params.Txid,
+				errCoinbaseReconfirmationStateChanged)
 		}
 
 		return nil
@@ -170,6 +171,7 @@ func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 
 func buildTxChainHooksSqlite(qtx *sqlcsqlite.Queries,
 	walletID uint32) txChainHooks {
+
 	return txChainHooks{
 		ListChildren: func(ctx context.Context, parentID int64) ([]int64, error) {
 			return listChildTxIDsSqlite(ctx, qtx, walletID, parentID)
@@ -343,6 +345,41 @@ func reclaimInputsByTxidSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	}, txID)
 	if err != nil {
 		return fmt.Errorf("reclaim inputs for transaction %s: %w", txid, err)
+	}
+
+	err = ensureWalletOwnedInputsReclaimedSqlite(ctx, qtx, walletID, tx, txID)
+	if err != nil {
+		return fmt.Errorf("verify reclaimed inputs for transaction %s: %w",
+			txid, err)
+	}
+
+	return nil
+}
+
+func ensureWalletOwnedInputsReclaimedSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries, walletID uint32, tx *wire.MsgTx,
+	txID int64) error {
+
+	for inputIndex, txIn := range tx.TxIn {
+		spenderID, err := qtx.GetUtxoSpenderByOutpoint(
+			ctx, sqlcsqlite.GetUtxoSpenderByOutpointParams{
+				WalletID:    int64(walletID),
+				TxHash:      txIn.PreviousOutPoint.Hash[:],
+				OutputIndex: int64(txIn.PreviousOutPoint.Index),
+			},
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+
+			return fmt.Errorf("get input claim %d: %w", inputIndex, err)
+		}
+
+		if !spenderID.Valid || spenderID.Int64 != txID {
+			return fmt.Errorf("input %d: %w", inputIndex,
+				errWinnerInputNotReclaimed)
+		}
 	}
 
 	return nil

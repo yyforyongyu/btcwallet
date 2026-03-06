@@ -135,6 +135,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUtxoIDByOutpointStmt, err = db.PrepareContext(ctx, GetUtxoIDByOutpoint); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUtxoIDByOutpoint: %w", err)
 	}
+	if q.getUtxoSpenderByOutpointStmt, err = db.PrepareContext(ctx, GetUtxoSpenderByOutpoint); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUtxoSpenderByOutpoint: %w", err)
+	}
 	if q.getWalletByIDStmt, err = db.PrepareContext(ctx, GetWalletByID); err != nil {
 		return nil, fmt.Errorf("error preparing query GetWalletByID: %w", err)
 	}
@@ -442,6 +445,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUtxoIDByOutpointStmt: %w", cerr)
 		}
 	}
+	if q.getUtxoSpenderByOutpointStmt != nil {
+		if cerr := q.getUtxoSpenderByOutpointStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUtxoSpenderByOutpointStmt: %w", cerr)
+		}
+	}
 	if q.getWalletByIDStmt != nil {
 		if cerr := q.getWalletByIDStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getWalletByIDStmt: %w", cerr)
@@ -713,6 +721,7 @@ type Queries struct {
 	getTransactionMetaByHashStmt                *sql.Stmt
 	getUtxoByOutpointStmt                       *sql.Stmt
 	getUtxoIDByOutpointStmt                     *sql.Stmt
+	getUtxoSpenderByOutpointStmt                *sql.Stmt
 	getWalletByIDStmt                           *sql.Stmt
 	getWalletByNameStmt                         *sql.Stmt
 	getWalletSecretsStmt                        *sql.Stmt
@@ -795,6 +804,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getTransactionMetaByHashStmt:                q.getTransactionMetaByHashStmt,
 		getUtxoByOutpointStmt:                       q.getUtxoByOutpointStmt,
 		getUtxoIDByOutpointStmt:                     q.getUtxoIDByOutpointStmt,
+		getUtxoSpenderByOutpointStmt:                q.getUtxoSpenderByOutpointStmt,
 		getWalletByIDStmt:                           q.getWalletByIDStmt,
 		getWalletByNameStmt:                         q.getWalletByNameStmt,
 		getWalletSecretsStmt:                        q.getWalletSecretsStmt,

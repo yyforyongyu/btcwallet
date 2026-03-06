@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
 )
 
@@ -160,8 +161,8 @@ func (s *PostgresStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 		}
 
 		if rows == 0 {
-			return fmt.Errorf("transaction %s: orphaned coinbase state changed",
-				params.Txid)
+			return fmt.Errorf("transaction %s: %w", params.Txid,
+				errCoinbaseReconfirmationStateChanged)
 		}
 
 		return nil
@@ -342,6 +343,46 @@ func reclaimInputsByTxidPg(ctx context.Context, qtx *sqlcpg.Queries,
 	}, txID)
 	if err != nil {
 		return fmt.Errorf("reclaim inputs for transaction %s: %w", txid, err)
+	}
+
+	err = ensureWalletOwnedInputsReclaimedPg(ctx, qtx, walletID, tx, txID)
+	if err != nil {
+		return fmt.Errorf("verify reclaimed inputs for transaction %s: %w",
+			txid, err)
+	}
+
+	return nil
+}
+
+func ensureWalletOwnedInputsReclaimedPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, tx *wire.MsgTx, txID int64) error {
+
+	for inputIndex, txIn := range tx.TxIn {
+		outputIndex, err := uint32ToInt32(txIn.PreviousOutPoint.Index)
+		if err != nil {
+			return fmt.Errorf("convert input outpoint index %d: %w",
+				inputIndex, err)
+		}
+
+		spenderID, err := qtx.GetUtxoSpenderByOutpoint(
+			ctx, sqlcpg.GetUtxoSpenderByOutpointParams{
+				WalletID:    int64(walletID),
+				TxHash:      txIn.PreviousOutPoint.Hash[:],
+				OutputIndex: outputIndex,
+			},
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+
+			return fmt.Errorf("get input claim %d: %w", inputIndex, err)
+		}
+
+		if !spenderID.Valid || spenderID.Int64 != txID {
+			return fmt.Errorf("input %d: %w", inputIndex,
+				errWinnerInputNotReclaimed)
+		}
 	}
 
 	return nil
