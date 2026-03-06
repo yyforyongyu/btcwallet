@@ -77,6 +77,57 @@ type KeyScopeSecret struct {
 	EncryptedCoinPrivKey []byte
 }
 
+type SpendableUtxo struct {
+	WalletID    int64
+	ID          int64
+	TxID        int64
+	OutputIndex int64
+	Amount      int64
+	AddressID   int64
+	BlockHeight sql.NullInt64
+	IsCoinbase  bool
+	TxStatus    string
+}
+
+type Transaction struct {
+	WalletID     int64
+	ID           int64
+	TxHash       []byte
+	RawTx        []byte
+	BlockHeight  sql.NullInt64
+	Status       string
+	ReceivedTime time.Time
+	IsCoinbase   bool
+	Label        string
+}
+
+type TxReplacement struct {
+	WalletID        int64
+	ID              int64
+	ReplacedTxID    int64
+	ReplacementTxID int64
+	CreatedAt       time.Time
+}
+
+type Utxo struct {
+	WalletID        int64
+	ID              int64
+	TxID            int64
+	OutputIndex     int64
+	Amount          int64
+	AddressID       int64
+	SpentByTxID     sql.NullInt64
+	SpentInputIndex sql.NullInt64
+}
+
+type UtxoLease struct {
+	WalletID  int64
+	ID        int64
+	UtxoID    int64
+	LockID    []byte
+	ExpiresAt time.Time
+}
+
 type Wallet struct {
 	ID                      int64
 	WalletName              string

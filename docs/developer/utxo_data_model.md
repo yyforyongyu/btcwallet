@@ -278,13 +278,21 @@ This can be implemented with an application-side loop (portable across databases
 ### 5.4 Coin Selection
 Coin selection queries focus purely on the UTXO set:
 1.  Filter by `SpentBy IS NULL`.
-2.  Join Parent Transaction to ensure `Status IN ('published', 'pending')`.
-    *   *Note:* Including `pending` allows chaining unbroadcast transactions (Zero-Latency Chaining), but creates a strict dependency: the parent must be broadcast before the child.
-    *   This is an advanced feature and should be opt-in for conservative policies.
-    *   If confirmation is required (e.g., for safety), add `AND BlockHeight IS NOT NULL`.
+2.  Join the parent transaction and choose a caller-specific live-status
+    filter.
+    *   Conservative callers can require `Status = 'published'`.
+    *   Zero-latency chaining can opt into `Status IN ('pending',
+        'published')`, but this creates a strict dependency: the parent must be
+        broadcast before the child.
+    *   If confirmation is required (e.g., for safety), add
+        `AND BlockHeight IS NOT NULL`.
 3.  Filter out active `Leases`.
 
-Important: The `spendable_utxos` view described in ADR 0006 does not exclude leases (because it depends on the database's current time function and requires a `NOT EXISTS` against `utxo_leases`). Coin selection must explicitly filter `utxo_leases` where `expires_at > CURRENT_TIMESTAMP`.
+Important: The `spendable_utxos` view described in ADR 0006 is a factual base
+view: it exposes parent transaction metadata but does not decide whether
+`pending` parents, leases, or immature coinbase outputs are acceptable for a
+specific caller. Coin selection must explicitly filter `utxo_leases` where
+`expires_at > CURRENT_TIMESTAMP` and apply its chosen status/maturity rules.
 
 Transaction reconstruction note: This model optimizes the high-frequency UTXO read path. Reconstructing a full transaction view (inputs/outputs for UI/history) is inherently more join-heavy and should be treated as a lower-frequency, separately optimized read path.
 
@@ -293,6 +301,6 @@ When multiple wallets share a single database, all `wtxmgr` rows are scoped by `
 
 *   **Consistency model:** The system assumes ACID semantics from the database. Reorg handling, status transitions, and lease acquisition must be performed as explicit SQL transactions.
 *   **Concurrency primitive:** UTXO leases are the wallet-level lock. Coin selection must exclude leased UTXOs, and lease acquisition should be treated as part of the same atomic unit as input selection.
-*   **Coinbase maturity:** Coinbase UTXOs require 100 confirmations. This rule should be enforced in a single, well-defined place (query helper/view + height parameter) to avoid accidental selection of immature funds.
+*   **Coinbase maturity:** Coinbase UTXOs require 100 confirmations. This rule should be enforced in a single, well-defined caller-side policy path to avoid accidental selection of immature funds.
 
-Suggested enforcement: a parameterized query helper or SQL function that takes `current_height` and filters out coinbase UTXOs where `current_height - block_height < 100`.
+Suggested enforcement: a parameterized caller-side query helper or composition layer that takes `current_height` and filters out coinbase UTXOs where `current_height - block_height < 100`.
