@@ -96,6 +96,34 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published');
 
+-- name: GetUtxoSpenderByOutpoint :one
+-- Retrieves the current spender for a wallet-owned outpoint, if any.
+--
+-- How:
+-- - Resolves the outpoint through transactions so callers can address a UTXO by
+--   tx hash plus output index instead of the internal row ID.
+-- - Rejoins addresses -> accounts -> key_scopes so the lookup only reports
+--   outputs that still belong to the requested wallet.
+-- - Keeps the parent transaction in a live state (`pending` or `published`) so
+--   callers only verify claims on outputs that remain part of the live wallet
+--   graph.
+-- Performance:
+-- - Uses the wallet-scoped tx hash lookup and unique outpoint constraint to
+--   bound the read to at most one credited output.
+SELECT u.spent_by_tx_id
+FROM utxos AS u
+INNER JOIN transactions AS t
+    ON u.wallet_id = t.wallet_id AND u.tx_id = t.id
+INNER JOIN addresses AS a ON u.address_id = a.id
+INNER JOIN accounts AS acc ON a.account_id = acc.id
+INNER JOIN key_scopes AS ks ON acc.scope_id = ks.id
+WHERE
+    u.wallet_id = $1
+    AND ks.wallet_id = $1
+    AND t.tx_hash = $2
+    AND u.output_index = $3
+    AND t.status IN ('pending', 'published');
+
 -- name: ListUtxos :many
 -- Lists unspent UTXOs that match the provided filters.
 --
@@ -135,8 +163,8 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published')
     AND (
-        sqlc.narg('account_number') IS NULL
-        OR acc.account_number = sqlc.narg('account_number')
+        sqlc.narg('account_number')::BIGINT IS NULL
+        OR acc.account_number = sqlc.narg('account_number')::BIGINT
     )
     AND (
         CASE
@@ -171,7 +199,7 @@ ORDER BY u.amount, t.tx_hash, u.output_index;
 -- Performance:
 -- - Executes as one aggregate over wallet-scoped live outputs, with an
 --   anti-join against utxo_leases only when requested.
-SELECT cast(coalesce(sum(u.amount), 0) AS BIGINT) AS balance
+SELECT (coalesce(sum(u.amount), 0))::BIGINT AS balance
 FROM utxos AS u
 INNER JOIN transactions AS t
     ON u.wallet_id = t.wallet_id AND u.tx_id = t.id
@@ -185,11 +213,11 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published')
     AND (
-        sqlc.narg('account_number') IS NULL
-        OR acc.account_number = sqlc.narg('account_number')
+        sqlc.narg('account_number')::BIGINT IS NULL
+        OR acc.account_number = sqlc.narg('account_number')::BIGINT
     )
     AND (
-        sqlc.narg('min_confirms') IS NULL
+        sqlc.narg('min_confirms')::INTEGER IS NULL
         OR (
             CASE
                 WHEN t.block_height IS NULL THEN 0
@@ -197,10 +225,10 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) >= sqlc.narg('min_confirms')
+        ) >= sqlc.narg('min_confirms')::INTEGER
     )
     AND (
-        sqlc.narg('max_confirms') IS NULL
+        sqlc.narg('max_confirms')::INTEGER IS NULL
         OR (
             CASE
                 WHEN t.block_height IS NULL THEN 0
@@ -208,7 +236,7 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) <= sqlc.narg('max_confirms')
+        ) <= sqlc.narg('max_confirms')::INTEGER
     )
     AND (
         sqlc.arg('exclude_leased') = FALSE
@@ -222,7 +250,7 @@ WHERE
         )
     )
     AND (
-        sqlc.narg('coinbase_maturity') IS NULL
+        sqlc.narg('coinbase_maturity')::INTEGER IS NULL
         OR NOT t.is_coinbase
         OR (
             CASE
@@ -231,7 +259,7 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) >= sqlc.narg('coinbase_maturity')
+        ) >= sqlc.narg('coinbase_maturity')::INTEGER
     );
 
 -- name: ListSpendingTxIDsByParentTxID :many

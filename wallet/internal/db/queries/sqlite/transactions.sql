@@ -158,6 +158,27 @@ WHERE
     wallet_id = sqlc.arg('wallet_id')
     AND id IN (sqlc.slice('tx_ids'));
 
+-- name: ReconfirmOrphanedCoinbaseByHash :execrows
+-- Restores one orphaned coinbase transaction to the best chain.
+--
+-- How:
+-- - Updates `block_height` and `status` in the same statement so coinbase rows
+--   never pass through an invalid unconfirmed state.
+-- - Restricts the update to rows that are already orphaned coinbase
+--   transactions within the requested wallet.
+-- Performance:
+-- - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+UPDATE transactions
+SET
+    block_height = ?1,
+    status = 'published'
+WHERE
+    wallet_id = ?2
+    AND tx_hash = ?3
+    AND is_coinbase
+    AND block_height IS NULL
+    AND status = 'orphaned';
+
 -- name: DeleteUnminedTransactionByHash :execrows
 -- Deletes an unconfirmed transaction row.
 --

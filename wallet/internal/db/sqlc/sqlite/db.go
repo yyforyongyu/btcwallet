@@ -135,6 +135,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUtxoIDByOutpointStmt, err = db.PrepareContext(ctx, GetUtxoIDByOutpoint); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUtxoIDByOutpoint: %w", err)
 	}
+	if q.getUtxoSpenderByOutpointStmt, err = db.PrepareContext(ctx, GetUtxoSpenderByOutpoint); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUtxoSpenderByOutpoint: %w", err)
+	}
 	if q.getWalletByIDStmt, err = db.PrepareContext(ctx, GetWalletByID); err != nil {
 		return nil, fmt.Errorf("error preparing query GetWalletByID: %w", err)
 	}
@@ -224,6 +227,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.markUtxoSpentStmt, err = db.PrepareContext(ctx, MarkUtxoSpent); err != nil {
 		return nil, fmt.Errorf("error preparing query MarkUtxoSpent: %w", err)
+	}
+	if q.reconfirmOrphanedCoinbaseByHashStmt, err = db.PrepareContext(ctx, ReconfirmOrphanedCoinbaseByHash); err != nil {
+		return nil, fmt.Errorf("error preparing query ReconfirmOrphanedCoinbaseByHash: %w", err)
 	}
 	if q.releaseUtxoLeaseStmt, err = db.PrepareContext(ctx, ReleaseUtxoLease); err != nil {
 		return nil, fmt.Errorf("error preparing query ReleaseUtxoLease: %w", err)
@@ -436,6 +442,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUtxoIDByOutpointStmt: %w", cerr)
 		}
 	}
+	if q.getUtxoSpenderByOutpointStmt != nil {
+		if cerr := q.getUtxoSpenderByOutpointStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUtxoSpenderByOutpointStmt: %w", cerr)
+		}
+	}
 	if q.getWalletByIDStmt != nil {
 		if cerr := q.getWalletByIDStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getWalletByIDStmt: %w", cerr)
@@ -586,6 +597,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing markUtxoSpentStmt: %w", cerr)
 		}
 	}
+	if q.reconfirmOrphanedCoinbaseByHashStmt != nil {
+		if cerr := q.reconfirmOrphanedCoinbaseByHashStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing reconfirmOrphanedCoinbaseByHashStmt: %w", cerr)
+		}
+	}
 	if q.releaseUtxoLeaseStmt != nil {
 		if cerr := q.releaseUtxoLeaseStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing releaseUtxoLeaseStmt: %w", cerr)
@@ -697,6 +713,7 @@ type Queries struct {
 	getTransactionMetaByHashStmt                *sql.Stmt
 	getUtxoByOutpointStmt                       *sql.Stmt
 	getUtxoIDByOutpointStmt                     *sql.Stmt
+	getUtxoSpenderByOutpointStmt                *sql.Stmt
 	getWalletByIDStmt                           *sql.Stmt
 	getWalletByNameStmt                         *sql.Stmt
 	getWalletSecretsStmt                        *sql.Stmt
@@ -727,6 +744,7 @@ type Queries struct {
 	listUtxosStmt                               *sql.Stmt
 	listWalletsStmt                             *sql.Stmt
 	markUtxoSpentStmt                           *sql.Stmt
+	reconfirmOrphanedCoinbaseByHashStmt         *sql.Stmt
 	releaseUtxoLeaseStmt                        *sql.Stmt
 	updateAccountNameByWalletScopeAndNameStmt   *sql.Stmt
 	updateAccountNameByWalletScopeAndNumberStmt *sql.Stmt
@@ -777,6 +795,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getTransactionMetaByHashStmt:                q.getTransactionMetaByHashStmt,
 		getUtxoByOutpointStmt:                       q.getUtxoByOutpointStmt,
 		getUtxoIDByOutpointStmt:                     q.getUtxoIDByOutpointStmt,
+		getUtxoSpenderByOutpointStmt:                q.getUtxoSpenderByOutpointStmt,
 		getWalletByIDStmt:                           q.getWalletByIDStmt,
 		getWalletByNameStmt:                         q.getWalletByNameStmt,
 		getWalletSecretsStmt:                        q.getWalletSecretsStmt,
@@ -807,6 +826,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listUtxosStmt:                               q.listUtxosStmt,
 		listWalletsStmt:                             q.listWalletsStmt,
 		markUtxoSpentStmt:                           q.markUtxoSpentStmt,
+		reconfirmOrphanedCoinbaseByHashStmt:         q.reconfirmOrphanedCoinbaseByHashStmt,
 		releaseUtxoLeaseStmt:                        q.releaseUtxoLeaseStmt,
 		updateAccountNameByWalletScopeAndNameStmt:   q.updateAccountNameByWalletScopeAndNameStmt,
 		updateAccountNameByWalletScopeAndNumberStmt: q.updateAccountNameByWalletScopeAndNumberStmt,

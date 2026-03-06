@@ -448,6 +448,43 @@ func (q *Queries) ListUnminedTransactions(ctx context.Context, walletID int64) (
 	return items, nil
 }
 
+const ReconfirmOrphanedCoinbaseByHash = `-- name: ReconfirmOrphanedCoinbaseByHash :execrows
+UPDATE transactions
+SET
+    block_height = $1,
+    status = 'published'
+WHERE
+    wallet_id = $2
+    AND tx_hash = $3
+    AND is_coinbase
+    AND block_height IS NULL
+    AND status = 'orphaned'
+`
+
+type ReconfirmOrphanedCoinbaseByHashParams struct {
+	BlockHeight sql.NullInt32
+	WalletID    int64
+	TxHash      []byte
+}
+
+// Restores one orphaned coinbase transaction to the best chain.
+//
+// How:
+//   - Updates `block_height` and `status` in the same statement so coinbase rows
+//     never pass through an invalid unconfirmed state.
+//   - Restricts the update to rows that are already orphaned coinbase
+//     transactions within the requested wallet.
+//
+// Performance:
+// - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+func (q *Queries) ReconfirmOrphanedCoinbaseByHash(ctx context.Context, arg ReconfirmOrphanedCoinbaseByHashParams) (int64, error) {
+	result, err := q.exec(ctx, q.reconfirmOrphanedCoinbaseByHashStmt, ReconfirmOrphanedCoinbaseByHash, arg.BlockHeight, arg.WalletID, arg.TxHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const UpdateTransactionLabelByHash = `-- name: UpdateTransactionLabelByHash :execrows
 UPDATE transactions
 SET label = $1

@@ -212,6 +212,20 @@ type Querier interface {
 	// - Uses the wallet-scoped transaction hash lookup first, then narrows to the
 	//   unique `(wallet_id, tx_id, output_index)` outpoint.
 	GetUtxoIDByOutpoint(ctx context.Context, arg GetUtxoIDByOutpointParams) (int64, error)
+	// Retrieves the current spender for a wallet-owned outpoint, if any.
+	//
+	// How:
+	// - Resolves the outpoint through transactions so callers can address a UTXO by
+	//   tx hash plus output index instead of the internal row ID.
+	// - Rejoins addresses -> accounts -> key_scopes so the lookup only reports
+	//   outputs that still belong to the requested wallet.
+	// - Keeps the parent transaction in a live state (`pending` or `published`) so
+	//   callers only verify claims on outputs that remain part of the live wallet
+	//   graph.
+	// Performance:
+	// - Uses the wallet-scoped tx hash lookup and unique outpoint constraint to
+	//   bound the read to at most one credited output.
+	GetUtxoSpenderByOutpoint(ctx context.Context, arg GetUtxoSpenderByOutpointParams) (sql.NullInt64, error)
 	GetWalletByID(ctx context.Context, id int64) (GetWalletByIDRow, error)
 	GetWalletByName(ctx context.Context, walletName string) (GetWalletByNameRow, error)
 	GetWalletSecrets(ctx context.Context, walletID int64) (WalletSecret, error)
@@ -402,6 +416,16 @@ type Querier interface {
 	// - Targets one outpoint in one wallet; the subquery uses the unique
 	//   wallet-scoped tx hash lookup.
 	MarkUtxoSpent(ctx context.Context, arg MarkUtxoSpentParams) (int64, error)
+	// Restores one orphaned coinbase transaction to the best chain.
+	//
+	// How:
+	// - Updates `block_height` and `status` in the same statement so coinbase rows
+	//   never pass through an invalid unconfirmed state.
+	// - Restricts the update to rows that are already orphaned coinbase
+	//   transactions within the requested wallet.
+	// Performance:
+	// - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+	ReconfirmOrphanedCoinbaseByHash(ctx context.Context, arg ReconfirmOrphanedCoinbaseByHashParams) (int64, error)
 	// Releases a lease for a UTXO ID if the lock_id matches.
 	//
 	// How:
