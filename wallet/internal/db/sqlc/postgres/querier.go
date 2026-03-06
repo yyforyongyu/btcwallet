@@ -436,6 +436,16 @@ type Querier interface {
 	// - Targets one outpoint in one wallet; the subquery uses the unique
 	//   wallet-scoped tx hash lookup.
 	MarkUtxoSpent(ctx context.Context, arg MarkUtxoSpentParams) (int64, error)
+	// Restores one orphaned coinbase transaction to the best chain.
+	//
+	// How:
+	// - Updates `block_height` and `status` in the same statement so coinbase rows
+	//   never pass through an invalid unconfirmed state.
+	// - Restricts the update to rows that are already orphaned coinbase
+	//   transactions within the requested wallet.
+	// Performance:
+	// - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+	ReconfirmOrphanedCoinbaseByHash(ctx context.Context, arg ReconfirmOrphanedCoinbaseByHashParams) (int64, error)
 	// Releases a lease for a UTXO ID if the lock_id matches.
 	//
 	// How:
