@@ -14,7 +14,10 @@ import (
 // Ensure SqliteStore satisfies the UTXOStore interface.
 var _ UTXOStore = (*SqliteStore)(nil)
 
-// GetUtxo retrieves one live wallet-owned UTXO by outpoint.
+// GetUtxo retrieves one live wallet-owned UTXO by outpoint. It performs a
+// single wallet-scoped read against the current unspent set, so spent outputs,
+// outputs from invalid parents, and outputs owned by other wallets are never
+// returned.
 func (s *SqliteStore) GetUtxo(ctx context.Context,
 	query GetUtxoQuery) (*UtxoInfo, error) {
 
@@ -40,15 +43,18 @@ func (s *SqliteStore) GetUtxo(ctx context.Context,
 	)
 }
 
-// ListUTXOs lists all live wallet-owned UTXOs matching the caller filters.
+// ListUTXOs lists live wallet-owned UTXOs matching the caller filters. It runs
+// as one wallet-scoped read over the current unspent set, preserving the API
+// invariant that filters only narrow live outputs rather than resurrect spent
+// or invalidated entries.
 func (s *SqliteStore) ListUTXOs(ctx context.Context,
 	query ListUtxosQuery) ([]UtxoInfo, error) {
 
 	rows, err := s.queries.ListUtxos(ctx, sqlcsqlite.ListUtxosParams{
 		WalletID:      int64(query.WalletID),
 		AccountNumber: optionalUint32Int64(query.Account),
-		MinConfirms:   sql.NullInt64{Int64: int64(query.MinConfs), Valid: true},
-		MaxConfirms:   sql.NullInt64{Int64: int64(query.MaxConfs), Valid: true},
+		MinConfirms:   nullableInt32Int64(query.MinConfs),
+		MaxConfirms:   nullableInt32Int64(query.MaxConfs),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list utxos: %w", err)
@@ -70,7 +76,9 @@ func (s *SqliteStore) ListUTXOs(ctx context.Context,
 	return utxos, nil
 }
 
-// LeaseOutput acquires or renews a lease for one live UTXO.
+// LeaseOutput atomically acquires or renews a lease for one live UTXO. The
+// lookup and lease mutation happen inside one SQL transaction, and the stored
+// `expires_at` value is normalized to UTC before it is written.
 func (s *SqliteStore) LeaseOutput(ctx context.Context,
 	params LeaseOutputParams) (*LeasedOutput, error) {
 
@@ -122,7 +130,10 @@ func (s *SqliteStore) LeaseOutput(ctx context.Context,
 	return lease, nil
 }
 
-// ReleaseOutput releases a lease when the caller provides the active lock ID.
+// ReleaseOutput atomically releases a lease when the caller provides the active
+// lock ID. The lookup and conditional delete happen inside one SQL
+// transaction, so lock validation and state removal cannot be observed
+// separately.
 func (s *SqliteStore) ReleaseOutput(ctx context.Context,
 	params ReleaseOutputParams) error {
 
@@ -168,7 +179,9 @@ func (s *SqliteStore) ReleaseOutput(ctx context.Context,
 	})
 }
 
-// ListLeasedOutputs lists all active leases for live wallet-owned UTXOs.
+// ListLeasedOutputs lists all active leases for live wallet-owned UTXOs. It
+// executes as one wallet-scoped read and only reports leases whose referenced
+// UTXOs still belong to the live wallet view.
 func (s *SqliteStore) ListLeasedOutputs(ctx context.Context,
 	walletID uint32) ([]LeasedOutput, error) {
 
@@ -197,7 +210,10 @@ func (s *SqliteStore) ListLeasedOutputs(ctx context.Context,
 	return leases, nil
 }
 
-// Balance returns the sum of wallet-owned live UTXOs after optional filters.
+// Balance returns the sum of wallet-owned live UTXOs after optional filters. It
+// computes the total in one SQL statement over the same live-set invariants as
+// ListUTXOs, so spent outputs and invalid parents never contribute. Coinbase
+// maturity remains enforced even when no explicit MinConfs lower bound is set.
 func (s *SqliteStore) Balance(ctx context.Context,
 	params BalanceParams) (btcutil.Amount, error) {
 
@@ -216,6 +232,8 @@ func (s *SqliteStore) Balance(ctx context.Context,
 	return btcutil.Amount(balance), nil
 }
 
+// utxoInfoFromSqliteRow maps one sqlite row into the public UtxoInfo contract,
+// including NULL block-height handling for unconfirmed outputs.
 func utxoInfoFromSqliteRow(hash []byte, outputIndex int64, amount int64,
 	pkScript []byte, received time.Time, isCoinbase bool,
 	blockHeight sql.NullInt64) (*UtxoInfo, error) {

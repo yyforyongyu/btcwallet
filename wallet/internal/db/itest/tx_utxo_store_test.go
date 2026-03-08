@@ -15,9 +15,26 @@ import (
 
 // TestTxStoreLifecycle verifies the baseline SQL TxStore behavior for creating,
 // reading, listing, updating, deleting, and rolling back transactions.
+//
+// Scenario:
+//   - One wallet receives an unconfirmed credit, spends it, deletes the spend,
+//     then confirms and rolls back a later credit.
+//
+// Setup:
+// - Create one wallet, one default account, and one wallet-owned address.
+// - Seed blocks so a later transaction can be confirmed and then rolled back.
+// Action:
+//   - Exercise CreateTx, GetTx, ListTxns, UpdateTx, GetUtxo, DeleteTx, and
+//     RollbackToBlock against the same wallet history.
+//
+// Assertions:
+// - Labels, spend state, and restored wallet-owned UTXOs stay coherent.
+// - Rolled-back confirmed transactions return to the blockless published set.
 func TestTxStoreLifecycle(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: Build one wallet history with an unconfirmed credit, a temporary
+	// spend, and a later confirmed credit that can be rolled back.
 	store := NewTestStore(t)
 	walletID := newWallet(t, store, "wallet-tx-store")
 	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
@@ -50,6 +67,8 @@ func TestTxStoreLifecycle(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// Act: Read, list, update, spend, delete, confirm, and roll back the wallet
+	// transaction history.
 	pendingInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
 		WalletID: walletID,
 		Txid:     pendingTx.TxHash(),
@@ -176,6 +195,8 @@ func TestTxStoreLifecycle(t *testing.T) {
 	err = store.RollbackToBlock(t.Context(), confirmedBlock.Height)
 	require.NoError(t, err)
 
+	// Assert: Labels, spend state, restored UTXOs, and rolled-back transaction
+	// visibility all remain coherent.
 	rolledBackInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
 		WalletID: walletID,
 		Txid:     confirmedTx.TxHash(),
@@ -194,9 +215,26 @@ func TestTxStoreLifecycle(t *testing.T) {
 
 // TestDeleteTxRejectsNonLeafTransaction verifies that DeleteTx refuses to erase
 // an unconfirmed transaction that still has direct child spenders.
+//
+// Scenario:
+//   - One pending parent creates a wallet-owned output and one pending child
+//     spends that output.
+//
+// Setup:
+//   - Create one wallet, one default account, and one wallet-owned address.
+//   - Insert both transactions so the parent is no longer a leaf in the local
+//     unconfirmed graph.
+//
+// Action:
+// - Attempt to delete the parent transaction while its child still exists.
+// Assertions:
+// - DeleteTx rejects the request with the leaf-only invariant error.
+// - Both the parent and child rows remain present and keep their live status.
 func TestDeleteTxRejectsNonLeafTransaction(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: Create one pending parent and one pending child that spends the
+	// parent's wallet-owned output.
 	store := NewTestStore(t)
 	walletID := newWallet(t, store, "wallet-delete-non-leaf")
 	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
@@ -243,12 +281,14 @@ func TestDeleteTxRejectsNonLeafTransaction(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// Act: Attempt to delete the non-leaf parent transaction.
 	err = store.DeleteTx(t.Context(), db.DeleteTxParams{
 		WalletID: walletID,
 		Txid:     parentTx.TxHash(),
 	})
 	require.ErrorContains(t, err, "delete requires a leaf transaction")
 
+	// Assert: Both parent and child remain present with their live status.
 	parentInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
 		WalletID: walletID,
 		Txid:     parentTx.TxHash(),
@@ -266,9 +306,29 @@ func TestDeleteTxRejectsNonLeafTransaction(t *testing.T) {
 
 // TestUtxoStoreLeaseAndBalance verifies listing, leasing, releasing, and
 // balance filtering across confirmed, unconfirmed, and coinbase outputs.
+//
+// Scenario:
+//   - One wallet owns confirmed, unconfirmed, and coinbase outputs across two
+//     accounts.
+//
+// Setup:
+//   - Create default and savings accounts plus one address in each account.
+//   - Insert one confirmed transaction, one unconfirmed transaction, and one
+//     coinbase transaction while advancing wallet sync state.
+//
+// Action:
+//   - Query UTXOs and balances with account/confirmation filters, then acquire
+//     and release a lease on one confirmed output.
+//
+// Assertions:
+//   - Zero-value UTXO queries return the full live set while explicit bounds
+//     narrow it correctly.
+//   - Balance and lease reads honor account, maturity, and active-lock filters.
 func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: Create one wallet with confirmed, unconfirmed, and coinbase UTXOs
+	// across two accounts.
 	store := NewTestStore(t)
 	walletID := newWallet(t, store, "wallet-utxo-store")
 	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
@@ -347,10 +407,10 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// Act: Query balances and UTXO views, then lease and release one confirmed
+	// output.
 	allUtxos, err := store.ListUTXOs(t.Context(), db.ListUtxosQuery{
 		WalletID: walletID,
-		MinConfs: 0,
-		MaxConfs: 1000,
 	})
 	require.NoError(t, err)
 	require.Len(t, allUtxos, 3)
@@ -359,8 +419,7 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 	defaultUtxos, err := store.ListUTXOs(t.Context(), db.ListUtxosQuery{
 		WalletID: walletID,
 		Account:  &defaultAccount,
-		MinConfs: 1,
-		MaxConfs: 1000,
+		MinConfs: int32Ptr(1),
 	})
 	require.NoError(t, err)
 	require.Len(t, defaultUtxos, 2)
@@ -369,8 +428,8 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 	unconfirmedSavings, err := store.ListUTXOs(t.Context(), db.ListUtxosQuery{
 		WalletID: walletID,
 		Account:  &savingsAccount,
-		MinConfs: 0,
-		MaxConfs: 0,
+		MinConfs: int32Ptr(0),
+		MaxConfs: int32Ptr(0),
 	})
 	require.NoError(t, err)
 	require.Len(t, unconfirmedSavings, 1)
@@ -382,6 +441,16 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, btcutil.Amount(62000), totalBalance)
+
+	coinbaseMaturityOnlyBalance, err := store.Balance(
+		t.Context(), db.BalanceParams{
+			WalletID:         walletID,
+			Account:          &defaultAccount,
+			CoinbaseMaturity: int32Ptr(3),
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, btcutil.Amount(10000), coinbaseMaturityOnlyBalance)
 
 	defaultBalance, err := store.Balance(t.Context(), db.BalanceParams{
 		WalletID: walletID,
@@ -456,9 +525,14 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 		WalletID: walletID,
 		OutPoint: wire.OutPoint{Hash: randomHash(), Index: 9},
 	})
+
+	// Assert: Account filters, maturity rules, and active lease checks all match
+	// the expected public store behavior.
 	require.ErrorIs(t, err, db.ErrUtxoNotFound)
 }
 
+// newRegularTx builds a simple fixture transaction with the provided inputs and
+// outputs.
 func newRegularTx(inputs []wire.OutPoint, outputs []*wire.TxOut) *wire.MsgTx {
 	tx := wire.NewMsgTx(2)
 
@@ -473,6 +547,8 @@ func newRegularTx(inputs []wire.OutPoint, outputs []*wire.TxOut) *wire.MsgTx {
 	return tx
 }
 
+// newCoinbaseTx builds a minimal coinbase fixture transaction with the provided
+// outputs.
 func newCoinbaseTx(outputs []*wire.TxOut) *wire.MsgTx {
 	tx := wire.NewMsgTx(2)
 	tx.AddTxIn(&wire.TxIn{
@@ -487,18 +563,23 @@ func newCoinbaseTx(outputs []*wire.TxOut) *wire.MsgTx {
 	return tx
 }
 
+// randomOutPoint returns one fixture outpoint backed by a random hash.
 func randomOutPoint() wire.OutPoint {
 	return wire.OutPoint{Hash: randomHash(), Index: 0}
 }
 
+// randomHash returns one fixture transaction hash.
 func randomHash() chainhash.Hash {
 	return RandomHash()
 }
 
+// int32Ptr returns the address of the provided int32 fixture value.
 func int32Ptr(value int32) *int32 {
 	return &value
 }
 
+// lockIDFixture builds a deterministic lease lock ID with the requested prefix
+// byte.
 func lockIDFixture(firstByte byte) [32]byte {
 	var lockID [32]byte
 	lockID[0] = firstByte

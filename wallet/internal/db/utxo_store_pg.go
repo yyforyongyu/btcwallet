@@ -14,7 +14,10 @@ import (
 // Ensure PostgresStore satisfies the UTXOStore interface.
 var _ UTXOStore = (*PostgresStore)(nil)
 
-// GetUtxo retrieves one live wallet-owned UTXO by outpoint.
+// GetUtxo retrieves one live wallet-owned UTXO by outpoint. It performs a
+// single wallet-scoped read against the current unspent set, so spent outputs,
+// outputs from invalid parents, and outputs owned by other wallets are never
+// returned.
 func (s *PostgresStore) GetUtxo(ctx context.Context,
 	query GetUtxoQuery) (*UtxoInfo, error) {
 
@@ -45,7 +48,10 @@ func (s *PostgresStore) GetUtxo(ctx context.Context,
 	)
 }
 
-// ListUTXOs lists all live wallet-owned UTXOs matching the caller filters.
+// ListUTXOs lists live wallet-owned UTXOs matching the caller filters. It runs
+// as one wallet-scoped read over the current unspent set, preserving the API
+// invariant that filters only narrow live outputs rather than resurrect spent
+// or invalidated entries.
 func (s *PostgresStore) ListUTXOs(ctx context.Context,
 	query ListUtxosQuery) ([]UtxoInfo, error) {
 
@@ -70,7 +76,9 @@ func (s *PostgresStore) ListUTXOs(ctx context.Context,
 	return utxos, nil
 }
 
-// LeaseOutput acquires or renews a lease for one live UTXO.
+// LeaseOutput atomically acquires or renews a lease for one live UTXO. The
+// lookup and lease mutation happen inside one SQL transaction, and the stored
+// `expires_at` value is normalized to UTC before it is written.
 func (s *PostgresStore) LeaseOutput(ctx context.Context,
 	params LeaseOutputParams) (*LeasedOutput, error) {
 
@@ -125,7 +133,10 @@ func (s *PostgresStore) LeaseOutput(ctx context.Context,
 	return lease, nil
 }
 
-// ReleaseOutput releases a lease when the caller provides the active lock ID.
+// ReleaseOutput atomically releases a lease when the caller provides the active
+// lock ID. The lookup and conditional delete happen inside one SQL
+// transaction, so lock validation and state removal cannot be observed
+// separately.
 func (s *PostgresStore) ReleaseOutput(ctx context.Context,
 	params ReleaseOutputParams) error {
 
@@ -176,7 +187,9 @@ func (s *PostgresStore) ReleaseOutput(ctx context.Context,
 	})
 }
 
-// ListLeasedOutputs lists all active leases for live wallet-owned UTXOs.
+// ListLeasedOutputs lists all active leases for live wallet-owned UTXOs. It
+// executes as one wallet-scoped read and only reports leases whose referenced
+// UTXOs still belong to the live wallet view.
 func (s *PostgresStore) ListLeasedOutputs(ctx context.Context,
 	walletID uint32) ([]LeasedOutput, error) {
 
@@ -205,7 +218,10 @@ func (s *PostgresStore) ListLeasedOutputs(ctx context.Context,
 	return leases, nil
 }
 
-// Balance returns the sum of wallet-owned live UTXOs after optional filters.
+// Balance returns the sum of wallet-owned live UTXOs after optional filters. It
+// computes the total in one SQL statement over the same live-set invariants as
+// ListUTXOs, so spent outputs and invalid parents never contribute. Coinbase
+// maturity remains enforced even when no explicit MinConfs lower bound is set.
 func (s *PostgresStore) Balance(ctx context.Context,
 	params BalanceParams) (btcutil.Amount, error) {
 
@@ -224,15 +240,19 @@ func (s *PostgresStore) Balance(ctx context.Context,
 	return btcutil.Amount(balance), nil
 }
 
+// buildListUtxosParamsPg converts the public list query into the postgres sqlc
+// parameter shape.
 func buildListUtxosParamsPg(query ListUtxosQuery) sqlcpg.ListUtxosParams {
 	return sqlcpg.ListUtxosParams{
 		WalletID:      int64(query.WalletID),
 		AccountNumber: nullableUint32Int64(query.Account),
-		MinConfirms:   sql.NullInt32{Int32: query.MinConfs, Valid: true},
-		MaxConfirms:   sql.NullInt32{Int32: query.MaxConfs, Valid: true},
+		MinConfirms:   nullableInt32(query.MinConfs),
+		MaxConfirms:   nullableInt32(query.MaxConfs),
 	}
 }
 
+// utxoInfoFromPgRow maps one postgres row into the public UtxoInfo contract,
+// including NULL block-height handling for unconfirmed outputs.
 func utxoInfoFromPgRow(hash []byte, outputIndex int32, amount int64,
 	pkScript []byte, received time.Time, isCoinbase bool,
 	blockHeight sql.NullInt32) (*UtxoInfo, error) {
@@ -257,6 +277,8 @@ func utxoInfoFromPgRow(hash []byte, outputIndex int32, amount int64,
 	)
 }
 
+// optionalUint32Int64 converts an optional uint32 filter into either nil or the
+// sqlite-style int64 value expected by shared sqlc parameter structs.
 func optionalUint32Int64(value *uint32) interface{} {
 	if value == nil {
 		return nil
@@ -265,6 +287,9 @@ func optionalUint32Int64(value *uint32) interface{} {
 	return int64(*value)
 }
 
+// optionalInt32 converts an optional int32 filter into either nil or the raw
+// integer value expected by sqlite sqlc parameter structs that still use
+// interface{} placeholders.
 func optionalInt32(value *int32) interface{} {
 	if value == nil {
 		return nil
@@ -273,6 +298,19 @@ func optionalInt32(value *int32) interface{} {
 	return *value
 }
 
+// nullableInt32Int64 converts an optional int32 filter into a valid
+// sql.NullInt64 for sqlite sqlc parameter structs that materialize nullable
+// integer placeholders as sql.NullInt64.
+func nullableInt32Int64(value *int32) sql.NullInt64 {
+	if value == nil {
+		return sql.NullInt64{}
+	}
+
+	return sql.NullInt64{Int64: int64(*value), Valid: true}
+}
+
+// nullableUint32Int64 converts an optional uint32 filter into a valid
+// sql.NullInt64 for postgres sqlc parameters.
 func nullableUint32Int64(value *uint32) sql.NullInt64 {
 	if value == nil {
 		return sql.NullInt64{}
@@ -281,6 +319,8 @@ func nullableUint32Int64(value *uint32) sql.NullInt64 {
 	return sql.NullInt64{Int64: int64(*value), Valid: true}
 }
 
+// nullableInt32 converts an optional int32 filter into a valid sql.NullInt32
+// for postgres sqlc parameters.
 func nullableInt32(value *int32) sql.NullInt32 {
 	if value == nil {
 		return sql.NullInt32{}

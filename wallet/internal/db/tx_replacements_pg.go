@@ -11,9 +11,11 @@ import (
 	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
 )
 
-// ApplyTxReplacement records directed replacement edges, marks each direct
-// victim as replaced, recursively fails descendants, and reclaims the winner's
-// spent-input edges inside one SQL transaction.
+// ApplyTxReplacement records directed replacement edges for one live
+// unconfirmed winner, marks each direct victim as replaced, recursively fails
+// descendants, and reclaims the winner's spent-input edges inside one SQL
+// transaction. Every supplied victim must directly conflict with the winner
+// on a wallet-owned input.
 func (s *PostgresStore) ApplyTxReplacement(ctx context.Context,
 	params ApplyTxReplacementParams) error {
 
@@ -37,7 +39,9 @@ func (s *PostgresStore) ApplyTxReplacement(ctx context.Context,
 
 // ApplyTxFailure marks each direct loser as failed, recursively fails
 // descendants, and reclaims the winner's spent-input edges inside one SQL
-// transaction.
+// transaction. This is the direct-conflict path for winners that are confirmed
+// or otherwise not eligible for mempool replacement semantics. Every supplied
+// loser must directly conflict with the winner on a wallet-owned input.
 func (s *PostgresStore) ApplyTxFailure(ctx context.Context,
 	params ApplyTxFailureParams) error {
 
@@ -85,7 +89,9 @@ func (s *PostgresStore) OrphanTxChain(ctx context.Context,
 }
 
 // ReconfirmOrphanedCoinbase restores one orphaned coinbase transaction to a new
-// confirming block inside one SQL transaction.
+// confirming block inside one SQL transaction. This is intentionally a
+// root-only transition: coinbase spends require maturity, so the supported
+// reconfirmation path assumes no descendant branch needs replay.
 func (s *PostgresStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	params ReconfirmOrphanedCoinbaseParams) error {
 
@@ -132,6 +138,8 @@ func (s *PostgresStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 
 // buildTxChainHooksPg binds the shared replacement helpers to the postgres
 // query set active for the surrounding SQL transaction.
+//
+
 func buildTxChainHooksPg(qtx *sqlcpg.Queries, walletID uint32) txChainHooks {
 	return buildTxChainHooks(
 		func(ctx context.Context, parentID int64) ([]int64, error) {
@@ -157,9 +165,16 @@ func buildTxChainHooksPg(qtx *sqlcpg.Queries, walletID uint32) txChainHooks {
 				ctx, qtx, walletID, replacedTxID, replacementTxID,
 			)
 		},
+		func(ctx context.Context, txid chainhash.Hash) ([]txChainMeta, error) {
+			return listDirectConflictRootsByTxidPg(
+				ctx, qtx, walletID, txid,
+			)
+		},
 	)
 }
 
+// loadTxChainMetasPg resolves one metadata row per requested transaction hash
+// for the shared invalidation flows.
 func loadTxChainMetasPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32,
 	txids []chainhash.Hash) ([]txChainMeta, error) {
@@ -177,6 +192,8 @@ func loadTxChainMetasPg(ctx context.Context, qtx *sqlcpg.Queries,
 	return metas, nil
 }
 
+// loadTxChainMetaPg loads the wallet-scoped metadata needed to validate one
+// transaction's replacement or orphaning state.
 func loadTxChainMetaPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32,
 	txid chainhash.Hash) (txChainMeta, error) {
@@ -210,6 +227,8 @@ func loadTxChainMetaPg(ctx context.Context, qtx *sqlcpg.Queries,
 	}, nil
 }
 
+// listChildTxIDsPg returns the direct spender transaction IDs for outputs
+// created by the provided parent row.
 func listChildTxIDsPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint32,
 	parentID int64) ([]int64, error) {
 
@@ -236,6 +255,8 @@ func listChildTxIDsPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint32,
 	return childIDs, nil
 }
 
+// clearSpentByTxIDPg releases every wallet-owned spent-input edge currently
+// claimed by the provided transaction row.
 func clearSpentByTxIDPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32,
 	txID int64) error {
@@ -254,6 +275,8 @@ func clearSpentByTxIDPg(ctx context.Context, qtx *sqlcpg.Queries,
 	return nil
 }
 
+// updateTxStatusPg applies one wallet-scoped status update batch for the shared
+// invalidation flows.
 func updateTxStatusPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint32,
 	status TxStatus, txIDs []int64) error {
 
@@ -275,6 +298,8 @@ func updateTxStatusPg(ctx context.Context, qtx *sqlcpg.Queries, walletID uint32,
 	return nil
 }
 
+// recordReplacementEdgePg inserts one victim-to-winner audit edge for a direct
+// replacement relationship.
 func recordReplacementEdgePg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32, replacedTxID int64, replacementTxID int64) error {
 
@@ -293,6 +318,8 @@ func recordReplacementEdgePg(ctx context.Context, qtx *sqlcpg.Queries,
 	return nil
 }
 
+// reclaimInputsByTxidPg replays the winner's wallet-owned spent-input edges and
+// verifies that reclamation completed before commit.
 func reclaimInputsByTxidPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32, txid chainhash.Hash, txID int64) error {
 
@@ -332,6 +359,130 @@ func reclaimInputsByTxidPg(ctx context.Context, qtx *sqlcpg.Queries,
 	return nil
 }
 
+// listDirectConflictRootsByTxidPg loads the winner transaction and derives the
+// complete live direct loser set for its wallet-owned inputs.
+func listDirectConflictRootsByTxidPg(ctx context.Context,
+	qtx *sqlcpg.Queries, walletID uint32,
+	txid chainhash.Hash) ([]txChainMeta, error) {
+
+	row, err := qtx.GetTransactionByHash(
+		ctx, sqlcpg.GetTransactionByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   txid[:],
+		},
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("transaction %s: %w", txid, ErrTxNotFound)
+		}
+
+		return nil, fmt.Errorf("get transaction for root validation: %w", err)
+	}
+
+	tx, err := deserializeMsgTx(row.RawTx)
+	if err != nil {
+		return nil, err
+	}
+
+	return listDirectConflictRootsPg(ctx, qtx, walletID, row.ID, tx)
+}
+
+// listDirectConflictRootsPg scans live unconfirmed wallet transactions and
+// returns those that directly conflict with the winner on wallet-owned inputs.
+//
+//nolint:dupl // Backend-specific sqlc row types differ.
+func listDirectConflictRootsPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, winnerID int64,
+	tx *wire.MsgTx) ([]txChainMeta, error) {
+
+	walletOwnedInputs, err := listWalletOwnedInputsPg(ctx, qtx, walletID, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(walletOwnedInputs) == 0 {
+		return nil, nil
+	}
+
+	rows, err := qtx.ListUnminedTransactions(ctx, int64(walletID))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"list unmined transactions for root validation: %w", err,
+		)
+	}
+
+	roots := make([]txChainMeta, 0, len(rows))
+
+	for _, row := range rows {
+		if row.ID == winnerID {
+			continue
+		}
+
+		meta, ok, err := buildDirectConflictMeta(
+			row.ID, row.TxHash, row.Status, row.BlockHeight.Valid,
+			row.IsCoinbase,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if !ok {
+			continue
+		}
+
+		candidateTx, err := deserializeMsgTx(row.RawTx)
+		if err != nil {
+			return nil, err
+		}
+
+		if !txSpendsAnyOutpoint(candidateTx, walletOwnedInputs) {
+			continue
+		}
+
+		roots = append(roots, meta)
+	}
+
+	return roots, nil
+}
+
+// listWalletOwnedInputsPg filters the winner's inputs down to wallet-owned
+// outpoints, which define the eligible direct-conflict surface.
+func listWalletOwnedInputsPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, tx *wire.MsgTx) (map[wire.OutPoint]struct{}, error) {
+
+	walletOwnedInputs := make(map[wire.OutPoint]struct{}, len(tx.TxIn))
+
+	for inputIndex, txIn := range tx.TxIn {
+		outputIndex, err := uint32ToInt32(txIn.PreviousOutPoint.Index)
+		if err != nil {
+			return nil, fmt.Errorf("convert input outpoint index %d: %w",
+				inputIndex, err)
+		}
+
+		_, err = qtx.GetUtxoSpenderByOutpoint(
+			ctx, sqlcpg.GetUtxoSpenderByOutpointParams{
+				WalletID:    int64(walletID),
+				TxHash:      txIn.PreviousOutPoint.Hash[:],
+				OutputIndex: outputIndex,
+			},
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+
+			return nil, fmt.Errorf("check wallet-owned input %d: %w",
+				inputIndex, err)
+		}
+
+		walletOwnedInputs[txIn.PreviousOutPoint] = struct{}{}
+	}
+
+	return walletOwnedInputs, nil
+}
+
+// ensureWalletOwnedInputsReclaimedPg verifies that every wallet-owned input of
+// the winner now points back to the winner row before commit.
 func ensureWalletOwnedInputsReclaimedPg(ctx context.Context,
 	qtx *sqlcpg.Queries,
 	walletID uint32, tx *wire.MsgTx, txID int64) error {

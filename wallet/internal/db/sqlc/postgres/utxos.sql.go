@@ -30,7 +30,22 @@ WHERE
         OR acc.account_number = $2::BIGINT
     )
     AND (
-        $3::INTEGER IS NULL
+        CASE
+            WHEN t.block_height IS NULL THEN 0
+            WHEN s.synced_height IS NULL THEN 0
+            WHEN t.block_height > s.synced_height THEN 0
+            ELSE s.synced_height - t.block_height + 1
+        END
+    ) >= greatest(
+        coalesce($3::INTEGER, 0),
+        CASE
+            WHEN t.is_coinbase
+                THEN coalesce($4::INTEGER, 0)
+            ELSE 0
+        END
+    )
+    AND (
+        $5::INTEGER IS NULL
         OR (
             CASE
                 WHEN t.block_height IS NULL THEN 0
@@ -38,21 +53,10 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) >= $3::INTEGER
+        ) <= $5::INTEGER
     )
     AND (
-        $4::INTEGER IS NULL
-        OR (
-            CASE
-                WHEN t.block_height IS NULL THEN 0
-                WHEN s.synced_height IS NULL THEN 0
-                WHEN t.block_height > s.synced_height THEN 0
-                ELSE s.synced_height - t.block_height + 1
-            END
-        ) <= $4::INTEGER
-    )
-    AND (
-        $5 = FALSE
+        $6 = FALSE
         OR NOT EXISTS (
             SELECT 1
             FROM utxo_leases AS l
@@ -62,27 +66,15 @@ WHERE
                 AND l.expires_at > (current_timestamp AT TIME ZONE 'UTC')
         )
     )
-    AND (
-        $6::INTEGER IS NULL
-        OR NOT t.is_coinbase
-        OR (
-            CASE
-                WHEN t.block_height IS NULL THEN 0
-                WHEN s.synced_height IS NULL THEN 0
-                WHEN t.block_height > s.synced_height THEN 0
-                ELSE s.synced_height - t.block_height + 1
-            END
-        ) >= $6::INTEGER
-    )
 `
 
 type BalanceParams struct {
 	WalletID         int64
 	AccountNumber    sql.NullInt64
 	MinConfirms      sql.NullInt32
+	CoinbaseMaturity sql.NullInt32
 	MaxConfirms      sql.NullInt32
 	ExcludeLeased    interface{}
-	CoinbaseMaturity sql.NullInt32
 }
 
 // Returns the total value represented by the wallet's current unspent UTXO set.
@@ -91,6 +83,9 @@ type BalanceParams struct {
 //   - Starts from wallet-scoped unspent outputs and rejoins transactions plus
 //     addresses -> accounts -> key_scopes so ownership validation and optional
 //     account filtering stay in one read.
+//   - Reuses one confirmation expression for the upper bound and a second shared
+//     expression for the combined lower bound (`min_confirms` plus optional
+//     coinbase maturity, which still applies when `min_confirms` is NULL).
 //   - Applies optional confirmation-range and coinbase-maturity policy directly
 //     inside the aggregate query so callers can request factual or policy-shaped
 //     balance reads through one public method.
@@ -100,14 +95,16 @@ type BalanceParams struct {
 // Performance:
 //   - Executes as one aggregate over wallet-scoped live outputs, with an
 //     anti-join against utxo_leases only when requested.
+//   - Consolidates the lower-bound confirmation logic so coinbase maturity and
+//     `min_confirms` share one threshold calculation.
 func (q *Queries) Balance(ctx context.Context, arg BalanceParams) (int64, error) {
 	row := q.queryRow(ctx, q.balanceStmt, Balance,
 		arg.WalletID,
 		arg.AccountNumber,
 		arg.MinConfirms,
+		arg.CoinbaseMaturity,
 		arg.MaxConfirms,
 		arg.ExcludeLeased,
-		arg.CoinbaseMaturity,
 	)
 	var balance int64
 	err := row.Scan(&balance)
@@ -456,6 +453,9 @@ WHERE
         $2::BIGINT IS NULL
         OR acc.account_number = $2::BIGINT
     )
+    -- NOTE: sqlc's SQLite codegen currently drops named params when this range
+    -- filter is rewritten as ` + "`" + `BETWEEN` + "`" + `, so we keep the duplicated CASE here to
+    -- preserve backend parity and stable generated APIs.
     AND (
         CASE
             WHEN t.block_height IS NULL THEN 0
@@ -463,7 +463,7 @@ WHERE
             WHEN t.block_height > s.synced_height THEN 0
             ELSE s.synced_height - t.block_height + 1
         END
-    ) >= $3
+    ) >= coalesce($3::INTEGER, 0)
     AND (
         CASE
             WHEN t.block_height IS NULL THEN 0
@@ -471,7 +471,10 @@ WHERE
             WHEN t.block_height > s.synced_height THEN 0
             ELSE s.synced_height - t.block_height + 1
         END
-    ) <= $4
+    ) <= coalesce(
+        $4::INTEGER,
+        2147483647
+    )
 ORDER BY u.amount, t.tx_hash, u.output_index
 `
 
@@ -497,6 +500,8 @@ type ListUtxosRow struct {
 // How:
 //   - Starts from utxos and joins transactions for tx metadata plus
 //     wallet_sync_states for confirmation math.
+//   - Applies optional confirmation bounds; nil min/max parameters mean "no
+//     lower bound" or "no upper bound".
 //   - Rejoins addresses -> accounts -> key_scopes so account filtering and wallet
 //     ownership checks happen in the same read.
 //   - Returns leased outputs too because the API models leases separately from
@@ -510,6 +515,8 @@ type ListUtxosRow struct {
 //   - Restricts first by wallet, spend state, and transaction status.
 //   - Uses the address/account/scope joins to keep ownership validation and
 //     account filtering in one pass.
+//   - Keeps the duplicated confirmation CASE local to this query so the optional
+//     lower/upper bounds remain explicit in the generated parameter struct.
 func (q *Queries) ListUtxos(ctx context.Context, arg ListUtxosParams) ([]ListUtxosRow, error) {
 	rows, err := q.query(ctx, q.listUtxosStmt, ListUtxos,
 		arg.WalletID,

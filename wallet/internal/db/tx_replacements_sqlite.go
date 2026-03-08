@@ -11,9 +11,11 @@ import (
 	sqlcsqlite "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/sqlite"
 )
 
-// ApplyTxReplacement records directed replacement edges, marks each direct
-// victim as replaced, recursively fails descendants, and reclaims the winner's
-// spent-input edges inside one SQL transaction.
+// ApplyTxReplacement records directed replacement edges for one live
+// unconfirmed winner, marks each direct victim as replaced, recursively fails
+// descendants, and reclaims the winner's spent-input edges inside one SQL
+// transaction. Every supplied victim must directly conflict with the winner
+// on a wallet-owned input.
 func (s *SqliteStore) ApplyTxReplacement(ctx context.Context,
 	params ApplyTxReplacementParams) error {
 
@@ -41,7 +43,9 @@ func (s *SqliteStore) ApplyTxReplacement(ctx context.Context,
 
 // ApplyTxFailure marks each direct loser as failed, recursively fails
 // descendants, and reclaims the winner's spent-input edges inside one SQL
-// transaction.
+// transaction. This is the direct-conflict path for winners that are confirmed
+// or otherwise not eligible for mempool replacement semantics. Every supplied
+// loser must directly conflict with the winner on a wallet-owned input.
 func (s *SqliteStore) ApplyTxFailure(ctx context.Context,
 	params ApplyTxFailureParams) error {
 
@@ -93,7 +97,9 @@ func (s *SqliteStore) OrphanTxChain(ctx context.Context,
 }
 
 // ReconfirmOrphanedCoinbase restores one orphaned coinbase transaction to a new
-// confirming block inside one SQL transaction.
+// confirming block inside one SQL transaction. This is intentionally a
+// root-only transition: coinbase spends require maturity, so the supported
+// reconfirmation path assumes no descendant branch needs replay.
 func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	params ReconfirmOrphanedCoinbaseParams) error {
 
@@ -140,6 +146,8 @@ func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 
 // buildTxChainHooksSqlite binds the shared replacement helpers to the sqlite
 // query set active for the surrounding SQL transaction.
+//
+
 func buildTxChainHooksSqlite(qtx *sqlcsqlite.Queries,
 	walletID uint32) txChainHooks {
 
@@ -167,9 +175,16 @@ func buildTxChainHooksSqlite(qtx *sqlcsqlite.Queries,
 				ctx, qtx, walletID, replacedTxID, replacementTxID,
 			)
 		},
+		func(ctx context.Context, txid chainhash.Hash) ([]txChainMeta, error) {
+			return listDirectConflictRootsByTxidSqlite(
+				ctx, qtx, walletID, txid,
+			)
+		},
 	)
 }
 
+// loadTxChainMetasSqlite resolves one metadata row per requested transaction
+// hash for the shared invalidation flows.
 func loadTxChainMetasSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	walletID uint32, txids []chainhash.Hash) ([]txChainMeta, error) {
 
@@ -186,6 +201,8 @@ func loadTxChainMetasSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return metas, nil
 }
 
+// loadTxChainMetaSqlite loads the wallet-scoped metadata needed to validate one
+// transaction's replacement or orphaning state.
 func loadTxChainMetaSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	walletID uint32, txid chainhash.Hash) (txChainMeta, error) {
 
@@ -218,6 +235,8 @@ func loadTxChainMetaSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	}, nil
 }
 
+// listChildTxIDsSqlite returns the direct spender transaction IDs for outputs
+// created by the provided parent row.
 func listChildTxIDsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	walletID uint32, parentID int64) ([]int64, error) {
 
@@ -244,6 +263,8 @@ func listChildTxIDsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return childIDs, nil
 }
 
+// clearSpentByTxIDSqlite releases every wallet-owned spent-input edge currently
+// claimed by the provided transaction row.
 func clearSpentByTxIDSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	walletID uint32, txID int64) error {
 
@@ -261,6 +282,8 @@ func clearSpentByTxIDSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return nil
 }
 
+// updateTxStatusSqlite applies one wallet-scoped status update batch for the
+// shared invalidation flows.
 func updateTxStatusSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	walletID uint32, status TxStatus, txIDs []int64) error {
 
@@ -282,6 +305,8 @@ func updateTxStatusSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return nil
 }
 
+// recordReplacementEdgeSqlite inserts one victim-to-winner audit edge for a
+// direct replacement relationship.
 func recordReplacementEdgeSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	walletID uint32, replacedTxID int64, replacementTxID int64) error {
 
@@ -300,6 +325,8 @@ func recordReplacementEdgeSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return nil
 }
 
+// reclaimInputsByTxidSqlite replays the winner's wallet-owned spent-input edges
+// and verifies that reclamation completed before commit.
 func reclaimInputsByTxidSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	walletID uint32, txid chainhash.Hash, txID int64) error {
 
@@ -339,6 +366,127 @@ func reclaimInputsByTxidSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return nil
 }
 
+// listDirectConflictRootsByTxidSqlite loads the winner transaction and derives
+// the complete live direct loser set for its wallet-owned inputs.
+func listDirectConflictRootsByTxidSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries, walletID uint32,
+	txid chainhash.Hash) ([]txChainMeta, error) {
+
+	row, err := qtx.GetTransactionByHash(
+		ctx, sqlcsqlite.GetTransactionByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   txid[:],
+		},
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("transaction %s: %w", txid, ErrTxNotFound)
+		}
+
+		return nil, fmt.Errorf("get transaction for root validation: %w", err)
+	}
+
+	tx, err := deserializeMsgTx(row.RawTx)
+	if err != nil {
+		return nil, err
+	}
+
+	return listDirectConflictRootsSqlite(ctx, qtx, walletID, row.ID, tx)
+}
+
+// listDirectConflictRootsSqlite scans live unconfirmed wallet transactions and
+// returns those that directly conflict with the winner on wallet-owned inputs.
+//
+//nolint:dupl // Backend-specific sqlc row types differ.
+func listDirectConflictRootsSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries, walletID uint32, winnerID int64,
+	tx *wire.MsgTx) ([]txChainMeta, error) {
+
+	walletOwnedInputs, err := listWalletOwnedInputsSqlite(
+		ctx, qtx, walletID, tx,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(walletOwnedInputs) == 0 {
+		return nil, nil
+	}
+
+	rows, err := qtx.ListUnminedTransactions(ctx, int64(walletID))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"list unmined transactions for root validation: %w", err,
+		)
+	}
+
+	roots := make([]txChainMeta, 0, len(rows))
+
+	for _, row := range rows {
+		if row.ID == winnerID {
+			continue
+		}
+
+		meta, ok, err := buildDirectConflictMeta(
+			row.ID, row.TxHash, row.Status, row.BlockHeight.Valid,
+			row.IsCoinbase,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if !ok {
+			continue
+		}
+
+		candidateTx, err := deserializeMsgTx(row.RawTx)
+		if err != nil {
+			return nil, err
+		}
+
+		if !txSpendsAnyOutpoint(candidateTx, walletOwnedInputs) {
+			continue
+		}
+
+		roots = append(roots, meta)
+	}
+
+	return roots, nil
+}
+
+// listWalletOwnedInputsSqlite filters the winner's inputs down to wallet-owned
+// outpoints, which define the eligible direct-conflict surface.
+func listWalletOwnedInputsSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries, walletID uint32,
+	tx *wire.MsgTx) (map[wire.OutPoint]struct{}, error) {
+
+	walletOwnedInputs := make(map[wire.OutPoint]struct{}, len(tx.TxIn))
+
+	for inputIndex, txIn := range tx.TxIn {
+		_, err := qtx.GetUtxoSpenderByOutpoint(
+			ctx, sqlcsqlite.GetUtxoSpenderByOutpointParams{
+				WalletID:    int64(walletID),
+				TxHash:      txIn.PreviousOutPoint.Hash[:],
+				OutputIndex: int64(txIn.PreviousOutPoint.Index),
+			},
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+
+			return nil, fmt.Errorf("check wallet-owned input %d: %w",
+				inputIndex, err)
+		}
+
+		walletOwnedInputs[txIn.PreviousOutPoint] = struct{}{}
+	}
+
+	return walletOwnedInputs, nil
+}
+
+// ensureWalletOwnedInputsReclaimedSqlite verifies that every wallet-owned input
+// of the winner now points back to the winner row before commit.
 func ensureWalletOwnedInputsReclaimedSqlite(ctx context.Context,
 	qtx *sqlcsqlite.Queries, walletID uint32, tx *wire.MsgTx,
 	txID int64) error {

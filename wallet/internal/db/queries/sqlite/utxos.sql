@@ -130,6 +130,8 @@ WHERE
 -- How:
 -- - Starts from utxos and joins transactions for tx metadata plus
 --   wallet_sync_states for confirmation math.
+-- - Applies optional confirmation bounds; nil min/max parameters mean "no
+--   lower bound" or "no upper bound".
 -- - Rejoins addresses -> accounts -> key_scopes so account filtering and wallet
 --   ownership checks happen in the same read.
 -- - Returns leased outputs too because the API models leases separately from
@@ -142,6 +144,8 @@ WHERE
 -- - Restricts first by wallet, spend state, and transaction status.
 -- - Uses the address/account/scope joins to keep ownership validation and
 --   account filtering in one pass.
+-- - Keeps the duplicated confirmation CASE local to this query so the optional
+--   lower/upper bounds remain explicit in the generated parameter struct.
 SELECT
     t.tx_hash,
     u.output_index,
@@ -166,6 +170,9 @@ WHERE
         sqlc.narg('account_number') IS NULL
         OR acc.account_number = sqlc.narg('account_number')
     )
+    -- NOTE: sqlc's SQLite codegen currently drops named params when this range
+    -- filter is rewritten as `BETWEEN`, so we keep the duplicated CASE here to
+    -- preserve backend parity and stable generated APIs.
     AND (
         CASE
             WHEN t.block_height IS NULL THEN 0
@@ -173,7 +180,7 @@ WHERE
             WHEN t.block_height > s.synced_height THEN 0
             ELSE s.synced_height - t.block_height + 1
         END
-    ) >= sqlc.arg('min_confirms')
+    ) >= coalesce(sqlc.narg('min_confirms'), 0)
     AND (
         CASE
             WHEN t.block_height IS NULL THEN 0
@@ -181,7 +188,7 @@ WHERE
             WHEN t.block_height > s.synced_height THEN 0
             ELSE s.synced_height - t.block_height + 1
         END
-    ) <= sqlc.arg('max_confirms')
+    ) <= coalesce(sqlc.narg('max_confirms'), 2147483647)
 ORDER BY u.amount, t.tx_hash, u.output_index;
 
 -- name: Balance :one
@@ -191,6 +198,9 @@ ORDER BY u.amount, t.tx_hash, u.output_index;
 -- - Starts from wallet-scoped unspent outputs and rejoins transactions plus
 --   addresses -> accounts -> key_scopes so ownership validation and optional
 --   account filtering stay in one read.
+-- - Reuses one confirmation expression for the upper bound and a second shared
+--   expression for the combined lower bound (`min_confirms` plus optional
+--   coinbase maturity, which still applies when `min_confirms` is NULL).
 -- - Applies optional confirmation-range and coinbase-maturity policy directly
 --   inside the aggregate query so callers can request factual or policy-shaped
 --   balance reads through one public method.
@@ -199,6 +209,8 @@ ORDER BY u.amount, t.tx_hash, u.output_index;
 -- Performance:
 -- - Executes as one aggregate over wallet-scoped live outputs, with an
 --   anti-join against utxo_leases only when requested.
+-- - Consolidates the lower-bound confirmation logic so coinbase maturity and
+--   `min_confirms` share one threshold calculation.
 SELECT cast(coalesce(sum(u.amount), 0) AS INTEGER) AS balance
 FROM utxos AS u
 INNER JOIN transactions AS t
@@ -217,15 +229,18 @@ WHERE
         OR acc.account_number = sqlc.narg('account_number')
     )
     AND (
-        sqlc.narg('min_confirms') IS NULL
-        OR (
-            CASE
-                WHEN t.block_height IS NULL THEN 0
-                WHEN s.synced_height IS NULL THEN 0
-                WHEN t.block_height > s.synced_height THEN 0
-                ELSE s.synced_height - t.block_height + 1
-            END
-        ) >= sqlc.narg('min_confirms')
+        CASE
+            WHEN t.block_height IS NULL THEN 0
+            WHEN s.synced_height IS NULL THEN 0
+            WHEN t.block_height > s.synced_height THEN 0
+            ELSE s.synced_height - t.block_height + 1
+        END
+    ) >= max(
+        coalesce(sqlc.narg('min_confirms'), 0),
+        CASE
+            WHEN t.is_coinbase THEN coalesce(sqlc.narg('coinbase_maturity'), 0)
+            ELSE 0
+        END
     )
     AND (
         sqlc.narg('max_confirms') IS NULL
@@ -248,18 +263,6 @@ WHERE
                 AND l.utxo_id = u.id
                 AND l.expires_at > current_timestamp
         )
-    )
-    AND (
-        sqlc.narg('coinbase_maturity') IS NULL
-        OR NOT t.is_coinbase
-        OR (
-            CASE
-                WHEN t.block_height IS NULL THEN 0
-                WHEN s.synced_height IS NULL THEN 0
-                WHEN t.block_height > s.synced_height THEN 0
-                ELSE s.synced_height - t.block_height + 1
-            END
-        ) >= sqlc.narg('coinbase_maturity')
     );
 
 -- name: ListSpendingTxIDsByParentTxID :many

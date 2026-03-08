@@ -14,8 +14,11 @@ import (
 // Ensure SqliteStore satisfies the TxStore interface.
 var _ TxStore = (*SqliteStore)(nil)
 
-// CreateTx atomically records a transaction row, its wallet-owned credits, and
-// any spend edges created by its inputs.
+// CreateTx atomically records one wallet-scoped transaction row together with
+// any wallet-owned credits and spent-input edges derived from the same payload.
+// The method normalizes the received timestamp to UTC before writing and keeps
+// the transaction row, created UTXOs, and input-spend claims in one SQL
+// transaction so readers never observe a partially-applied wallet view.
 func (s *SqliteStore) CreateTx(ctx context.Context,
 	params CreateTxParams) error {
 
@@ -77,8 +80,8 @@ func (s *SqliteStore) CreateTx(ctx context.Context,
 	})
 }
 
-// UpdateTx updates the user-visible transaction label for one wallet-scoped
-// transaction.
+// UpdateTx updates only the user-visible label for one wallet-scoped
+// transaction. It does not modify chain-assignment fields or validity state.
 func (s *SqliteStore) UpdateTx(ctx context.Context,
 	params UpdateTxParams) error {
 
@@ -100,7 +103,8 @@ func (s *SqliteStore) UpdateTx(ctx context.Context,
 	return nil
 }
 
-// GetTx retrieves a wallet-scoped transaction by hash.
+// GetTx retrieves one wallet-scoped transaction by hash and maps the stored row
+// into the public TxInfo contract, including optional block metadata.
 func (s *SqliteStore) GetTx(ctx context.Context,
 	query GetTxQuery) (*TxInfo, error) {
 
@@ -125,8 +129,10 @@ func (s *SqliteStore) GetTx(ctx context.Context,
 	)
 }
 
-// ListTxns lists wallet-scoped transactions using either the confirmed-range or
-// unmined-only read path.
+// ListTxns returns wallet-scoped transaction history using either the confirmed
+// height-range query or the blockless history query. The unmined path preserves
+// invalid history rows such as `failed`, `replaced`, and orphaned coinbase
+// transactions instead of collapsing history to the live mempool set.
 func (s *SqliteStore) ListTxns(ctx context.Context,
 	query ListTxnsQuery) ([]TxInfo, error) {
 
@@ -194,8 +200,10 @@ func (s *SqliteStore) ListTxns(ctx context.Context,
 	return infos, nil
 }
 
-// DeleteTx removes one live unconfirmed transaction and restores any wallet
-// UTXO rows that it had spent.
+// DeleteTx atomically removes one live unconfirmed leaf transaction after
+// verifying it has no wallet-scoped descendants. The surrounding SQL
+// transaction restores any wallet-owned inputs claimed by the deleted row
+// before pruning the row itself.
 func (s *SqliteStore) DeleteTx(ctx context.Context,
 	params DeleteTxParams) error {
 
@@ -276,9 +284,10 @@ func deleteUnminedTxByHashSqlite(ctx context.Context,
 	return rows, nil
 }
 
-// RollbackToBlock removes every block at or above the provided
-// height and rewrites wallet sync-state references so the block
-// delete can succeed.
+// RollbackToBlock atomically disconnects every block at or above the provided
+// height. It rewrites wallet sync-state references, snapshots coinbase roots
+// that will become orphaned, deletes the blocks, and then recursively fails any
+// descendant branch that depended on those roots before commit.
 func (s *SqliteStore) RollbackToBlock(ctx context.Context,
 	height uint32) error {
 
@@ -290,7 +299,14 @@ func (s *SqliteStore) RollbackToBlock(ctx context.Context,
 	}
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		_, err := qtx.ClampWalletSyncStateHeightsForRollback(
+		orphanRoots, err := listRollbackOrphanRootsSqlite(
+			ctx, qtx, int64(height),
+		)
+		if err != nil {
+			return err
+		}
+
+		_, err = qtx.ClampWalletSyncStateHeightsForRollback(
 			ctx, sqlcsqlite.ClampWalletSyncStateHeightsForRollbackParams{
 				RollbackHeight: rollbackArg,
 				NewHeight:      newHeight,
@@ -305,10 +321,53 @@ func (s *SqliteStore) RollbackToBlock(ctx context.Context,
 			return fmt.Errorf("delete blocks at or above height: %w", err)
 		}
 
+		err = applyRollbackOrphanInvalidation(
+			ctx, orphanRoots,
+			func(walletID uint32) txChainHooks {
+				return buildTxChainHooksSqlite(qtx, walletID)
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("apply rollback orphan invalidation: %w", err)
+		}
+
 		return nil
 	})
 }
 
+// listRollbackOrphanRootsSqlite resolves the confirmed coinbase rows that will
+// become orphan roots when rollback deletes the target block range.
+func listRollbackOrphanRootsSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries,
+	rollbackHeight int64) ([]rollbackOrphanRoot, error) {
+
+	rows, err := qtx.ListCoinbaseRollbackRootsAtOrAboveHeight(
+		ctx, sql.NullInt64{Int64: rollbackHeight, Valid: true},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list rollback orphan roots: %w", err)
+	}
+
+	roots := make([]rollbackOrphanRoot, 0, len(rows))
+	for _, row := range rows {
+		walletID, err := int64ToUint32(row.WalletID)
+		if err != nil {
+			return nil, fmt.Errorf("convert rollback orphan wallet id: %w",
+				err)
+		}
+
+		roots = append(roots, rollbackOrphanRoot{
+			WalletID: walletID,
+			TxID:     row.ID,
+		})
+	}
+
+	return roots, nil
+}
+
+// insertCreditsSqlite resolves each credited wallet output by script and
+// inserts the corresponding UTXO rows inside the surrounding CreateTx
+// transaction.
 func insertCreditsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	params CreateTxParams, txID int64) error {
 
@@ -331,10 +390,16 @@ func insertCreditsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 				err)
 		}
 
+		outputIndex, err := uint32ToInt32(credit.Index)
+		if err != nil {
+			return fmt.Errorf("convert credit index %d: %w", credit.Index,
+				err)
+		}
+
 		_, err = qtx.InsertUtxo(ctx, sqlcsqlite.InsertUtxoParams{
 			WalletID:    int64(params.WalletID),
 			TxID:        txID,
-			OutputIndex: int64(credit.Index),
+			OutputIndex: int64(outputIndex),
 			Amount:      params.Tx.TxOut[credit.Index].Value,
 			AddressID:   addrRow.ID,
 		})
@@ -347,6 +412,8 @@ func insertCreditsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return nil
 }
 
+// markInputsSpentSqlite records the new spender on any wallet-owned inputs used
+// by the transaction being inserted.
 func markInputsSpentSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	params CreateTxParams, txID int64) error {
 
@@ -355,13 +422,24 @@ func markInputsSpentSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	}
 
 	for inputIndex, txIn := range params.Tx.TxIn {
-		_, err := qtx.MarkUtxoSpent(ctx, sqlcsqlite.MarkUtxoSpentParams{
+		outputIndex, err := uint32ToInt32(txIn.PreviousOutPoint.Index)
+		if err != nil {
+			return fmt.Errorf("convert input outpoint index %d: %w",
+				inputIndex, err)
+		}
+
+		spentInputIndex, err := intToInt32(inputIndex)
+		if err != nil {
+			return fmt.Errorf("convert input index %d: %w", inputIndex, err)
+		}
+
+		_, err = qtx.MarkUtxoSpent(ctx, sqlcsqlite.MarkUtxoSpentParams{
 			WalletID:    int64(params.WalletID),
 			TxHash:      txIn.PreviousOutPoint.Hash[:],
-			OutputIndex: int64(txIn.PreviousOutPoint.Index),
+			OutputIndex: int64(outputIndex),
 			SpentByTxID: sql.NullInt64{Int64: txID, Valid: true},
 			SpentInputIndex: sql.NullInt64{
-				Int64: int64(inputIndex),
+				Int64: int64(spentInputIndex),
 				Valid: true,
 			},
 		})
@@ -373,6 +451,8 @@ func markInputsSpentSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return nil
 }
 
+// txInfoFromSqliteRow maps one sqlite query row into the public TxInfo
+// contract, including optional block metadata.
 func txInfoFromSqliteRow(hash []byte, rawTx []byte, received time.Time,
 	blockHeight sql.NullInt64, blockHash []byte, blockTimestamp sql.NullInt64,
 	status string, label string) (*TxInfo, error) {
@@ -389,6 +469,8 @@ func txInfoFromSqliteRow(hash []byte, rawTx []byte, received time.Time,
 	)
 }
 
+// buildSqliteOptionalBlock converts nullable sqlite block columns into an
+// optional public Block and reports whether a confirmation block was present.
 func buildSqliteOptionalBlock(height sql.NullInt64, hash []byte,
 	timestamp sql.NullInt64) (*Block, bool, error) {
 
@@ -404,6 +486,8 @@ func buildSqliteOptionalBlock(height sql.NullInt64, hash []byte,
 	return block, true, nil
 }
 
+// buildSqliteConfirmedBlock converts required sqlite block columns into the
+// public Block shape used by confirmed-only read paths.
 func buildSqliteConfirmedBlock(height sql.NullInt64, hash []byte,
 	timestamp int64) (*Block, error) {
 

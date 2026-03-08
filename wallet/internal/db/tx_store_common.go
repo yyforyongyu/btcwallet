@@ -35,6 +35,12 @@ var (
 		"create tx cannot use orphaned status",
 	)
 
+	// errCreateTxTerminalStatus indicates that CreateTx attempted to insert an
+	// unmined transaction directly in a terminal invalid state.
+	errCreateTxTerminalStatus = errors.New(
+		"create tx cannot use terminal status",
+	)
+
 	// errInvalidTxStatus indicates that a status string does not map to a
 	// supported TxStatus value.
 	errInvalidTxStatus = errors.New("invalid transaction status")
@@ -158,6 +164,12 @@ func validateCreateTxStatus(status TxStatus, block *Block,
 
 	if status == TxStatusOrphaned {
 		return errCreateTxOrphanedStatus
+	}
+
+	if block == nil &&
+		status != TxStatusPending && status != TxStatusPublished {
+
+		return errCreateTxTerminalStatus
 	}
 
 	if isCoinbase && block == nil {

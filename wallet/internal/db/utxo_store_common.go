@@ -13,6 +13,17 @@ import (
 )
 
 var (
+	// errInvalidUtxoAmount indicates that a UTXO row contained a
+	// negative amount, which would violate wallet value invariants.
+	errInvalidUtxoAmount = errors.New("invalid utxo amount")
+
+	// errInvalidConfirmedUtxoHeight indicates that a confirmed
+	// UTXO row reused the public unmined-height sentinel instead
+	// of a real block height.
+	errInvalidConfirmedUtxoHeight = errors.New(
+		"invalid confirmed utxo height",
+	)
+
 	// errInvalidLockID indicates that a lease row contained bytes
 	// that cannot be represented as a fixed-size LockID.
 	errInvalidLockID = errors.New("invalid lock id length")
@@ -30,8 +41,16 @@ var (
 // utxoLeaseHooks bundles the backend-specific lease queries used by
 // the shared acquire and release flows.
 type utxoLeaseHooks struct {
+	// AcquireLease attempts to create or renew the requested lease and returns
+	// the resulting expiration time.
 	AcquireLease func(context.Context) (time.Time, error)
+
+	// LookupUtxoID checks whether the requested outpoint still exists as a
+	// wallet-owned UTXO when lease acquisition fails.
 	LookupUtxoID func(context.Context) (int64, error)
+
+	// ReleaseLease clears the active lease for the resolved UTXO row when the
+	// caller presents the correct lock ID.
 	ReleaseLease func(context.Context, int64) (int64, error)
 }
 
@@ -52,6 +71,11 @@ func buildUtxoInfo(hash []byte, outputIndex uint32, amount int64,
 	pkScript []byte, received time.Time, isCoinbase bool,
 	blockHeight *uint32) (*UtxoInfo, error) {
 
+	if amount < 0 {
+		return nil, fmt.Errorf("utxo amount %d: %w", amount,
+			errInvalidUtxoAmount)
+	}
+
 	outPoint, err := buildOutPoint(hash, outputIndex)
 	if err != nil {
 		return nil, err
@@ -59,6 +83,11 @@ func buildUtxoInfo(hash []byte, outputIndex uint32, amount int64,
 
 	height := UnminedHeight
 	if blockHeight != nil {
+		if *blockHeight == UnminedHeight {
+			return nil, fmt.Errorf("utxo confirmed height %d: %w",
+				*blockHeight, errInvalidConfirmedUtxoHeight)
+		}
+
 		height = *blockHeight
 	}
 

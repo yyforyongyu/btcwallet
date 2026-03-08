@@ -11,8 +11,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSerializeDeserializeMsgTx verifies that the common serialization helpers
-// preserve transaction bytes across a round trip.
+// TestSerializeDeserializeMsgTx verifies the common transaction serialization
+// helpers.
+//
+// Scenario:
+// - One regular transaction is serialized and then decoded again.
+// Setup:
+// - Build one representative regular transaction fixture.
+// Action:
+// - Serialize the transaction and deserialize the resulting bytes.
+// Assertions:
+// - The decoded transaction re-serializes to the exact original bytes.
 func TestSerializeDeserializeMsgTx(t *testing.T) {
 	t.Parallel()
 
@@ -32,8 +41,17 @@ func TestSerializeDeserializeMsgTx(t *testing.T) {
 	require.Equal(t, rawTx, got.Bytes())
 }
 
-// TestParseTxStatus verifies that stored string values map back to the public
-// TxStatus enum and that unknown values fail loudly.
+// TestParseTxStatus verifies the shared stored-status parser.
+//
+// Scenario:
+// - The database returns both valid and invalid status strings.
+// Setup:
+// - Define one table-driven set of stored status values and expectations.
+// Action:
+// - Parse each stored string through the shared helper.
+// Assertions:
+// - Known values map to the public TxStatus enum.
+// - Unknown values fail with errInvalidTxStatus.
 func TestParseTxStatus(t *testing.T) {
 	t.Parallel()
 
@@ -67,8 +85,17 @@ func TestParseTxStatus(t *testing.T) {
 	}
 }
 
-// TestValidateCreateTxParams verifies the shared CreateTx invariants that both
-// SQL backends rely on before opening a write transaction.
+// TestValidateCreateTxParams verifies the shared CreateTx preflight checks.
+//
+// Scenario:
+// - Callers submit valid and invalid transaction-create requests.
+// Setup:
+// - Define one table-driven set of parameter combinations and expected errors.
+// Action:
+// - Validate each parameter set before any backend transaction opens.
+// Assertions:
+// - Invalid combinations fail with the expected sentinel error.
+// - Supported pending and confirmed requests are accepted.
 func TestValidateCreateTxParams(t *testing.T) {
 	t.Parallel()
 
@@ -108,6 +135,22 @@ func TestValidateCreateTxParams(t *testing.T) {
 				Status: TxStatusOrphaned,
 			},
 			wantErr: errCreateTxOrphanedStatus,
+		},
+		{
+			name: "failed status rejected on create",
+			params: CreateTxParams{
+				Tx:     testRegularMsgTx(),
+				Status: TxStatusFailed,
+			},
+			wantErr: errCreateTxTerminalStatus,
+		},
+		{
+			name: "replaced status rejected on create",
+			params: CreateTxParams{
+				Tx:     testRegularMsgTx(),
+				Status: TxStatusReplaced,
+			},
+			wantErr: errCreateTxTerminalStatus,
 		},
 		{
 			name: "credit index out of range",
@@ -170,8 +213,17 @@ func TestValidateCreateTxParams(t *testing.T) {
 	}
 }
 
-// TestBuildTxInfo verifies the shared row-to-domain conversion used by both
-// SQL backends when returning TxInfo values.
+// TestBuildTxInfo verifies the shared row-to-domain mapper for TxInfo values.
+//
+// Scenario:
+// - One normalized SQL row is converted into the public TxInfo shape.
+// Setup:
+// - Build serialized transaction bytes plus one confirmed block fixture.
+// Action:
+// - Convert valid and invalid input rows with buildTxInfo.
+// Assertions:
+// - Valid rows preserve hashes, labels, block data, and UTC timestamps.
+// - Invalid hashes and unknown statuses fail loudly.
 func TestBuildTxInfo(t *testing.T) {
 	t.Parallel()
 
@@ -206,6 +258,8 @@ func TestBuildTxInfo(t *testing.T) {
 	require.ErrorIs(t, err, errInvalidTxStatus)
 }
 
+// testRegularMsgTx builds one regular transaction fixture for shared mapper and
+// serialization tests.
 func testRegularMsgTx() *wire.MsgTx {
 	tx := wire.NewMsgTx(wire.TxVersion)
 
@@ -223,6 +277,8 @@ func testRegularMsgTx() *wire.MsgTx {
 	return tx
 }
 
+// testCoinbaseMsgTx builds one minimal coinbase fixture transaction for shared
+// mapper and serialization tests.
 func testCoinbaseMsgTx() *wire.MsgTx {
 	tx := wire.NewMsgTx(wire.TxVersion)
 
