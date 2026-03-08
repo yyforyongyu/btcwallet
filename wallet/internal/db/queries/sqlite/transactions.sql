@@ -70,15 +70,15 @@ WHERE t.wallet_id = ? AND t.tx_hash = ?;
 -- Lists all unconfirmed transactions for a wallet.
 --
 -- How:
--- - Reads from transactions only and filters on blockless rows that are still
---   in a live unconfirmed state (`pending` or `published`).
--- - Excludes orphaned/replaced/failed history so rollback-produced coinbase
---   rows do not reappear as mempool transactions.
--- - Returns NULL block metadata explicitly because live unmined rows have no
+-- - Reads from transactions only and returns every blockless row, including
+--   invalid history states such as `failed`, `replaced`, and `orphaned`.
+-- - Leaves it to higher layers to decide whether they want the full blockless
+--   history view or only the live mempool subset.
+-- - Returns NULL block metadata explicitly because unmined rows have no
 --   block.
 -- Performance:
--- - Matches the partial unconfirmed index and orders by received time for the
---   common "latest mempool activity" read path.
+-- - Matches the partial unconfirmed index and orders by received time for a
+--   wallet-scoped blockless-history read.
 SELECT
     t.id,
     t.tx_hash,
@@ -91,11 +91,11 @@ SELECT
     t.status,
     t.label
 FROM transactions AS t
+-- The always-false join projects typed NULL block columns for SQLite.
 LEFT JOIN blocks AS b ON 1 = 0
 WHERE
     t.wallet_id = ?
     AND t.block_height IS NULL
-    AND t.status IN ('pending', 'published')
 ORDER BY t.received_time DESC, t.id DESC;
 
 -- name: ListTransactionsByHeightRange :many
@@ -158,6 +158,27 @@ WHERE
     wallet_id = sqlc.arg('wallet_id')
     AND id IN (sqlc.slice('tx_ids'));
 
+-- name: ReconfirmOrphanedCoinbaseByHash :execrows
+-- Restores one orphaned coinbase transaction to the best chain.
+--
+-- How:
+-- - Updates `block_height` and `status` in the same statement so coinbase rows
+--   never pass through an invalid unconfirmed state.
+-- - Restricts the update to rows that are already orphaned coinbase
+--   transactions within the requested wallet.
+-- Performance:
+-- - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+UPDATE transactions
+SET
+    block_height = ?1,
+    status = 'published'
+WHERE
+    wallet_id = ?2
+    AND tx_hash = ?3
+    AND is_coinbase
+    AND block_height IS NULL
+    AND status = 'orphaned';
+
 -- name: DeleteUnminedTransactionByHash :execrows
 -- Deletes an unconfirmed transaction row.
 --
@@ -214,13 +235,36 @@ WHERE
         AND birthday_height >= sqlc.arg('rollback_height')
     );
 
+-- name: ListCoinbaseRollbackRootsAtOrAboveHeight :many
+-- Lists the coinbase transaction rows that will become orphan roots during
+-- rollback.
+--
+-- How:
+-- - Reads only wallet scope and row identity for confirmed coinbase
+--   transactions at or above the rollback height.
+-- - Lets RollbackToBlock collect the orphan roots before block deletion and
+--   then run descendant invalidation in the same SQL transaction.
+-- Performance:
+-- - Rare rollback helper. The scan is bounded by the rollback height and only
+--   returns lightweight row identifiers.
+SELECT
+    wallet_id,
+    id
+FROM transactions
+WHERE
+    is_coinbase
+    AND block_height >= ?
+ORDER BY wallet_id, id;
+
 -- name: DeleteBlocksAtOrAboveHeight :execrows
 -- Deletes blocks at and after the provided height.
 --
 -- How:
 -- - Deletes directly from blocks by the natural height key.
 -- - Relies on FK/trigger side effects to null transaction block references and
---   orphan coinbase rows.
+--   orphan coinbase roots.
+-- - Expects RollbackToBlock to collect those roots before the delete and then
+--   recursively fail descendants in the same transaction.
 -- Performance:
 -- - Executes as a range delete over the block-height primary key.
 DELETE FROM blocks

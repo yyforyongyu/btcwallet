@@ -41,6 +41,9 @@ type Querier interface {
 	// - Starts from wallet-scoped unspent outputs and rejoins transactions plus
 	//   addresses -> accounts -> key_scopes so ownership validation and optional
 	//   account filtering stay in one read.
+	// - Reuses one confirmation expression for the upper bound and a second shared
+	//   expression for the combined lower bound (`min_confirms` plus optional
+	//   coinbase maturity, which still applies when `min_confirms` is NULL).
 	// - Applies optional confirmation-range and coinbase-maturity policy directly
 	//   inside the aggregate query so callers can request factual or policy-shaped
 	//   balance reads through one public method.
@@ -49,6 +52,8 @@ type Querier interface {
 	// Performance:
 	// - Executes as one aggregate over wallet-scoped live outputs, with an
 	//   anti-join against utxo_leases only when requested.
+	// - Consolidates the lower-bound confirmation logic so coinbase maturity and
+	//   `min_confirms` share one threshold calculation.
 	Balance(ctx context.Context, arg BalanceParams) (int64, error)
 	// Rewrites wallet sync-state heights so they stop referencing blocks that are
 	// about to be deleted during RollbackToBlock.
@@ -98,7 +103,9 @@ type Querier interface {
 	// How:
 	// - Deletes directly from blocks by the natural height key.
 	// - Relies on FK/trigger side effects to null transaction block references and
-	//   orphan coinbase rows.
+	//   orphan coinbase roots.
+	// - Expects RollbackToBlock to collect those roots before the delete and then
+	//   recursively fail descendants in the same transaction.
 	// Performance:
 	// - Executes as a range delete over the block-height primary key.
 	DeleteBlocksAtOrAboveHeight(ctx context.Context, blockHeight int32) (int64, error)
@@ -217,6 +224,20 @@ type Querier interface {
 	// - Uses the wallet-scoped transaction hash lookup first, then narrows to the
 	//   unique `(wallet_id, tx_id, output_index)` outpoint.
 	GetUtxoIDByOutpoint(ctx context.Context, arg GetUtxoIDByOutpointParams) (int64, error)
+	// Retrieves the current spender for a wallet-owned outpoint, if any.
+	//
+	// How:
+	// - Resolves the outpoint through transactions so callers can address a UTXO by
+	//   tx hash plus output index instead of the internal row ID.
+	// - Rejoins addresses -> accounts -> key_scopes so the lookup only reports
+	//   outputs that still belong to the requested wallet.
+	// - Keeps the parent transaction in a live state (`pending` or `published`) so
+	//   callers only verify claims on outputs that remain part of the live wallet
+	//   graph.
+	// Performance:
+	// - Uses the wallet-scoped tx hash lookup and unique outpoint constraint to
+	//   bound the read to at most one credited output.
+	GetUtxoSpenderByOutpoint(ctx context.Context, arg GetUtxoSpenderByOutpointParams) (sql.NullInt64, error)
 	GetWalletByID(ctx context.Context, id int64) (GetWalletByIDRow, error)
 	GetWalletByName(ctx context.Context, walletName string) (GetWalletByNameRow, error)
 	GetWalletSecrets(ctx context.Context, walletID int64) (WalletSecret, error)
@@ -305,6 +326,18 @@ type Querier interface {
 	// (purpose/coin_type), and account name. Returns all address columns for
 	// filtering and processing by the application.
 	ListAddressesByAccount(ctx context.Context, arg ListAddressesByAccountParams) ([]ListAddressesByAccountRow, error)
+	// Lists the coinbase transaction rows that will become orphan roots during
+	// rollback.
+	//
+	// How:
+	// - Reads only wallet scope and row identity for confirmed coinbase
+	//   transactions at or above the rollback height.
+	// - Lets RollbackToBlock collect the orphan roots before block deletion and
+	//   then run descendant invalidation in the same SQL transaction.
+	// Performance:
+	// - Rare rollback helper. The scan is bounded by the rollback height and only
+	//   returns lightweight row identifiers.
+	ListCoinbaseRollbackRootsAtOrAboveHeight(ctx context.Context, blockHeight sql.NullInt32) ([]ListCoinbaseRollbackRootsAtOrAboveHeightRow, error)
 	// Lists all key scopes for a wallet, ordered by ID.
 	ListKeyScopesByWallet(ctx context.Context, walletID int64) ([]KeyScope, error)
 	// Lists victim txids for a given replacement txid.
@@ -371,21 +404,23 @@ type Querier interface {
 	// Lists all unconfirmed transactions for a wallet.
 	//
 	// How:
-	// - Reads from transactions only and filters on blockless rows that are still
-	//   in a live unconfirmed state (`pending` or `published`).
-	// - Excludes orphaned/replaced/failed history so rollback-produced coinbase
-	//   rows do not reappear as mempool transactions.
-	// - Returns NULL block metadata explicitly because live unmined rows have no
+	// - Reads from transactions only and returns every blockless row, including
+	//   invalid history states such as `failed`, `replaced`, and `orphaned`.
+	// - Leaves it to higher layers to decide whether they want the full blockless
+	//   history view or only the live mempool subset.
+	// - Returns NULL block metadata explicitly because unmined rows have no
 	//   block.
 	// Performance:
-	// - Matches the partial unconfirmed index and orders by received time for the
-	//   common "latest mempool activity" read path.
+	// - Matches the partial unconfirmed index and orders by received time for a
+	//   wallet-scoped blockless-history read.
 	ListUnminedTransactions(ctx context.Context, walletID int64) ([]ListUnminedTransactionsRow, error)
 	// Lists unspent UTXOs that match the provided filters.
 	//
 	// How:
 	// - Starts from utxos and joins transactions for tx metadata plus
 	//   wallet_sync_states for confirmation math.
+	// - Applies optional confirmation bounds; nil min/max parameters mean "no
+	//   lower bound" or "no upper bound".
 	// - Rejoins addresses -> accounts -> key_scopes so account filtering and wallet
 	//   ownership checks happen in the same read.
 	// - Returns leased outputs too because the API models leases separately from
@@ -398,6 +433,8 @@ type Querier interface {
 	// - Restricts first by wallet, spend state, and transaction status.
 	// - Uses the address/account/scope joins to keep ownership validation and
 	//   account filtering in one pass.
+	// - Keeps the duplicated confirmation CASE local to this query so the optional
+	//   lower/upper bounds remain explicit in the generated parameter struct.
 	ListUtxos(ctx context.Context, arg ListUtxosParams) ([]ListUtxosRow, error)
 	ListWallets(ctx context.Context) ([]ListWalletsRow, error)
 	// Acquires a transaction-level advisory lock to serialize account creation within a scope.
@@ -436,6 +473,16 @@ type Querier interface {
 	// - Targets one outpoint in one wallet; the subquery uses the unique
 	//   wallet-scoped tx hash lookup.
 	MarkUtxoSpent(ctx context.Context, arg MarkUtxoSpentParams) (int64, error)
+	// Restores one orphaned coinbase transaction to the best chain.
+	//
+	// How:
+	// - Updates `block_height` and `status` in the same statement so coinbase rows
+	//   never pass through an invalid unconfirmed state.
+	// - Restricts the update to rows that are already orphaned coinbase
+	//   transactions within the requested wallet.
+	// Performance:
+	// - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+	ReconfirmOrphanedCoinbaseByHash(ctx context.Context, arg ReconfirmOrphanedCoinbaseByHashParams) (int64, error)
 	// Releases a lease for a UTXO ID if the lock_id matches.
 	//
 	// How:

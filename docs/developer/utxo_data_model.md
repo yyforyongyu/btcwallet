@@ -17,10 +17,13 @@ Our data model distinguishes between data integrity and operational efficiency:
 
 ### 1.2 The "Immutable History" Policy
 
-We adhere to a strict **"Never Delete History"** policy.
+We adhere to a strict **"Never Delete History"** policy for mined and invalid
+history, with one narrow pruning exception for live unconfirmed leaf
+transactions.
 *   **Chain Data is Immutable:** Once a transaction is mined, it happened. We record it.
 *   **Intent is Immutable:** If a user attempts a transaction that later fails (e.g., RBF replaced), that attempt is part of the wallet's audit trail.
-*   **Soft Deletion:** We do not physically `DELETE` rows. Invalid or replaced transactions are marked with a status (`failed`, `replaced`) so they are ignored by balance calculations but preserved for history.
+*   **Soft Deletion:** Invalid or replaced transactions are marked with a status (`failed`, `replaced`) so they are ignored by balance calculations but preserved for history.
+*   **Explicit prune exception:** `DeleteTx` may hard-delete a wallet-scoped, blockless leaf transaction while it is still in a live unconfirmed state. This is an explicit caller-driven cleanup path, not the normal history lifecycle.
 
 ---
 
@@ -126,7 +129,7 @@ We distinguish between a transaction's **Validity** (Status) and its **Confirmat
 
 | Status | Meaning | Affects Balance? |
 | :--- | :--- | :--- |
-| `pending` | Created locally, not yet broadcast. | **No** (Locked) |
+| `pending` | Created locally, not yet broadcast. | **Yes** (Live, blockless wallet output) |
 | `published` | Active in mempool or blockchain. | **Yes** (If valid) |
 | `replaced` | Replaced by a higher-fee transaction (RBF). | **No** |
 | `failed` | Invalidated by a conflicting transaction (Double-Spend). | **No** |
@@ -134,7 +137,7 @@ We distinguish between a transaction's **Validity** (Status) and its **Confirmat
 
 *Additional invariant: Coinbase transactions cannot exist in the mempool. A coinbase transaction is either confirmed (`BlockHeight IS NOT NULL` and `Status='published'`) or orphaned (`Status='orphaned'` and `BlockHeight IS NULL`).*
 
-*Note: There is no "Abandoned" state. A broadcast transaction cannot be safely abandoned; it can only be invalidated by double-spending its inputs.*
+*Note: There is no "Abandoned" status. A broadcast transaction cannot be safely abandoned; it can only be invalidated by double-spending its inputs. If a caller wants to drop a live blockless leaf transaction entirely, it must use the explicit `DeleteTx` prune path rather than a status transition.*
 
 ---
 
@@ -179,7 +182,7 @@ A UTXO does not store its own status field. Its status is calculated dynamically
 | UTXO State | Parent Tx Status | `BlockHeight` | `SpentBy` Pointer | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
 | **Confirmed** | `published` | `NOT NULL` | `NULL` | Available, mature funds. |
-| **Unconfirmed** | `published` | `NULL` | `NULL` | Incoming funds, risk of RBF. |
+| **Unconfirmed** | `pending` / `published` | `NULL` | `NULL` | Live blockless funds; `published` may be network-visible, `pending` may still be local-only. |
 | **Immature** | `published` (Coinbase) | `NOT NULL` | `NULL` | Mined coins, must wait 100 blocks. |
 | **Spent** | `published` | `NOT NULL` | `NOT NULL` | History. We used this money. |
 | **Dead (Permanent)** | `failed` / `replaced` | *Any* | *Any* | Permanently invalid output from a failed attempt. |
@@ -215,9 +218,16 @@ Implementation note: The SQL `blocks` table models the current best chain. Durin
 
 Coinbase reconfirmation note: If an orphaned coinbase transaction re-enters the best chain, restoring it requires updating `BlockHeight` and `Status='published'` atomically (one SQL statement within a transaction) to satisfy coinbase invariants.
 
+Supported scope note: reconfirmation is modeled as a root-only transition. The
+wallet does not persist descendant restoration state for orphaned coinbase
+branches because valid coinbase spends require 100 confirmations. A descendant
+branch would therefore imply a reorg deeper than coinbase maturity, which is
+treated as out of scope for first-class SQL recovery.
+
 Reconfirmation semantics:
 *   The transaction keeps the same `tx_hash` and is associated with a new `block_height`.
 *   Outputs created by the transaction transition from `Dead (Recoverable)` back to `Immature` (and later become spendable after maturity).
+*   Descendant resurrection is not modeled; catastrophic deep-reorg recovery is expected to use broader rescan/rebuild flows.
 
 Deep reorg note: A deep reorg is handled as a batch of block disconnects. Implementations should treat this as a bounded, transactional operation (potentially chunked) rather than assuming a single-block example.
 
@@ -272,6 +282,10 @@ Suggested implementation strategy:
 3.  Find UTXOs created by those transactions.
 4.  For each such UTXO, find transactions that spend it and enqueue them.
 5.  Repeat until the queue is empty.
+
+Rollback consequence: when block disconnect turns coinbase rows into orphaned
+roots, the store should collect those roots before deleting the blocks and run
+the same descendant invalidation loop in the surrounding SQL transaction.
 
 This can be implemented with an application-side loop (portable across databases) or a database-side recursive CTE (PostgreSQL).
 

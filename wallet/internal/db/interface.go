@@ -90,17 +90,15 @@ var (
 // Until we break the wallet into independent components, we use this monolithic
 // Store abstraction as a transitional step.
 //
-// For this PR, Store only includes UTXOStore. Over time it is expected to grow
-// to include WalletStore, AccountStore, AddressStore, and TxStore as those
-// callers migrate to the new internal db interfaces.
+// Store currently includes the SQL-backed UTXO and transaction surfaces used by
+// the wallet. Over time it is expected to grow further to include WalletStore,
+// AccountStore, and AddressStore as those callers migrate to the new internal
+// db interfaces.
 //
 // TODO(yy): Break down wallet managers into independent components.
-//
-// TODO(yy): Remove the linter ignore once Store grows beyond UTXOStore.
-//
-//nolint:iface // Transitional alias until Store grows beyond UTXOStore.
 type Store interface {
 	UTXOStore
+	TxStore
 }
 
 // WalletStore defines the methods for wallet-level operations.
@@ -236,10 +234,11 @@ type AddressStore interface {
 type TxStore interface {
 	// CreateTx atomically records a transaction and its associated credits
 	// in the database. This is a single atomic operation that also handles
-	// the corresponding UTXO state changes: it will delete any UTXOs spent
-	// by the new transaction's inputs and create new UTXOs for any of its
-	// outputs that are spendable by the wallet. This ensures that the
-	// transaction record and the UTXO set are always consistent.
+	// the corresponding UTXO state changes: it marks any existing wallet-owned
+	// outputs referenced by the new transaction's inputs as spent by this
+	// transaction and creates new UTXOs for any of its outputs that are
+	// spendable by the wallet. This ensures that the transaction record and
+	// the UTXO set are always consistent.
 	//
 	// CreateTx is also responsible for recording transaction metadata
 	// required by higher-level wallet policy:
@@ -249,7 +248,9 @@ type TxStore interface {
 	//
 	// The create path does not infer whether an unmined transaction should
 	// start in TxStatusPending or TxStatusPublished; callers must provide
-	// that choice explicitly in CreateTxParams.
+	// that choice explicitly in CreateTxParams. Unmined inserts must start in
+	// one of those live states; terminal invalid states are reserved for later
+	// replacement, failure, or rollback flows.
 	CreateTx(ctx context.Context, params CreateTxParams) error
 
 	// UpdateTx updates an existing transaction record in the database. It
@@ -262,33 +263,36 @@ type TxStore interface {
 	// replacement handling.
 	UpdateTx(ctx context.Context, params UpdateTxParams) error
 
-	// GetTx retrieves a transaction record by its hash. It takes a context
-	// and GetTxQuery, returning a TxInfo struct or an error if the
-	// transaction is not found. Note that the `Credits` and `Debits` fields
-	// of the returned `TxInfo` are not stored directly in the transaction
-	// record; they are derived by querying the UTXO store and represent
-	// wallet-specific information about the transaction's impact on the
-	// UTXO set.
+	// GetTx retrieves a wallet-scoped transaction record by its hash and
+	// returns the persisted metadata represented by TxInfo. The response
+	// includes the serialized transaction, wallet-relative status, received
+	// timestamp, optional block assignment, and user label.
 	GetTx(ctx context.Context, query GetTxQuery) (*TxInfo, error)
 
-	// ListTxns returns a slice of transaction information based on the
-	// provided query parameters. It takes a context and ListTxnsQuery,
-	// returning a slice of TxInfo or an error if the retrieval fails.
+	// ListTxns returns wallet-scoped transaction history based on the
+	// provided query parameters. Confirmed reads are block-height bounded.
+	// Unmined reads return every blockless row, including invalid history
+	// such as `failed`, `replaced`, and orphaned coinbase transactions.
 	ListTxns(ctx context.Context, query ListTxnsQuery) ([]TxInfo, error)
 
 	// DeleteTx removes a live unconfirmed transaction from the store. It
 	// takes a context and DeleteTxParams, returning an error if the
 	// transaction is not found or the deletion fails.
 	//
-	// DeleteTx is intentionally narrower than "delete any blockless row".
+	// DeleteTx is intentionally narrower than "delete any blockless row". Only
+	// live unconfirmed leaf transactions are deletable.
 	// Orphaned, replaced, and failed transactions remain part of the wallet's
 	// historical view and must not be erased through the ordinary unconfirmed
 	// deletion path.
 	DeleteTx(ctx context.Context, params DeleteTxParams) error
 
 	// RollbackToBlock removes all blocks at and after a given height,
-	// moving any transactions within those blocks back to the unconfirmed
-	// pool. This operation is performed as a single, atomic database
+	// moving disconnected non-coinbase transactions back to blockless history.
+	// Rolled-back coinbase rows become TxStatusOrphaned blockless history, and
+	// any descendant branch that depends on those orphaned roots is recursively
+	// marked failed in the same rollback transaction instead of re-entering the
+	// live unconfirmed set. This operation is performed as a single, atomic
+	// database
 	// transaction to ensure data integrity. Breaking it into smaller,
 	// separate interface methods would risk leaving the database in an
 	// inconsistent state if an error occurred mid-process. The current
@@ -304,8 +308,6 @@ type TxStore interface {
 }
 
 // UTXOStore defines the database actions for managing the UTXO set.
-//
-//nolint:iface // Store is a transitional wrapper over UTXOStore.
 type UTXOStore interface {
 	// GetUtxo retrieves a single unspent transaction output (UTXO) by its
 	// outpoint. It returns a UtxoInfo struct containing the UTXO's details
@@ -316,9 +318,10 @@ type UTXOStore interface {
 	// UTXO set.
 	GetUtxo(ctx context.Context, query GetUtxoQuery) (*UtxoInfo, error)
 
-	// ListUTXOs returns a slice of all unspent transaction outputs (UTXOs)
-	// that match the provided query parameters. This can be used to list
-	// all UTXOs or filter them by account or confirmation status.
+	// ListUTXOs returns live wallet-owned UTXOs that match the provided
+	// query parameters. Nil confirmation bounds mean "no lower bound" or
+	// "no upper bound", which allows a zero-value query to list all live
+	// wallet-owned UTXOs.
 	//
 	// ListUTXOs includes outputs from live unconfirmed parent transactions.
 	// Spendability policy such as coinbase maturity, lease state, or whether
@@ -348,10 +351,13 @@ type UTXOStore interface {
 	// Balance returns the total value represented by the wallet's current
 	// unspent UTXO set after applying any optional caller-supplied filters.
 	//
-	// The zero-value BalanceParams request the wallet's live factual balance.
+	// The zero-value BalanceParams request the wallet's live factual balance,
+	// including blockless outputs owned by live `pending` or `published`
+	// transactions.
 	// Callers may narrow that view by account, confirmation range, lease
 	// exclusion, or coinbase maturity when they need a workflow-specific
-	// balance policy from the public store interface.
+	// balance policy from the public store interface. Coinbase maturity still
+	// applies when MinConfs is nil.
 	Balance(ctx context.Context, params BalanceParams) (
 		btcutil.Amount, error)
 }

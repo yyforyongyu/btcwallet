@@ -747,12 +747,20 @@ const (
 	// wallet still treats the transaction as live.
 	TxStatusPublished TxStatus = "published"
 
-	// TxStatusReplaced indicates a transaction that was invalidated by a
-	// competing transaction spending the same inputs via RBF.
+	// TxStatusReplaced indicates an unconfirmed transaction that was
+	// invalidated by a competing unconfirmed transaction spending the same
+	// inputs via RBF.
+	//
+	// Confirmed direct-conflict winners instead mark wallet transactions
+	// TxStatusFailed because the loser is no longer a mempool-replacement case.
 	TxStatusReplaced TxStatus = "replaced"
 
-	// TxStatusFailed indicates a transaction that was invalidated by a
-	// competing transaction spending the same inputs (double-spend).
+	// TxStatusFailed indicates a transaction that is no longer valid because an
+	// ancestor branch was invalidated.
+	//
+	// This includes direct double-spend losers as well as descendants of a
+	// replaced, failed, or orphaned ancestor that can no longer remain in the
+	// wallet's live history.
 	TxStatusFailed TxStatus = "failed"
 
 	// TxStatusOrphaned indicates a coinbase transaction that was reorged out of
@@ -821,8 +829,9 @@ type CreateTxParams struct {
 	// Callers must set this explicitly so unmined inserts do not have to
 	// guess between TxStatusPending and TxStatusPublished. When Block is
 	// non-nil, Status must be TxStatusPublished to satisfy the transaction
-	// state invariants. TxStatusOrphaned is reserved for coinbase rows and
-	// must not be used for ordinary transactions.
+	// state invariants. Unmined inserts may only start as `pending` or
+	// `published`. TxStatusOrphaned is reserved for coinbase rows and must
+	// not be used for ordinary CreateTx calls.
 	Status TxStatus
 
 	// Label is an optional label for the transaction.
@@ -881,14 +890,10 @@ type UpdateTxParams struct {
 	Label string
 }
 
-// GetTxQuery contains the parameters for querying a transaction. While a
-// transaction hash (TxHash) is globally unique on the blockchain, the WalletID
-// is necessary to retrieve wallet-specific metadata (e.g., labels, credits,
-// debits) associated with that transaction. In a multi-wallet database, the
-// same transaction might be relevant to multiple wallets, but its context
-// (e.g., whether it's a credit or debit, and any custom labels) will differ
-// for each wallet. The WalletID ensures the query returns the transaction's
-// details from the correct wallet's perspective.
+// GetTxQuery contains the parameters for querying one wallet-scoped
+// transaction. While a transaction hash is globally unique on the blockchain,
+// WalletID is still needed to load wallet-specific metadata such as labels and
+// wallet-relative status.
 type GetTxQuery struct {
 	// WalletID is the ID of the wallet to query.
 	//
@@ -915,8 +920,10 @@ type ListTxnsQuery struct {
 	EndHeight uint32
 
 	// UnminedOnly, if true, will return only unmined (unconfirmed)
-	// transactions. If this is set, StartHeight and EndHeight will be
-	// ignored.
+	// transactions. This includes invalid history rows whose
+	// `block_height` is NULL, such as `failed`, `replaced`, and orphaned
+	// coinbase transactions. If this is set, StartHeight and EndHeight
+	// will be ignored.
 	UnminedOnly bool
 }
 
@@ -972,7 +979,8 @@ type GetUtxoQuery struct {
 	OutPoint wire.OutPoint
 }
 
-// ListUtxosQuery holds the set of options for a ListUTXOs query.
+// ListUtxosQuery holds the set of options for a ListUTXOs query. A zero-value
+// query lists all live wallet-owned UTXOs.
 type ListUtxosQuery struct {
 	// WalletID is the ID of the wallet to query.
 	//
@@ -983,13 +991,15 @@ type ListUtxosQuery struct {
 	// Account is an optional BIP44 account-number filter.
 	Account *uint32
 
-	// MinConfs is the minimum number of confirmations for a UTXO to be
-	// included.
-	MinConfs int32
+	// MinConfs is an optional minimum confirmation bound.
+	//
+	// When nil, the query does not enforce a lower confirmation bound.
+	MinConfs *int32
 
-	// MaxConfs is the maximum number of confirmations for a UTXO to be
-	// included.
-	MaxConfs int32
+	// MaxConfs is an optional maximum confirmation bound.
+	//
+	// When nil, the query does not enforce an upper confirmation bound.
+	MaxConfs *int32
 }
 
 // LeaseOutputParams contains the parameters for leasing a UTXO.
@@ -1061,7 +1071,7 @@ type BalanceParams struct {
 
 	// CoinbaseMaturity optionally requires coinbase outputs to have at
 	// least this many confirmations before they count toward the returned
-	// balance.
+	// balance, even when MinConfs is nil.
 	// Non-coinbase outputs ignore this filter.
 	CoinbaseMaturity *int32
 }

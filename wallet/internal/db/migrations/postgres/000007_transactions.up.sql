@@ -115,6 +115,10 @@ ON transactions (wallet_id, received_time DESC);
 -- ON DELETE SET NULL action updates referencing transactions.block_height to
 -- NULL. For coinbase transactions, we must also rewrite status to 'orphaned'
 -- atomically to satisfy check_coinbase_confirmation_state.
+--
+-- NOTE: This trigger only rewrites the disconnected coinbase root. Rollback
+-- code must still collect those roots and recursively fail descendants in the
+-- surrounding SQL transaction.
 CREATE FUNCTION set_coinbase_orphaned_on_disconnect() RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.block_height IS NULL AND OLD.block_height IS NOT NULL

@@ -19,9 +19,10 @@ We will adopt a **UTXO-Centered, Soft-Deletion Schema**.
 ### 2.1 Core Principles
 1.  **UTXO-Centered Operations:** The schema is optimized for `Balance()` and `CoinSelection()` queries, which focus on the `utxos` table.
 2.  **Transaction-Centered Integrity:** Validity flows from Parent to Child. A UTXO is only valid if its parent Transaction is valid (`status='published'`) or is explicitly allowed for chaining (`status='pending'`).
-3.  **Immutable History (Soft Deletion):** We **NEVER** automatically `DELETE` rows.
+3.  **Immutable History (Soft Deletion):** We **NEVER** automatically `DELETE` rows from mined or invalid history.
     *   Failed/RBF'd transactions are marked with a `status` field (e.g., `replaced`, `failed`).
     *   They remain in the database for audit history but are excluded from balance queries.
+    *   The one narrow exception is explicit caller-driven pruning of a live blockless leaf transaction via `DeleteTx`.
     *   Foreign Keys use `ON DELETE RESTRICT` for creation relationships to prevent accidental data loss.
 4.  **Wallet-Scoped Rows:** All `wtxmgr` tables are scoped by `wallet_id` to support multiple wallets sharing a single database without row-level conflicts.
 
@@ -74,6 +75,9 @@ Recommended operational defaults:
         *   If you enforce the coinbase invariant at the database level, a simple `DELETE FROM blocks ...` will fail unless the coinbase row's `status` is updated to `orphaned` as part of the same statement.
         *   Recommended: use a trigger to rewrite coinbase `status` during the `block_height -> NULL` update (see 3.6).
     *   **Reconfirmation:** If an orphaned coinbase transaction re-enters the best chain, restoring it requires setting `block_height` and `status='published'` atomically.
+        *   The supported implementation treats this as a **root-only** transition.
+        *   We do **not** persist descendant restoration state for orphaned coinbase branches.
+        *   Rationale: wallet coinbase spends require 100 confirmations, so any descendant branch implies a >100-block reorg. That scenario is treated as out of scope for first-class recovery and should be handled by broader rescan/rebuild tooling instead of extra schema.
 *   **RBF:** Handled by updating the `utxos.spent_by_tx_id` pointer to the new transaction and marking the old transaction as `replaced`.
 
 ### 2.4 Implementation Notes
@@ -119,6 +123,17 @@ table can normalize the row. To preserve the coinbase orphaning invariant, the
 implementation adds a `BEFORE DELETE ON blocks` trigger that rewrites affected
 transactions into their final disconnected state before the block row is
 removed.
+
+**Coinbase reconfirmation scope**
+
+The implementation only restores the orphaned coinbase root row itself when a
+stale block becomes best-chain again.
+
+This is intentional. A wallet is only allowed to spend a coinbase output after
+100 confirmations, so a descendant branch would require a reorg deeper than the
+coinbase maturity window. That case is treated as operationally out of scope
+for the SQL schema. We prefer a simple root-only reconfirmation rule over extra
+restoration tables that only serve catastrophic deep-reorg recovery.
 
 **Transaction labels**
 
@@ -238,7 +253,7 @@ CREATE TABLE utxos (
     address_id BIGINT NOT NULL REFERENCES addresses(id) ON DELETE RESTRICT,
     
     -- Spending (Input):
-    -- ON DELETE SET NULL: If the spending tx is manually pruned, the UTXO becomes unspent.
+    -- ON DELETE RESTRICT: Manual pruning must clear spent_by_* first.
     spent_by_tx_id BIGINT,
     -- NULL when unspent; non-NULL when spent (enforced by pair constraint).
     spent_input_index INTEGER CHECK (spent_input_index IS NULL OR spent_input_index >= 0),
@@ -249,7 +264,7 @@ CREATE TABLE utxos (
     CONSTRAINT fkey_utxos_tx FOREIGN KEY (wallet_id, tx_id)
         REFERENCES transactions(wallet_id, id) ON DELETE RESTRICT,
     CONSTRAINT fkey_utxos_spent_by FOREIGN KEY (wallet_id, spent_by_tx_id)
-        REFERENCES transactions(wallet_id, id) ON DELETE SET NULL,
+        REFERENCES transactions(wallet_id, id) ON DELETE RESTRICT,
     
     CONSTRAINT check_spent_tx_and_index_pair CHECK (
         (spent_by_tx_id IS NULL AND spent_input_index IS NULL) OR
@@ -398,15 +413,9 @@ This can be implemented with a `BEFORE UPDATE` trigger on `transactions`. Foreig
 
 Portability note:
 *   PostgreSQL: Foreign-key actions (such as `ON DELETE SET NULL`) are performed via ordinary `UPDATE` statements on the referencing table, and triggers on that table will fire.
-*   SQLite: Foreign-key actions occur after the parent row operation. If you cannot rely on triggers to rewrite `status` during the FK action, enforce coinbase orphaning with an explicit application-side update in the same SQL transaction as the disconnect.
+*   SQLite: The shipped schema uses a `BEFORE DELETE ON blocks` trigger to rewrite affected transaction rows into their final disconnected state before the block row is removed.
 
-**SQLite example:** To atomically disconnect a block and orphan its coinbase transactions, run the following within a single transaction:
-```sql
-BEGIN;
-DELETE FROM blocks WHERE block_height = ?;
-UPDATE transactions SET status = 'orphaned' WHERE is_coinbase AND block_height IS NULL;
-COMMIT;
-```
+**SQLite shipped flow:** To atomically disconnect a block and orphan its coinbase transactions, the schema installs `trg_disconnect_transactions_before_block_delete`, a `BEFORE DELETE ON blocks` trigger that rewrites `transactions.status` and clears `transactions.block_height` in one trigger-driven flow.
 
 Example sketch:
 
@@ -446,7 +455,7 @@ balance" API because callers may disagree about pending chaining, lease
 exclusion, confirmation thresholds, or coinbase maturity rules.
 
 ### 4.3. Audit Trail
-By using "Soft Deletion" (`status='replaced'`), we maintain a complete history of user attempts, even those that failed. This is superior to previous designs that physically deleted failed transactions.
+By using "Soft Deletion" (`status='replaced'`), we maintain a complete history of user attempts, even those that failed. This is superior to previous designs that physically deleted failed transactions. The one explicit exception is caller-driven pruning of a live blockless leaf transaction, which is modeled as an operational cleanup path rather than part of the ordinary history lifecycle.
 
 ### 4.4. Complexity Trade-off
 We accept slightly more complexity in **Transaction Reconstruction** (joining inputs/outputs) in exchange for maximal performance in **Balance Calculation** and **Coin Selection**, which are the high-frequency operations.

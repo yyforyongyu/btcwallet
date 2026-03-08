@@ -12,7 +12,7 @@ import (
 )
 
 const Balance = `-- name: Balance :one
-SELECT cast(coalesce(sum(u.amount), 0) AS BIGINT) AS balance
+SELECT (coalesce(sum(u.amount), 0))::BIGINT AS balance
 FROM utxos AS u
 INNER JOIN transactions AS t
     ON u.wallet_id = t.wallet_id AND u.tx_id = t.id
@@ -26,11 +26,26 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published')
     AND (
-        $2 IS NULL
-        OR acc.account_number = $2
+        $2::BIGINT IS NULL
+        OR acc.account_number = $2::BIGINT
     )
     AND (
-        $3 IS NULL
+        CASE
+            WHEN t.block_height IS NULL THEN 0
+            WHEN s.synced_height IS NULL THEN 0
+            WHEN t.block_height > s.synced_height THEN 0
+            ELSE s.synced_height - t.block_height + 1
+        END
+    ) >= greatest(
+        coalesce($3::INTEGER, 0),
+        CASE
+            WHEN t.is_coinbase
+                THEN coalesce($4::INTEGER, 0)
+            ELSE 0
+        END
+    )
+    AND (
+        $5::INTEGER IS NULL
         OR (
             CASE
                 WHEN t.block_height IS NULL THEN 0
@@ -38,21 +53,10 @@ WHERE
                 WHEN t.block_height > s.synced_height THEN 0
                 ELSE s.synced_height - t.block_height + 1
             END
-        ) >= $3
+        ) <= $5::INTEGER
     )
     AND (
-        $4 IS NULL
-        OR (
-            CASE
-                WHEN t.block_height IS NULL THEN 0
-                WHEN s.synced_height IS NULL THEN 0
-                WHEN t.block_height > s.synced_height THEN 0
-                ELSE s.synced_height - t.block_height + 1
-            END
-        ) <= $4
-    )
-    AND (
-        $5 = FALSE
+        $6 = FALSE
         OR NOT EXISTS (
             SELECT 1
             FROM utxo_leases AS l
@@ -62,27 +66,15 @@ WHERE
                 AND l.expires_at > (current_timestamp AT TIME ZONE 'UTC')
         )
     )
-    AND (
-        $6 IS NULL
-        OR NOT t.is_coinbase
-        OR (
-            CASE
-                WHEN t.block_height IS NULL THEN 0
-                WHEN s.synced_height IS NULL THEN 0
-                WHEN t.block_height > s.synced_height THEN 0
-                ELSE s.synced_height - t.block_height + 1
-            END
-        ) >= $6
-    )
 `
 
 type BalanceParams struct {
 	WalletID         int64
-	AccountNumber    interface{}
-	MinConfirms      interface{}
-	MaxConfirms      interface{}
+	AccountNumber    sql.NullInt64
+	MinConfirms      sql.NullInt32
+	CoinbaseMaturity sql.NullInt32
+	MaxConfirms      sql.NullInt32
 	ExcludeLeased    interface{}
-	CoinbaseMaturity interface{}
 }
 
 // Returns the total value represented by the wallet's current unspent UTXO set.
@@ -91,6 +83,9 @@ type BalanceParams struct {
 //   - Starts from wallet-scoped unspent outputs and rejoins transactions plus
 //     addresses -> accounts -> key_scopes so ownership validation and optional
 //     account filtering stay in one read.
+//   - Reuses one confirmation expression for the upper bound and a second shared
+//     expression for the combined lower bound (`min_confirms` plus optional
+//     coinbase maturity, which still applies when `min_confirms` is NULL).
 //   - Applies optional confirmation-range and coinbase-maturity policy directly
 //     inside the aggregate query so callers can request factual or policy-shaped
 //     balance reads through one public method.
@@ -100,14 +95,16 @@ type BalanceParams struct {
 // Performance:
 //   - Executes as one aggregate over wallet-scoped live outputs, with an
 //     anti-join against utxo_leases only when requested.
+//   - Consolidates the lower-bound confirmation logic so coinbase maturity and
+//     `min_confirms` share one threshold calculation.
 func (q *Queries) Balance(ctx context.Context, arg BalanceParams) (int64, error) {
 	row := q.queryRow(ctx, q.balanceStmt, Balance,
 		arg.WalletID,
 		arg.AccountNumber,
 		arg.MinConfirms,
+		arg.CoinbaseMaturity,
 		arg.MaxConfirms,
 		arg.ExcludeLeased,
-		arg.CoinbaseMaturity,
 	)
 	var balance int64
 	err := row.Scan(&balance)
@@ -285,6 +282,49 @@ func (q *Queries) GetUtxoIDByOutpoint(ctx context.Context, arg GetUtxoIDByOutpoi
 	return id, err
 }
 
+const GetUtxoSpenderByOutpoint = `-- name: GetUtxoSpenderByOutpoint :one
+SELECT u.spent_by_tx_id
+FROM utxos AS u
+INNER JOIN transactions AS t
+    ON u.wallet_id = t.wallet_id AND u.tx_id = t.id
+INNER JOIN addresses AS a ON u.address_id = a.id
+INNER JOIN accounts AS acc ON a.account_id = acc.id
+INNER JOIN key_scopes AS ks ON acc.scope_id = ks.id
+WHERE
+    u.wallet_id = $1
+    AND ks.wallet_id = $1
+    AND t.tx_hash = $2
+    AND u.output_index = $3
+    AND t.status IN ('pending', 'published')
+`
+
+type GetUtxoSpenderByOutpointParams struct {
+	WalletID    int64
+	TxHash      []byte
+	OutputIndex int32
+}
+
+// Retrieves the current spender for a wallet-owned outpoint, if any.
+//
+// How:
+//   - Resolves the outpoint through transactions so callers can address a UTXO by
+//     tx hash plus output index instead of the internal row ID.
+//   - Rejoins addresses -> accounts -> key_scopes so the lookup only reports
+//     outputs that still belong to the requested wallet.
+//   - Keeps the parent transaction in a live state (`pending` or `published`) so
+//     callers only verify claims on outputs that remain part of the live wallet
+//     graph.
+//
+// Performance:
+//   - Uses the wallet-scoped tx hash lookup and unique outpoint constraint to
+//     bound the read to at most one credited output.
+func (q *Queries) GetUtxoSpenderByOutpoint(ctx context.Context, arg GetUtxoSpenderByOutpointParams) (sql.NullInt64, error) {
+	row := q.queryRow(ctx, q.getUtxoSpenderByOutpointStmt, GetUtxoSpenderByOutpoint, arg.WalletID, arg.TxHash, arg.OutputIndex)
+	var spent_by_tx_id sql.NullInt64
+	err := row.Scan(&spent_by_tx_id)
+	return spent_by_tx_id, err
+}
+
 const InsertUtxo = `-- name: InsertUtxo :one
 INSERT INTO utxos (
     wallet_id,
@@ -410,9 +450,12 @@ WHERE
     AND u.spent_by_tx_id IS NULL
     AND t.status IN ('pending', 'published')
     AND (
-        $2 IS NULL
-        OR acc.account_number = $2
+        $2::BIGINT IS NULL
+        OR acc.account_number = $2::BIGINT
     )
+    -- NOTE: sqlc's SQLite codegen currently drops named params when this range
+    -- filter is rewritten as ` + "`" + `BETWEEN` + "`" + `, so we keep the duplicated CASE here to
+    -- preserve backend parity and stable generated APIs.
     AND (
         CASE
             WHEN t.block_height IS NULL THEN 0
@@ -420,7 +463,7 @@ WHERE
             WHEN t.block_height > s.synced_height THEN 0
             ELSE s.synced_height - t.block_height + 1
         END
-    ) >= $3
+    ) >= coalesce($3::INTEGER, 0)
     AND (
         CASE
             WHEN t.block_height IS NULL THEN 0
@@ -428,13 +471,16 @@ WHERE
             WHEN t.block_height > s.synced_height THEN 0
             ELSE s.synced_height - t.block_height + 1
         END
-    ) <= $4
+    ) <= coalesce(
+        $4::INTEGER,
+        2147483647
+    )
 ORDER BY u.amount, t.tx_hash, u.output_index
 `
 
 type ListUtxosParams struct {
 	WalletID      int64
-	AccountNumber interface{}
+	AccountNumber sql.NullInt64
 	MinConfirms   sql.NullInt32
 	MaxConfirms   sql.NullInt32
 }
@@ -454,6 +500,8 @@ type ListUtxosRow struct {
 // How:
 //   - Starts from utxos and joins transactions for tx metadata plus
 //     wallet_sync_states for confirmation math.
+//   - Applies optional confirmation bounds; nil min/max parameters mean "no
+//     lower bound" or "no upper bound".
 //   - Rejoins addresses -> accounts -> key_scopes so account filtering and wallet
 //     ownership checks happen in the same read.
 //   - Returns leased outputs too because the API models leases separately from
@@ -467,6 +515,8 @@ type ListUtxosRow struct {
 //   - Restricts first by wallet, spend state, and transaction status.
 //   - Uses the address/account/scope joins to keep ownership validation and
 //     account filtering in one pass.
+//   - Keeps the duplicated confirmation CASE local to this query so the optional
+//     lower/upper bounds remain explicit in the generated parameter struct.
 func (q *Queries) ListUtxos(ctx context.Context, arg ListUtxosParams) ([]ListUtxosRow, error) {
 	rows, err := q.query(ctx, q.listUtxosStmt, ListUtxos,
 		arg.WalletID,

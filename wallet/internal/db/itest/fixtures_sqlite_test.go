@@ -9,6 +9,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	sqlcsqlite "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/sqlite"
 	"github.com/stretchr/testify/require"
@@ -151,6 +152,35 @@ func getAddressSecret(t *testing.T, queries *sqlcsqlite.Queries,
 	t.Helper()
 
 	return queries.GetAddressSecret(t.Context(), addressID)
+}
+
+// requireReplacementEdge asserts that the replacement edge audit table records
+// exactly one victim -> winner relationship for the provided hashes.
+func requireReplacementEdge(t *testing.T, queries *sqlcsqlite.Queries,
+	walletID uint32, replacedTxid chainhash.Hash,
+	replacementTxid chainhash.Hash) {
+
+	t.Helper()
+
+	replacedRows, err := queries.ListReplacedTxHashesByReplacementTxHash(
+		t.Context(), sqlcsqlite.ListReplacedTxHashesByReplacementTxHashParams{
+			WalletID: int64(walletID),
+			TxHash:   replacementTxid[:],
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, replacedRows, 1)
+	require.Equal(t, replacedTxid[:], replacedRows[0].ReplacedTxHash)
+
+	replacementRows, err := queries.ListReplacementTxHashesByReplacedTxHash(
+		t.Context(), sqlcsqlite.ListReplacementTxHashesByReplacedTxHashParams{
+			WalletID: int64(walletID),
+			TxHash:   replacedTxid[:],
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, replacementRows, 1)
+	require.Equal(t, replacementTxid[:], replacementRows[0].ReplacementTxHash)
 }
 
 // MustDeleteAddress deletes an address by ID for test scenarios.
