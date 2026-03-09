@@ -360,6 +360,9 @@ type Wallet struct {
 	// wallet was created or loaded.
 	cfg Config
 
+	// id is the persistent database identifier assigned to this wallet.
+	id uint32
+
 	// sync is the dedicated synchronization component that manages the
 	// chain loop, scanning, and reorganization handling.
 	sync chainSyncer
@@ -397,6 +400,11 @@ type Wallet struct {
 	// birthdayBlock is the block from which the wallet started scanning.
 	// It is loaded on startup and cached to avoid database lookups.
 	birthdayBlock waddrmgr.BlockStamp
+}
+
+// ID returns the persistent database identifier for the wallet.
+func (w *Wallet) ID() uint32 {
+	return w.id
 }
 
 // RemoveDescendants attempts to remove any transaction from the wallet's tx
