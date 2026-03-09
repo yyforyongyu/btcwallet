@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -181,4 +183,36 @@ func NewTestStore(t *testing.T) *db.PostgresStore {
 	})
 
 	return store
+}
+
+// childSpendingTxIDs returns the direct child transaction IDs recorded for the
+// provided parent transaction hash.
+func childSpendingTxIDs(t *testing.T, store *db.PostgresStore, walletID uint32,
+	txHash chainhash.Hash) []int64 {
+
+	t.Helper()
+
+	meta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcpg.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   txHash[:],
+		},
+	)
+	require.NoError(t, err)
+
+	childIDs, err := store.Queries().ListSpendingTxIDsByParentTxID(
+		t.Context(), sqlcpg.ListSpendingTxIDsByParentTxIDParams{
+			WalletID: int64(walletID),
+			TxID:     meta.ID,
+		},
+	)
+	require.NoError(t, err)
+
+	ids := make([]int64, 0, len(childIDs))
+	for _, childID := range childIDs {
+		require.True(t, childID.Valid)
+		ids = append(ids, childID.Int64)
+	}
+
+	return ids
 }
