@@ -38,6 +38,12 @@ var (
 		"create tx cannot use orphaned status",
 	)
 
+	// errCreateTxTerminalStatus indicates that CreateTx attempted to insert a
+	// blockless transaction directly in a terminal invalid state.
+	errCreateTxTerminalStatus = errors.New(
+		"create tx cannot use terminal blockless status",
+	)
+
 	// errInvalidTxStatus indicates that a status string does not map to a
 	// supported TxStatus value.
 	errInvalidTxStatus = errors.New("invalid transaction status")
@@ -53,12 +59,21 @@ var (
 	// errDuplicateInputOutPoint indicates that CreateTx received the same
 	// previous outpoint more than once.
 	errDuplicateInputOutPoint = errors.New("duplicate input outpoint")
+
+	// errDeleteRequiresLiveUnconfirmed indicates that DeleteTx only accepts
+	// live blockless transactions.
+	errDeleteRequiresLiveUnconfirmed = errors.New(
+		"live unconfirmed transaction required",
+	)
+
+	// errDeleteRequiresLeaf indicates that DeleteTx only accepts live
+	// transactions with no child spenders.
+	errDeleteRequiresLeaf = errors.New("delete requires a leaf transaction")
 )
 
 // serializeMsgTx serializes a wire.MsgTx so it can be stored in the
 // transactions table.
 func serializeMsgTx(tx *wire.MsgTx) ([]byte, error) {
-
 	var buf bytes.Buffer
 
 	err := tx.Serialize(&buf)
@@ -72,7 +87,6 @@ func serializeMsgTx(tx *wire.MsgTx) ([]byte, error) {
 // deserializeMsgTx deserializes a stored transaction payload back into a
 // wire.MsgTx.
 func deserializeMsgTx(rawTx []byte) (*wire.MsgTx, error) {
-
 	var tx wire.MsgTx
 
 	err := tx.Deserialize(bytes.NewReader(rawTx))
@@ -86,7 +100,6 @@ func deserializeMsgTx(rawTx []byte) (*wire.MsgTx, error) {
 // parseTxStatus converts a stored status string into the strongly typed
 // TxStatus enum used by the public db API.
 func parseTxStatus(status string) (TxStatus, error) {
-
 	switch TxStatus(status) {
 	case TxStatusPending,
 		TxStatusPublished,
@@ -104,7 +117,6 @@ func parseTxStatus(status string) (TxStatus, error) {
 // validateCreateTxParams enforces the API invariants shared by both SQL
 // backends before a transaction write begins.
 func validateCreateTxParams(params CreateTxParams) error {
-
 	if params.Tx == nil {
 		return errNilTransaction
 	}
@@ -117,10 +129,13 @@ func validateCreateTxParams(params CreateTxParams) error {
 	}
 
 	seenCredits := make(map[uint32]struct{}, len(params.Credits))
-	maxIndex := uint32(len(params.Tx.TxOut))
+	maxIndex := int64(len(params.Tx.TxOut))
 
+	// Every requested credit must map to one real output exactly once because
+	// the write path persists one UTXO row per credited output index and later
+	// dereferences params.Tx.TxOut[credit.Index].
 	for _, credit := range params.Credits {
-		if credit.Index >= maxIndex {
+		if int64(credit.Index) >= maxIndex {
 			return fmt.Errorf(
 				"credit index %d: %w", credit.Index,
 				errCreditIndexOutOfRange,
@@ -157,21 +172,44 @@ func validateCreateTxParams(params CreateTxParams) error {
 
 // validateCreateTxStatus enforces the combinations of block assignment,
 // wallet-visible status, and coinbase semantics that CreateTx accepts.
-func validateCreateTxStatus(status TxStatus, block *Block, isCoinbase bool) error {
+//
+// The accepted state space is intentionally narrow:
+//   - callers must not insert orphaned history directly because orphaning is
+//     a derived state created by rollback or invalidation flows;
+//   - coinbase rows must carry a confirming block because a blockless
+//     coinbase is not spendable wallet history; and
+//   - any row tied to a block must be published because confirmation and
+//     pending status are mutually exclusive.
+func validateCreateTxStatus(status TxStatus, block *Block,
+	isCoinbase bool) error {
 
 	_, err := parseTxStatus(string(status))
 	if err != nil {
 		return err
 	}
 
+	// Orphaned rows only arise from disconnect handling after the transaction
+	// has already been stored as mined history.
 	if status == TxStatusOrphaned {
 		return errCreateTxOrphanedStatus
 	}
 
+	// Blockless inserts may only represent the live unconfirmed set. Terminal
+	// invalid-history states are derived later by invalidation flows.
+	if block == nil &&
+		status != TxStatusPending && status != TxStatusPublished {
+
+		return errCreateTxTerminalStatus
+	}
+
+	// A coinbase without a confirming block cannot represent valid wallet
+	// state, so validation fails immediately with errCoinbaseRequiresBlock.
 	if isCoinbase && block == nil {
 		return errCoinbaseRequiresBlock
 	}
 
+	// Once a row is tied to a block it is confirmed history, so it cannot
+	// retain an unconfirmed status such as pending.
 	if block != nil && status != TxStatusPublished {
 		return errConfirmedRequiresPublished
 	}
@@ -389,4 +427,19 @@ func buildTxInfo(hash []byte, rawTx []byte, received time.Time, block *Block,
 		Status:       txStatus,
 		Label:        label,
 	}, nil
+}
+
+// isLiveUnconfirmedStatus reports whether a status still belongs to the live
+// blockless transaction set that DeleteTx may erase.
+func isLiveUnconfirmedStatus(status TxStatus) bool {
+	switch status {
+	case TxStatusPending, TxStatusPublished:
+		return true
+
+	case TxStatusReplaced, TxStatusFailed, TxStatusOrphaned:
+		return false
+
+	default:
+		return false
+	}
 }
