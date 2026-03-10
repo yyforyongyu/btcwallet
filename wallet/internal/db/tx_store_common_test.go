@@ -11,17 +11,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSerializeDeserializeMsgTx verifies that the common serialization helpers
-// preserve transaction bytes across a round trip.
+// TestSerializeDeserializeMsgTx verifies the common transaction serialization
+// helpers.
 //
 // Scenario:
-// - A transaction is serialized for storage and then decoded again.
+// - One regular transaction is serialized and then decoded again.
 // Setup:
-// - Build one minimal non-coinbase transaction fixture.
+// - Build one representative regular transaction fixture.
 // Action:
-// - Serialize the transaction, deserialize it, and serialize the decoded copy.
+// - Serialize the transaction and deserialize the resulting bytes.
 // Assertions:
-// - The final serialized bytes match the original payload exactly.
+// - The decoded transaction re-serializes to the exact original bytes.
 func TestSerializeDeserializeMsgTx(t *testing.T) {
 	t.Parallel()
 
@@ -41,18 +41,17 @@ func TestSerializeDeserializeMsgTx(t *testing.T) {
 	require.Equal(t, rawTx, got.Bytes())
 }
 
-// TestParseTxStatus verifies that stored string values map back to the public
-// TxStatus enum and that unknown values fail loudly.
+// TestParseTxStatus verifies the shared stored-status parser.
 //
 // Scenario:
-// - SQL rows carry both valid and invalid transaction status strings.
+// - The database returns both valid and invalid status strings.
 // Setup:
-// - Define one table of known statuses plus one unknown input.
+// - Define one table-driven set of stored status values and expectations.
 // Action:
-// - Parse each stored status string.
+// - Parse each stored string through the shared helper.
 // Assertions:
-// - Known strings map to the expected TxStatus values.
-// - Unknown strings fail with errInvalidTxStatus.
+// - Known values map to the public TxStatus enum.
+// - Unknown values fail with errInvalidTxStatus.
 func TestParseTxStatus(t *testing.T) {
 	t.Parallel()
 
@@ -86,15 +85,14 @@ func TestParseTxStatus(t *testing.T) {
 	}
 }
 
-// TestValidateCreateTxParams verifies the shared CreateTx invariants that both
-// SQL backends rely on before opening a write transaction.
+// TestValidateCreateTxParams verifies the shared CreateTx preflight checks.
 //
 // Scenario:
 // - Callers submit valid and invalid transaction-create requests.
 // Setup:
-// - Define one table of parameter combinations and expected outcomes.
+// - Define one table-driven set of parameter combinations and expected errors.
 // Action:
-// - Validate each parameter set before any backend write transaction opens.
+// - Validate each parameter set before any backend transaction opens.
 // Assertions:
 // - Invalid combinations fail with the expected sentinel error.
 // - Supported pending and confirmed requests are accepted.
@@ -102,6 +100,11 @@ func TestValidateCreateTxParams(t *testing.T) {
 	t.Parallel()
 
 	confirmedBlock := &Block{Height: 100, Timestamp: time.Unix(123, 0)}
+	duplicateInputTx := testRegularMsgTx()
+	duplicateInputTx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: duplicateInputTx.TxIn[0].PreviousOutPoint,
+		Sequence:         wire.MaxTxInSequenceNum,
+	})
 
 	tests := []struct {
 		name    string
@@ -180,24 +183,7 @@ func TestValidateCreateTxParams(t *testing.T) {
 		{
 			name: "duplicate input outpoint",
 			params: CreateTxParams{
-				Tx: &wire.MsgTx{
-					Version: wire.TxVersion,
-					TxIn: []*wire.TxIn{
-						{
-							PreviousOutPoint: wire.OutPoint{
-								Hash:  chainhash.Hash{1},
-								Index: 0,
-							},
-						},
-						{
-							PreviousOutPoint: wire.OutPoint{
-								Hash:  chainhash.Hash{1},
-								Index: 0,
-							},
-						},
-					},
-					TxOut: []*wire.TxOut{{Value: 1, PkScript: []byte{0x51}}},
-				},
+				Tx:     duplicateInputTx,
 				Status: TxStatusPending,
 			},
 			wantErr: errDuplicateInputOutPoint,
@@ -240,22 +226,20 @@ func TestValidateCreateTxParams(t *testing.T) {
 	}
 }
 
-// TestBuildTxInfo verifies the shared row-to-domain conversion used by both
-// SQL backends when returning a valid TxInfo value.
+// TestBuildTxInfo verifies the shared row-to-domain mapper for TxInfo values.
 //
 // Scenario:
-// - One normalized transaction row is read back from the store.
+// - One normalized SQL row is converted into the public TxInfo shape.
 // Setup:
-// - Build a valid serialized transaction, hash, and confirmed block.
+// - Build serialized transaction bytes plus one confirmed block fixture.
 // Action:
-// - Convert the normalized row into a public TxInfo value.
+// - Convert the valid input row with buildTxInfo.
 // Assertions:
-// - The persisted wallet metadata is preserved.
+// - Valid rows preserve hashes, labels, block data, and UTC timestamps.
 func TestBuildTxInfo(t *testing.T) {
 	t.Parallel()
 
-	// Scenario: One normalized transaction row is read back from the store.
-	// Setup: Build a valid serialized transaction, hash, and confirmed block.
+	// Arrange: Build one valid normalized transaction row.
 	tx := testRegularMsgTx()
 	hash := tx.TxHash()
 	rawTx, err := serializeMsgTx(tx)
@@ -268,13 +252,13 @@ func TestBuildTxInfo(t *testing.T) {
 		Timestamp: time.Unix(500, 0),
 	}
 
-	// Act: Build the public TxInfo view from the normalized row fields.
+	// Act: Convert the normalized row into the public TxInfo shape.
 	info, err := buildTxInfo(
 		hash[:], rawTx, time.Unix(600, 0).In(time.FixedZone("X", 3600)),
 		block, string(TxStatusPublished), "note",
 	)
 
-	// Assert: The helper preserves the persisted wallet metadata.
+	// Assert: The public TxInfo view preserves the stored metadata.
 	require.NoError(t, err)
 	require.Equal(t, hash, info.Hash)
 	require.Equal(t, rawTx, info.SerializedTx)
@@ -284,58 +268,56 @@ func TestBuildTxInfo(t *testing.T) {
 	require.Equal(t, block, info.Block)
 }
 
-// TestBuildTxInfo_InvalidHash verifies that buildTxInfo rejects malformed hash
-// bytes.
+// TestBuildTxInfoInvalidHash verifies that buildTxInfo rejects malformed
+// transaction hashes.
 //
 // Scenario:
-// - A normalized transaction row carries malformed hash bytes.
+// - One normalized SQL row carries invalid transaction-hash bytes.
 // Setup:
-// - Build a valid serialized transaction payload.
+// - Build one valid serialized transaction payload.
 // Action:
-// - Attempt to convert the malformed row into a public TxInfo value.
+// - Convert the malformed row with buildTxInfo.
 // Assertions:
 // - The helper returns an error instead of building a partial TxInfo.
-func TestBuildTxInfo_InvalidHash(t *testing.T) {
+func TestBuildTxInfoInvalidHash(t *testing.T) {
 	t.Parallel()
 
-	// Scenario: A normalized row carries invalid transaction-hash bytes.
-	// Setup: Build a valid serialized transaction payload.
+	// Arrange: Build one valid serialized transaction payload.
 	tx := testRegularMsgTx()
 	rawTx, err := serializeMsgTx(tx)
 	require.NoError(t, err)
 
-	// Act: Attempt to build the public TxInfo view.
+	// Act: Convert a row carrying malformed transaction-hash bytes.
 	_, err = buildTxInfo([]byte{1, 2, 3}, rawTx, time.Now(), nil, "pending", "")
 
-	// Assert: The helper rejects the malformed hash.
+	// Assert: The malformed hash is rejected.
 	require.Error(t, err)
 }
 
-// TestBuildTxInfo_InvalidStatus verifies that buildTxInfo rejects unknown
+// TestBuildTxInfoInvalidStatus verifies that buildTxInfo rejects unknown stored
 // status strings.
 //
 // Scenario:
-// - A normalized transaction row carries an unknown status string.
+// - One normalized SQL row carries an unsupported transaction status.
 // Setup:
-// - Build a valid serialized transaction payload and hash.
+// - Build one valid serialized transaction payload and hash.
 // Action:
-// - Attempt to convert the row into a public TxInfo value.
+// - Convert the malformed row with buildTxInfo.
 // Assertions:
 // - The helper returns errInvalidTxStatus.
-func TestBuildTxInfo_InvalidStatus(t *testing.T) {
+func TestBuildTxInfoInvalidStatus(t *testing.T) {
 	t.Parallel()
 
-	// Scenario: A normalized row carries an unknown transaction status.
-	// Setup: Build a valid serialized transaction payload and hash.
+	// Arrange: Build one valid serialized transaction payload and hash.
 	tx := testRegularMsgTx()
 	hash := tx.TxHash()
 	rawTx, err := serializeMsgTx(tx)
 	require.NoError(t, err)
 
-	// Act: Attempt to build the public TxInfo view.
+	// Act: Convert a row carrying an unknown transaction status.
 	_, err = buildTxInfo(hash[:], rawTx, time.Now(), nil, "bogus", "")
 
-	// Assert: The helper returns the invalid-status sentinel.
+	// Assert: Unknown statuses are rejected.
 	require.ErrorIs(t, err, errInvalidTxStatus)
 }
 

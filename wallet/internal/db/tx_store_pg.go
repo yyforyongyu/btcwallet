@@ -15,12 +15,11 @@ import (
 // Ensure PostgresStore satisfies the TxStore interface.
 var _ TxStore = (*PostgresStore)(nil)
 
-// CreateTx atomically records a wallet-scoped transaction row, its
-// wallet-owned credits, and any spend edges created by its inputs.
-//
-// The full write runs inside ExecuteTx so the transaction row, created UTXOs,
-// and spent-parent markers are either committed together or not at all.
-// Received timestamps are normalized to UTC before insert.
+// CreateTx atomically records one wallet-scoped transaction row together with
+// any wallet-owned credits and spent-input edges derived from the same payload.
+// The method normalizes the received timestamp to UTC before writing and keeps
+// the transaction row, created UTXOs, and input-spend claims in one SQL
+// transaction so readers never observe a partially-applied wallet view.
 func (s *PostgresStore) CreateTx(ctx context.Context,
 	params CreateTxParams) error {
 
@@ -120,10 +119,7 @@ func prepareCreateTxBlockHeightPg(ctx context.Context, qtx *sqlcpg.Queries,
 }
 
 // UpdateTx updates only the user-visible label for one wallet-scoped
-// transaction.
-//
-// Block assignment, spend-graph updates, and status transitions are handled by
-// dedicated transaction-store paths so label edits cannot mutate wallet state.
+// transaction. It does not modify chain-assignment fields or validity state.
 func (s *PostgresStore) UpdateTx(ctx context.Context,
 	params UpdateTxParams) error {
 
@@ -145,10 +141,8 @@ func (s *PostgresStore) UpdateTx(ctx context.Context,
 	return nil
 }
 
-// GetTx retrieves one wallet-scoped transaction snapshot by hash.
-//
-// The returned TxInfo is rebuilt from normalized SQL columns; missing rows map
-// to ErrTxNotFound for the requested wallet/hash pair.
+// GetTx retrieves one wallet-scoped transaction by hash and maps the stored row
+// into the public TxInfo contract, including optional block metadata.
 func (s *PostgresStore) GetTx(ctx context.Context,
 	query GetTxQuery) (*TxInfo, error) {
 
@@ -173,11 +167,10 @@ func (s *PostgresStore) GetTx(ctx context.Context,
 	)
 }
 
-// ListTxns lists wallet-scoped transactions using either the confirmed-range
-// or unmined-only read path.
-//
-// The unmined path returns blockless history only, while the confirmed path is
-// bounded by the requested height range.
+// ListTxns returns wallet-scoped transaction history using either the confirmed
+// height-range query or the blockless history query. The unmined path preserves
+// invalid history rows such as `failed`, `replaced`, and orphaned coinbase
+// transactions instead of collapsing history to the live mempool set.
 func (s *PostgresStore) ListTxns(ctx context.Context,
 	query ListTxnsQuery) ([]TxInfo, error) {
 
@@ -191,8 +184,8 @@ func (s *PostgresStore) ListTxns(ctx context.Context,
 	return s.listConfirmedTxnsPg(ctx, query)
 }
 
-// listUnminedTxnsPg loads the blockless transaction view used by ListTxns when
-// callers request only unmined history.
+// listUnminedTxnsPg returns every wallet-scoped blockless transaction row,
+// including invalid history states that must remain visible to history reads.
 func (s *PostgresStore) listUnminedTxnsPg(ctx context.Context,
 	walletID uint32) ([]TxInfo, error) {
 
@@ -217,8 +210,8 @@ func (s *PostgresStore) listUnminedTxnsPg(ctx context.Context,
 	return infos, nil
 }
 
-// listConfirmedTxnsPg loads the confirmed height-range view used by ListTxns
-// when callers query mined history.
+// listConfirmedTxnsPg returns the confirmed transaction rows whose block
+// heights fall within the inclusive caller-provided range.
 func (s *PostgresStore) listConfirmedTxnsPg(ctx context.Context,
 	query ListTxnsQuery) ([]TxInfo, error) {
 
@@ -265,81 +258,56 @@ func (s *PostgresStore) listConfirmedTxnsPg(ctx context.Context,
 	return infos, nil
 }
 
-// DeleteTx atomically removes one live blockless transaction and restores any
-// wallet UTXO rows that it had spent.
-//
-// DeleteTx is limited to the live unconfirmed set; confirmed rows and terminal
-// invalid-history rows remain part of the wallet timeline. The transaction must
-// also be a leaf in the local spend graph so the delete cannot detach live
-// child spenders from their parent history.
-//
-//nolint:dupl // Backend-specific sqlc types keep the delete wrappers aligned.
+// DeleteTx atomically removes one live unconfirmed leaf transaction after
+// verifying it has no wallet-scoped descendants. The surrounding SQL
+// transaction restores any wallet-owned inputs claimed by the deleted row
+// before pruning the row itself.
 func (s *PostgresStore) DeleteTx(ctx context.Context,
 	params DeleteTxParams) error {
 
-	deleteTx := func(qtx *sqlcpg.Queries) error {
-		meta, err := getDeleteTxMetaPg(ctx, qtx, params.WalletID,
-			params.Txid)
-		if err != nil {
-			return err
-		}
-
-		err = ensureDeleteLeafPg(ctx, qtx, params.WalletID, params.Txid,
-			meta.ID)
-		if err != nil {
-			return err
-		}
-
-		_, err = qtx.ClearUtxosSpentByTxID(
-			ctx, sqlcpg.ClearUtxosSpentByTxIDParams{
-				WalletID:    int64(params.WalletID),
-				SpentByTxID: sql.NullInt64{Int64: meta.ID, Valid: true},
-			},
+	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
+		return deleteTxCommon(
+			ctx, params.Txid, buildTxDeleteHooksPg(qtx, params),
 		)
-		if err != nil {
-			return fmt.Errorf("clear spent utxos: %w", err)
-		}
-
-		_, err = qtx.DeleteUtxosByTxID(
-			ctx, sqlcpg.DeleteUtxosByTxIDParams{
-				WalletID: int64(params.WalletID),
-				TxID:     meta.ID,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("delete created utxos: %w", err)
-		}
-
-		rows, err := qtx.DeleteUnminedTransactionByHash(
-			ctx, sqlcpg.DeleteUnminedTransactionByHashParams{
-				WalletID: int64(params.WalletID),
-				TxHash:   params.Txid[:],
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("delete unmined transaction: %w", err)
-		}
-
-		if rows == 0 {
-			return fmt.Errorf("transaction %s: %w", params.Txid,
-				ErrTxNotFound)
-		}
-
-		return nil
-	}
-
-	return s.ExecuteTx(ctx, deleteTx)
+	})
 }
 
-// ensureDeleteLeafPg rejects DeleteTx requests for transactions that still have
-// direct live child spenders, including children that spend non-credit parent
-// outputs.
-func ensureDeleteLeafPg(ctx context.Context, qtx *sqlcpg.Queries,
-	walletID uint32, txHash chainhash.Hash, txID int64) error {
+// buildTxDeleteHooksPg binds the shared delete flow to the postgres query set
+// active for the surrounding SQL transaction.
+func buildTxDeleteHooksPg(qtx *sqlcpg.Queries,
+	params DeleteTxParams) txDeleteHooks {
+
+	return buildTxDeleteHooks(
+		func(ctx context.Context) (txChainMeta, error) {
+			return loadTxChainMetaPg(ctx, qtx, params.WalletID, params.Txid)
+		},
+		func(ctx context.Context, txID int64) ([]int64, error) {
+			return listDeleteChildTxIDsPg(
+				ctx, qtx, params.WalletID, params.Txid, txID,
+			)
+		},
+		func(ctx context.Context, txID int64) error {
+			return clearSpentByTxIDPg(ctx, qtx, params.WalletID, txID)
+		},
+		func(ctx context.Context, txID int64) error {
+			return deleteUtxosByTxIDPg(ctx, qtx, params.WalletID, txID)
+		},
+		func(ctx context.Context) (int64, error) {
+			return deleteUnminedTxByHashPg(
+				ctx, qtx, params.WalletID, params.Txid,
+			)
+		},
+	)
+}
+
+// listDeleteChildTxIDsPg returns the direct live child spenders of one parent
+// transaction, including children that spend non-credit parent outputs.
+func listDeleteChildTxIDsPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, txHash chainhash.Hash, txID int64) ([]int64, error) {
 
 	rows, err := qtx.ListUnminedTransactions(ctx, int64(walletID))
 	if err != nil {
-		return fmt.Errorf("list live transactions: %w", err)
+		return nil, fmt.Errorf("list live transactions: %w", err)
 	}
 
 	candidates := make([]liveTxRecord, 0, len(rows))
@@ -350,66 +318,56 @@ func ensureDeleteLeafPg(ctx context.Context, qtx *sqlcpg.Queries,
 
 		candidate, err := newLiveTxRecord(row.ID, row.TxHash, row.RawTx)
 		if err != nil {
-			return fmt.Errorf("decode live transaction %d: %w", row.ID, err)
+			return nil, fmt.Errorf("decode live transaction %d: %w", row.ID,
+				err)
 		}
 
 		candidates = append(candidates, candidate)
 	}
 
-	if len(collectDirectChildTxIDs(txHash, candidates)) > 0 {
-		return fmt.Errorf("delete transaction %s: %w", txHash,
-			errDeleteRequiresLeaf)
+	return collectDirectChildTxIDs(txHash, candidates), nil
+}
+
+// deleteUtxosByTxIDPg removes the wallet-owned outputs created by one
+// transaction before its row is pruned from the live graph.
+func deleteUtxosByTxIDPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, txID int64) error {
+
+	_, err := qtx.DeleteUtxosByTxID(
+		ctx, sqlcpg.DeleteUtxosByTxIDParams{
+			WalletID: int64(walletID),
+			TxID:     txID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("delete created utxos: %w", err)
 	}
 
 	return nil
 }
 
-// getDeleteTxMetaPg loads the transaction metadata DeleteTx needs and enforces
-// the live-unconfirmed precondition up front.
-func getDeleteTxMetaPg(ctx context.Context, qtx *sqlcpg.Queries,
-	walletID uint32, txHash chainhash.Hash) (sqlcpg.GetTransactionMetaByHashRow,
-	error) {
+// deleteUnminedTxByHashPg removes the unconfirmed transaction row after its
+// dependent UTXO edges have already been cleared.
+func deleteUnminedTxByHashPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, txid [32]byte) (int64, error) {
 
-	meta, err := qtx.GetTransactionMetaByHash(
-		ctx, sqlcpg.GetTransactionMetaByHashParams{
+	rows, err := qtx.DeleteUnminedTransactionByHash(
+		ctx, sqlcpg.DeleteUnminedTransactionByHashParams{
 			WalletID: int64(walletID),
-			TxHash:   txHash[:],
+			TxHash:   txid[:],
 		},
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return sqlcpg.GetTransactionMetaByHashRow{}, fmt.Errorf(
-				"transaction %s: %w", txHash, ErrTxNotFound,
-			)
-		}
-
-		return sqlcpg.GetTransactionMetaByHashRow{}, fmt.Errorf(
-			"get transaction metadata: %w", err,
-		)
+		return 0, fmt.Errorf("delete unmined transaction: %w", err)
 	}
 
-	status, err := parseTxStatus(meta.Status)
-	if err != nil {
-		return sqlcpg.GetTransactionMetaByHashRow{}, err
-	}
-
-	if meta.BlockHeight.Valid || !isLiveUnconfirmedStatus(status) {
-		return sqlcpg.GetTransactionMetaByHashRow{}, fmt.Errorf(
-			"delete transaction %s: %w", txHash,
-			errDeleteRequiresLiveUnconfirmed,
-		)
-	}
-
-	return meta, nil
+	return rows, nil
 }
 
-// RollbackToBlock atomically removes every block at or above the provided
-// height and rewrites wallet sync-state references so the block delete can
-// succeed.
-//
-// The sync-state clamp, descendant invalidation, and block deletion run in one
-// transaction so rollback cannot leave dangling references or live descendants
-// of disconnected coinbase history.
+// RollbackToBlock atomically disconnects every block at or above the provided
+// height. It rewrites wallet sync-state references, snapshots coinbase roots
+// that will become orphaned, deletes the blocks, and then recursively fails any
+// descendant branch that depended on those roots before commit.
 func (s *PostgresStore) RollbackToBlock(ctx context.Context,
 	height uint32) error {
 
@@ -428,13 +386,10 @@ func (s *PostgresStore) RollbackToBlock(ctx context.Context,
 		newHeight = sql.NullInt32{Int32: clampedHeight, Valid: true}
 	}
 
-	rollbackBlocks := func(qtx *sqlcpg.Queries) error {
-		roots, err := qtx.ListRollbackCoinbaseRoots(ctx, rollbackHeight)
-		if err != nil {
-			return fmt.Errorf("list rollback coinbase roots: %w", err)
-		}
-
-		rootHashesByWallet, err := groupRollbackCoinbaseRootsPg(roots)
+	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
+		orphanRoots, err := listRollbackOrphanRootsPg(
+			ctx, qtx, rollbackHeight,
+		)
 		if err != nil {
 			return err
 		}
@@ -454,52 +409,51 @@ func (s *PostgresStore) RollbackToBlock(ctx context.Context,
 			return fmt.Errorf("delete blocks at or above height: %w", err)
 		}
 
-		err = applyRollbackDescendantInvalidation(
-			ctx,
-			rootHashesByWallet,
-			qtx.ListUnminedTransactions,
-			func(row sqlcpg.ListUnminedTransactionsRow) (
-				int64, []byte, []byte,
-			) {
-
-				return row.ID, row.TxHash, row.RawTx
-			},
-			qtx.ClearUtxosSpentByTxID,
-			func(walletID int64,
-				descendantID int64) sqlcpg.ClearUtxosSpentByTxIDParams {
-
-				return sqlcpg.ClearUtxosSpentByTxIDParams{
-					WalletID: walletID,
-					SpentByTxID: sql.NullInt64{
-						Int64: descendantID,
-						Valid: true,
-					},
-				}
-			},
-			qtx.UpdateTransactionStatusByIDs,
-			func(
-				walletID int64, descendantIDs []int64,
-			) sqlcpg.UpdateTransactionStatusByIDsParams {
-
-				return sqlcpg.UpdateTransactionStatusByIDsParams{
-					WalletID: walletID,
-					Status:   string(TxStatusFailed),
-					TxIds:    descendantIDs,
-				}
+		err = applyRollbackOrphanInvalidation(
+			ctx, orphanRoots,
+			func(walletID uint32) txChainHooks {
+				return buildTxChainHooksPg(qtx, walletID)
 			},
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("apply rollback orphan invalidation: %w", err)
 		}
 
 		return nil
-	}
-
-	return s.ExecuteTx(ctx, rollbackBlocks)
+	})
 }
 
-// insertCreditsPg inserts one wallet-owned UTXO row for each credited output of
-// the transaction being stored.
+// listRollbackOrphanRootsPg resolves the confirmed coinbase rows that will
+// become orphan roots when rollback deletes the target block range.
+func listRollbackOrphanRootsPg(ctx context.Context, qtx *sqlcpg.Queries,
+	rollbackHeight int32) ([]rollbackOrphanRoot, error) {
+
+	rows, err := qtx.ListCoinbaseRollbackRootsAtOrAboveHeight(
+		ctx, sql.NullInt32{Int32: rollbackHeight, Valid: true},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list rollback orphan roots: %w", err)
+	}
+
+	roots := make([]rollbackOrphanRoot, 0, len(rows))
+	for _, row := range rows {
+		walletID, err := int64ToUint32(row.WalletID)
+		if err != nil {
+			return nil, fmt.Errorf("convert rollback orphan wallet id: %w",
+				err)
+		}
+
+		roots = append(roots, rollbackOrphanRoot{
+			WalletID: walletID,
+			TxID:     row.ID,
+		})
+	}
+
+	return roots, nil
+}
+
+// insertCreditsPg resolves each credited wallet output by script and inserts
+// the corresponding UTXO rows inside the surrounding CreateTx transaction.
 func insertCreditsPg(ctx context.Context, qtx *sqlcpg.Queries,
 	params CreateTxParams, txID int64) error {
 
@@ -544,12 +498,8 @@ func insertCreditsPg(ctx context.Context, qtx *sqlcpg.Queries,
 	return nil
 }
 
-// markInputsSpentPg attaches wallet-owned outpoints spent by the stored
-// transaction to its row ID and input indexes.
-//
-// If another live wallet transaction already owns the spend edge for a
-// wallet-controlled input, the create path fails with ErrTxInputConflict
-// instead of silently storing a second live spender.
+// markInputsSpentPg records the new spender on any wallet-owned inputs used by
+// the transaction being inserted.
 func markInputsSpentPg(ctx context.Context, qtx *sqlcpg.Queries,
 	params CreateTxParams, txID int64) error {
 
@@ -564,18 +514,23 @@ func markInputsSpentPg(ctx context.Context, qtx *sqlcpg.Queries,
 				inputIndex, err)
 		}
 
-		spentInputIndex, err := int64ToInt32(int64(inputIndex))
+		spentInputIndex, err := intToInt32(inputIndex)
 		if err != nil {
 			return fmt.Errorf("convert input index %d: %w", inputIndex, err)
 		}
 
-		rowsAffected, err := qtx.MarkUtxoSpent(ctx, sqlcpg.MarkUtxoSpentParams{
-			WalletID:        int64(params.WalletID),
-			TxHash:          txIn.PreviousOutPoint.Hash[:],
-			OutputIndex:     outputIndex,
-			SpentByTxID:     sql.NullInt64{Int64: txID, Valid: true},
-			SpentInputIndex: sql.NullInt32{Int32: spentInputIndex, Valid: true},
-		})
+		rowsAffected, err := qtx.MarkUtxoSpent(
+			ctx, sqlcpg.MarkUtxoSpentParams{
+				WalletID:    int64(params.WalletID),
+				TxHash:      txIn.PreviousOutPoint.Hash[:],
+				OutputIndex: outputIndex,
+				SpentByTxID: sql.NullInt64{Int64: txID, Valid: true},
+				SpentInputIndex: sql.NullInt32{
+					Int32: spentInputIndex,
+					Valid: true,
+				},
+			},
+		)
 		if err != nil {
 			return fmt.Errorf("mark spent input %d: %w", inputIndex, err)
 		}
@@ -624,42 +579,15 @@ func ensureSpendConflictPg(ctx context.Context, qtx *sqlcpg.Queries,
 	return nil
 }
 
-// groupRollbackCoinbaseRootsPg groups rollback-affected coinbase hashes by
-// wallet so descendant invalidation can reuse wallet-scoped unmined queries.
-func groupRollbackCoinbaseRootsPg(rows []sqlcpg.ListRollbackCoinbaseRootsRow) (
-	map[uint32]map[chainhash.Hash]struct{}, error) {
-
-	rootHashesByWallet := make(map[uint32]map[chainhash.Hash]struct{},
-		len(rows))
-
-	for _, row := range rows {
-		walletID, err := int64ToUint32(row.WalletID)
-		if err != nil {
-			return nil, fmt.Errorf("rollback coinbase wallet id: %w", err)
-		}
-
-		txHash, err := chainhash.NewHash(row.TxHash)
-		if err != nil {
-			return nil, fmt.Errorf("rollback coinbase hash: %w", err)
-		}
-
-		if _, ok := rootHashesByWallet[walletID]; !ok {
-			rootHashesByWallet[walletID] = make(map[chainhash.Hash]struct{})
-		}
-
-		rootHashesByWallet[walletID][*txHash] = struct{}{}
-	}
-
-	return rootHashesByWallet, nil
-}
-
-// txInfoFromPgRow converts one normalized postgres query row into the public
-// TxInfo shape.
+// txInfoFromPgRow maps one postgres query row into the public TxInfo contract,
+// including optional block metadata.
 func txInfoFromPgRow(hash []byte, rawTx []byte, received time.Time,
 	blockHeight sql.NullInt32, blockHash []byte, blockTimestamp sql.NullInt64,
 	status string, label string) (*TxInfo, error) {
 
-	block, err := buildPgOptionalBlock(blockHeight, blockHash, blockTimestamp)
+	block, _, err := buildPgOptionalBlock(
+		blockHeight, blockHash, blockTimestamp,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -669,18 +597,21 @@ func txInfoFromPgRow(hash []byte, rawTx []byte, received time.Time,
 	)
 }
 
-// buildPgOptionalBlock returns nil for blockless history and otherwise converts
-// the postgres block columns into the public Block shape.
+// buildPgOptionalBlock converts nullable postgres block columns into an
+// optional public Block and reports whether a confirmation block was present.
 func buildPgOptionalBlock(height sql.NullInt32, hash []byte,
-	timestamp sql.NullInt64) (*Block, error) {
+	timestamp sql.NullInt64) (*Block, bool, error) {
 
 	if !height.Valid {
-		// Nil block is the expected shape for blockless history.
-		//nolint:nilnil
-		return nil, nil
+		return nil, false, nil
 	}
 
-	return buildPgBlock(height, hash, timestamp)
+	block, err := buildPgBlock(height, hash, timestamp)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return block, true, nil
 }
 
 // buildPgConfirmedBlock converts required postgres block columns into the

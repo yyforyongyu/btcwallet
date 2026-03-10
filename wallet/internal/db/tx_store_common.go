@@ -38,10 +38,10 @@ var (
 		"create tx cannot use orphaned status",
 	)
 
-	// errCreateTxTerminalStatus indicates that CreateTx attempted to insert a
-	// blockless transaction directly in a terminal invalid state.
+	// errCreateTxTerminalStatus indicates that CreateTx attempted to insert an
+	// unmined transaction directly in a terminal invalid state.
 	errCreateTxTerminalStatus = errors.New(
-		"create tx cannot use terminal blockless status",
+		"create tx cannot use terminal status",
 	)
 
 	// errInvalidTxStatus indicates that a status string does not map to a
@@ -56,8 +56,8 @@ var (
 	// output index more than once.
 	errDuplicateCreditIndex = errors.New("duplicate credit index")
 
-	// errDuplicateInputOutPoint indicates that CreateTx received the same
-	// previous outpoint more than once.
+	// errDuplicateInputOutPoint indicates that CreateTx received the same input
+	// outpoint more than once in the serialized transaction.
 	errDuplicateInputOutPoint = errors.New("duplicate input outpoint")
 
 	// errDeleteRequiresLiveUnconfirmed indicates that DeleteTx only accepts
@@ -66,9 +66,11 @@ var (
 		"live unconfirmed transaction required",
 	)
 
-	// errDeleteRequiresLeaf indicates that DeleteTx only accepts live
-	// transactions with no child spenders.
-	errDeleteRequiresLeaf = errors.New("delete requires a leaf transaction")
+	// errDeleteTxHasDependents indicates that DeleteTx was called for a
+	// transaction that still has direct child spenders.
+	errDeleteTxHasDependents = errors.New(
+		"delete requires a leaf transaction",
+	)
 )
 
 // serializeMsgTx serializes a wire.MsgTx so it can be stored in the
@@ -129,13 +131,18 @@ func validateCreateTxParams(params CreateTxParams) error {
 	}
 
 	seenCredits := make(map[uint32]struct{}, len(params.Credits))
-	maxIndex := int64(len(params.Tx.TxOut))
+	seenInputs := make(map[wire.OutPoint]struct{}, len(params.Tx.TxIn))
+
+	maxIndex, err := intToUint32(len(params.Tx.TxOut))
+	if err != nil {
+		return fmt.Errorf("convert tx output count: %w", err)
+	}
 
 	// Every requested credit must map to one real output exactly once because
 	// the write path persists one UTXO row per credited output index and later
 	// dereferences params.Tx.TxOut[credit.Index].
 	for _, credit := range params.Credits {
-		if int64(credit.Index) >= maxIndex {
+		if credit.Index >= maxIndex {
 			return fmt.Errorf(
 				"credit index %d: %w", credit.Index,
 				errCreditIndexOutOfRange,
@@ -152,19 +159,16 @@ func validateCreateTxParams(params CreateTxParams) error {
 		seenCredits[credit.Index] = struct{}{}
 	}
 
-	if !isCoinbase {
-		seenInputs := make(map[wire.OutPoint]struct{}, len(params.Tx.TxIn))
-
-		for _, txIn := range params.Tx.TxIn {
-			if _, ok := seenInputs[txIn.PreviousOutPoint]; ok {
-				return fmt.Errorf(
-					"input outpoint %s: %w",
-					txIn.PreviousOutPoint, errDuplicateInputOutPoint,
-				)
-			}
-
-			seenInputs[txIn.PreviousOutPoint] = struct{}{}
+	// The spend graph stores at most one `(spent_by_tx_id, spent_input_index)`
+	// pointer per wallet-owned outpoint, so duplicate prevouts must be rejected
+	// before the write path starts.
+	for inputIndex, txIn := range params.Tx.TxIn {
+		if _, ok := seenInputs[txIn.PreviousOutPoint]; ok {
+			return fmt.Errorf("input %d: %w", inputIndex,
+				errDuplicateInputOutPoint)
 		}
+
+		seenInputs[txIn.PreviousOutPoint] = struct{}{}
 	}
 
 	return nil
@@ -244,26 +248,6 @@ func newLiveTxRecord(
 	return liveTxRecord{ID: id, Hash: *txHash, Tx: tx}, nil
 }
 
-// buildLiveTxRecords decodes backend-specific live transaction rows into the
-// shared dependency-walk shape.
-func buildLiveTxRecords[T any](rows []T,
-	extract func(T) (int64, []byte, []byte)) ([]liveTxRecord, error) {
-
-	records := make([]liveTxRecord, 0, len(rows))
-	for _, row := range rows {
-		id, hash, rawTx := extract(row)
-
-		record, err := newLiveTxRecord(id, hash, rawTx)
-		if err != nil {
-			return nil, fmt.Errorf("decode live transaction %d: %w", id, err)
-		}
-
-		records = append(records, record)
-	}
-
-	return records, nil
-}
-
 // collectDirectChildTxIDs returns the IDs of live transactions that directly
 // spend any output created by the provided parent hash.
 func collectDirectChildTxIDs(parentHash chainhash.Hash,
@@ -281,113 +265,6 @@ func collectDirectChildTxIDs(parentHash chainhash.Hash,
 	}
 
 	return childIDs
-}
-
-// collectDescendantTxIDs returns every live transaction that depends on any of
-// the provided root hashes, including indirect descendants discovered through
-// newly invalidated child hashes.
-func collectDescendantTxIDs(rootHashes map[chainhash.Hash]struct{},
-	candidates []liveTxRecord) []int64 {
-
-	invalidHashes := make(map[chainhash.Hash]struct{}, len(rootHashes))
-	for hash := range rootHashes {
-		invalidHashes[hash] = struct{}{}
-	}
-
-	invalidIDs := make(map[int64]struct{}, len(candidates))
-
-	// Keep walking until one full pass finds no new descendants. Each newly
-	// invalidated child hash can reveal additional grandchildren on the next
-	// iteration.
-	for changed := true; changed; {
-		changed = false
-
-		for _, candidate := range candidates {
-			if _, ok := invalidIDs[candidate.ID]; ok {
-				continue
-			}
-
-			if !txSpendsAnyParent(candidate.Tx, invalidHashes) {
-				continue
-			}
-
-			invalidIDs[candidate.ID] = struct{}{}
-			invalidHashes[candidate.Hash] = struct{}{}
-			changed = true
-		}
-	}
-
-	descendantIDs := make([]int64, 0, len(invalidIDs))
-	for _, candidate := range candidates {
-		if _, ok := invalidIDs[candidate.ID]; ok {
-			descendantIDs = append(descendantIDs, candidate.ID)
-		}
-	}
-
-	return descendantIDs
-}
-
-// applyRollbackDescendantInvalidation clears spend edges and marks failed every
-// live descendant discovered from the provided wallet-scoped rollback roots.
-func applyRollbackDescendantInvalidation[
-	Row any, ClearParams any, UpdateParams any,
-](ctx context.Context,
-	rootHashesByWallet map[uint32]map[chainhash.Hash]struct{},
-	listUnminedTransactions func(context.Context, int64) ([]Row, error),
-	extractLiveTx func(Row) (int64, []byte, []byte),
-	clearUtxosSpentByTxID func(context.Context, ClearParams) (int64, error),
-	buildClearParams func(walletID int64, descendantID int64) ClearParams,
-	updateTransactionStatusByIDs func(context.Context, UpdateParams) (
-		int64, error,
-	),
-	buildUpdateParams func(walletID int64, descendantIDs []int64) UpdateParams,
-) error {
-
-	for walletID, rootHashes := range rootHashesByWallet {
-		walletID64 := int64(walletID)
-
-		rows, err := listUnminedTransactions(ctx, walletID64)
-		if err != nil {
-			return fmt.Errorf(
-				"list live rollback descendants for wallet %d: %w",
-				walletID, err,
-			)
-		}
-
-		candidates, err := buildLiveTxRecords(rows, extractLiveTx)
-		if err != nil {
-			return err
-		}
-
-		descendantIDs := collectDescendantTxIDs(rootHashes, candidates)
-		if len(descendantIDs) == 0 {
-			continue
-		}
-
-		for _, descendantID := range descendantIDs {
-			_, err = clearUtxosSpentByTxID(
-				ctx, buildClearParams(walletID64, descendantID),
-			)
-			if err != nil {
-				return fmt.Errorf(
-					"clear rollback descendant spends for wallet %d: %w",
-					walletID, err,
-				)
-			}
-		}
-
-		_, err = updateTransactionStatusByIDs(
-			ctx, buildUpdateParams(walletID64, descendantIDs),
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"mark rollback descendants failed for wallet %d: %w",
-				walletID, err,
-			)
-		}
-	}
-
-	return nil
 }
 
 // txSpendsAnyParent reports whether a transaction spends an outpoint created by
@@ -429,8 +306,95 @@ func buildTxInfo(hash []byte, rawTx []byte, received time.Time, block *Block,
 	}, nil
 }
 
-// isLiveUnconfirmedStatus reports whether a status still belongs to the live
-// blockless transaction set that DeleteTx may erase.
+// txDeleteHooks bundles the backend-specific callbacks used by
+// the shared live-unconfirmed delete flow.
+type txDeleteHooks struct {
+	// LoadMeta resolves the transaction row to evaluate and delete.
+	LoadMeta func(context.Context) (txChainMeta, error)
+
+	// ListChildren returns any direct child spenders that still depend on the
+	// candidate transaction.
+	ListChildren func(context.Context, int64) ([]int64, error)
+
+	// ClearSpentByTx releases wallet-owned inputs previously claimed by the
+	// transaction being deleted.
+	ClearSpentByTx func(context.Context, int64) error
+
+	// DeleteUtxosByTx removes wallet-owned outputs created by the transaction.
+	DeleteUtxosByTx func(context.Context, int64) error
+
+	// DeleteTx removes the transaction row itself and reports affected rows.
+	DeleteTx func(context.Context) (int64, error)
+}
+
+// buildTxDeleteHooks wires backend-specific delete callbacks into
+// the shared txDeleteHooks container.
+func buildTxDeleteHooks(
+	loadMeta func(context.Context) (txChainMeta, error),
+	listChildren func(context.Context, int64) ([]int64, error),
+	clearSpentByTx func(context.Context, int64) error,
+	deleteUtxosByTx func(context.Context, int64) error,
+	deleteTx func(context.Context) (int64, error),
+) txDeleteHooks {
+
+	return txDeleteHooks{
+		LoadMeta:        loadMeta,
+		ListChildren:    listChildren,
+		ClearSpentByTx:  clearSpentByTx,
+		DeleteUtxosByTx: deleteUtxosByTx,
+		DeleteTx:        deleteTx,
+	}
+}
+
+// deleteTxCommon removes one live unconfirmed leaf transaction through the
+// backend-specific callbacks supplied in txDeleteHooks.
+func deleteTxCommon(ctx context.Context, txid chainhash.Hash,
+	hooks txDeleteHooks) error {
+
+	meta, err := hooks.LoadMeta(ctx)
+	if err != nil {
+		return err
+	}
+
+	if meta.HasBlock || !isLiveUnconfirmedStatus(meta.Status) {
+		return fmt.Errorf("transaction %s: %w", txid,
+			errDeleteRequiresLiveUnconfirmed)
+	}
+
+	childIDs, err := hooks.ListChildren(ctx, meta.ID)
+	if err != nil {
+		return err
+	}
+
+	if len(childIDs) > 0 {
+		return fmt.Errorf("transaction %s: %w", txid,
+			errDeleteTxHasDependents)
+	}
+
+	err = hooks.ClearSpentByTx(ctx, meta.ID)
+	if err != nil {
+		return err
+	}
+
+	err = hooks.DeleteUtxosByTx(ctx, meta.ID)
+	if err != nil {
+		return err
+	}
+
+	rows, err := hooks.DeleteTx(ctx)
+	if err != nil {
+		return err
+	}
+
+	if rows == 0 {
+		return fmt.Errorf("transaction %s: %w", txid, ErrTxNotFound)
+	}
+
+	return nil
+}
+
+// isLiveUnconfirmedStatus reports whether a transaction remains part of the
+// live unconfirmed graph that ordinary DeleteTx calls are allowed to mutate.
 func isLiveUnconfirmedStatus(status TxStatus) bool {
 	switch status {
 	case TxStatusPending, TxStatusPublished:
@@ -438,8 +402,7 @@ func isLiveUnconfirmedStatus(status TxStatus) bool {
 
 	case TxStatusReplaced, TxStatusFailed, TxStatusOrphaned:
 		return false
-
-	default:
-		return false
 	}
+
+	return false
 }
