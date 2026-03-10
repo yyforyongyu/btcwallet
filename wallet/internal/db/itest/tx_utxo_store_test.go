@@ -537,7 +537,8 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 		WalletID: walletID,
 	})
 	require.NoError(t, err)
-	require.Equal(t, btcutil.Amount(62000), totalBalance)
+	require.Equal(t, btcutil.Amount(62000), totalBalance.Total)
+	require.Zero(t, totalBalance.Locked)
 
 	coinbaseMaturityOnlyBalance, err := store.Balance(
 		t.Context(), db.BalanceParams{
@@ -547,7 +548,8 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 		},
 	)
 	require.NoError(t, err)
-	require.Equal(t, btcutil.Amount(10000), coinbaseMaturityOnlyBalance)
+	require.Equal(t, btcutil.Amount(10000), coinbaseMaturityOnlyBalance.Total)
+	require.Zero(t, coinbaseMaturityOnlyBalance.Locked)
 
 	defaultBalance, err := store.Balance(t.Context(), db.BalanceParams{
 		WalletID: walletID,
@@ -555,7 +557,8 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 		MinConfs: int32Ptr(1),
 	})
 	require.NoError(t, err)
-	require.Equal(t, btcutil.Amount(60000), defaultBalance)
+	require.Equal(t, btcutil.Amount(60000), defaultBalance.Total)
+	require.Zero(t, defaultBalance.Locked)
 
 	strictCoinbaseBalance, err := store.Balance(t.Context(), db.BalanceParams{
 		WalletID:         walletID,
@@ -564,7 +567,8 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 		CoinbaseMaturity: int32Ptr(3),
 	})
 	require.NoError(t, err)
-	require.Equal(t, btcutil.Amount(10000), strictCoinbaseBalance)
+	require.Equal(t, btcutil.Amount(10000), strictCoinbaseBalance.Total)
+	require.Zero(t, strictCoinbaseBalance.Locked)
 
 	leaseOutPoint := wire.OutPoint{Hash: confirmedTx.TxHash(), Index: 0}
 	leaseID := lockIDFixture(1)
@@ -591,14 +595,14 @@ func TestUtxoStoreLeaseAndBalance(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "output already leased")
 
-	excludeLeasedBalance, err := store.Balance(t.Context(), db.BalanceParams{
-		WalletID:      walletID,
-		Account:       &defaultAccount,
-		MinConfs:      int32Ptr(1),
-		ExcludeLeased: true,
+	leasedBalance, err := store.Balance(t.Context(), db.BalanceParams{
+		WalletID: walletID,
+		Account:  &defaultAccount,
+		MinConfs: int32Ptr(1),
 	})
 	require.NoError(t, err)
-	require.Equal(t, btcutil.Amount(50000), excludeLeasedBalance)
+	require.Equal(t, btcutil.Amount(60000), leasedBalance.Total)
+	require.Equal(t, btcutil.Amount(10000), leasedBalance.Locked)
 
 	err = store.ReleaseOutput(t.Context(), db.ReleaseOutputParams{
 		WalletID: walletID,

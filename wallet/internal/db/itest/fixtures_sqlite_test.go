@@ -154,6 +154,8 @@ func getAddressSecret(t *testing.T, queries *sqlcsqlite.Queries,
 	return queries.GetAddressSecret(t.Context(), addressID)
 }
 
+// requireReplacementEdge asserts that the replacement edge audit table records
+// exactly one victim -> winner relationship for the provided hashes.
 func requireReplacementEdge(t *testing.T, queries *sqlcsqlite.Queries,
 	walletID uint32, replacedTxid chainhash.Hash,
 	replacementTxid chainhash.Hash) {
