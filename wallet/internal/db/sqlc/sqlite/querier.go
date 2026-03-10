@@ -339,6 +339,16 @@ type Querier interface {
 	ListAddressesByAccount(ctx context.Context, arg ListAddressesByAccountParams) ([]ListAddressesByAccountRow, error)
 	// Lists all key scopes for a wallet, ordered by ID.
 	ListKeyScopesByWallet(ctx context.Context, walletID int64) ([]KeyScope, error)
+	// Lists live unmined transactions that may directly conflict with one winner.
+	//
+	// How:
+	// - Reads only blockless live rows (`pending` or `published`).
+	// - Returns raw transactions so callers can inspect inputs for wallet-owned
+	//   conflicts without re-querying each row.
+	// Performance:
+	// - Uses the wallet-scoped blockless-history index and keeps the projection
+	//   narrow to replacement-validation fields.
+	ListLiveUnminedConflictCandidates(ctx context.Context, walletID int64) ([]ListLiveUnminedConflictCandidatesRow, error)
 	// Lists victim txids for a given replacement txid.
 	//
 	// How:
@@ -416,10 +426,10 @@ type Querier interface {
 	// Lists all unconfirmed transactions for a wallet.
 	//
 	// How:
-	// - Reads from transactions only and filters on blockless rows that are still
-	//   in a live unconfirmed state (`pending` or `published`).
-	// - Excludes orphaned/replaced/failed history so rollback-produced coinbase
-	//   rows do not reappear as mempool transactions.
+	// - Reads from transactions only and filters on blockless rows.
+	// - Preserves blockless history rows such as replaced, failed, or orphaned
+	//   transactions so callers can inspect the full wallet-local transaction
+	//   history even after invalidation flows or rollback.
 	// - Projects typed NULL block metadata through `LEFT JOIN blocks AS b ON 1 = 0`
 	//   so the unmined row shape stays aligned with the confirmed query below.
 	// Performance:
@@ -462,6 +472,14 @@ type Querier interface {
 	// - Targets one outpoint in one wallet; the subquery uses the unique
 	//   wallet-scoped tx hash lookup.
 	MarkUtxoSpent(ctx context.Context, arg MarkUtxoSpentParams) (int64, error)
+	// Restores one orphaned coinbase row to a confirming block.
+	//
+	// How:
+	// - Updates only blockless orphaned coinbase rows.
+	// - Reuses the provided block reference and restores the live published status.
+	// Performance:
+	// - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+	ReconfirmOrphanedCoinbaseByHash(ctx context.Context, arg ReconfirmOrphanedCoinbaseByHashParams) (int64, error)
 	// Releases a lease for a UTXO ID if the lock_id matches.
 	//
 	// How:

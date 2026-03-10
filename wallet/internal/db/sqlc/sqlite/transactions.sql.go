@@ -266,6 +266,68 @@ func (q *Queries) InsertTransaction(ctx context.Context, arg InsertTransactionPa
 	return id, err
 }
 
+const ListLiveUnminedConflictCandidates = `-- name: ListLiveUnminedConflictCandidates :many
+SELECT
+    id,
+    tx_hash,
+    raw_tx,
+    is_coinbase,
+    tx_status
+FROM transactions
+WHERE
+    wallet_id = ?
+    AND block_height IS NULL
+    AND tx_status IN (0, 1)
+ORDER BY id
+`
+
+type ListLiveUnminedConflictCandidatesRow struct {
+	ID         int64
+	TxHash     []byte
+	RawTx      []byte
+	IsCoinbase bool
+	TxStatus   int64
+}
+
+// Lists live unmined transactions that may directly conflict with one winner.
+//
+// How:
+//   - Reads only blockless live rows (`pending` or `published`).
+//   - Returns raw transactions so callers can inspect inputs for wallet-owned
+//     conflicts without re-querying each row.
+//
+// Performance:
+//   - Uses the wallet-scoped blockless-history index and keeps the projection
+//     narrow to replacement-validation fields.
+func (q *Queries) ListLiveUnminedConflictCandidates(ctx context.Context, walletID int64) ([]ListLiveUnminedConflictCandidatesRow, error) {
+	rows, err := q.query(ctx, q.listLiveUnminedConflictCandidatesStmt, ListLiveUnminedConflictCandidates, walletID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLiveUnminedConflictCandidatesRow
+	for rows.Next() {
+		var i ListLiveUnminedConflictCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TxHash,
+			&i.RawTx,
+			&i.IsCoinbase,
+			&i.TxStatus,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const ListRollbackCoinbaseRoots = `-- name: ListRollbackCoinbaseRoots :many
 SELECT
     wallet_id,
@@ -419,7 +481,6 @@ LEFT JOIN blocks AS b ON 1 = 0
 WHERE
     t.wallet_id = ?
     AND t.block_height IS NULL
-    AND t.tx_status IN (0, 1)
 ORDER BY t.received_time DESC, t.id DESC
 `
 
@@ -439,10 +500,10 @@ type ListUnminedTransactionsRow struct {
 // Lists all unconfirmed transactions for a wallet.
 //
 // How:
-//   - Reads from transactions only and filters on blockless rows that are still
-//     in a live unconfirmed state (`pending` or `published`).
-//   - Excludes orphaned/replaced/failed history so rollback-produced coinbase
-//     rows do not reappear as mempool transactions.
+//   - Reads from transactions only and filters on blockless rows.
+//   - Preserves blockless history rows such as replaced, failed, or orphaned
+//     transactions so callers can inspect the full wallet-local transaction
+//     history even after invalidation flows or rollback.
 //   - Projects typed NULL block metadata through `LEFT JOIN blocks AS b ON 1 = 0`
 //     so the unmined row shape stays aligned with the confirmed query below.
 //
@@ -481,6 +542,40 @@ func (q *Queries) ListUnminedTransactions(ctx context.Context, walletID int64) (
 		return nil, err
 	}
 	return items, nil
+}
+
+const ReconfirmOrphanedCoinbaseByHash = `-- name: ReconfirmOrphanedCoinbaseByHash :execrows
+UPDATE transactions
+SET
+    block_height = cast(?1 AS INTEGER),
+    tx_status = 1
+WHERE
+    wallet_id = ?2
+    AND tx_hash = ?3
+    AND block_height IS NULL
+    AND is_coinbase
+    AND tx_status = 4
+`
+
+type ReconfirmOrphanedCoinbaseByHashParams struct {
+	BlockHeight int64
+	WalletID    int64
+	TxHash      []byte
+}
+
+// Restores one orphaned coinbase row to a confirming block.
+//
+// How:
+// - Updates only blockless orphaned coinbase rows.
+// - Reuses the provided block reference and restores the live published status.
+// Performance:
+// - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+func (q *Queries) ReconfirmOrphanedCoinbaseByHash(ctx context.Context, arg ReconfirmOrphanedCoinbaseByHashParams) (int64, error) {
+	result, err := q.exec(ctx, q.reconfirmOrphanedCoinbaseByHashStmt, ReconfirmOrphanedCoinbaseByHash, arg.BlockHeight, arg.WalletID, arg.TxHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const RewindWalletSyncStateHeightsForRollback = `-- name: RewindWalletSyncStateHeightsForRollback :execrows
