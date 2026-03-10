@@ -344,6 +344,8 @@ type TxReplacementStore interface {
 }
 
 // UTXOStore defines the database actions for managing the UTXO set.
+//
+//nolint:iface // Store is a transitional wrapper over UTXOStore.
 type UTXOStore interface {
 	// GetUtxo retrieves a single unspent transaction output (UTXO) by its
 	// outpoint. It returns a UtxoInfo struct containing the UTXO's details
