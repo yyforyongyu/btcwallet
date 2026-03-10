@@ -275,18 +275,16 @@ type TxStore interface {
 	// replacement handling.
 	UpdateTxLabel(ctx context.Context, params UpdateTxLabelParams) error
 
-	// GetTx retrieves a transaction record by its hash. It takes a context
-	// and GetTxQuery, returning a TxInfo struct or an error if the
-	// transaction is not found. Note that the `Credits` and `Debits` fields
-	// of the returned `TxInfo` are not stored directly in the transaction
-	// record; they are derived by querying the UTXO store and represent
-	// wallet-specific information about the transaction's impact on the
-	// UTXO set.
+	// GetTx retrieves a wallet-scoped transaction record by its hash and
+	// returns the persisted metadata represented by TxInfo. The response
+	// includes the serialized transaction, wallet-relative status, received
+	// timestamp, optional block assignment, and user label.
 	GetTx(ctx context.Context, query GetTxQuery) (*TxInfo, error)
 
-	// ListTxns returns a slice of transaction information based on the
-	// provided query parameters. It takes a context and ListTxnsQuery,
-	// returning a slice of TxInfo or an error if the retrieval fails.
+	// ListTxns returns wallet-scoped transaction history based on the
+	// provided query parameters. Confirmed reads are block-height bounded.
+	// Unmined reads return every blockless row, including invalid history
+	// such as `failed`, `replaced`, and orphaned coinbase transactions.
 	ListTxns(ctx context.Context, query ListTxnsQuery) ([]TxInfo, error)
 
 	// DeleteTx removes a live unconfirmed transaction from the store. It
@@ -294,16 +292,20 @@ type TxStore interface {
 	// transaction is not found or the deletion fails.
 	//
 	// DeleteTx is intentionally narrower than a generic
-	// "delete any transaction" API. Orphaned, replaced, and failed rows remain
-	// part of the wallet's historical view for audit, reorg, and replacement
-	// handling and therefore must not be erased through the ordinary
-	// unconfirmed-deletion path.
+	// "delete any transaction" API. Only live unconfirmed leaf transactions
+	// are deletable. Orphaned, replaced, and failed rows remain part of the
+	// wallet's historical view for audit, reorg, and replacement handling and
+	// therefore must not be erased through the ordinary unconfirmed-deletion
+	// path.
 	DeleteTx(ctx context.Context, params DeleteTxParams) error
 
 	// RollbackToBlock removes all blocks at and after a given height,
-	// moving any transactions within those blocks back to the unconfirmed
-	// pool. This operation is performed as a single, atomic database
-	// transaction to ensure data integrity. Breaking it into smaller,
+	// moving disconnected non-coinbase transactions back to blockless history.
+	// Rolled-back coinbase rows become TxStatusOrphaned blockless history, and
+	// any descendant branch that depends on those orphaned roots is recursively
+	// marked failed in the same rollback transaction instead of re-entering the
+	// live unconfirmed set. This operation is performed as a single, atomic
+	// database transaction to ensure data integrity. Breaking it into smaller,
 	// separate interface methods would risk leaving the database in an
 	// inconsistent state if an error occurred mid-process. The current
 	// approach guarantees that the rollback is either fully completed or
@@ -317,9 +319,31 @@ type TxStore interface {
 	RollbackToBlock(ctx context.Context, height uint32) error
 }
 
+// TxReplacementStore defines the transaction-graph invalidation flows layered
+// on top of the base TxStore APIs.
+type TxReplacementStore interface {
+	// ApplyTxReplacement records one live winner, marks every direct victim as
+	// replaced, recursively fails descendants, and reclaims the winner's
+	// wallet-owned spent-input edges.
+	ApplyTxReplacement(ctx context.Context,
+		params ApplyTxReplacementParams) error
+
+	// ApplyTxFailure marks every direct loser as failed, recursively fails
+	// descendants, and reclaims the conflicting winner's wallet-owned
+	// spent-input edges.
+	ApplyTxFailure(ctx context.Context, params ApplyTxFailureParams) error
+
+	// OrphanTxChain keeps the supplied coinbase roots orphaned while
+	// recursively failing every descendant branch that depends on those roots.
+	OrphanTxChain(ctx context.Context, params OrphanTxChainParams) error
+
+	// ReconfirmOrphanedCoinbase restores one orphaned coinbase root to a new
+	// confirming block without replaying any descendant branch.
+	ReconfirmOrphanedCoinbase(ctx context.Context,
+		params ReconfirmOrphanedCoinbaseParams) error
+}
+
 // UTXOStore defines the database actions for managing the UTXO set.
-//
-//nolint:iface // Store is a transitional wrapper over UTXOStore.
 type UTXOStore interface {
 	// GetUtxo retrieves a single unspent transaction output (UTXO) by its
 	// outpoint. It returns a UtxoInfo struct containing the UTXO's details
@@ -330,9 +354,10 @@ type UTXOStore interface {
 	// UTXO set.
 	GetUtxo(ctx context.Context, query GetUtxoQuery) (*UtxoInfo, error)
 
-	// ListUTXOs returns a slice of all unspent transaction outputs (UTXOs)
-	// that match the provided query parameters. This can be used to list
-	// all UTXOs or filter them by account or confirmation status.
+	// ListUTXOs returns live wallet-owned UTXOs that match the provided
+	// query parameters. Nil confirmation bounds mean "no lower bound" or
+	// "no upper bound", which allows a zero-value query to list all live
+	// wallet-owned UTXOs.
 	//
 	// ListUTXOs includes outputs from live unconfirmed parent transactions.
 	// Spendability policy such as coinbase maturity, lease state, or whether
@@ -365,7 +390,9 @@ type UTXOStore interface {
 	// Balance returns a wallet-scoped balance view for the current unspent UTXO
 	// set after applying any optional caller-supplied filters.
 	//
-	// The zero-value BalanceParams request the wallet's live factual balance.
+	// The zero-value BalanceParams request the wallet's live factual balance,
+	// including blockless outputs owned by live `pending` or `published`
+	// transactions.
 	// Callers may narrow that view by account, confirmation range, lease
 	// or coinbase maturity when they need a workflow-specific balance policy
 	// from the public store interface. The returned BalanceResult always uses
