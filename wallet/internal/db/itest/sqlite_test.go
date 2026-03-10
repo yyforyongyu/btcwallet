@@ -3,11 +3,15 @@
 package itest
 
 import (
+	"bytes"
+	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	sqlcsqlite "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/sqlite"
 	"github.com/stretchr/testify/require"
@@ -66,4 +70,58 @@ func childSpendingTxIDs(t *testing.T, store *db.SqliteStore, walletID uint32,
 	}
 
 	return ids
+}
+
+// insertConflictingRegularTx inserts one live regular transaction row plus any
+// credited wallet-owned outputs without claiming wallet spend edges.
+func insertConflictingRegularTx(t *testing.T, store *db.SqliteStore,
+	walletID uint32, tx *wire.MsgTx, received time.Time, status db.TxStatus,
+	credits map[uint32]btcutil.Address) {
+
+	t.Helper()
+
+	var raw bytes.Buffer
+	err := tx.Serialize(&raw)
+	require.NoError(t, err)
+
+	err = store.ExecuteTx(t.Context(), func(qtx *sqlcsqlite.Queries) error {
+		txHash := tx.TxHash()
+		txID, err := qtx.InsertTransaction(
+			t.Context(), sqlcsqlite.InsertTransactionParams{
+				WalletID:     int64(walletID),
+				TxHash:       txHash[:],
+				RawTx:        raw.Bytes(),
+				BlockHeight:  sql.NullInt64{},
+				Status:       int64(status),
+				ReceivedTime: received.UTC(),
+				IsCoinbase:   false,
+				Label:        "",
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		for index := range credits {
+			addressID := getAddressID(
+				t, qtx, tx.TxOut[index].PkScript, walletID,
+			)
+
+			_, err = qtx.InsertUtxo(
+				t.Context(), sqlcsqlite.InsertUtxoParams{
+					WalletID:    int64(walletID),
+					TxID:        txID,
+					OutputIndex: int64(index),
+					Amount:      tx.TxOut[index].Value,
+					AddressID:   addressID,
+				},
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
 }
