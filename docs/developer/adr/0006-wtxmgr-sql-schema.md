@@ -22,6 +22,7 @@ We will adopt a **UTXO-Centered, Soft-Deletion Schema**.
 3.  **Immutable History (Soft Deletion):** We **NEVER** automatically `DELETE` rows.
     *   Failed/RBF'd transactions are marked with a `tx_status` field (e.g., `replaced`, `failed`).
     *   They remain in the database for audit history but are excluded from balance queries.
+    *   The one narrow exception is explicit caller-driven pruning of a live blockless leaf transaction via `DeleteTx`.
     *   Foreign Keys use `ON DELETE RESTRICT` for creation relationships to prevent accidental data loss.
 4.  **Wallet-Scoped Rows:** All `wtxmgr` tables are scoped by `wallet_id` to support multiple wallets sharing a single database without row-level conflicts.
 
@@ -76,6 +77,9 @@ Recommended operational defaults:
         *   If you enforce the coinbase invariant at the database level, a simple `DELETE FROM blocks ...` will fail unless the coinbase row's `tx_status` is updated to `orphaned` as part of the same statement.
         *   Recommended: use a trigger to rewrite coinbase `tx_status` during the `block_height -> NULL` update (see 3.5).
     *   **Reconfirmation:** If an orphaned coinbase transaction re-enters the best chain, restoring it requires setting `block_height` and `tx_status = 1` (`published`) atomically.
+        *   The supported implementation treats this as a **root-only** transition.
+        *   We do **not** persist descendant restoration state for orphaned coinbase branches.
+        *   Rationale: wallet coinbase spends require 100 confirmations, so any descendant branch implies a >100-block reorg. That scenario is treated as out of scope for first-class recovery and should be handled by broader rescan/rebuild tooling instead of extra schema.
 *   **RBF:** Handled by updating the `utxos.spent_by_tx_id` pointer to the new transaction and marking the old transaction as `replaced`.
 
 ### 2.4 Implementation Notes
@@ -121,6 +125,17 @@ table can normalize the row. To preserve the coinbase orphaning invariant, the
 implementation adds a `BEFORE DELETE ON blocks` trigger that rewrites affected
 transactions into their final disconnected state before the block row is
 removed.
+
+**Coinbase reconfirmation scope**
+
+The implementation only restores the orphaned coinbase root row itself when a
+stale block becomes best-chain again.
+
+This is intentional. A wallet is only allowed to spend a coinbase output after
+100 confirmations, so a descendant branch would require a reorg deeper than the
+coinbase maturity window. That case is treated as operationally out of scope
+for the SQL schema. We prefer a simple root-only reconfirmation rule over extra
+restoration tables that only serve catastrophic deep-reorg recovery.
 
 **Transaction labels**
 
@@ -227,6 +242,9 @@ exclusion, confirmation thresholds, or coinbase maturity rules.
 By using soft-deletion style transaction states (`tx_status = 2`, `replaced`),
 we maintain a complete history of user attempts, even those that failed. This
 is superior to previous designs that physically deleted failed transactions.
+The one explicit exception is caller-driven pruning of a live blockless leaf
+transaction, which is modeled as an operational cleanup path rather than part
+of the ordinary history lifecycle.
 
 ### 4.4. Complexity Trade-off
 We accept slightly more complexity in **Transaction Reconstruction** (joining inputs/outputs) in exchange for maximal performance in **Balance Calculation** and **Coin Selection**, which are the high-frequency operations.
