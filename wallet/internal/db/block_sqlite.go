@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	sqlcsqlite "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/sqlite"
@@ -28,13 +29,24 @@ func ensureBlockExistsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 
 	height := int64(block.Height)
 
+	row, err := qtx.GetBlockByHeight(ctx, height)
+	if err == nil {
+		return ensureStoredBlockMatches(
+			block, row.HeaderHash, row.BlockTimestamp,
+		)
+	}
+
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("get block by height: %w", err)
+	}
+
 	blockParams := sqlcsqlite.InsertBlockParams{
 		BlockHeight:    height,
 		HeaderHash:     block.Hash[:],
 		BlockTimestamp: block.Timestamp.Unix(),
 	}
 
-	err := qtx.InsertBlock(ctx, blockParams)
+	err = qtx.InsertBlock(ctx, blockParams)
 	if err != nil {
 		return fmt.Errorf("insert block: %w", err)
 	}

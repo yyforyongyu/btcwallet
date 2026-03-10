@@ -137,6 +137,10 @@ ON transactions (wallet_id, received_time DESC);
 -- The BEFORE DELETE trigger on blocks updates child rows into their final
 -- disconnected shape before the parent block row is removed.
 --
+-- NOTE: This trigger only rewrites disconnected coinbase roots. Rollback code
+-- must still collect those roots and recursively fail descendants in the
+-- surrounding SQL transaction.
+--
 -- NOTE: Generic per-row block disconnects are intentionally unsupported here.
 -- Wallet code should use dedicated rollback/rewind operations instead of
 -- `UPDATE transactions SET block_height = NULL`.

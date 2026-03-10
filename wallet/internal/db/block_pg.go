@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
@@ -28,6 +29,17 @@ func ensureBlockExistsPg(ctx context.Context, qtx *sqlcpg.Queries,
 	height, err := uint32ToInt32(block.Height)
 	if err != nil {
 		return fmt.Errorf("convert block height: %w", err)
+	}
+
+	row, err := qtx.GetBlockByHeight(ctx, height)
+	if err == nil {
+		return ensureStoredBlockMatches(
+			block, row.HeaderHash, row.BlockTimestamp,
+		)
+	}
+
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("get block by height: %w", err)
 	}
 
 	blockParams := sqlcpg.InsertBlockParams{

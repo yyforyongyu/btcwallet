@@ -135,6 +135,10 @@ ON transactions (wallet_id, received_time DESC);
 -- a real `UPDATE OF block_height ON transactions`, so a BEFORE UPDATE trigger
 -- can rewrite the same child row from `(published, block)` to
 -- `(orphaned, NULL block)` before the new version is checked.
+--
+-- NOTE: This trigger only rewrites the disconnected coinbase root. Rollback
+-- code must still collect those roots and recursively fail descendants in the
+-- surrounding SQL transaction.
 CREATE FUNCTION set_coinbase_orphaned_on_disconnect() RETURNS TRIGGER AS $$
 BEGIN
     -- Detect the disconnect transition caused by the FK action on block delete.
