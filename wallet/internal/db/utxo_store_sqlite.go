@@ -1,7 +1,6 @@
 package db
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -15,10 +14,10 @@ import (
 // Ensure SqliteStore satisfies the UTXOStore interface.
 var _ UTXOStore = (*SqliteStore)(nil)
 
-// GetUtxo retrieves one live wallet-owned UTXO by outpoint.
-//
-// Live means the output is still unspent and its creating transaction remains
-// visible in the wallet's spendable history.
+// GetUtxo retrieves one live wallet-owned UTXO by outpoint. It performs a
+// single wallet-scoped read against the current unspent set, so spent outputs,
+// outputs from invalid parents, and outputs owned by other wallets are never
+// returned.
 func (s *SqliteStore) GetUtxo(ctx context.Context,
 	query GetUtxoQuery) (*UtxoInfo, error) {
 
@@ -44,18 +43,18 @@ func (s *SqliteStore) GetUtxo(ctx context.Context,
 	)
 }
 
-// ListUTXOs lists all live wallet-owned UTXOs matching the caller filters.
-//
-// The result set is already constrained to outputs whose creating
-// transactions still belong to the wallet's live UTXO set.
+// ListUTXOs lists live wallet-owned UTXOs matching the caller filters. It runs
+// as one wallet-scoped read over the current unspent set, preserving the API
+// invariant that filters only narrow live outputs rather than resurrect spent
+// or invalidated entries.
 func (s *SqliteStore) ListUTXOs(ctx context.Context,
 	query ListUtxosQuery) ([]UtxoInfo, error) {
 
 	rows, err := s.queries.ListUtxos(ctx, sqlcsqlite.ListUtxosParams{
 		WalletID:      int64(query.WalletID),
 		AccountNumber: optionalUint32Int64(query.Account),
-		MinConfirms:   optionalInt32(query.MinConfs),
-		MaxConfirms:   optionalInt32(query.MaxConfs),
+		MinConfirms:   nullableInt32Int64(query.MinConfs),
+		MaxConfirms:   nullableInt32Int64(query.MaxConfs),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list utxos: %w", err)
@@ -77,11 +76,9 @@ func (s *SqliteStore) ListUTXOs(ctx context.Context,
 	return utxos, nil
 }
 
-// LeaseOutput atomically acquires or renews a lease for one live UTXO.
-//
-// The lease lookup and acquisition run in one transaction so competing calls
-// cannot observe a partially-written lease. Expiration timestamps are
-// normalized to UTC before insert.
+// LeaseOutput atomically acquires or renews a lease for one live UTXO. The
+// lookup and lease mutation happen inside one SQL transaction, and the stored
+// `expires_at` value is normalized to UTC before it is written.
 func (s *SqliteStore) LeaseOutput(ctx context.Context,
 	params LeaseOutputParams) (*LeasedOutput, error) {
 
@@ -89,52 +86,45 @@ func (s *SqliteStore) LeaseOutput(ctx context.Context,
 
 	var lease *LeasedOutput
 
-	acquireLease := func(qtx *sqlcsqlite.Queries) error {
-		expiration, err := qtx.AcquireUtxoLease(
-			ctx, sqlcsqlite.AcquireUtxoLeaseParams{
-				WalletID:    int64(params.WalletID),
-				LockID:      params.ID[:],
-				ExpiresAt:   expiresAt,
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: int64(params.OutPoint.Index),
+	err := s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
+		acquiredLease, err := acquireLeaseCommon(
+			ctx, params.OutPoint, params.ID, utxoLeaseHooks{
+				AcquireLease: func(ctx context.Context) (time.Time, error) {
+					return qtx.AcquireUtxoLease(
+						ctx, sqlcsqlite.AcquireUtxoLeaseParams{
+							WalletID:    int64(params.WalletID),
+							LockID:      params.ID[:],
+							ExpiresAt:   expiresAt,
+							TxHash:      params.OutPoint.Hash[:],
+							OutputIndex: int64(params.OutPoint.Index),
+						},
+					)
+				},
+				LookupUtxoID: func(ctx context.Context) (int64, error) {
+					return qtx.GetUtxoIDByOutpoint(
+						ctx, sqlcsqlite.GetUtxoIDByOutpointParams{
+							WalletID:    int64(params.WalletID),
+							TxHash:      params.OutPoint.Hash[:],
+							OutputIndex: int64(params.OutPoint.Index),
+						},
+					)
+				},
 			},
 		)
-		if err == nil {
-			lease = &LeasedOutput{
-				OutPoint:   params.OutPoint,
-				LockID:     LockID(params.ID),
-				Expiration: expiration.UTC(),
+		if err != nil {
+			if errors.Is(err, errOutputAlreadyLeased) ||
+				errors.Is(err, ErrUtxoNotFound) {
+
+				return err
 			}
 
-			return nil
-		}
-
-		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("acquire utxo lease: %w", err)
 		}
 
-		_, lookupErr := qtx.GetUtxoIDByOutpoint(
-			ctx, sqlcsqlite.GetUtxoIDByOutpointParams{
-				WalletID:    int64(params.WalletID),
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: int64(params.OutPoint.Index),
-			},
-		)
-		if lookupErr != nil {
-			if errors.Is(lookupErr, sql.ErrNoRows) {
-				return fmt.Errorf("utxo %s: %w", params.OutPoint,
-					ErrUtxoNotFound)
-			}
+		lease = acquiredLease
 
-			return fmt.Errorf("lookup utxo before lease conflict: %w",
-				lookupErr)
-		}
-
-		return fmt.Errorf("utxo %s: %w", params.OutPoint,
-			ErrOutputAlreadyLeased)
-	}
-
-	err := s.ExecuteTx(ctx, acquireLease)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -142,72 +132,69 @@ func (s *SqliteStore) LeaseOutput(ctx context.Context,
 	return lease, nil
 }
 
-// ReleaseOutput atomically releases a lease when the caller provides the
-// active lock ID.
-//
-// The ownership check and lease deletion run in one transaction so callers
-// cannot unlock a UTXO using stale state from a separate read.
+// ReleaseOutput atomically releases a lease when the caller provides the active
+// lock ID. The lookup and conditional delete happen inside one SQL
+// transaction, so lock validation and state removal cannot be observed
+// separately.
 func (s *SqliteStore) ReleaseOutput(ctx context.Context,
 	params ReleaseOutputParams) error {
 
-	releaseLease := func(qtx *sqlcsqlite.Queries) error {
-		utxoID, err := qtx.GetUtxoIDByOutpoint(
-			ctx, sqlcsqlite.GetUtxoIDByOutpointParams{
-				WalletID:    int64(params.WalletID),
-				TxHash:      params.OutPoint.Hash[:],
-				OutputIndex: int64(params.OutPoint.Index),
-			},
-		)
+	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
+		err := releaseLeaseCommon(ctx, params.OutPoint, params.ID,
+			utxoLeaseHooks{
+				LookupUtxoID: func(ctx context.Context) (int64, error) {
+					return qtx.GetUtxoIDByOutpoint(
+						ctx, sqlcsqlite.GetUtxoIDByOutpointParams{
+							WalletID:    int64(params.WalletID),
+							TxHash:      params.OutPoint.Hash[:],
+							OutputIndex: int64(params.OutPoint.Index),
+						},
+					)
+				},
+				ReleaseLease: func(ctx context.Context,
+					utxoID int64) (int64, error) {
+
+					rows, err := qtx.ReleaseUtxoLease(
+						ctx, sqlcsqlite.ReleaseUtxoLeaseParams{
+							WalletID: int64(params.WalletID),
+							UtxoID:   utxoID,
+							LockID:   params.ID[:],
+						},
+					)
+					if err != nil {
+						return 0, fmt.Errorf("release utxo lease: %w", err)
+					}
+
+					return rows, nil
+				},
+				LookupActiveLeaseLockID: func(ctx context.Context,
+					utxoID int64) ([]byte, error) {
+
+					return qtx.GetActiveUtxoLeaseLockID(
+						ctx, sqlcsqlite.GetActiveUtxoLeaseLockIDParams{
+							WalletID: int64(params.WalletID),
+							UtxoID:   utxoID,
+						},
+					)
+				},
+			})
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("utxo %s: %w", params.OutPoint,
-					ErrUtxoNotFound)
+			if errors.Is(err, errOutputUnlockNotAllowed) ||
+				errors.Is(err, ErrUtxoNotFound) {
+
+				return err
 			}
 
 			return fmt.Errorf("lookup utxo for release: %w", err)
 		}
 
-		rows, err := qtx.ReleaseUtxoLease(
-			ctx, sqlcsqlite.ReleaseUtxoLeaseParams{
-				WalletID: int64(params.WalletID),
-				UtxoID:   utxoID,
-				LockID:   params.ID[:],
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("release utxo lease: %w", err)
-		}
-
-		if rows == 0 {
-			activeLockID, err := qtx.GetActiveUtxoLeaseLockID(
-				ctx, sqlcsqlite.GetActiveUtxoLeaseLockIDParams{
-					WalletID: int64(params.WalletID),
-					UtxoID:   utxoID,
-				},
-			)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return nil
-				}
-
-				return fmt.Errorf("lookup active utxo lease: %w", err)
-			}
-
-			if !bytes.Equal(activeLockID, params.ID[:]) {
-				return fmt.Errorf("utxo %s: %w", params.OutPoint,
-					ErrOutputUnlockNotAllowed)
-			}
-
-			return nil
-		}
-
 		return nil
-	}
-
-	return s.ExecuteTx(ctx, releaseLease)
+	})
 }
 
-// ListLeasedOutputs lists all active leases for live wallet-owned UTXOs.
+// ListLeasedOutputs lists all active leases for live wallet-owned UTXOs. It
+// executes as one wallet-scoped read and only reports leases whose referenced
+// UTXOs still belong to the live wallet view.
 func (s *SqliteStore) ListLeasedOutputs(ctx context.Context,
 	walletID uint32) ([]LeasedOutput, error) {
 
@@ -236,7 +223,10 @@ func (s *SqliteStore) ListLeasedOutputs(ctx context.Context,
 	return leases, nil
 }
 
-// Balance returns the sum of wallet-owned live UTXOs after optional filters.
+// Balance returns the sum of wallet-owned live UTXOs after optional filters. It
+// computes the total in one SQL statement over the same live-set invariants as
+// ListUTXOs, so spent outputs and invalid parents never contribute. Coinbase
+// maturity remains enforced even when no explicit MinConfs lower bound is set.
 func (s *SqliteStore) Balance(ctx context.Context,
 	params BalanceParams) (BalanceResult, error) {
 
