@@ -100,6 +100,77 @@ func TestInt64ToInt32(t *testing.T) {
 	}
 }
 
+// TestIntToInt32 checks that an int value is converted to int32 only when it
+// fits within the signed 32 bit range.
+func TestIntToInt32(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		val     int
+		want    int32
+		wantErr bool
+	}{
+		{name: "zero", val: 0, want: 0},
+		{name: "max int32", val: math.MaxInt32, want: math.MaxInt32},
+		{name: "min int32", val: math.MinInt32, want: math.MinInt32},
+		{name: "above max", val: int(int64(math.MaxInt32) + 1), wantErr: true},
+		{name: "below min", val: int(int64(math.MinInt32) - 1), wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := intToInt32(tc.val)
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrCastingOverflow)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestIntToUint32 checks that an int value is converted to uint32 only when it
+// is non-negative and fits within the uint32 range.
+func TestIntToUint32(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		val     int
+		want    uint32
+		wantErr bool
+	}{
+		{name: "zero", val: 0, want: 0},
+		{name: "max uint32", val: int(math.MaxUint32), want: math.MaxUint32},
+		{name: "negative", val: -1, wantErr: true},
+		{
+			name:    "above max",
+			val:     int(int64(math.MaxUint32) + 1),
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := intToUint32(tc.val)
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrCastingOverflow)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
 // TestInt64ToUint8 checks that an int64 value is converted to uint8 only
 // when it is non-negative and fits within the uint8 range. It should fail
 // loudly for any value outside those bounds.
