@@ -15,6 +15,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,9 +36,9 @@ func mockDeriveFunc() db.AddressDerivationFunc {
 	}
 }
 
+// newDerivedAddress creates and returns a derived address for testing.
 func newDerivedAddress(t *testing.T, store db.AddressStore, walletID uint32,
 	scope db.KeyScope, accountName string, change bool) *db.AddressInfo {
-
 	t.Helper()
 
 	info, err := store.NewDerivedAddress(
@@ -53,10 +54,11 @@ func newDerivedAddress(t *testing.T, store db.AddressStore, walletID uint32,
 	return info
 }
 
+// createDerivedAddresses creates and returns a slice of derived addresses for
+// testing.
 func createDerivedAddresses(t *testing.T, store db.AddressStore,
 	walletID uint32, scope db.KeyScope, accountName string, change bool,
 	count int) []db.AddressInfo {
-
 	t.Helper()
 
 	addresses := make([]db.AddressInfo, 0, count)
@@ -70,9 +72,9 @@ func createDerivedAddresses(t *testing.T, store db.AddressStore,
 	return addresses
 }
 
+// getAccountByName retrieves an account by wallet, scope, and name for testing.
 func getAccountByName(t *testing.T, store db.AccountStore, walletID uint32,
 	scope db.KeyScope, accountName string) *db.AccountInfo {
-
 	t.Helper()
 
 	account, err := store.GetAccount(
@@ -81,6 +83,45 @@ func getAccountByName(t *testing.T, store db.AccountStore, walletID uint32,
 	require.NoError(t, err)
 
 	return account
+}
+
+// collectAddressPages collects paginated address results by iterating
+// through all pages from ListAddresses, using cursor pagination until
+// HasMore is false.
+func collectAddressPages(t *testing.T, store db.AddressStore,
+	query db.ListAddressesQuery) []page.Result[db.AddressInfo, uint32] {
+	t.Helper()
+
+	pages := make([]page.Result[db.AddressInfo, uint32], 0)
+	for {
+		pageResult, err := store.ListAddresses(t.Context(), query)
+		require.NoError(t, err)
+		pages = append(pages, pageResult)
+
+		if !pageResult.HasMore {
+			return pages
+		}
+
+		query.Page = query.Page.WithCursor(*pageResult.LastCursor)
+	}
+}
+
+// flattenAddressPages flattens paginated address results into a single
+// slice containing all addresses from all pages.
+func flattenAddressPages(
+	pages []page.Result[db.AddressInfo, uint32]) []db.AddressInfo {
+
+	count := 0
+	for i := range pages {
+		count += len(pages[i].Items)
+	}
+
+	addresses := make([]db.AddressInfo, 0, count)
+	for i := range pages {
+		addresses = append(addresses, pages[i].Items...)
+	}
+
+	return addresses
 }
 
 // TestNewImportedAddress verifies that NewImportedAddress correctly imports
@@ -236,7 +277,9 @@ func TestNewImportedAddressWithEncryptedScript(t *testing.T) {
 	queries := store.Queries()
 	walletID := newWallet(t, store, "wallet-encrypted-script")
 	createImportedAccount(t, store, walletID, db.KeyScopeBIP0044, "imported")
-	createImportedAccount(t, store, walletID, db.KeyScopeBIP0049Plus, "imported")
+	createImportedAccount(
+		t, store, walletID, db.KeyScopeBIP0049Plus, "imported",
+	)
 
 	redeemScript := RandomBytes(32)
 	witnessScript := RandomBytes(48)
@@ -661,9 +704,9 @@ func TestGetAddress(t *testing.T) {
 	}
 }
 
-// TestListAddresses verifies that ListAddresses correctly returns all
-// addresses for an account in a specified scope, filters by scope
-// appropriately, and handles empty results without error.
+// TestListAddresses verifies that ListAddresses correctly returns addresses
+// with page-contract behavior, filters by scope appropriately, and handles
+// empty results without error.
 func TestListAddresses(t *testing.T) {
 	t.Parallel()
 
@@ -780,7 +823,7 @@ func TestListAddresses(t *testing.T) {
 			walletID := newWallet(t, store, tc.name+"-wallet")
 
 			query := tc.setupFunc(t, store, store, walletID)
-			addrs, err := store.ListAddresses(t.Context(), query)
+			pageResult, err := store.ListAddresses(t.Context(), query)
 
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
@@ -788,6 +831,7 @@ func TestListAddresses(t *testing.T) {
 			}
 
 			require.NoError(t, err)
+			addrs := pageResult.Items
 			require.Len(t, addrs, tc.wantCount)
 
 			if tc.validate != nil {
@@ -946,7 +990,7 @@ func TestListAddressesOrdering(t *testing.T) {
 		t, store, walletID, db.KeyScopeBIP0084, "ordering-account", true, 3,
 	)
 
-	addresses, err := store.ListAddresses(
+	pageResult, err := store.ListAddresses(
 		t.Context(),
 		db.ListAddressesQuery{
 			WalletID:    walletID,
@@ -956,6 +1000,7 @@ func TestListAddressesOrdering(t *testing.T) {
 	)
 
 	require.NoError(t, err)
+	addresses := pageResult.Items
 	require.Len(t, addresses, 6)
 
 	// Separate addresses by branch for verification.
@@ -984,6 +1029,537 @@ func TestListAddressesOrdering(t *testing.T) {
 			t, changeAddrs[i-1].Index <= changeAddrs[i].Index,
 			"change addresses not in order",
 		)
+	}
+}
+
+// TestListAddressesDeferredExhaustion verifies that ListAddresses with deferred
+// exhaustion (the default mode) paginates correctly and requires an extra
+// empty-page fetch to confirm end-of-list.
+func TestListAddressesDeferredExhaustion(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-list-addresses-paged")
+	scope := db.KeyScopeBIP0084
+
+	createDerivedAccount(t, store, walletID, scope, "account-a")
+	createDerivedAccount(t, store, walletID, scope, "account-b")
+
+	accountA := createDerivedAddresses(
+		t, store, walletID, scope, "account-a", false, 5,
+	)
+	createDerivedAddresses(t, store, walletID, scope, "account-b", false, 2)
+
+	pageSize := uint(2)
+	query := db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: "account-a",
+		Page:        page.Request[uint32]{}.WithSize(uint32(pageSize)),
+	}
+
+	page1, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 2)
+	require.Equal(t, accountA[:2], page1.Items)
+	require.NotNil(t, page1.LastCursor)
+
+	query.Page = query.Page.WithCursor(*page1.LastCursor)
+	page2, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 2)
+	require.Equal(t, accountA[2:4], page2.Items)
+	require.NotNil(t, page2.LastCursor)
+
+	query.Page = query.Page.WithCursor(*page2.LastCursor)
+	page3, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page3.Items, 1)
+	require.Equal(t, accountA[4:], page3.Items)
+	require.NotNil(t, page3.LastCursor)
+	require.Equal(t, page3.Items[0].ID, *page3.LastCursor)
+
+	query.Page = query.Page.WithCursor(*page3.LastCursor)
+	page4, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Empty(t, page4.Items)
+	require.Nil(t, page4.LastCursor)
+
+	paged := append([]db.AddressInfo{}, page1.Items...)
+	paged = append(paged, page2.Items...)
+	paged = append(paged, page3.Items...)
+	require.Equal(t, accountA, paged)
+	for i, addr := range paged {
+		require.Equal(t, uint32(i), addr.Index)
+		require.Equal(t, uint32(0), addr.Branch)
+	}
+}
+
+// TestListAddressesEarlyExhaustion verifies that ListAddresses with early
+// exhaustion mode correctly reports HasMore without requiring an extra
+// round-trip.
+func TestListAddressesEarlyExhaustion(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-list-addresses-strong-mode")
+	scope := db.KeyScopeBIP0084
+
+	createDerivedAccount(t, store, walletID, scope, "account-a")
+	createDerivedAccount(t, store, walletID, scope, "account-b")
+
+	accountA := createDerivedAddresses(
+		t, store, walletID, scope, "account-a", false, 5,
+	)
+	createDerivedAddresses(t, store, walletID, scope, "account-b", false, 2)
+
+	query := db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: "account-a",
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	}
+
+	page1, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 2)
+	require.Equal(t, accountA[:2], page1.Items)
+	require.NotNil(t, page1.LastCursor)
+	require.True(t, page1.HasMore)
+
+	query.Page = query.Page.WithCursor(*page1.LastCursor)
+	page2, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 2)
+	require.Equal(t, accountA[2:4], page2.Items)
+	require.NotNil(t, page2.LastCursor)
+
+	query.Page = query.Page.WithCursor(*page2.LastCursor)
+	page3, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page3.Items, 1)
+	require.Equal(t, accountA[4:], page3.Items)
+	require.NotNil(t, page3.LastCursor)
+	require.False(t, page3.HasMore)
+
+	query.Page = query.Page.WithCursor(page3.Items[len(page3.Items)-1].ID)
+	page4, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Empty(t, page4.Items)
+	require.Nil(t, page4.LastCursor)
+	require.False(t, page4.HasMore)
+
+	paged := append([]db.AddressInfo{}, page1.Items...)
+	paged = append(paged, page2.Items...)
+	paged = append(paged, page3.Items...)
+	require.Equal(t, accountA, paged)
+	for i, addr := range paged {
+		require.Equal(t, uint32(i), addr.Index)
+		require.Equal(t, uint32(0), addr.Branch)
+	}
+}
+
+// TestListAddressesExactBoundary verifies that pagination correctly handles
+// the exact boundary case where total results equal page-size multiples,
+// validating HasMore behavior differs between deferred and early exhaustion.
+func TestListAddressesExactBoundary(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name            string
+		earlyExhaustion bool
+		wantSecondMore  bool
+	}{
+		{
+			name:            "deferred exhaustion",
+			earlyExhaustion: false,
+			wantSecondMore:  true,
+		},
+		{
+			name:            "early exhaustion",
+			earlyExhaustion: true,
+			wantSecondMore:  false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewTestStore(t)
+			walletID := newWallet(t, store, tc.name+"-wallet")
+			scope := db.KeyScopeBIP0084
+			accountName := "boundary-account"
+
+			createDerivedAccount(t, store, walletID, scope, accountName)
+			expected := createDerivedAddresses(
+				t, store, walletID, scope, accountName, false, 4,
+			)
+
+			query := db.ListAddressesQuery{
+				WalletID:    walletID,
+				Scope:       scope,
+				AccountName: accountName,
+				Page:        page.Request[uint32]{}.WithSize(2),
+			}
+			if tc.earlyExhaustion {
+				query.Page = query.Page.WithEarlyExhaustion()
+			}
+
+			page1, err := store.ListAddresses(t.Context(), query)
+			require.NoError(t, err)
+			require.Equal(t, expected[:2], page1.Items)
+			require.NotNil(t, page1.LastCursor)
+			require.Equal(t, page1.Items[1].ID, *page1.LastCursor)
+			require.True(t, page1.HasMore)
+
+			query.Page = query.Page.WithCursor(*page1.LastCursor)
+			page2, err := store.ListAddresses(t.Context(), query)
+			require.NoError(t, err)
+			require.Equal(t, expected[2:], page2.Items)
+			require.NotNil(t, page2.LastCursor)
+			require.Equal(t, page2.Items[1].ID, *page2.LastCursor)
+			require.Equal(t, tc.wantSecondMore, page2.HasMore)
+			require.Greater(t, page2.Items[0].ID, *page1.LastCursor)
+
+			query.Page = query.Page.WithCursor(*page2.LastCursor)
+			page3, err := store.ListAddresses(t.Context(), query)
+			require.NoError(t, err)
+			require.Empty(t, page3.Items)
+			require.Nil(t, page3.LastCursor)
+			require.False(t, page3.HasMore)
+		})
+	}
+}
+
+// TestListAddressesPagedEmptyResult verifies that paginated ListAddresses
+// returns an empty result with no cursor for an account with no addresses.
+func TestListAddressesPagedEmptyResult(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-list-addresses-empty")
+	scope := db.KeyScopeBIP0084
+	pageSize := uint(2)
+
+	createDerivedAccount(t, store, walletID, scope, "empty-account")
+
+	pageResult, err := store.ListAddresses(t.Context(), db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: "empty-account",
+		Page:        page.Request[uint32]{}.WithSize(uint32(pageSize)),
+	})
+	require.NoError(t, err)
+	require.Empty(t, pageResult.Items)
+	require.Nil(t, pageResult.LastCursor)
+}
+
+// TestListAddressesDeterministicPagination verifies stable ID-ordered address
+// pagination and next-cursor behavior.
+func TestListAddressesDeterministicPagination(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-address-deterministic")
+	scope := db.KeyScopeBIP0084
+	accountName := "deterministic-account"
+	createDerivedAccount(t, store, walletID, scope, accountName)
+	expected := createDerivedAddresses(
+		t, store, walletID, scope, accountName, false, 5,
+	)
+
+	pages := collectAddressPages(t, store, db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: accountName,
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	})
+	require.Len(t, pages, 3)
+	require.Len(t, pages[0].Items, 2)
+	require.Len(t, pages[1].Items, 2)
+	require.Len(t, pages[2].Items, 1)
+	require.NotNil(t, pages[0].LastCursor)
+	require.True(t, pages[0].HasMore)
+	require.NotNil(t, pages[1].LastCursor)
+	require.True(t, pages[1].HasMore)
+	require.NotNil(t, pages[2].LastCursor)
+	require.False(t, pages[2].HasMore)
+
+	addresses := flattenAddressPages(pages)
+	require.Equal(t, expected, addresses)
+
+	seenIDs := make(map[uint32]struct{}, len(addresses))
+	for i := range pages {
+		for j, addr := range pages[i].Items {
+			_, duplicate := seenIDs[addr.ID]
+			require.False(t, duplicate)
+			seenIDs[addr.ID] = struct{}{}
+
+			// Skip the first item on the first page; there's no prior cursor
+			// to compare against.
+			if i == 0 && j == 0 {
+				continue
+			}
+
+			// First item on a later page: verify it sorts strictly after the
+			// previous page's cursor to ensure no gaps or duplicates at page
+			// boundaries.
+			if j == 0 {
+				require.Greater(t, addr.ID, *pages[i-1].LastCursor)
+				continue
+			}
+
+			// Items within the same page: verify strict ordering to ensure
+			// the page contents are sorted.
+			require.Greater(t, addr.ID, pages[i].Items[j-1].ID)
+		}
+	}
+
+	for i := range addresses {
+		if i == 0 {
+			continue
+		}
+
+		require.Less(t, addresses[i-1].ID, addresses[i].ID)
+	}
+}
+
+// TestListAddressesAccountIsolation verifies that ListAddresses returns only
+// addresses for the requested account, excluding addresses from other accounts.
+func TestListAddressesAccountIsolation(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-address-account-isolation")
+	scope := db.KeyScopeBIP0084
+
+	createDerivedAccount(t, store, walletID, scope, "account-a")
+	createDerivedAccount(t, store, walletID, scope, "account-b")
+
+	expected := createDerivedAddresses(
+		t, store, walletID, scope, "account-a", false, 5,
+	)
+	otherAccount := createDerivedAddresses(
+		t, store, walletID, scope, "account-b", false, 3,
+	)
+
+	pages := collectAddressPages(t, store, db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: "account-a",
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	})
+	addresses := flattenAddressPages(pages)
+
+	require.Len(t, addresses, len(expected))
+	require.Equal(t, expected, addresses)
+	accountAID := expected[0].AccountID
+	accountBID := otherAccount[0].AccountID
+	for _, addr := range addresses {
+		require.Equal(t, accountAID, addr.AccountID)
+		require.NotEqual(t, accountBID, addr.AccountID)
+	}
+}
+
+// TestListAddressesBoundaryInsertTradeoff verifies inserts after the cursor
+// sort point appear on later pages while boundary inserts remain a
+// moving-dataset tradeoff.
+func TestListAddressesBoundaryInsertTradeoff(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-address-boundary-insert")
+	scope := db.KeyScopeBIP0084
+	accountName := "boundary-account"
+	createDerivedAccount(t, store, walletID, scope, accountName)
+	createDerivedAddresses(t, store, walletID, scope, accountName, false, 3)
+
+	query := db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: accountName,
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	}
+	page1, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 2)
+	require.NotNil(t, page1.LastCursor)
+
+	// page1.HasMore is true because WithEarlyExhaustion detected at least one
+	// row beyond the page-size boundary (the third address exists in the
+	// backend).
+	require.True(t, page1.HasMore)
+
+	// Boundary-insert tradeoff: rows inserted between page N and page N+1
+	// fetches that sort at or before the page N cursor boundary are not
+	// guaranteed to appear on page N+1. This is a known moving-dataset
+	// property, not a bug. Rows inserted after the cursor sort point will
+	// appear on subsequent pages as expected.
+	inserted := newDerivedAddress(
+		t, store, walletID, scope, accountName, false,
+	)
+
+	query.Page = query.Page.WithCursor(*page1.LastCursor)
+	page2, err := store.ListAddresses(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 2)
+	require.Equal(t, uint32(2), page2.Items[0].Index)
+	require.Equal(t, inserted.ID, page2.Items[1].ID)
+	require.Equal(t, uint32(3), page2.Items[1].Index)
+	require.NotNil(t, page2.LastCursor)
+
+	// page2.HasMore is false because after the insert, page2 contains the
+	// original third address plus the newly inserted fourth address, filling
+	// the 2-item page size. WithEarlyExhaustion detects no additional rows
+	// exist.
+	require.False(t, page2.HasMore)
+}
+
+// TestListAddressesCursorEdges verifies stale and zero-value cursors produce
+// deterministic page results.
+func TestListAddressesCursorEdges(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-address-cursor-edges")
+	scope := db.KeyScopeBIP0084
+	accountName := "cursor-account"
+	createDerivedAccount(t, store, walletID, scope, accountName)
+	createDerivedAddresses(t, store, walletID, scope, accountName, false, 3)
+
+	stalePage, err := store.ListAddresses(t.Context(), db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: accountName,
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithCursor(math.MaxUint32),
+	})
+	require.NoError(t, err)
+	require.Empty(t, stalePage.Items)
+	require.Nil(t, stalePage.LastCursor)
+	require.False(t, stalePage.HasMore)
+
+	zeroPage, err := store.ListAddresses(t.Context(), db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: accountName,
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithCursor(0),
+	})
+	require.NoError(t, err)
+	require.Len(t, zeroPage.Items, 2)
+	require.Equal(t, uint32(0), zeroPage.Items[0].Index)
+	require.Equal(t, uint32(1), zeroPage.Items[1].Index)
+	require.NotNil(t, zeroPage.LastCursor)
+	require.True(t, zeroPage.HasMore)
+}
+
+// TestIterAddresses verifies that IterAddresses yields the same addresses in
+// the same order as manual cursor-based pagination.
+func TestIterAddresses(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-iter-addresses")
+	scope := db.KeyScopeBIP0084
+	pageSize := uint(2)
+
+	createDerivedAccount(t, store, walletID, scope, "iter-account")
+	expected := createDerivedAddresses(
+		t, store, walletID, scope, "iter-account", false, 5,
+	)
+
+	query := db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: "iter-account",
+		Page:        page.Request[uint32]{}.WithSize(uint32(pageSize)),
+	}
+
+	iterAddrs := make([]db.AddressInfo, 0, len(expected))
+	for addr, err := range store.IterAddresses(t.Context(), query) {
+		require.NoError(t, err)
+		iterAddrs = append(iterAddrs, addr)
+	}
+
+	paged := flattenAddressPages(collectAddressPages(t, store, query))
+	require.Equal(t, expected, paged)
+	require.Equal(t, expected, iterAddrs)
+	require.Equal(t, paged, iterAddrs)
+}
+
+// TestIterAddressesEarlyExhaustion verifies that IterAddresses with early
+// exhaustion produces the same results as manual pagination and correctly
+// signals end-of-list.
+func TestIterAddressesEarlyExhaustion(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-iter-addresses-early")
+	scope := db.KeyScopeBIP0084
+
+	createDerivedAccount(t, store, walletID, scope, "iter-account")
+	createDerivedAddresses(
+		t, store, walletID, scope, "iter-account", false, 4,
+	)
+
+	query := db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: "iter-account",
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	}
+
+	pages := collectAddressPages(t, store, query)
+	require.Len(t, pages, 2)
+	require.True(t, pages[0].HasMore)
+	require.False(t, pages[1].HasMore)
+
+	expected := flattenAddressPages(pages)
+
+	iterAddrs := make([]db.AddressInfo, 0, len(expected))
+	for addr, err := range store.IterAddresses(t.Context(), query) {
+		require.NoError(t, err)
+		iterAddrs = append(iterAddrs, addr)
+	}
+
+	require.Equal(t, expected, iterAddrs)
+}
+
+// TestIterAddressesEmpty verifies that IterAddresses correctly handles
+// empty accounts without error and yields no addresses.
+func TestIterAddressesEmpty(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-iter-addresses-empty")
+	scope := db.KeyScopeBIP0084
+
+	createDerivedAccount(t, store, walletID, scope, "empty-account")
+
+	query := db.ListAddressesQuery{
+		WalletID:    walletID,
+		Scope:       scope,
+		AccountName: "empty-account",
+		Page:        page.Request[uint32]{}.WithSize(10),
+	}
+
+	for addr, err := range store.IterAddresses(t.Context(), query) {
+		require.NoError(t, err)
+		require.Failf(t, "unexpected address", "address=%v", addr)
 	}
 }
 
