@@ -59,7 +59,9 @@ WHERE block_height >= $1
 // How:
 //   - Deletes directly from blocks by the natural height key.
 //   - Relies on FK/trigger side effects to null transaction block references and
-//     orphan coinbase rows.
+//     orphan coinbase roots.
+//   - Expects RollbackToBlock to collect those roots before the delete and then
+//     recursively fail descendants in the same transaction.
 //
 // Performance:
 // - Executes as a range delete over the block-height primary key.
@@ -267,6 +269,121 @@ func (q *Queries) InsertTransaction(ctx context.Context, arg InsertTransactionPa
 	return id, err
 }
 
+const ListCoinbaseRollbackRootsAtOrAboveHeight = `-- name: ListCoinbaseRollbackRootsAtOrAboveHeight :many
+SELECT
+    wallet_id,
+    id
+FROM transactions
+WHERE
+    is_coinbase
+    AND block_height >= $1
+ORDER BY wallet_id, id
+`
+
+type ListCoinbaseRollbackRootsAtOrAboveHeightRow struct {
+	WalletID int64
+	ID       int64
+}
+
+// Lists the coinbase transaction rows that will become orphan roots during
+// rollback.
+//
+// How:
+//   - Reads only wallet scope and row identity for confirmed coinbase
+//     transactions at or above the rollback height.
+//   - Lets RollbackToBlock collect the orphan roots before block deletion and
+//     then run descendant invalidation in the same SQL transaction.
+//
+// Performance:
+//   - Rare rollback helper. The scan is bounded by the rollback height and only
+//     returns lightweight row identifiers.
+func (q *Queries) ListCoinbaseRollbackRootsAtOrAboveHeight(ctx context.Context, blockHeight sql.NullInt32) ([]ListCoinbaseRollbackRootsAtOrAboveHeightRow, error) {
+	rows, err := q.query(ctx, q.listCoinbaseRollbackRootsAtOrAboveHeightStmt, ListCoinbaseRollbackRootsAtOrAboveHeight, blockHeight)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCoinbaseRollbackRootsAtOrAboveHeightRow
+	for rows.Next() {
+		var i ListCoinbaseRollbackRootsAtOrAboveHeightRow
+		if err := rows.Scan(&i.WalletID, &i.ID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const ListLiveUnminedConflictCandidates = `-- name: ListLiveUnminedConflictCandidates :many
+SELECT
+    id,
+    tx_hash,
+    raw_tx,
+    status,
+    is_coinbase
+FROM transactions
+WHERE
+    wallet_id = $1
+    AND block_height IS NULL
+    AND status IN ('pending', 'published')
+ORDER BY received_time DESC, id DESC
+`
+
+type ListLiveUnminedConflictCandidatesRow struct {
+	ID         int64
+	TxHash     []byte
+	RawTx      []byte
+	Status     string
+	IsCoinbase bool
+}
+
+// Lists only the live blockless transaction rows needed for conflict-root
+// validation.
+//
+// How:
+//   - Reads from transactions only and filters to live unconfirmed rows
+//     (`pending` or `published`).
+//   - Returns only the columns needed to validate direct conflict roots and to
+//     deserialize candidate transactions.
+//
+// Performance:
+//   - Avoids loading invalid-history rows and skips extra metadata columns such as
+//     labels or block join fields.
+func (q *Queries) ListLiveUnminedConflictCandidates(ctx context.Context, walletID int64) ([]ListLiveUnminedConflictCandidatesRow, error) {
+	rows, err := q.query(ctx, q.listLiveUnminedConflictCandidatesStmt, ListLiveUnminedConflictCandidates, walletID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLiveUnminedConflictCandidatesRow
+	for rows.Next() {
+		var i ListLiveUnminedConflictCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TxHash,
+			&i.RawTx,
+			&i.Status,
+			&i.IsCoinbase,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const ListRollbackCoinbaseRoots = `-- name: ListRollbackCoinbaseRoots :many
 SELECT
     wallet_id,
@@ -417,7 +534,6 @@ FROM transactions AS t
 WHERE
     t.wallet_id = $1
     AND t.block_height IS NULL
-    AND t.status IN ('pending', 'published')
 ORDER BY t.received_time DESC, t.id DESC
 `
 
@@ -437,13 +553,12 @@ type ListUnminedTransactionsRow struct {
 // Lists all unconfirmed transactions for a wallet.
 //
 // How:
-//   - Reads from transactions only and filters on blockless rows that are still
-//     in a live unconfirmed state (`pending` or `published`).
-//   - Excludes orphaned/replaced/failed history so rollback-produced coinbase
-//     rows do not reappear as mempool transactions.
-//   - Returns typed NULL block metadata explicitly because live unmined rows have
-//     no block. `NULL::BYTEA AS block_hash` and `NULL::BIGINT AS block_timestamp`
-//     keep the unmined row shape aligned with the confirmed query below.
+//   - Reads from transactions only and returns every blockless row, including
+//     invalid history states such as `failed`, `replaced`, and `orphaned`.
+//   - Leaves it to higher layers to decide whether they want the full blockless
+//     history view or only the live mempool subset.
+//   - Returns NULL block metadata explicitly because unmined rows have no
+//     block.
 //
 // Performance:
 //   - Matches the dedicated blockless-history index while the more selective
@@ -480,6 +595,43 @@ func (q *Queries) ListUnminedTransactions(ctx context.Context, walletID int64) (
 		return nil, err
 	}
 	return items, nil
+}
+
+const ReconfirmOrphanedCoinbaseByHash = `-- name: ReconfirmOrphanedCoinbaseByHash :execrows
+UPDATE transactions
+SET
+    block_height = $1,
+    status = 'published'
+WHERE
+    wallet_id = $2
+    AND tx_hash = $3
+    AND is_coinbase
+    AND block_height IS NULL
+    AND status = 'orphaned'
+`
+
+type ReconfirmOrphanedCoinbaseByHashParams struct {
+	BlockHeight sql.NullInt32
+	WalletID    int64
+	TxHash      []byte
+}
+
+// Restores one orphaned coinbase transaction to the best chain.
+//
+// How:
+//   - Updates `block_height` and `status` in the same statement so coinbase rows
+//     never pass through an invalid unconfirmed state.
+//   - Restricts the update to rows that are already orphaned coinbase
+//     transactions within the requested wallet.
+//
+// Performance:
+// - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+func (q *Queries) ReconfirmOrphanedCoinbaseByHash(ctx context.Context, arg ReconfirmOrphanedCoinbaseByHashParams) (int64, error) {
+	result, err := q.exec(ctx, q.reconfirmOrphanedCoinbaseByHashStmt, ReconfirmOrphanedCoinbaseByHash, arg.BlockHeight, arg.WalletID, arg.TxHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const RewindWalletSyncStateHeightsForRollback = `-- name: RewindWalletSyncStateHeightsForRollback :execrows
@@ -523,10 +675,6 @@ type RewindWalletSyncStateHeightsForRollbackParams struct {
 //   - Updates wallet_sync_states directly without joining other tables.
 //   - Rewrites both synced_height and birthday_height in one statement so the
 //     subsequent block delete does not violate `ON DELETE RESTRICT`.
-//   - Example: if `rollback_height = 195`, then any `synced_height` or
-//     `birthday_height` at 195 or above rewinds to `new_height = 194`.
-//   - If rollback starts from height 0, callers pass `new_height = NULL` so the
-//     sync state no longer points at any surviving block row.
 //
 // Performance:
 //   - Touches only wallet_sync_states rows whose heights are at or above the
