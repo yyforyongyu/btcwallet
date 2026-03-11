@@ -201,8 +201,14 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listAddressesByAccountStmt, err = db.PrepareContext(ctx, ListAddressesByAccount); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAddressesByAccount: %w", err)
 	}
+	if q.listCoinbaseRollbackRootsAtOrAboveHeightStmt, err = db.PrepareContext(ctx, ListCoinbaseRollbackRootsAtOrAboveHeight); err != nil {
+		return nil, fmt.Errorf("error preparing query ListCoinbaseRollbackRootsAtOrAboveHeight: %w", err)
+	}
 	if q.listKeyScopesByWalletStmt, err = db.PrepareContext(ctx, ListKeyScopesByWallet); err != nil {
 		return nil, fmt.Errorf("error preparing query ListKeyScopesByWallet: %w", err)
+	}
+	if q.listLiveUnminedConflictCandidatesStmt, err = db.PrepareContext(ctx, ListLiveUnminedConflictCandidates); err != nil {
+		return nil, fmt.Errorf("error preparing query ListLiveUnminedConflictCandidates: %w", err)
 	}
 	if q.listReplacedTxHashesByReplacementTxHashStmt, err = db.PrepareContext(ctx, ListReplacedTxHashesByReplacementTxHash); err != nil {
 		return nil, fmt.Errorf("error preparing query ListReplacedTxHashesByReplacementTxHash: %w", err)
@@ -239,6 +245,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.markUtxoSpentStmt, err = db.PrepareContext(ctx, MarkUtxoSpent); err != nil {
 		return nil, fmt.Errorf("error preparing query MarkUtxoSpent: %w", err)
+	}
+	if q.reconfirmOrphanedCoinbaseByHashStmt, err = db.PrepareContext(ctx, ReconfirmOrphanedCoinbaseByHash); err != nil {
+		return nil, fmt.Errorf("error preparing query ReconfirmOrphanedCoinbaseByHash: %w", err)
 	}
 	if q.releaseUtxoLeaseStmt, err = db.PrepareContext(ctx, ReleaseUtxoLease); err != nil {
 		return nil, fmt.Errorf("error preparing query ReleaseUtxoLease: %w", err)
@@ -564,9 +573,19 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listAddressesByAccountStmt: %w", cerr)
 		}
 	}
+	if q.listCoinbaseRollbackRootsAtOrAboveHeightStmt != nil {
+		if cerr := q.listCoinbaseRollbackRootsAtOrAboveHeightStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listCoinbaseRollbackRootsAtOrAboveHeightStmt: %w", cerr)
+		}
+	}
 	if q.listKeyScopesByWalletStmt != nil {
 		if cerr := q.listKeyScopesByWalletStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listKeyScopesByWalletStmt: %w", cerr)
+		}
+	}
+	if q.listLiveUnminedConflictCandidatesStmt != nil {
+		if cerr := q.listLiveUnminedConflictCandidatesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listLiveUnminedConflictCandidatesStmt: %w", cerr)
 		}
 	}
 	if q.listReplacedTxHashesByReplacementTxHashStmt != nil {
@@ -627,6 +646,11 @@ func (q *Queries) Close() error {
 	if q.markUtxoSpentStmt != nil {
 		if cerr := q.markUtxoSpentStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing markUtxoSpentStmt: %w", cerr)
+		}
+	}
+	if q.reconfirmOrphanedCoinbaseByHashStmt != nil {
+		if cerr := q.reconfirmOrphanedCoinbaseByHashStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing reconfirmOrphanedCoinbaseByHashStmt: %w", cerr)
 		}
 	}
 	if q.releaseUtxoLeaseStmt != nil {
@@ -706,173 +730,179 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 }
 
 type Queries struct {
-	db                                          DBTX
-	tx                                          *sql.Tx
-	acquireUtxoLeaseStmt                        *sql.Stmt
-	balanceStmt                                 *sql.Stmt
-	clearUtxosSpentByTxIDStmt                   *sql.Stmt
-	confirmUnminedTransactionByHashStmt         *sql.Stmt
-	createAccountSecretStmt                     *sql.Stmt
-	createDerivedAccountStmt                    *sql.Stmt
-	createDerivedAccountWithNumberStmt          *sql.Stmt
-	createDerivedAddressStmt                    *sql.Stmt
-	createImportedAccountStmt                   *sql.Stmt
-	createImportedAddressStmt                   *sql.Stmt
-	createKeyScopeStmt                          *sql.Stmt
-	createWalletStmt                            *sql.Stmt
-	deleteBlockStmt                             *sql.Stmt
-	deleteBlocksAtOrAboveHeightStmt             *sql.Stmt
-	deleteExpiredUtxoLeasesStmt                 *sql.Stmt
-	deleteKeyScopeStmt                          *sql.Stmt
-	deleteKeyScopeSecretsStmt                   *sql.Stmt
-	deleteUnminedTransactionByHashStmt          *sql.Stmt
-	deleteUtxosByTxIDStmt                       *sql.Stmt
-	getAccountByScopeAndNameStmt                *sql.Stmt
-	getAccountByScopeAndNumberStmt              *sql.Stmt
-	getAccountByWalletScopeAndNameStmt          *sql.Stmt
-	getAccountByWalletScopeAndNumberStmt        *sql.Stmt
-	getAccountPropsByIdStmt                     *sql.Stmt
-	getActiveUtxoLeaseLockIDStmt                *sql.Stmt
-	getAddressByScriptPubKeyStmt                *sql.Stmt
-	getAddressSecretStmt                        *sql.Stmt
-	getAddressTypeByIDStmt                      *sql.Stmt
-	getAndIncrementNextExternalIndexStmt        *sql.Stmt
-	getAndIncrementNextInternalIndexStmt        *sql.Stmt
-	getBlockByHeightStmt                        *sql.Stmt
-	getKeyScopeByIDStmt                         *sql.Stmt
-	getKeyScopeByWalletAndScopeStmt             *sql.Stmt
-	getKeyScopeSecretsStmt                      *sql.Stmt
-	getTransactionByHashStmt                    *sql.Stmt
-	getTransactionMetaByHashStmt                *sql.Stmt
-	getUtxoByOutpointStmt                       *sql.Stmt
-	getUtxoIDByOutpointStmt                     *sql.Stmt
-	getUtxoSpendByOutpointStmt                  *sql.Stmt
-	getWalletByIDStmt                           *sql.Stmt
-	getWalletByNameStmt                         *sql.Stmt
-	getWalletSecretsStmt                        *sql.Stmt
-	hasDeadWalletUtxoByOutpointStmt             *sql.Stmt
-	insertAddressSecretStmt                     *sql.Stmt
-	insertBlockStmt                             *sql.Stmt
-	insertKeyScopeSecretsStmt                   *sql.Stmt
-	insertTransactionStmt                       *sql.Stmt
-	insertTxReplacementEdgeStmt                 *sql.Stmt
-	insertTxReplacementEdgeByHashStmt           *sql.Stmt
-	insertUtxoStmt                              *sql.Stmt
-	insertWalletSecretsStmt                     *sql.Stmt
-	insertWalletSyncStateStmt                   *sql.Stmt
-	listAccountsByScopeStmt                     *sql.Stmt
-	listAccountsByWalletStmt                    *sql.Stmt
-	listAccountsByWalletAndNameStmt             *sql.Stmt
-	listAccountsByWalletScopeStmt               *sql.Stmt
-	listActiveUtxoLeasesStmt                    *sql.Stmt
-	listAddressTypesStmt                        *sql.Stmt
-	listAddressesByAccountStmt                  *sql.Stmt
-	listKeyScopesByWalletStmt                   *sql.Stmt
-	listReplacedTxHashesByReplacementTxHashStmt *sql.Stmt
-	listReplacedTxIDsByReplacementTxIDStmt      *sql.Stmt
-	listReplacementTxHashesByReplacedTxHashStmt *sql.Stmt
-	listReplacementTxIDsByReplacedTxIDStmt      *sql.Stmt
-	listRollbackCoinbaseRootsStmt               *sql.Stmt
-	listSpendingTxIDsByParentTxIDStmt           *sql.Stmt
-	listTransactionsByHeightRangeStmt           *sql.Stmt
-	listUnminedTransactionsStmt                 *sql.Stmt
-	listUtxosStmt                               *sql.Stmt
-	listWalletsStmt                             *sql.Stmt
-	lockAccountScopeStmt                        *sql.Stmt
-	markUtxoSpentStmt                           *sql.Stmt
-	releaseUtxoLeaseStmt                        *sql.Stmt
-	rewindWalletSyncStateHeightsForRollbackStmt *sql.Stmt
-	updateAccountNameByWalletScopeAndNameStmt   *sql.Stmt
-	updateAccountNameByWalletScopeAndNumberStmt *sql.Stmt
-	updateTransactionLabelByHashStmt            *sql.Stmt
-	updateTransactionStatusByIDsStmt            *sql.Stmt
-	updateWalletSecretsStmt                     *sql.Stmt
-	updateWalletSyncStateStmt                   *sql.Stmt
+	db                                           DBTX
+	tx                                           *sql.Tx
+	acquireUtxoLeaseStmt                         *sql.Stmt
+	balanceStmt                                  *sql.Stmt
+	clearUtxosSpentByTxIDStmt                    *sql.Stmt
+	confirmUnminedTransactionByHashStmt          *sql.Stmt
+	createAccountSecretStmt                      *sql.Stmt
+	createDerivedAccountStmt                     *sql.Stmt
+	createDerivedAccountWithNumberStmt           *sql.Stmt
+	createDerivedAddressStmt                     *sql.Stmt
+	createImportedAccountStmt                    *sql.Stmt
+	createImportedAddressStmt                    *sql.Stmt
+	createKeyScopeStmt                           *sql.Stmt
+	createWalletStmt                             *sql.Stmt
+	deleteBlockStmt                              *sql.Stmt
+	deleteBlocksAtOrAboveHeightStmt              *sql.Stmt
+	deleteExpiredUtxoLeasesStmt                  *sql.Stmt
+	deleteKeyScopeStmt                           *sql.Stmt
+	deleteKeyScopeSecretsStmt                    *sql.Stmt
+	deleteUnminedTransactionByHashStmt           *sql.Stmt
+	deleteUtxosByTxIDStmt                        *sql.Stmt
+	getAccountByScopeAndNameStmt                 *sql.Stmt
+	getAccountByScopeAndNumberStmt               *sql.Stmt
+	getAccountByWalletScopeAndNameStmt           *sql.Stmt
+	getAccountByWalletScopeAndNumberStmt         *sql.Stmt
+	getAccountPropsByIdStmt                      *sql.Stmt
+	getActiveUtxoLeaseLockIDStmt                 *sql.Stmt
+	getAddressByScriptPubKeyStmt                 *sql.Stmt
+	getAddressSecretStmt                         *sql.Stmt
+	getAddressTypeByIDStmt                       *sql.Stmt
+	getAndIncrementNextExternalIndexStmt         *sql.Stmt
+	getAndIncrementNextInternalIndexStmt         *sql.Stmt
+	getBlockByHeightStmt                         *sql.Stmt
+	getKeyScopeByIDStmt                          *sql.Stmt
+	getKeyScopeByWalletAndScopeStmt              *sql.Stmt
+	getKeyScopeSecretsStmt                       *sql.Stmt
+	getTransactionByHashStmt                     *sql.Stmt
+	getTransactionMetaByHashStmt                 *sql.Stmt
+	getUtxoByOutpointStmt                        *sql.Stmt
+	getUtxoIDByOutpointStmt                      *sql.Stmt
+	getUtxoSpendByOutpointStmt                   *sql.Stmt
+	getWalletByIDStmt                            *sql.Stmt
+	getWalletByNameStmt                          *sql.Stmt
+	getWalletSecretsStmt                         *sql.Stmt
+	hasDeadWalletUtxoByOutpointStmt              *sql.Stmt
+	insertAddressSecretStmt                      *sql.Stmt
+	insertBlockStmt                              *sql.Stmt
+	insertKeyScopeSecretsStmt                    *sql.Stmt
+	insertTransactionStmt                        *sql.Stmt
+	insertTxReplacementEdgeStmt                  *sql.Stmt
+	insertTxReplacementEdgeByHashStmt            *sql.Stmt
+	insertUtxoStmt                               *sql.Stmt
+	insertWalletSecretsStmt                      *sql.Stmt
+	insertWalletSyncStateStmt                    *sql.Stmt
+	listAccountsByScopeStmt                      *sql.Stmt
+	listAccountsByWalletStmt                     *sql.Stmt
+	listAccountsByWalletAndNameStmt              *sql.Stmt
+	listAccountsByWalletScopeStmt                *sql.Stmt
+	listActiveUtxoLeasesStmt                     *sql.Stmt
+	listAddressTypesStmt                         *sql.Stmt
+	listAddressesByAccountStmt                   *sql.Stmt
+	listCoinbaseRollbackRootsAtOrAboveHeightStmt *sql.Stmt
+	listKeyScopesByWalletStmt                    *sql.Stmt
+	listLiveUnminedConflictCandidatesStmt        *sql.Stmt
+	listReplacedTxHashesByReplacementTxHashStmt  *sql.Stmt
+	listReplacedTxIDsByReplacementTxIDStmt       *sql.Stmt
+	listReplacementTxHashesByReplacedTxHashStmt  *sql.Stmt
+	listReplacementTxIDsByReplacedTxIDStmt       *sql.Stmt
+	listRollbackCoinbaseRootsStmt                *sql.Stmt
+	listSpendingTxIDsByParentTxIDStmt            *sql.Stmt
+	listTransactionsByHeightRangeStmt            *sql.Stmt
+	listUnminedTransactionsStmt                  *sql.Stmt
+	listUtxosStmt                                *sql.Stmt
+	listWalletsStmt                              *sql.Stmt
+	lockAccountScopeStmt                         *sql.Stmt
+	markUtxoSpentStmt                            *sql.Stmt
+	reconfirmOrphanedCoinbaseByHashStmt          *sql.Stmt
+	releaseUtxoLeaseStmt                         *sql.Stmt
+	rewindWalletSyncStateHeightsForRollbackStmt  *sql.Stmt
+	updateAccountNameByWalletScopeAndNameStmt    *sql.Stmt
+	updateAccountNameByWalletScopeAndNumberStmt  *sql.Stmt
+	updateTransactionLabelByHashStmt             *sql.Stmt
+	updateTransactionStatusByIDsStmt             *sql.Stmt
+	updateWalletSecretsStmt                      *sql.Stmt
+	updateWalletSyncStateStmt                    *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db:                                          tx,
-		tx:                                          tx,
-		acquireUtxoLeaseStmt:                        q.acquireUtxoLeaseStmt,
-		balanceStmt:                                 q.balanceStmt,
-		clearUtxosSpentByTxIDStmt:                   q.clearUtxosSpentByTxIDStmt,
-		confirmUnminedTransactionByHashStmt:         q.confirmUnminedTransactionByHashStmt,
-		createAccountSecretStmt:                     q.createAccountSecretStmt,
-		createDerivedAccountStmt:                    q.createDerivedAccountStmt,
-		createDerivedAccountWithNumberStmt:          q.createDerivedAccountWithNumberStmt,
-		createDerivedAddressStmt:                    q.createDerivedAddressStmt,
-		createImportedAccountStmt:                   q.createImportedAccountStmt,
-		createImportedAddressStmt:                   q.createImportedAddressStmt,
-		createKeyScopeStmt:                          q.createKeyScopeStmt,
-		createWalletStmt:                            q.createWalletStmt,
-		deleteBlockStmt:                             q.deleteBlockStmt,
-		deleteBlocksAtOrAboveHeightStmt:             q.deleteBlocksAtOrAboveHeightStmt,
-		deleteExpiredUtxoLeasesStmt:                 q.deleteExpiredUtxoLeasesStmt,
-		deleteKeyScopeStmt:                          q.deleteKeyScopeStmt,
-		deleteKeyScopeSecretsStmt:                   q.deleteKeyScopeSecretsStmt,
-		deleteUnminedTransactionByHashStmt:          q.deleteUnminedTransactionByHashStmt,
-		deleteUtxosByTxIDStmt:                       q.deleteUtxosByTxIDStmt,
-		getAccountByScopeAndNameStmt:                q.getAccountByScopeAndNameStmt,
-		getAccountByScopeAndNumberStmt:              q.getAccountByScopeAndNumberStmt,
-		getAccountByWalletScopeAndNameStmt:          q.getAccountByWalletScopeAndNameStmt,
-		getAccountByWalletScopeAndNumberStmt:        q.getAccountByWalletScopeAndNumberStmt,
-		getAccountPropsByIdStmt:                     q.getAccountPropsByIdStmt,
-		getActiveUtxoLeaseLockIDStmt:                q.getActiveUtxoLeaseLockIDStmt,
-		getAddressByScriptPubKeyStmt:                q.getAddressByScriptPubKeyStmt,
-		getAddressSecretStmt:                        q.getAddressSecretStmt,
-		getAddressTypeByIDStmt:                      q.getAddressTypeByIDStmt,
-		getAndIncrementNextExternalIndexStmt:        q.getAndIncrementNextExternalIndexStmt,
-		getAndIncrementNextInternalIndexStmt:        q.getAndIncrementNextInternalIndexStmt,
-		getBlockByHeightStmt:                        q.getBlockByHeightStmt,
-		getKeyScopeByIDStmt:                         q.getKeyScopeByIDStmt,
-		getKeyScopeByWalletAndScopeStmt:             q.getKeyScopeByWalletAndScopeStmt,
-		getKeyScopeSecretsStmt:                      q.getKeyScopeSecretsStmt,
-		getTransactionByHashStmt:                    q.getTransactionByHashStmt,
-		getTransactionMetaByHashStmt:                q.getTransactionMetaByHashStmt,
-		getUtxoByOutpointStmt:                       q.getUtxoByOutpointStmt,
-		getUtxoIDByOutpointStmt:                     q.getUtxoIDByOutpointStmt,
-		getUtxoSpendByOutpointStmt:                  q.getUtxoSpendByOutpointStmt,
-		getWalletByIDStmt:                           q.getWalletByIDStmt,
-		getWalletByNameStmt:                         q.getWalletByNameStmt,
-		getWalletSecretsStmt:                        q.getWalletSecretsStmt,
-		hasDeadWalletUtxoByOutpointStmt:             q.hasDeadWalletUtxoByOutpointStmt,
-		insertAddressSecretStmt:                     q.insertAddressSecretStmt,
-		insertBlockStmt:                             q.insertBlockStmt,
-		insertKeyScopeSecretsStmt:                   q.insertKeyScopeSecretsStmt,
-		insertTransactionStmt:                       q.insertTransactionStmt,
-		insertTxReplacementEdgeStmt:                 q.insertTxReplacementEdgeStmt,
-		insertTxReplacementEdgeByHashStmt:           q.insertTxReplacementEdgeByHashStmt,
-		insertUtxoStmt:                              q.insertUtxoStmt,
-		insertWalletSecretsStmt:                     q.insertWalletSecretsStmt,
-		insertWalletSyncStateStmt:                   q.insertWalletSyncStateStmt,
-		listAccountsByScopeStmt:                     q.listAccountsByScopeStmt,
-		listAccountsByWalletStmt:                    q.listAccountsByWalletStmt,
-		listAccountsByWalletAndNameStmt:             q.listAccountsByWalletAndNameStmt,
-		listAccountsByWalletScopeStmt:               q.listAccountsByWalletScopeStmt,
-		listActiveUtxoLeasesStmt:                    q.listActiveUtxoLeasesStmt,
-		listAddressTypesStmt:                        q.listAddressTypesStmt,
-		listAddressesByAccountStmt:                  q.listAddressesByAccountStmt,
-		listKeyScopesByWalletStmt:                   q.listKeyScopesByWalletStmt,
-		listReplacedTxHashesByReplacementTxHashStmt: q.listReplacedTxHashesByReplacementTxHashStmt,
-		listReplacedTxIDsByReplacementTxIDStmt:      q.listReplacedTxIDsByReplacementTxIDStmt,
-		listReplacementTxHashesByReplacedTxHashStmt: q.listReplacementTxHashesByReplacedTxHashStmt,
-		listReplacementTxIDsByReplacedTxIDStmt:      q.listReplacementTxIDsByReplacedTxIDStmt,
-		listRollbackCoinbaseRootsStmt:               q.listRollbackCoinbaseRootsStmt,
-		listSpendingTxIDsByParentTxIDStmt:           q.listSpendingTxIDsByParentTxIDStmt,
-		listTransactionsByHeightRangeStmt:           q.listTransactionsByHeightRangeStmt,
-		listUnminedTransactionsStmt:                 q.listUnminedTransactionsStmt,
-		listUtxosStmt:                               q.listUtxosStmt,
-		listWalletsStmt:                             q.listWalletsStmt,
-		lockAccountScopeStmt:                        q.lockAccountScopeStmt,
-		markUtxoSpentStmt:                           q.markUtxoSpentStmt,
-		releaseUtxoLeaseStmt:                        q.releaseUtxoLeaseStmt,
-		rewindWalletSyncStateHeightsForRollbackStmt: q.rewindWalletSyncStateHeightsForRollbackStmt,
-		updateAccountNameByWalletScopeAndNameStmt:   q.updateAccountNameByWalletScopeAndNameStmt,
-		updateAccountNameByWalletScopeAndNumberStmt: q.updateAccountNameByWalletScopeAndNumberStmt,
-		updateTransactionLabelByHashStmt:            q.updateTransactionLabelByHashStmt,
-		updateTransactionStatusByIDsStmt:            q.updateTransactionStatusByIDsStmt,
-		updateWalletSecretsStmt:                     q.updateWalletSecretsStmt,
-		updateWalletSyncStateStmt:                   q.updateWalletSyncStateStmt,
+		db:                                           tx,
+		tx:                                           tx,
+		acquireUtxoLeaseStmt:                         q.acquireUtxoLeaseStmt,
+		balanceStmt:                                  q.balanceStmt,
+		clearUtxosSpentByTxIDStmt:                    q.clearUtxosSpentByTxIDStmt,
+		confirmUnminedTransactionByHashStmt:          q.confirmUnminedTransactionByHashStmt,
+		createAccountSecretStmt:                      q.createAccountSecretStmt,
+		createDerivedAccountStmt:                     q.createDerivedAccountStmt,
+		createDerivedAccountWithNumberStmt:           q.createDerivedAccountWithNumberStmt,
+		createDerivedAddressStmt:                     q.createDerivedAddressStmt,
+		createImportedAccountStmt:                    q.createImportedAccountStmt,
+		createImportedAddressStmt:                    q.createImportedAddressStmt,
+		createKeyScopeStmt:                           q.createKeyScopeStmt,
+		createWalletStmt:                             q.createWalletStmt,
+		deleteBlockStmt:                              q.deleteBlockStmt,
+		deleteBlocksAtOrAboveHeightStmt:              q.deleteBlocksAtOrAboveHeightStmt,
+		deleteExpiredUtxoLeasesStmt:                  q.deleteExpiredUtxoLeasesStmt,
+		deleteKeyScopeStmt:                           q.deleteKeyScopeStmt,
+		deleteKeyScopeSecretsStmt:                    q.deleteKeyScopeSecretsStmt,
+		deleteUnminedTransactionByHashStmt:           q.deleteUnminedTransactionByHashStmt,
+		deleteUtxosByTxIDStmt:                        q.deleteUtxosByTxIDStmt,
+		getAccountByScopeAndNameStmt:                 q.getAccountByScopeAndNameStmt,
+		getAccountByScopeAndNumberStmt:               q.getAccountByScopeAndNumberStmt,
+		getAccountByWalletScopeAndNameStmt:           q.getAccountByWalletScopeAndNameStmt,
+		getAccountByWalletScopeAndNumberStmt:         q.getAccountByWalletScopeAndNumberStmt,
+		getAccountPropsByIdStmt:                      q.getAccountPropsByIdStmt,
+		getActiveUtxoLeaseLockIDStmt:                 q.getActiveUtxoLeaseLockIDStmt,
+		getAddressByScriptPubKeyStmt:                 q.getAddressByScriptPubKeyStmt,
+		getAddressSecretStmt:                         q.getAddressSecretStmt,
+		getAddressTypeByIDStmt:                       q.getAddressTypeByIDStmt,
+		getAndIncrementNextExternalIndexStmt:         q.getAndIncrementNextExternalIndexStmt,
+		getAndIncrementNextInternalIndexStmt:         q.getAndIncrementNextInternalIndexStmt,
+		getBlockByHeightStmt:                         q.getBlockByHeightStmt,
+		getKeyScopeByIDStmt:                          q.getKeyScopeByIDStmt,
+		getKeyScopeByWalletAndScopeStmt:              q.getKeyScopeByWalletAndScopeStmt,
+		getKeyScopeSecretsStmt:                       q.getKeyScopeSecretsStmt,
+		getTransactionByHashStmt:                     q.getTransactionByHashStmt,
+		getTransactionMetaByHashStmt:                 q.getTransactionMetaByHashStmt,
+		getUtxoByOutpointStmt:                        q.getUtxoByOutpointStmt,
+		getUtxoIDByOutpointStmt:                      q.getUtxoIDByOutpointStmt,
+		getUtxoSpendByOutpointStmt:                   q.getUtxoSpendByOutpointStmt,
+		getWalletByIDStmt:                            q.getWalletByIDStmt,
+		getWalletByNameStmt:                          q.getWalletByNameStmt,
+		getWalletSecretsStmt:                         q.getWalletSecretsStmt,
+		hasDeadWalletUtxoByOutpointStmt:              q.hasDeadWalletUtxoByOutpointStmt,
+		insertAddressSecretStmt:                      q.insertAddressSecretStmt,
+		insertBlockStmt:                              q.insertBlockStmt,
+		insertKeyScopeSecretsStmt:                    q.insertKeyScopeSecretsStmt,
+		insertTransactionStmt:                        q.insertTransactionStmt,
+		insertTxReplacementEdgeStmt:                  q.insertTxReplacementEdgeStmt,
+		insertTxReplacementEdgeByHashStmt:            q.insertTxReplacementEdgeByHashStmt,
+		insertUtxoStmt:                               q.insertUtxoStmt,
+		insertWalletSecretsStmt:                      q.insertWalletSecretsStmt,
+		insertWalletSyncStateStmt:                    q.insertWalletSyncStateStmt,
+		listAccountsByScopeStmt:                      q.listAccountsByScopeStmt,
+		listAccountsByWalletStmt:                     q.listAccountsByWalletStmt,
+		listAccountsByWalletAndNameStmt:              q.listAccountsByWalletAndNameStmt,
+		listAccountsByWalletScopeStmt:                q.listAccountsByWalletScopeStmt,
+		listActiveUtxoLeasesStmt:                     q.listActiveUtxoLeasesStmt,
+		listAddressTypesStmt:                         q.listAddressTypesStmt,
+		listAddressesByAccountStmt:                   q.listAddressesByAccountStmt,
+		listCoinbaseRollbackRootsAtOrAboveHeightStmt: q.listCoinbaseRollbackRootsAtOrAboveHeightStmt,
+		listKeyScopesByWalletStmt:                    q.listKeyScopesByWalletStmt,
+		listLiveUnminedConflictCandidatesStmt:        q.listLiveUnminedConflictCandidatesStmt,
+		listReplacedTxHashesByReplacementTxHashStmt:  q.listReplacedTxHashesByReplacementTxHashStmt,
+		listReplacedTxIDsByReplacementTxIDStmt:       q.listReplacedTxIDsByReplacementTxIDStmt,
+		listReplacementTxHashesByReplacedTxHashStmt:  q.listReplacementTxHashesByReplacedTxHashStmt,
+		listReplacementTxIDsByReplacedTxIDStmt:       q.listReplacementTxIDsByReplacedTxIDStmt,
+		listRollbackCoinbaseRootsStmt:                q.listRollbackCoinbaseRootsStmt,
+		listSpendingTxIDsByParentTxIDStmt:            q.listSpendingTxIDsByParentTxIDStmt,
+		listTransactionsByHeightRangeStmt:            q.listTransactionsByHeightRangeStmt,
+		listUnminedTransactionsStmt:                  q.listUnminedTransactionsStmt,
+		listUtxosStmt:                                q.listUtxosStmt,
+		listWalletsStmt:                              q.listWalletsStmt,
+		lockAccountScopeStmt:                         q.lockAccountScopeStmt,
+		markUtxoSpentStmt:                            q.markUtxoSpentStmt,
+		reconfirmOrphanedCoinbaseByHashStmt:          q.reconfirmOrphanedCoinbaseByHashStmt,
+		releaseUtxoLeaseStmt:                         q.releaseUtxoLeaseStmt,
+		rewindWalletSyncStateHeightsForRollbackStmt:  q.rewindWalletSyncStateHeightsForRollbackStmt,
+		updateAccountNameByWalletScopeAndNameStmt:    q.updateAccountNameByWalletScopeAndNameStmt,
+		updateAccountNameByWalletScopeAndNumberStmt:  q.updateAccountNameByWalletScopeAndNumberStmt,
+		updateTransactionLabelByHashStmt:             q.updateTransactionLabelByHashStmt,
+		updateTransactionStatusByIDsStmt:             q.updateTransactionStatusByIDsStmt,
+		updateWalletSecretsStmt:                      q.updateWalletSecretsStmt,
+		updateWalletSyncStateStmt:                    q.updateWalletSyncStateStmt,
 	}
 }
