@@ -718,15 +718,13 @@ type ListAddressesQuery struct {
 
 // TxStatus represents the wallet-relative validity state of a transaction.
 //
-// The value is stored in the `transactions.status` column so the store can
-// answer validity questions directly from transaction rows instead of
-// re-deriving them from replacement edges, spend state, and reorg metadata on
-// every read.
+// The value is stored in the `transactions.status` column as a compact numeric
+// code so hot-path predicates and indexes do not pay the storage/index cost of
+// repeated status strings.
 //
-// The status therefore tracks wallet-facing state transitions such as
-// publication, replacement, failure, and coinbase orphaning, while block
-// confirmation remains a separate concern encoded by TxInfo.Block.
-type TxStatus string
+// The enum values MUST match the numeric codes enforced by migration
+// `000007_transactions` in both Postgres and SQLite.
+type TxStatus uint8
 
 const (
 	// TxStatusPending indicates a locally-created transaction that has not yet
@@ -734,7 +732,7 @@ const (
 	//
 	// Callers use this state when they need the store to retain a locally
 	// authored transaction before network publication.
-	TxStatusPending TxStatus = "pending"
+	TxStatusPending TxStatus = iota
 
 	// TxStatusPublished indicates a transaction that is still considered
 	// valid by the wallet and is either unconfirmed in the mempool or
@@ -745,15 +743,15 @@ const (
 	// TxStatusPublished avoids contradictory combinations such as
 	// "confirmed but not published" and keeps this field focused on whether the
 	// wallet still treats the transaction as live.
-	TxStatusPublished TxStatus = "published"
+	TxStatusPublished
 
 	// TxStatusReplaced indicates a transaction that was invalidated by a
 	// competing transaction spending the same inputs via RBF.
-	TxStatusReplaced TxStatus = "replaced"
+	TxStatusReplaced
 
 	// TxStatusFailed indicates a transaction that was invalidated by a
 	// competing transaction spending the same inputs (double-spend).
-	TxStatusFailed TxStatus = "failed"
+	TxStatusFailed
 
 	// TxStatusOrphaned indicates a coinbase transaction that was reorged out of
 	// the best chain.
@@ -761,8 +759,31 @@ const (
 	// This state is reserved for coinbase transactions. Non-coinbase rows must
 	// use a different terminal state such as TxStatusFailed or
 	// TxStatusReplaced.
-	TxStatusOrphaned TxStatus = "orphaned"
+	TxStatusOrphaned
 )
+
+// String returns the human-readable name of one transaction status code.
+func (s TxStatus) String() string {
+	switch s {
+	case TxStatusPending:
+		return "pending"
+
+	case TxStatusPublished:
+		return "published"
+
+	case TxStatusReplaced:
+		return "replaced"
+
+	case TxStatusFailed:
+		return "failed"
+
+	case TxStatusOrphaned:
+		return "orphaned"
+
+	default:
+		return "unknown"
+	}
+}
 
 // TxInfo represents the details of a transaction relevant to the wallet.
 type TxInfo struct {

@@ -95,7 +95,7 @@ LEFT JOIN blocks AS b ON 1 = 0
 WHERE
     t.wallet_id = ?
     AND t.block_height IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
 ORDER BY t.received_time DESC, t.id DESC;
 
 -- name: ListTransactionsByHeightRange :many
@@ -155,12 +155,12 @@ WHERE
 UPDATE transactions
 SET
     block_height = cast(sqlc.arg('block_height') AS INTEGER),
-    status = 'published'
+    status = 1
 WHERE
     wallet_id = sqlc.arg('wallet_id')
     AND tx_hash = sqlc.arg('tx_hash')
     AND block_height IS NULL
-    AND status IN ('pending', 'published');
+    AND status IN (0, 1);
 
 -- name: UpdateTransactionStatusByIDs :execrows
 -- Updates the wallet-relative status for a set of transaction row IDs.
@@ -194,7 +194,7 @@ WHERE
     wallet_id = ?
     AND tx_hash = ?
     AND block_height IS NULL
-    AND status IN ('pending', 'published');
+    AND status IN (0, 1);
 
 -- name: ListRollbackCoinbaseRoots :many
 -- Lists wallet-scoped coinbase transaction hashes that will be disconnected by

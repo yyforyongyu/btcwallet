@@ -86,7 +86,7 @@ type SpendableUtxo struct {
 	AddressID   int64
 	BlockHeight sql.NullInt32
 	IsCoinbase  bool
-	TxStatus    string
+	TxStatus    int16
 }
 
 type Transaction struct {
@@ -95,7 +95,7 @@ type Transaction struct {
 	TxHash       []byte
 	RawTx        []byte
 	BlockHeight  sql.NullInt32
-	Status       string
+	Status       int16
 	ReceivedTime time.Time
 	IsCoinbase   bool
 	Label        string

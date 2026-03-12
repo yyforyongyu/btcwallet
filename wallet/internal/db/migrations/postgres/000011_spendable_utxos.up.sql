@@ -25,4 +25,4 @@ INNER JOIN transactions AS t
     ON u.wallet_id = t.wallet_id AND u.tx_id = t.id
 WHERE
     u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published');
+    AND t.status IN (0, 1);

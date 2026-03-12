@@ -41,7 +41,7 @@ WHERE
     AND t.tx_hash = sqlc.arg('tx_hash')
     AND u.output_index = sqlc.arg('output_index')
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
 ON CONFLICT (wallet_id, utxo_id) DO UPDATE
 SET
     lock_id = excluded.lock_id,
@@ -106,7 +106,7 @@ WHERE
     l.wallet_id = ?1
     AND l.expires_at > current_timestamp
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
 ORDER BY l.expires_at;
 
 -- name: DeleteExpiredUtxoLeases :execrows

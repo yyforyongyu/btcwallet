@@ -17,12 +17,12 @@ const ConfirmUnminedTransactionByHash = `-- name: ConfirmUnminedTransactionByHas
 UPDATE transactions
 SET
     block_height = $1::INTEGER,
-    status = 'published'
+    status = 1
 WHERE
     wallet_id = $2
     AND tx_hash = $3
     AND block_height IS NULL
-    AND status IN ('pending', 'published')
+    AND status IN (0, 1)
 `
 
 type ConfirmUnminedTransactionByHashParams struct {
@@ -77,7 +77,7 @@ WHERE
     wallet_id = $1
     AND tx_hash = $2
     AND block_height IS NULL
-    AND status IN ('pending', 'published')
+    AND status IN (0, 1)
 `
 
 type DeleteUnminedTransactionByHashParams struct {
@@ -135,7 +135,7 @@ type GetTransactionByHashRow struct {
 	BlockHash      []byte
 	BlockTimestamp sql.NullInt64
 	IsCoinbase     bool
-	Status         string
+	Status         int16
 	Label          string
 }
 
@@ -187,7 +187,7 @@ type GetTransactionMetaByHashRow struct {
 	ID          int64
 	BlockHeight sql.NullInt32
 	IsCoinbase  bool
-	Status      string
+	Status      int16
 	Label       string
 }
 
@@ -233,7 +233,7 @@ type InsertTransactionParams struct {
 	TxHash       []byte
 	RawTx        []byte
 	BlockHeight  sql.NullInt32
-	Status       string
+	Status       int16
 	ReceivedTime time.Time
 	IsCoinbase   bool
 	Label        string
@@ -353,7 +353,7 @@ type ListTransactionsByHeightRangeRow struct {
 	BlockHash      []byte
 	BlockTimestamp int64
 	IsCoinbase     bool
-	Status         string
+	Status         int16
 	Label          string
 }
 
@@ -417,7 +417,7 @@ FROM transactions AS t
 WHERE
     t.wallet_id = $1
     AND t.block_height IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
 ORDER BY t.received_time DESC, t.id DESC
 `
 
@@ -430,7 +430,7 @@ type ListUnminedTransactionsRow struct {
 	BlockHash      []byte
 	BlockTimestamp sql.NullInt64
 	IsCoinbase     bool
-	Status         string
+	Status         int16
 	Label          string
 }
 
@@ -579,7 +579,7 @@ WHERE
 `
 
 type UpdateTransactionStatusByIDsParams struct {
-	Status   string
+	Status   int16
 	WalletID int64
 	TxIds    []int64
 }

@@ -35,9 +35,17 @@ CREATE TABLE transactions (
     -- NOTE: `status` is the intentional schema/API name from ADR 0006 and the
     -- Go TxStatus types. Keep the local `-- noqa: RF04` SQLFluff suppression so
     -- linting does not force a rename away from that shared contract.
-    -- Regular store writes still pass status explicitly; this default is only a
-    -- defensive fallback for raw SQL paths that omit the column.
-    status TEXT NOT NULL DEFAULT 'pending', -- noqa: RF04
+    --
+    -- Store the status code inline instead of via a lookup table because this
+    -- enum is tiny, closed, and appears on hot-path predicates/indexes.
+    --
+    -- Status codes:
+    --   0 = pending
+    --   1 = published
+    --   2 = replaced
+    --   3 = failed
+    --   4 = orphaned
+    status SMALLINT NOT NULL, -- noqa: RF04
 
     -- Absolute wall clock time, supplied by the caller and stored in UTC
     -- without timezone info.
@@ -66,41 +74,41 @@ CREATE TABLE transactions (
     -- Keep the persisted validity state closed over the finite set of states
     -- the store knows how to interpret and transition between.
     CONSTRAINT valid_status CHECK (
-        status IN ('pending', 'published', 'replaced', 'failed', 'orphaned')
+        status IN (0, 1, 2, 3, 4)
     ),
 
     -- Non-coinbase transactions cannot enter the orphaned state. That state is
     -- reserved for coinbase rows that were disconnected from the best chain.
     CONSTRAINT check_orphaned_coinbase_only CHECK (
-        status != 'orphaned' OR is_coinbase
+        status != 4 OR is_coinbase
     ),
 
     -- A transaction attached to a block is treated as confirmed wallet history.
     -- For confirmed rows, the only valid status is `published`; every other
     -- status represents either blockless local state or disconnected history.
     CONSTRAINT check_confirmed_published CHECK (
-        block_height IS NULL OR status = 'published'
+        block_height IS NULL OR status = 1
     ),
 
     -- Coinbase transactions cannot exist in the local-only pre-broadcast state
     -- because they are created by mining, not by wallet authorship.
     CONSTRAINT check_coinbase_not_pending CHECK (
-        NOT (is_coinbase AND status = 'pending')
+        NOT (is_coinbase AND status = 0)
     ),
 
     -- Coinbase rows may only be recorded in their mined form or in the
     -- orphaned form produced by a disconnect/reorg transition.
     CONSTRAINT check_coinbase_confirmation_state CHECK (
         NOT is_coinbase
-        OR (block_height IS NOT NULL AND status = 'published')
-        OR (block_height IS NULL AND status = 'orphaned')
+        OR (block_height IS NOT NULL AND status = 1)
+        OR (block_height IS NULL AND status = 4)
     )
 );
 
 -- Optimization for live unconfirmed transaction lookups.
 CREATE INDEX idx_transactions_unconfirmed
 ON transactions (wallet_id, block_height)
-WHERE block_height IS NULL AND status IN ('pending', 'published');
+WHERE block_height IS NULL AND status IN (0, 1);
 
 -- Optimization for wallet-scoped blockless history reads ordered by newest
 -- receive time first.
@@ -129,8 +137,8 @@ ON transactions (wallet_id, received_time DESC);
 -- FK `ON DELETE SET NULL` action rewrites child `transactions.block_height`
 -- values to NULL. Coinbase rows cannot stay in `published` once that happens,
 -- because the schema requires:
---   - coinbase + confirmed block => status = 'published'
---   - coinbase + no block        => status = 'orphaned'
+--   - coinbase + confirmed block => status = 1 (`published`)
+--   - coinbase + no block        => status = 4 (`orphaned`)
 --
 -- PostgreSQL can solve this on the child-row update path. The FK action causes
 -- a real `UPDATE OF block_height ON transactions`, so a BEFORE UPDATE trigger
@@ -143,7 +151,7 @@ BEGIN
         AND NEW.is_coinbase THEN
         -- Only coinbase rows need rewriting here. Ordinary transactions may
         -- become unconfirmed while keeping their existing non-orphaned status.
-        NEW.status := 'orphaned';
+        NEW.status := 4;
     END IF;
 
     RETURN NEW;

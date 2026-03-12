@@ -58,7 +58,7 @@ WHERE
     AND t.tx_hash = $2
     AND u.output_index = $3
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published');
+    AND t.status IN (0, 1);
 
 -- name: GetUtxoByOutpoint :one
 -- Retrieves a single unspent UTXO by its outpoint.
@@ -95,7 +95,7 @@ WHERE
     AND t.tx_hash = $2
     AND u.output_index = $3
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published');
+    AND t.status IN (0, 1);
 
 -- name: ListUtxos :many
 -- Lists unspent UTXOs that match the provided filters.
@@ -137,7 +137,7 @@ WHERE
     u.wallet_id = sqlc.arg('wallet_id')
     AND ks.wallet_id = sqlc.arg('wallet_id')
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
     AND (
         sqlc.narg('account_number')::BIGINT IS NULL
         OR acc.account_number = sqlc.narg('account_number')::BIGINT
@@ -213,7 +213,7 @@ WHERE
     u.wallet_id = sqlc.arg('wallet_id')
     AND ks.wallet_id = sqlc.arg('wallet_id')
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
     AND (
         sqlc.narg('account_number')::BIGINT IS NULL
         OR acc.account_number = sqlc.narg('account_number')::BIGINT
@@ -292,7 +292,7 @@ WHERE
     u.wallet_id = $1
     AND t.tx_hash = $2
     AND u.output_index = $3
-    AND t.status IN ('pending', 'published');
+    AND t.status IN (0, 1);
 
 -- name: MarkUtxoSpent :execrows
 -- Marks a wallet-owned UTXO as spent by a transaction.
@@ -320,7 +320,7 @@ WHERE
         WHERE
             t.wallet_id = $1
             AND t.tx_hash = $2
-            AND t.status IN ('pending', 'published')
+            AND t.status IN (0, 1)
     )
     AND u.output_index = $3
     AND (

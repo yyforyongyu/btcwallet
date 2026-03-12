@@ -38,7 +38,7 @@ WHERE
     u.wallet_id = $1
     AND ks.wallet_id = $1
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
     AND (
         $2::BIGINT IS NULL
         OR acc.account_number = $2::BIGINT
@@ -203,7 +203,7 @@ WHERE
     AND t.tx_hash = $2
     AND u.output_index = $3
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
 `
 
 type GetUtxoByOutpointParams struct {
@@ -266,7 +266,7 @@ WHERE
     AND t.tx_hash = $2
     AND u.output_index = $3
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
 `
 
 type GetUtxoIDByOutpointParams struct {
@@ -307,7 +307,7 @@ WHERE
     u.wallet_id = $1
     AND t.tx_hash = $2
     AND u.output_index = $3
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
 `
 
 type GetUtxoSpendByOutpointParams struct {
@@ -457,7 +457,7 @@ WHERE
     u.wallet_id = $1
     AND ks.wallet_id = $1
     AND u.spent_by_tx_id IS NULL
-    AND t.status IN ('pending', 'published')
+    AND t.status IN (0, 1)
     AND (
         $2::BIGINT IS NULL
         OR acc.account_number = $2::BIGINT
@@ -575,7 +575,7 @@ WHERE
         WHERE
             t.wallet_id = $1
             AND t.tx_hash = $2
-            AND t.status IN ('pending', 'published')
+            AND t.status IN (0, 1)
     )
     AND u.output_index = $3
     AND (
