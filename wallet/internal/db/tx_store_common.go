@@ -49,10 +49,6 @@ var (
 	// exist in the serialized transaction.
 	errCreditIndexOutOfRange = errors.New("credit index out of range")
 
-	// errDuplicateCreditIndex indicates that CreateTx received the same credit
-	// output index more than once.
-	errDuplicateCreditIndex = errors.New("duplicate credit index")
-
 	// errDuplicateInputOutPoint indicates that CreateTx received the same
 	// previous outpoint more than once.
 	errDuplicateInputOutPoint = errors.New("duplicate input outpoint")
@@ -136,28 +132,18 @@ func validateCreateTxParams(params CreateTxParams) error {
 		return err
 	}
 
-	seenCredits := make(map[uint32]struct{}, len(params.Credits))
 	maxIndex := int64(len(params.Tx.TxOut))
 
 	// Every requested credit must map to one real output exactly once because
 	// the write path persists one UTXO row per credited output index and later
 	// dereferences params.Tx.TxOut[credit.Index].
-	for _, credit := range params.Credits {
-		if int64(credit.Index) >= maxIndex {
+	for index := range params.Credits {
+		if int64(index) >= maxIndex {
 			return fmt.Errorf(
-				"credit index %d: %w", credit.Index,
+				"credit index %d: %w", index,
 				errCreditIndexOutOfRange,
 			)
 		}
-
-		if _, ok := seenCredits[credit.Index]; ok {
-			return fmt.Errorf(
-				"credit index %d: %w", credit.Index,
-				errDuplicateCreditIndex,
-			)
-		}
-
-		seenCredits[credit.Index] = struct{}{}
 	}
 
 	// Coinbase transactions do not participate in the wallet-owned spend graph,

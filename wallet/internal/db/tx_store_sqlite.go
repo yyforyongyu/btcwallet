@@ -466,8 +466,8 @@ func (s *SqliteStore) RollbackToBlock(ctx context.Context,
 func insertCreditsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	params CreateTxParams, txID int64) error {
 
-	for _, credit := range params.Credits {
-		pkScript := params.Tx.TxOut[credit.Index].PkScript
+	for index := range params.Credits {
+		pkScript := params.Tx.TxOut[index].PkScript
 
 		addrRow, err := qtx.GetAddressByScriptPubKey(
 			ctx, sqlcsqlite.GetAddressByScriptPubKeyParams{
@@ -477,23 +477,23 @@ func insertCreditsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("credit output %d: %w", credit.Index,
+				return fmt.Errorf("credit output %d: %w", index,
 					ErrAddressNotFound)
 			}
 
-			return fmt.Errorf("resolve credit address %d: %w", credit.Index,
+			return fmt.Errorf("resolve credit address %d: %w", index,
 				err)
 		}
 
 		_, err = qtx.InsertUtxo(ctx, sqlcsqlite.InsertUtxoParams{
 			WalletID:    int64(params.WalletID),
 			TxID:        txID,
-			OutputIndex: int64(credit.Index),
-			Amount:      params.Tx.TxOut[credit.Index].Value,
+			OutputIndex: int64(index),
+			Amount:      params.Tx.TxOut[index].Value,
 			AddressID:   addrRow.ID,
 		})
 		if err != nil {
-			return fmt.Errorf("insert credit output %d: %w", credit.Index,
+			return fmt.Errorf("insert credit output %d: %w", index,
 				err)
 		}
 	}
@@ -506,7 +506,8 @@ func insertCreditsSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 //
 // If another live wallet transaction already owns the spend edge for a
 // wallet-controlled input, the create path fails with ErrTxInputConflict
-// instead of silently storing a second live spender.
+// instead of silently storing a second live spender. Inputs that reference a
+// dead wallet parent fail with ErrTxInputDeadWalletParent.
 func markInputsSpentSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	params CreateTxParams, txID int64) error {
 
@@ -546,7 +547,8 @@ func markInputsSpentSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 
 // ensureSpendConflictSqlite reports ErrTxInputConflict when the referenced
 // outpoint is wallet-owned, still eligible for spending, and already attached
-// to another transaction.
+// to another transaction. If the wallet owns the parent output but that parent
+// is already dead, the helper returns ErrTxInputDeadWalletParent instead.
 func ensureSpendConflictSqlite(ctx context.Context,
 	qtx *sqlcsqlite.Queries, walletID uint32, txHash chainhash.Hash,
 	outputIndex int64, txID int64) error {
@@ -560,7 +562,9 @@ func ensureSpendConflictSqlite(ctx context.Context,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+			return ensureWalletParentLiveSqlite(
+				ctx, qtx, walletID, txHash, outputIndex,
+			)
 		}
 
 		return fmt.Errorf("check spend conflict: %w", err)
@@ -571,6 +575,31 @@ func ensureSpendConflictSqlite(ctx context.Context,
 	}
 
 	return nil
+}
+
+// ensureWalletParentLiveSqlite reports ErrTxInputDeadWalletParent when the
+// wallet owns the referenced outpoint but its parent transaction is already
+// dead.
+func ensureWalletParentLiveSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries, walletID uint32, txHash chainhash.Hash,
+	outputIndex int64) error {
+
+	_, err := qtx.HasDeadWalletUtxoByOutpoint(
+		ctx, sqlcsqlite.HasDeadWalletUtxoByOutpointParams{
+			WalletID:    int64(walletID),
+			TxHash:      txHash[:],
+			OutputIndex: outputIndex,
+		},
+	)
+	if err == nil {
+		return ErrTxInputDeadWalletParent
+	}
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+
+	return fmt.Errorf("check dead wallet parent: %w", err)
 }
 
 // groupRollbackCoinbaseRootsSqlite groups rollback-affected coinbase hashes by

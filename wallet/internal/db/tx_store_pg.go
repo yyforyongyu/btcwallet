@@ -503,8 +503,8 @@ func (s *PostgresStore) RollbackToBlock(ctx context.Context,
 func insertCreditsPg(ctx context.Context, qtx *sqlcpg.Queries,
 	params CreateTxParams, txID int64) error {
 
-	for _, credit := range params.Credits {
-		pkScript := params.Tx.TxOut[credit.Index].PkScript
+	for index := range params.Credits {
+		pkScript := params.Tx.TxOut[index].PkScript
 
 		addrRow, err := qtx.GetAddressByScriptPubKey(
 			ctx, sqlcpg.GetAddressByScriptPubKeyParams{
@@ -514,17 +514,17 @@ func insertCreditsPg(ctx context.Context, qtx *sqlcpg.Queries,
 		)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("credit output %d: %w", credit.Index,
+				return fmt.Errorf("credit output %d: %w", index,
 					ErrAddressNotFound)
 			}
 
-			return fmt.Errorf("resolve credit address %d: %w", credit.Index,
+			return fmt.Errorf("resolve credit address %d: %w", index,
 				err)
 		}
 
-		outputIndex, err := uint32ToInt32(credit.Index)
+		outputIndex, err := uint32ToInt32(index)
 		if err != nil {
-			return fmt.Errorf("convert credit index %d: %w", credit.Index,
+			return fmt.Errorf("convert credit index %d: %w", index,
 				err)
 		}
 
@@ -532,11 +532,11 @@ func insertCreditsPg(ctx context.Context, qtx *sqlcpg.Queries,
 			WalletID:    int64(params.WalletID),
 			TxID:        txID,
 			OutputIndex: outputIndex,
-			Amount:      params.Tx.TxOut[credit.Index].Value,
+			Amount:      params.Tx.TxOut[index].Value,
 			AddressID:   addrRow.ID,
 		})
 		if err != nil {
-			return fmt.Errorf("insert credit output %d: %w", credit.Index,
+			return fmt.Errorf("insert credit output %d: %w", index,
 				err)
 		}
 	}
@@ -549,7 +549,8 @@ func insertCreditsPg(ctx context.Context, qtx *sqlcpg.Queries,
 //
 // If another live wallet transaction already owns the spend edge for a
 // wallet-controlled input, the create path fails with ErrTxInputConflict
-// instead of silently storing a second live spender.
+// instead of silently storing a second live spender. Inputs that reference a
+// dead wallet parent fail with ErrTxInputDeadWalletParent.
 func markInputsSpentPg(ctx context.Context, qtx *sqlcpg.Queries,
 	params CreateTxParams, txID int64) error {
 
@@ -597,7 +598,8 @@ func markInputsSpentPg(ctx context.Context, qtx *sqlcpg.Queries,
 
 // ensureSpendConflictPg reports ErrTxInputConflict when the referenced outpoint
 // is wallet-owned, still eligible for spending, and already attached to another
-// transaction.
+// transaction. If the wallet owns the parent output but that parent is already
+// dead, the helper returns ErrTxInputDeadWalletParent instead.
 func ensureSpendConflictPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32, txHash chainhash.Hash, outputIndex int32,
 	txID int64) error {
@@ -611,7 +613,9 @@ func ensureSpendConflictPg(ctx context.Context, qtx *sqlcpg.Queries,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+			return ensureWalletParentLivePg(
+				ctx, qtx, walletID, txHash, outputIndex,
+			)
 		}
 
 		return fmt.Errorf("check spend conflict: %w", err)
@@ -622,6 +626,29 @@ func ensureSpendConflictPg(ctx context.Context, qtx *sqlcpg.Queries,
 	}
 
 	return nil
+}
+
+// ensureWalletParentLivePg reports ErrTxInputDeadWalletParent when the wallet
+// owns the referenced outpoint but its parent transaction is already dead.
+func ensureWalletParentLivePg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, txHash chainhash.Hash, outputIndex int32) error {
+
+	_, err := qtx.HasDeadWalletUtxoByOutpoint(
+		ctx, sqlcpg.HasDeadWalletUtxoByOutpointParams{
+			WalletID:    int64(walletID),
+			TxHash:      txHash[:],
+			OutputIndex: outputIndex,
+		},
+	)
+	if err == nil {
+		return ErrTxInputDeadWalletParent
+	}
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+
+	return fmt.Errorf("check dead wallet parent: %w", err)
 }
 
 // groupRollbackCoinbaseRootsPg groups rollback-affected coinbase hashes by

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
@@ -55,9 +56,7 @@ func TestDeleteTxRejectsNonLeafTransaction(t *testing.T) {
 		Tx:       parentTx,
 		Received: time.Unix(1710000300, 0),
 		Status:   db.TxStatusPending,
-		Credits: []db.CreditData{{
-			Index: 0,
-		}},
+		Credits:  map[uint32]btcutil.Address{0: nil},
 	})
 	require.NoError(t, err)
 
@@ -74,9 +73,7 @@ func TestDeleteTxRejectsNonLeafTransaction(t *testing.T) {
 		Tx:       childTx,
 		Received: time.Unix(1710000310, 0),
 		Status:   db.TxStatusPending,
-		Credits: []db.CreditData{{
-			Index: 0,
-		}},
+		Credits:  map[uint32]btcutil.Address{0: nil},
 	})
 	require.NoError(t, err)
 
@@ -104,8 +101,8 @@ func TestDeleteTxRejectsNonLeafTransaction(t *testing.T) {
 	require.Equal(t, db.TxStatusPending, childInfo.Status)
 }
 
-// TestCreateTxDoesNotAttachDeadWalletParents verifies that CreateTx only marks
-// wallet-owned inputs spent when the parent transaction is still live.
+// TestCreateTxRejectsDeadWalletParents verifies that CreateTx rejects a child
+// that spends a wallet-owned output whose parent branch is already dead.
 //
 // Scenario:
 //   - One wallet-owned coinbase output is orphaned by rollback and a later child
@@ -119,9 +116,9 @@ func TestDeleteTxRejectsNonLeafTransaction(t *testing.T) {
 // Action:
 // - Insert a new pending transaction that references the orphaned outpoint.
 // Assertions:
-// - CreateTx succeeds but does not attach a spend edge to the dead parent.
+// - CreateTx fails with ErrTxInputDeadWalletParent.
 // - The orphaned parent remains orphaned and child-edge enumeration stays empty.
-func TestCreateTxDoesNotAttachDeadWalletParents(t *testing.T) {
+func TestCreateTxRejectsDeadWalletParents(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Create one confirmed coinbase credit and roll it back so the
@@ -147,9 +144,7 @@ func TestCreateTxDoesNotAttachDeadWalletParents(t *testing.T) {
 		Received: time.Unix(1710000400, 0),
 		Block:    &coinbaseBlock,
 		Status:   db.TxStatusPublished,
-		Credits: []db.CreditData{{
-			Index: 0,
-		}},
+		Credits:  map[uint32]btcutil.Address{0: nil},
 	})
 	require.NoError(t, err)
 
@@ -181,16 +176,16 @@ func TestCreateTxDoesNotAttachDeadWalletParents(t *testing.T) {
 		Status:   db.TxStatusPending,
 	})
 
-	// Assert: The child is stored, but the dead parent keeps no spend edge.
-	require.NoError(t, err)
+	// Assert: The dead wallet parent is rejected and no spend edge is attached.
+	require.ErrorIs(t, err, db.ErrTxInputDeadWalletParent)
 	require.Empty(t, childSpendingTxIDs(t, store, walletID, coinbaseTx.TxHash()))
 
 	childInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
 		WalletID: walletID,
 		Txid:     childTx.TxHash(),
 	})
-	require.NoError(t, err)
-	require.Equal(t, db.TxStatusPending, childInfo.Status)
+	require.Nil(t, childInfo)
+	require.ErrorIs(t, err, db.ErrTxNotFound)
 
 	orphanedParent, err = store.GetTx(t.Context(), db.GetTxQuery{
 		WalletID: walletID,
@@ -242,9 +237,7 @@ func TestCreateTxRejectsConflictingLiveWalletSpend(t *testing.T) {
 		Tx:       parentTx,
 		Received: time.Unix(1710000500, 0),
 		Status:   db.TxStatusPending,
-		Credits: []db.CreditData{{
-			Index: 0,
-		}},
+		Credits:  map[uint32]btcutil.Address{0: nil},
 	})
 	require.NoError(t, err)
 

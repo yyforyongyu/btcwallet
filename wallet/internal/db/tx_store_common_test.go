@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/stretchr/testify/require"
@@ -157,25 +158,11 @@ func TestValidateCreateTxParams(t *testing.T) {
 		{
 			name: "credit index out of range",
 			params: CreateTxParams{
-				Tx: testRegularMsgTx(),
-				Credits: []CreditData{{
-					Index: 2,
-				}},
-				Status: TxStatusPending,
+				Tx:      testRegularMsgTx(),
+				Credits: map[uint32]btcutil.Address{2: nil},
+				Status:  TxStatusPending,
 			},
 			wantErr: errCreditIndexOutOfRange,
-		},
-		{
-			name: "duplicate credit index",
-			params: CreateTxParams{
-				Tx: testRegularMsgTx(),
-				Credits: []CreditData{
-					{Index: 0},
-					{Index: 0},
-				},
-				Status: TxStatusPending,
-			},
-			wantErr: errDuplicateCreditIndex,
 		},
 		{
 			name: "duplicate input outpoint",
@@ -205,22 +192,18 @@ func TestValidateCreateTxParams(t *testing.T) {
 		{
 			name: "valid pending unmined transaction",
 			params: CreateTxParams{
-				Tx:     testRegularMsgTx(),
-				Status: TxStatusPending,
-				Credits: []CreditData{{
-					Index: 0,
-				}},
+				Tx:      testRegularMsgTx(),
+				Status:  TxStatusPending,
+				Credits: map[uint32]btcutil.Address{0: nil},
 			},
 		},
 		{
 			name: "valid published mined coinbase",
 			params: CreateTxParams{
-				Tx:     testCoinbaseMsgTx(),
-				Block:  confirmedBlock,
-				Status: TxStatusPublished,
-				Credits: []CreditData{{
-					Index: 0,
-				}},
+				Tx:      testCoinbaseMsgTx(),
+				Block:   confirmedBlock,
+				Status:  TxStatusPublished,
+				Credits: map[uint32]btcutil.Address{0: nil},
 			},
 		},
 	}

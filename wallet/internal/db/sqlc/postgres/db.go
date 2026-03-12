@@ -150,6 +150,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getWalletSecretsStmt, err = db.PrepareContext(ctx, GetWalletSecrets); err != nil {
 		return nil, fmt.Errorf("error preparing query GetWalletSecrets: %w", err)
 	}
+	if q.hasDeadWalletUtxoByOutpointStmt, err = db.PrepareContext(ctx, HasDeadWalletUtxoByOutpoint); err != nil {
+		return nil, fmt.Errorf("error preparing query HasDeadWalletUtxoByOutpoint: %w", err)
+	}
 	if q.insertAddressSecretStmt, err = db.PrepareContext(ctx, InsertAddressSecret); err != nil {
 		return nil, fmt.Errorf("error preparing query InsertAddressSecret: %w", err)
 	}
@@ -476,6 +479,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getWalletSecretsStmt: %w", cerr)
 		}
 	}
+	if q.hasDeadWalletUtxoByOutpointStmt != nil {
+		if cerr := q.hasDeadWalletUtxoByOutpointStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing hasDeadWalletUtxoByOutpointStmt: %w", cerr)
+		}
+	}
 	if q.insertAddressSecretStmt != nil {
 		if cerr := q.insertAddressSecretStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing insertAddressSecretStmt: %w", cerr)
@@ -742,6 +750,7 @@ type Queries struct {
 	getWalletByIDStmt                           *sql.Stmt
 	getWalletByNameStmt                         *sql.Stmt
 	getWalletSecretsStmt                        *sql.Stmt
+	hasDeadWalletUtxoByOutpointStmt             *sql.Stmt
 	insertAddressSecretStmt                     *sql.Stmt
 	insertBlockStmt                             *sql.Stmt
 	insertKeyScopeSecretsStmt                   *sql.Stmt
@@ -827,6 +836,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getWalletByIDStmt:                           q.getWalletByIDStmt,
 		getWalletByNameStmt:                         q.getWalletByNameStmt,
 		getWalletSecretsStmt:                        q.getWalletSecretsStmt,
+		hasDeadWalletUtxoByOutpointStmt:             q.hasDeadWalletUtxoByOutpointStmt,
 		insertAddressSecretStmt:                     q.insertAddressSecretStmt,
 		insertBlockStmt:                             q.insertBlockStmt,
 		insertKeyScopeSecretsStmt:                   q.insertKeyScopeSecretsStmt,
