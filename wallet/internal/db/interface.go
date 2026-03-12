@@ -83,6 +83,12 @@ var (
 	ErrTxInputConflict = errors.New(
 		"transaction input conflicts with live wallet spend",
 	)
+
+	// ErrTxInputDeadWalletParent is returned when CreateTx references a wallet-
+	// owned input whose parent transaction is already in a dead state.
+	ErrTxInputDeadWalletParent = errors.New(
+		"transaction input spends dead wallet parent",
+	)
 )
 
 // Store defines the set of database operations used by the wallet.

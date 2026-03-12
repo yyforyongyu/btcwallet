@@ -297,6 +297,28 @@ WHERE
     AND u.output_index = $3
     AND t.tx_status IN (0, 1);
 
+-- name: HasDeadWalletUtxoByOutpoint :one
+-- Reports whether an outpoint belongs to a wallet-owned UTXO whose parent
+-- transaction is already in a dead state.
+--
+-- How:
+-- - Resolves the parent transaction row from `(wallet_id, tx_hash)` and checks
+--   for any non-live status outside `pending`/`published`.
+-- - Exists so CreateTx can reject children of dead wallet parents instead of
+--   storing a live child row that would expose invalid credits.
+-- Performance:
+-- - Targets one wallet-scoped outpoint through the parent tx lookup plus the
+--   unique `(tx_id, output_index)` key.
+SELECT 1
+FROM utxos AS u
+INNER JOIN transactions AS t
+    ON u.tx_id = t.id
+WHERE
+    t.wallet_id = $1
+    AND t.tx_hash = $2
+    AND u.output_index = $3
+    AND t.tx_status NOT IN (0, 1);
+
 -- name: MarkUtxoSpent :execrows
 -- Marks a wallet-owned UTXO as spent by a transaction.
 --
