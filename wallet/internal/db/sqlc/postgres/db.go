@@ -204,6 +204,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listKeyScopesByWalletStmt, err = db.PrepareContext(ctx, ListKeyScopesByWallet); err != nil {
 		return nil, fmt.Errorf("error preparing query ListKeyScopesByWallet: %w", err)
 	}
+	if q.listLiveUnminedConflictCandidatesStmt, err = db.PrepareContext(ctx, ListLiveUnminedConflictCandidates); err != nil {
+		return nil, fmt.Errorf("error preparing query ListLiveUnminedConflictCandidates: %w", err)
+	}
 	if q.listReplacedTxHashesByReplacementTxHashStmt, err = db.PrepareContext(ctx, ListReplacedTxHashesByReplacementTxHash); err != nil {
 		return nil, fmt.Errorf("error preparing query ListReplacedTxHashesByReplacementTxHash: %w", err)
 	}
@@ -239,6 +242,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.markUtxoSpentStmt, err = db.PrepareContext(ctx, MarkUtxoSpent); err != nil {
 		return nil, fmt.Errorf("error preparing query MarkUtxoSpent: %w", err)
+	}
+	if q.reconfirmOrphanedCoinbaseByHashStmt, err = db.PrepareContext(ctx, ReconfirmOrphanedCoinbaseByHash); err != nil {
+		return nil, fmt.Errorf("error preparing query ReconfirmOrphanedCoinbaseByHash: %w", err)
 	}
 	if q.releaseUtxoLeaseStmt, err = db.PrepareContext(ctx, ReleaseUtxoLease); err != nil {
 		return nil, fmt.Errorf("error preparing query ReleaseUtxoLease: %w", err)
@@ -569,6 +575,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listKeyScopesByWalletStmt: %w", cerr)
 		}
 	}
+	if q.listLiveUnminedConflictCandidatesStmt != nil {
+		if cerr := q.listLiveUnminedConflictCandidatesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listLiveUnminedConflictCandidatesStmt: %w", cerr)
+		}
+	}
 	if q.listReplacedTxHashesByReplacementTxHashStmt != nil {
 		if cerr := q.listReplacedTxHashesByReplacementTxHashStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listReplacedTxHashesByReplacementTxHashStmt: %w", cerr)
@@ -627,6 +638,11 @@ func (q *Queries) Close() error {
 	if q.markUtxoSpentStmt != nil {
 		if cerr := q.markUtxoSpentStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing markUtxoSpentStmt: %w", cerr)
+		}
+	}
+	if q.reconfirmOrphanedCoinbaseByHashStmt != nil {
+		if cerr := q.reconfirmOrphanedCoinbaseByHashStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing reconfirmOrphanedCoinbaseByHashStmt: %w", cerr)
 		}
 	}
 	if q.releaseUtxoLeaseStmt != nil {
@@ -768,6 +784,7 @@ type Queries struct {
 	listAddressTypesStmt                        *sql.Stmt
 	listAddressesByAccountStmt                  *sql.Stmt
 	listKeyScopesByWalletStmt                   *sql.Stmt
+	listLiveUnminedConflictCandidatesStmt       *sql.Stmt
 	listReplacedTxHashesByReplacementTxHashStmt *sql.Stmt
 	listReplacedTxIDsByReplacementTxIDStmt      *sql.Stmt
 	listReplacementTxHashesByReplacedTxHashStmt *sql.Stmt
@@ -780,6 +797,7 @@ type Queries struct {
 	listWalletsStmt                             *sql.Stmt
 	lockAccountScopeStmt                        *sql.Stmt
 	markUtxoSpentStmt                           *sql.Stmt
+	reconfirmOrphanedCoinbaseByHashStmt         *sql.Stmt
 	releaseUtxoLeaseStmt                        *sql.Stmt
 	rewindWalletSyncStateHeightsForRollbackStmt *sql.Stmt
 	updateAccountNameByWalletScopeAndNameStmt   *sql.Stmt
@@ -854,6 +872,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listAddressTypesStmt:                        q.listAddressTypesStmt,
 		listAddressesByAccountStmt:                  q.listAddressesByAccountStmt,
 		listKeyScopesByWalletStmt:                   q.listKeyScopesByWalletStmt,
+		listLiveUnminedConflictCandidatesStmt:       q.listLiveUnminedConflictCandidatesStmt,
 		listReplacedTxHashesByReplacementTxHashStmt: q.listReplacedTxHashesByReplacementTxHashStmt,
 		listReplacedTxIDsByReplacementTxIDStmt:      q.listReplacedTxIDsByReplacementTxIDStmt,
 		listReplacementTxHashesByReplacedTxHashStmt: q.listReplacementTxHashesByReplacedTxHashStmt,
@@ -866,6 +885,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listWalletsStmt:                             q.listWalletsStmt,
 		lockAccountScopeStmt:                        q.lockAccountScopeStmt,
 		markUtxoSpentStmt:                           q.markUtxoSpentStmt,
+		reconfirmOrphanedCoinbaseByHashStmt:         q.reconfirmOrphanedCoinbaseByHashStmt,
 		releaseUtxoLeaseStmt:                        q.releaseUtxoLeaseStmt,
 		rewindWalletSyncStateHeightsForRollbackStmt: q.rewindWalletSyncStateHeightsForRollbackStmt,
 		updateAccountNameByWalletScopeAndNameStmt:   q.updateAccountNameByWalletScopeAndNameStmt,

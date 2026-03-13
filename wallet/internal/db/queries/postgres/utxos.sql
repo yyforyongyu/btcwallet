@@ -188,8 +188,8 @@ ORDER BY u.amount, t.tx_hash, u.output_index;
 -- - Uses the address/account/scope joins to keep ownership validation and
 --   account filtering in one pass.
 SELECT
-    (coalesce(sum(u.amount), 0))::BIGINT AS total_balance,
-    (coalesce(
+    coalesce(sum(u.amount), 0)::BIGINT AS total_balance,
+    coalesce(
         sum(u.amount) FILTER (
             WHERE EXISTS (
                 SELECT 1
@@ -201,7 +201,7 @@ SELECT
             )
         ),
         0
-    ))::BIGINT AS locked_balance
+    )::BIGINT AS locked_balance
 FROM transactions AS t
 INNER JOIN utxos AS u ON t.id = u.tx_id
 INNER JOIN addresses AS a ON u.address_id = a.id

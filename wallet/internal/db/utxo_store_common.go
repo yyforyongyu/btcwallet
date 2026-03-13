@@ -28,6 +28,15 @@ var (
 	// different lock ID from the currently active lease.
 	errOutputUnlockNotAllowed = errors.New("output unlock not allowed")
 
+	// errInvalidUtxoAmount indicates that a SQL row carried a negative amount.
+	errInvalidUtxoAmount = errors.New("invalid utxo amount")
+
+	// errInvalidConfirmedUtxoHeight indicates that a confirmed SQL row carried
+	// the unmined-height sentinel.
+	errInvalidConfirmedUtxoHeight = errors.New(
+		"invalid confirmed utxo height",
+	)
+
 	// ErrOutputUnlockNotAllowed reports that a UTXO release request used a lock
 	// ID different from the active lease.
 	ErrOutputUnlockNotAllowed = errOutputUnlockNotAllowed
@@ -57,7 +66,15 @@ func buildUtxoInfo(hash []byte, outputIndex uint32, amount int64,
 
 	height := UnminedHeight
 	if blockHeight != nil {
+		if *blockHeight == UnminedHeight {
+			return nil, errInvalidConfirmedUtxoHeight
+		}
+
 		height = *blockHeight
+	}
+
+	if amount < 0 {
+		return nil, errInvalidUtxoAmount
 	}
 
 	return &UtxoInfo{

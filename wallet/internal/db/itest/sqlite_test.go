@@ -3,10 +3,15 @@
 package itest
 
 import (
+	"bytes"
+	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	sqlcsqlite "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/sqlite"
 	"github.com/stretchr/testify/require"
@@ -65,4 +70,238 @@ func childSpendingTxIDs(t *testing.T, store *db.SqliteStore, walletID uint32,
 	}
 
 	return ids
+}
+
+// insertConflictingRegularTx inserts one live regular transaction row plus any
+// credited wallet-owned outputs without claiming wallet spend edges.
+func insertConflictingRegularTx(t *testing.T, store *db.SqliteStore,
+	walletID uint32, tx *wire.MsgTx, received time.Time, status db.TxStatus,
+	credits map[uint32]btcutil.Address) {
+
+	t.Helper()
+
+	var raw bytes.Buffer
+	err := tx.Serialize(&raw)
+	require.NoError(t, err)
+
+	err = store.ExecuteTx(t.Context(), func(qtx *sqlcsqlite.Queries) error {
+		txHash := tx.TxHash()
+		txID, err := qtx.InsertTransaction(
+			t.Context(), sqlcsqlite.InsertTransactionParams{
+				WalletID:     int64(walletID),
+				TxHash:       txHash[:],
+				RawTx:        raw.Bytes(),
+				BlockHeight:  sql.NullInt64{},
+				TxStatus:     int64(status),
+				ReceivedTime: received.UTC(),
+				IsCoinbase:   false,
+				TxLabel:      "",
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		for index := range credits {
+			addressID := getAddressID(
+				t, qtx, tx.TxOut[index].PkScript, walletID,
+			)
+
+			_, err = qtx.InsertUtxo(
+				t.Context(), sqlcsqlite.InsertUtxoParams{
+					WalletID:    int64(walletID),
+					TxID:        txID,
+					OutputIndex: int64(index),
+					Amount:      tx.TxOut[index].Value,
+					AddressID:   addressID,
+				},
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func insertReplacementEdge(t *testing.T, store *db.SqliteStore, walletID uint32,
+	replacedTxid chainhash.Hash, replacementTxid chainhash.Hash) {
+
+	t.Helper()
+
+	replacedMeta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcsqlite.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   replacedTxid[:],
+		},
+	)
+	require.NoError(t, err)
+
+	replacementMeta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcsqlite.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   replacementTxid[:],
+		},
+	)
+	require.NoError(t, err)
+
+	_, err = store.Queries().InsertTxReplacementEdge(
+		t.Context(), sqlcsqlite.InsertTxReplacementEdgeParams{
+			WalletID:        int64(walletID),
+			ReplacedTxID:    replacedMeta.ID,
+			ReplacementTxID: replacementMeta.ID,
+		},
+	)
+	require.NoError(t, err)
+}
+
+func forceOrphanedCoinbaseTx(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET block_height = NULL, tx_status = ? "+
+			"WHERE wallet_id = ? AND tx_hash = ?",
+		int64(db.TxStatusOrphaned), int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionRawTx(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash, rawTx []byte) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET raw_tx = ? WHERE wallet_id = ? AND tx_hash = ?",
+		rawTx, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionStatus(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash, status int64) {
+
+	t.Helper()
+
+	tx, err := store.DB().BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(t.Context(), "PRAGMA ignore_check_constraints = ON")
+	require.NoError(t, err)
+
+	result, err := tx.ExecContext(
+		t.Context(),
+		"UPDATE transactions SET tx_status = ? WHERE wallet_id = ? AND tx_hash = ?",
+		status, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(t.Context(), "PRAGMA ignore_check_constraints = OFF")
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+	require.NoError(t, tx.Commit())
+}
+
+func corruptTransactionHash(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash, hash []byte) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET tx_hash = ? WHERE wallet_id = ? AND tx_hash = ?",
+		hash, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionBlockHeight(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash, height int64) {
+
+	t.Helper()
+
+	blockHash := RandomHash()
+	_, err := store.DB().ExecContext(
+		t.Context(),
+		"INSERT INTO blocks (block_height, header_hash, block_timestamp) VALUES (?, ?, ?) "+
+			"ON CONFLICT(block_height) DO UPDATE SET header_hash = excluded.header_hash, "+
+			"block_timestamp = excluded.block_timestamp",
+		height, blockHash[:], time.Now().Unix(),
+	)
+	require.NoError(t, err)
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET block_height = ? WHERE wallet_id = ? AND tx_hash = ?",
+		height, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptUtxoOutputIndex(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash, oldIndex uint32, newIndex int64) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE utxos SET output_index = ? WHERE output_index = ? "+
+			"AND tx_id = (SELECT id FROM transactions WHERE wallet_id = ? AND tx_hash = ?)",
+		newIndex, int64(oldIndex), int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptActiveLeaseLockID(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash, outputIndex uint32, lockID []byte) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE utxo_leases SET lock_id = ? WHERE wallet_id = ? AND utxo_id = ("+
+			"SELECT u.id FROM utxos u JOIN transactions t ON t.id = u.tx_id "+
+			"WHERE t.wallet_id = ? AND t.tx_hash = ? AND u.output_index = ?)",
+		lockID, int64(walletID), int64(walletID), txHash[:], int64(outputIndex),
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func requireLargeOutputIndexError(t *testing.T, err error) {
+	t.Helper()
+
+	require.ErrorIs(t, err, db.ErrUtxoNotFound)
 }
