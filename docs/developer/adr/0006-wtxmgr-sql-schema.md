@@ -18,7 +18,7 @@ We will adopt a **UTXO-Centered, Soft-Deletion Schema**.
 
 ### 2.1 Core Principles
 1.  **UTXO-Centered Operations:** The schema is optimized for `Balance()` and `CoinSelection()` queries, which focus on the `utxos` table.
-2.  **Transaction-Centered Integrity:** Validity flows from Parent to Child. A UTXO is only valid if its parent Transaction is valid (`status='published'`) or is explicitly allowed for chaining (`status='pending'`).
+2.  **Transaction-Centered Integrity:** Validity flows from Parent to Child. A UTXO is only valid if its parent Transaction is valid (`status = 1`, `published`) or is explicitly allowed for chaining (`status = 0`, `pending`).
 3.  **Immutable History (Soft Deletion):** We **NEVER** automatically `DELETE` rows.
     *   Failed/RBF'd transactions are marked with a `status` field (e.g., `replaced`, `failed`).
     *   They remain in the database for audit history but are excluded from balance queries.
@@ -42,7 +42,9 @@ Two designs were considered for tracking transaction validity:
 
 *   **Explicit `status` column (chosen):**
     *   The `status` field is a pre-computed materialization of the transaction's validity state, set atomically at write time when the invalidating event occurs (RBF, double-spend, reorg).
-    *   Pros: Balance and coin-selection queries filter on a single status predicate (`status IN ('published', 'pending')`) with no joins (and can be indexed if profiling justifies it); cascading invalidation is performed once at write time and never re-derived; audit states (`failed`, `replaced`, `orphaned`) are directly queryable.
+    *   It is stored as a compact numeric code (`0 = pending`, `1 = published`, `2 = replaced`, `3 = failed`, `4 = orphaned`) so hot-path predicates and indexes do not pay the storage or comparison cost of repeated status strings.
+    *   The schema intentionally does **not** use a separate status lookup table. The status set is tiny, closed, and application-owned, so a reference table would add foreign-key and seed-data complexity without adding meaningful flexibility. Keeping the code inline on the transaction row preserves hot-path simplicity, while the Go enum layer provides the human-readable names.
+    *   Pros: Balance and coin-selection queries filter on a single status predicate (`status IN (1, 0)`) with no joins (and can be indexed if profiling justifies it); cascading invalidation is performed once at write time and never re-derived; audit states (`failed`, `replaced`, `orphaned`) are directly queryable.
     *   Cons: Introduces a field that could theoretically drift from the underlying facts. This is partially mitigated by `CHECK` constraints (`check_confirmed_published`, `check_coinbase_confirmation_state`) and coinbase reorg triggers; transition correctness for `failed`/`replaced` remains a write-path responsibility validated by tests.
 
 *   **Derived status from other columns (alternative):**
@@ -73,8 +75,69 @@ Recommended operational defaults:
         *   PostgreSQL evaluates `CHECK` constraints immediately, including updates performed by foreign-key actions such as `ON DELETE SET NULL`.
         *   If you enforce the coinbase invariant at the database level, a simple `DELETE FROM blocks ...` will fail unless the coinbase row's `status` is updated to `orphaned` as part of the same statement.
         *   Recommended: use a trigger to rewrite coinbase `status` during the `block_height -> NULL` update (see 3.6).
-    *   **Reconfirmation:** If an orphaned coinbase transaction re-enters the best chain, restoring it requires setting `block_height` and `status='published'` atomically.
+    *   **Reconfirmation:** If an orphaned coinbase transaction re-enters the best chain, restoring it requires setting `block_height` and `status = 1` (`published`) atomically.
 *   **RBF:** Handled by updating the `utxos.spent_by_tx_id` pointer to the new transaction and marking the old transaction as `replaced`.
+
+### 2.4 Implementation Notes
+
+This ADR includes a reference schema. The implementation keeps the same
+invariants, but makes a few deliberate schema choices to match the existing
+conventions in `wallet/internal/db/migrations/`.
+
+**Primary keys and wallet scoping**
+
+The reference schema uses composite primary keys (`(wallet_id, id)`) to make
+wallet scoping enforceable with foreign keys.
+
+In this repository, SQLite tables follow the rowid-backed
+`INTEGER PRIMARY KEY` pattern used by the existing wallet/account/address
+schema. To preserve the wallet-scoping invariant while keeping that
+convention, the implementation uses single-column primary keys on `id` and
+adds `UNIQUE(wallet_id, id)` constraints on wallet-scoped tables. Child tables
+then use composite foreign keys referencing `(wallet_id, id)`.
+
+**Manual pruning and `spent_by` semantics**
+
+The reference schema uses `ON DELETE SET NULL` for the
+`(wallet_id, spent_by_tx_id)` foreign key so that physically deleting a
+spending transaction can restore a UTXO to the unspent set.
+
+In a composite foreign key, `ON DELETE SET NULL` applies to *all* referencing
+columns. With `utxos.wallet_id` being `NOT NULL`, the reference behavior cannot
+be expressed directly as written.
+
+The implementation therefore uses `ON DELETE RESTRICT` for the spender foreign
+key and defines manual pruning as an explicit, application-driven operation
+that clears `utxos.spent_by_*` before deleting/pruning the spending
+transaction, all within a single SQL transaction.
+
+**SQLite coinbase disconnect handling**
+
+PostgreSQL can rely on the transaction-row trigger alone when a block delete
+causes `transactions.block_height` to become `NULL`.
+
+SQLite evaluates child-row checks before an `AFTER UPDATE` trigger on the child
+table can normalize the row. To preserve the coinbase orphaning invariant, the
+implementation adds a `BEFORE DELETE ON blocks` trigger that rewrites affected
+transactions into their final disconnected state before the block row is
+removed.
+
+**Transaction labels**
+
+User-facing labels are part of the internal store contract (`TxInfo.Label`).
+The implementation adds a `transactions.label` column (`TEXT NOT NULL DEFAULT
+''`) instead of a separate labels table to keep the hot read path simple.
+
+**Timestamps**
+
+To match the current schema, PostgreSQL uses `TIMESTAMP` for wall-clock receive
+times and `TIMESTAMPTZ` for lease/replacement timestamps, while SQLite uses
+`TIMESTAMP` consistently. All timestamps are stored in UTC without timezone
+metadata unless the column is explicitly `TIMESTAMPTZ`.
+
+For PostgreSQL lease expiries, the column type is `TIMESTAMPTZ`.
+Comparisons use native timestamptz semantics so session timezone settings do
+not change lease lifetime checks.
 
 ## 3. Reference Schema
 
@@ -97,15 +160,17 @@ CREATE TABLE transactions (
     block_height INTEGER REFERENCES blocks(block_height) ON DELETE SET NULL,
     
     -- Validity State (Soft Deletion):
-    -- pending:   Created locally, not yet broadcast.
-    -- published: Active in mempool or blockchain (Valid); not necessarily broadcast by this wallet.
-    -- replaced:  RBF'd by another transaction (Invalid).
-    -- failed:    Double-spent by a competitor (Invalid).
-    -- orphaned:  Coinbase tx that was reorged out (Invalid).
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    -- Store the status code inline instead of via a lookup table because this
+    -- enum is tiny, closed, and appears on hot-path predicates/indexes.
+    --   0 = pending   (Created locally, not yet broadcast)
+    --   1 = published (Active in mempool or blockchain)
+    --   2 = replaced  (RBF'd by another transaction)
+    --   3 = failed    (Double-spent by a competitor)
+    --   4 = orphaned  (Coinbase tx that was reorged out)
+    status SMALLINT NOT NULL,
     
     -- Absolute wall clock time, stored in UTC.
-    received_time TIMESTAMPTZ NOT NULL,
+    received_time TIMESTAMP NOT NULL,
     is_coinbase BOOLEAN NOT NULL DEFAULT FALSE,
     
     -- Composite primary key is intentional: it allows foreign keys to enforce
@@ -114,18 +179,22 @@ CREATE TABLE transactions (
     -- reworked to maintain the same invariant.
     CONSTRAINT pidx_transactions PRIMARY KEY (wallet_id, id),
     CONSTRAINT uidx_transactions_hash UNIQUE (wallet_id, tx_hash),
-    CONSTRAINT valid_status CHECK (status IN ('pending', 'published', 'replaced', 'failed', 'orphaned')),
-    -- Invariant: If a transaction is confirmed (mined), it must be 'published'.
+    CONSTRAINT valid_status CHECK (status IN (0, 1, 2, 3, 4)),
+    -- Invariant: Only coinbase rows may enter the orphaned state.
+    CONSTRAINT check_orphaned_coinbase_only CHECK (
+        status != 4 OR is_coinbase
+    ),
+    -- Invariant: If a transaction is confirmed (mined), it must be `published`.
     CONSTRAINT check_confirmed_published CHECK (
-        block_height IS NULL OR status = 'published'
+        block_height IS NULL OR status = 1
     ),
     -- Invariant: Coinbase transactions cannot exist in the mempool.
-    -- If a coinbase transaction loses its block via a reorg, it becomes orphaned.
-    CONSTRAINT check_coinbase_not_pending CHECK (NOT (is_coinbase AND status = 'pending')),
+    -- If a coinbase transaction loses its block via a reorg, it becomes `orphaned`.
+    CONSTRAINT check_coinbase_not_pending CHECK (NOT (is_coinbase AND status = 0)),
     CONSTRAINT check_coinbase_confirmation_state CHECK (
         NOT is_coinbase OR
-        (block_height IS NOT NULL AND status = 'published') OR
-        (block_height IS NULL AND status = 'orphaned')
+        (block_height IS NOT NULL AND status = 1) OR
+        (block_height IS NULL AND status = 4)
     )
 );
 
@@ -172,10 +241,11 @@ CREATE TABLE utxos (
     -- The `addresses` table is part of the address-manager schema (tracked
     -- separately from this ADR's `wtxmgr` schema).
     --
-    -- Note: in the draft address schema (`wallet/internal/db/migrations/*/000006_addresses.up.sql`),
-    -- `addresses` is keyed by an `account_id` that is ultimately rooted in a
-    -- specific wallet (via key scopes). Implementations must ensure `address_id`
-    -- always refers to an address belonging to the same `wallet_id`.
+-- Note: in the draft address schema (`wallet/internal/db/migrations/*/000006_addresses.up.sql`),
+-- `addresses` is keyed by an `account_id` that is ultimately rooted in a
+-- specific wallet (via key scopes). Implementations must therefore revalidate
+-- `address_id` ownership through `addresses -> accounts -> key_scopes` whenever
+-- a wallet-scoped query needs to prove that the address belongs to the wallet.
     address_id BIGINT NOT NULL REFERENCES addresses(id) ON DELETE RESTRICT,
     
     -- Spending (Input):
@@ -219,8 +289,7 @@ Denormalization note:
 
 Cross-wallet integrity note:
 *   Ideally, the database should prevent a `utxos` row from referencing an `address_id` belonging to a different wallet.
-*   The strongest enforcement is a composite FK `FOREIGN KEY (wallet_id, address_id) REFERENCES addresses(wallet_id, id)`.
-*   If the address-manager schema does not expose `wallet_id` on `addresses`, this invariant must be enforced by application logic.
+*   If the address-manager schema does not expose `wallet_id` on `addresses`, this invariant must be enforced by query/application logic via `addresses -> accounts -> key_scopes`.
 
 ### 3.3 Audit: `tx_replacements`
 Tracks the history of RBF and Double-Spends.
@@ -297,28 +366,37 @@ Deadlock avoidance note:
 ### 3.5 Convenience Views
 
 **`spendable_utxos` View:**
-Encapsulates the logic of joining transactions to filter out invalid/failed parents.
-Note: Filtering for maturity (Coinbase > 100 confs) is done at the application layer using the exposed `block_height` and `is_coinbase` columns, as Views cannot accept dynamic parameters like `current_height`.
+Provides a convenience join between unspent outputs and their parent
+transaction metadata. The view exposes `tx_status`, `block_height`, and
+`is_coinbase`, but leaves spendability policy to the caller.
+
+Note: Filtering for maturity (Coinbase > 100 confs) is done at the application
+layer using the exposed `block_height` and `is_coinbase` columns, as views
+cannot accept dynamic parameters like `current_height`.
 
 Suggested helper (parameterized query):
 *   Expose a query helper that takes `current_height` and filters out immature coinbase outputs:
     *   `WHERE (NOT is_coinbase) OR (current_height - block_height) >= 100`
 
-Important: The view includes `pending` parent transactions to enable zero-latency chaining. This is an advanced mode and should be opt-in for conservative spending policies.
+Important: Whether `pending` parent transactions are acceptable for
+zero-latency chaining is an application-level policy decision. Conservative
+callers may require `tx_status = 1` (`published`), while advanced callers may
+opt into `tx_status IN (0, 1)` (`pending`, `published`).
 
 Note: Leases are time-based and depend on the database's current time function. For clarity, the view does not attempt to exclude leased UTXOs. Coin selection MUST exclude active leases (for example using a `NOT EXISTS` subquery against `utxo_leases` where `expires_at > CURRENT_TIMESTAMP`).
 
 ```sql
 CREATE VIEW spendable_utxos AS
-SELECT 
+SELECT
     u.*,
     t.block_height,
     t.is_coinbase,
-    t.status as tx_status
+    t.status AS tx_status
 FROM utxos u
 JOIN transactions t ON t.wallet_id = u.wallet_id AND t.id = u.tx_id
-WHERE u.spent_by_tx_id IS NULL
-  AND t.status IN ('published', 'pending');
+WHERE
+    u.spent_by_tx_id IS NULL
+    AND t.status IN (0, 1);
 ```
 
 ### 3.6 Triggers (PostgreSQL)
@@ -326,7 +404,7 @@ WHERE u.spent_by_tx_id IS NULL
 To enforce the coinbase invariant under `ON DELETE SET NULL`, PostgreSQL needs a trigger because `CHECK` constraints are not deferrable.
 
 Recommended behavior:
-*   When `block_height` transitions from `NOT NULL` to `NULL`, and `is_coinbase = TRUE`, automatically rewrite `status = 'orphaned'`.
+*   When `block_height` transitions from `NOT NULL` to `NULL`, and `is_coinbase = TRUE`, automatically rewrite `status = 4` (`orphaned`).
 
 This can be implemented with a `BEFORE UPDATE` trigger on `transactions`. Foreign-key actions execute as ordinary `UPDATE` statements, and triggers on the referencing table will fire.
 
@@ -338,7 +416,7 @@ Portability note:
 ```sql
 BEGIN;
 DELETE FROM blocks WHERE block_height = ?;
-UPDATE transactions SET status = 'orphaned' WHERE is_coinbase AND block_height IS NULL;
+UPDATE transactions SET status = 4 WHERE is_coinbase AND block_height IS NULL;
 COMMIT;
 ```
 
@@ -351,7 +429,7 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     IF NEW.block_height IS NULL AND OLD.block_height IS NOT NULL AND NEW.is_coinbase THEN
-        NEW.status := 'orphaned';
+        NEW.status := 4;
     END IF;
     RETURN NEW;
 END;
@@ -371,16 +449,25 @@ All `wtxmgr` tables are scoped by `wallet_id`. This allows multiple wallets to s
 Note: A separate, truly global `transactions` table shared across wallets is a different design. That approach would require a join table (e.g., `wallet_transactions`) to track per-wallet ownership and metadata.
 
 ### 4.2. Native SQL Efficiency
-Balances are calculated using `SUM(amount)` on the `utxos` table (or `spendable_utxos` view), leveraging database optimizations.
+Balances are calculated using `SUM(amount)` on the `utxos` table (or a
+policy-specific query built on the `spendable_utxos` base view), leveraging
+database optimizations.
+
+The schema intentionally stops short of declaring one canonical "spendable
+balance" API because callers may disagree about pending chaining, lease
+exclusion, confirmation thresholds, or coinbase maturity rules.
 
 ### 4.3. Audit Trail
-By using "Soft Deletion" (`status='replaced'`), we maintain a complete history of user attempts, even those that failed. This is superior to previous designs that physically deleted failed transactions.
+By using "Soft Deletion" (`status = 2`, `replaced`), we maintain a complete history of user attempts, even those that failed. This is superior to previous designs that physically deleted failed transactions.
 
 ### 4.4. Complexity Trade-off
 We accept slightly more complexity in **Transaction Reconstruction** (joining inputs/outputs) in exchange for maximal performance in **Balance Calculation** and **Coin Selection**, which are the high-frequency operations.
 
 Additional operational consequences:
-*   **Pending-chaining is advanced:** The `spendable_utxos` view includes `pending` parents to enable zero-latency chaining. This increases operational risk (child transactions depend on parents being broadcast) and should be disabled for conservative policies.
+*   **Pending-chaining is advanced:** Zero-latency chaining should remain an
+    application-level choice. Callers that opt into `pending` parents take on
+    the operational risk that child transactions depend on parents being
+    broadcast successfully.
 *   **Recursive invalidation is unbounded in theory:** Marking downstream transactions `failed` after an upstream double-spend can require recursive graph traversal. Implementations should assume bounded typical depth but plan for worst-case behavior (e.g., set a maximum recursion depth or iteration limit).
 
 ### 4.5 Operational Notes (Out of Scope for This ADR)
