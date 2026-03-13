@@ -351,6 +351,43 @@ func (q *Queries) GetUtxoSpendByOutpoint(ctx context.Context, arg GetUtxoSpendBy
 	return spent_by_tx_id, err
 }
 
+const HasDeadWalletUtxoByOutpoint = `-- name: HasDeadWalletUtxoByOutpoint :one
+SELECT 1
+FROM utxos
+INNER JOIN transactions AS t
+    ON utxos.tx_id = t.id
+WHERE
+    t.wallet_id = ?1
+    AND t.tx_hash = ?2
+    AND utxos.output_index = ?3
+    AND t.tx_status NOT IN (0, 1)
+`
+
+type HasDeadWalletUtxoByOutpointParams struct {
+	WalletID    int64
+	TxHash      []byte
+	OutputIndex int64
+}
+
+// Reports whether an outpoint belongs to a wallet-owned UTXO whose parent
+// transaction is already in a dead state.
+//
+// How:
+//   - Resolves the parent transaction row from `(wallet_id, tx_hash)` and checks
+//     for any non-live status outside `pending`/`published`.
+//   - Exists so CreateTx can reject children of dead wallet parents instead of
+//     storing a live child row that would expose invalid credits.
+//
+// Performance:
+//   - Targets one wallet-scoped outpoint through the parent tx lookup plus the
+//     unique `(tx_id, output_index)` key.
+func (q *Queries) HasDeadWalletUtxoByOutpoint(ctx context.Context, arg HasDeadWalletUtxoByOutpointParams) (int64, error) {
+	row := q.queryRow(ctx, q.hasDeadWalletUtxoByOutpointStmt, HasDeadWalletUtxoByOutpoint, arg.WalletID, arg.TxHash, arg.OutputIndex)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const InsertUtxo = `-- name: InsertUtxo :one
 INSERT INTO utxos (
     tx_id,

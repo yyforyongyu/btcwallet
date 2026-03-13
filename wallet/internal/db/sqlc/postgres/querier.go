@@ -244,6 +244,18 @@ type Querier interface {
 	GetWalletByID(ctx context.Context, id int64) (GetWalletByIDRow, error)
 	GetWalletByName(ctx context.Context, walletName string) (GetWalletByNameRow, error)
 	GetWalletSecrets(ctx context.Context, walletID int64) (WalletSecret, error)
+	// Reports whether an outpoint belongs to a wallet-owned UTXO whose parent
+	// transaction is already in a dead state.
+	//
+	// How:
+	// - Resolves the parent transaction row from `(wallet_id, tx_hash)` and checks
+	//   for any non-live status outside `pending`/`published`.
+	// - Exists so CreateTx can reject children of dead wallet parents instead of
+	//   storing a live child row that would expose invalid credits.
+	// Performance:
+	// - Targets one wallet-scoped outpoint through the parent tx lookup plus the
+	//   unique `(tx_id, output_index)` key.
+	HasDeadWalletUtxoByOutpoint(ctx context.Context, arg HasDeadWalletUtxoByOutpointParams) (int32, error)
 	// Inserts address secret information (private key, script) for imported addresses.
 	// Not used for derived addresses (their keys are derived from account key).
 	InsertAddressSecret(ctx context.Context, arg InsertAddressSecretParams) error

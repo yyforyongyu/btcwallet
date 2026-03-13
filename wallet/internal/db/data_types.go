@@ -858,40 +858,16 @@ type CreateTxParams struct {
 	// Label is an optional label for the transaction.
 	Label string
 
-	// Credits lists the outputs of the transaction that are controlled by
-	// the wallet.
-	Credits []CreditData
-}
-
-// CreditData contains the information needed to record a transaction credit.
-// It acts as an explicit instruction to the CreateTx method, identifying which
-// of the transaction's outputs belongs to the wallet and should be recorded as
-// a new UTXO. This serves as a performance optimization, preventing the
-// database layer from needing to parse every transaction output and query the
-// address manager to determine ownership.
-type CreditData struct {
-	// Index is the output index of the credit.
-	Index uint32
-
-	// Address is the address that received the credit.
+	// Credits maps wallet-owned output indexes to their display addresses.
 	//
-	// NOTE: This field is for display only. The database layer should match the
-	// credit to an address row by the output's script_pub_key
-	// (`params.Tx.TxOut[Index].PkScript`), which is the canonical key
-	// used by the address schema. This is especially important for
-	// imported or script-based addresses, where wallet ownership is
-	// defined by the stored script material rather than by one canonical
-	// encoded address string.
+	// The output index is the map key, so duplicate credited outputs are
+	// impossible by construction.
 	//
-	// Examples:
-	// - A standard P2WPKH credit usually has one obvious bech32 address for UI
-	//   display, but the wallet still keys ownership off the exact witness
-	//   program bytes recorded in script_pub_key.
-	// - An imported script address (`waddrmgr.Script`,
-	//   `waddrmgr.WitnessScript`, or `waddrmgr.TaprootScript`) is owned because
-	//   the wallet imported the script material; the encoded address, if
-	//   any, is only a presentation form of that script.
-	Address btcutil.Address
+	// NOTE: The address value is for display only. The database layer still
+	// matches ownership by the output's script_pub_key
+	// (`params.Tx.TxOut[index].PkScript`), which is the canonical key
+	// used by the address schema.
+	Credits map[uint32]btcutil.Address
 }
 
 // UpdateTxLabelParams contains the parameters for updating a transaction label.
@@ -944,9 +920,12 @@ type ListTxnsQuery struct {
 	// EndHeight is the ending block height for the query.
 	EndHeight uint32
 
-	// UnminedOnly, if true, will return only unmined (unconfirmed)
-	// transactions. If this is set, StartHeight and EndHeight will be
-	// ignored.
+	// UnminedOnly, if true, switches ListTxns onto the dedicated blockless read
+	// path that returns only unmined transactions.
+	//
+	// This is not equivalent to using zero confirmations. The confirmed height
+	// range query cannot express "only rows with no block", so StartHeight and
+	// EndHeight are ignored when this flag is set.
 	UnminedOnly bool
 }
 
