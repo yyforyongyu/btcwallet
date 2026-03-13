@@ -21,6 +21,7 @@ require (
 	github.com/jackc/pgx/v5 v5.5.4
 	github.com/jessevdk/go-flags v1.6.1
 	github.com/jrick/logrotate v1.1.2
+	github.com/lib/pq v1.10.9
 	github.com/lightninglabs/gozmq v0.0.0-20191113021534-d20a764486bf
 	github.com/lightninglabs/neutrino v0.16.2
 	github.com/lightninglabs/neutrino/cache v1.1.3
@@ -69,7 +70,6 @@ require (
 	github.com/jackc/puddle/v2 v2.2.1 // indirect
 	github.com/kkdai/bstream v1.0.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
-	github.com/lib/pq v1.10.9 // indirect
 	github.com/lightningnetwork/lnd/clock v1.0.1 // indirect
 	github.com/lightningnetwork/lnd/queue v1.0.1 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
