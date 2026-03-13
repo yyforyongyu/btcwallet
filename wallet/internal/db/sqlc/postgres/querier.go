@@ -102,9 +102,7 @@ type Querier interface {
 	// How:
 	// - Deletes directly from blocks by the natural height key.
 	// - Relies on FK/trigger side effects to null transaction block references and
-	//   orphan coinbase roots.
-	// - Expects RollbackToBlock to collect those roots before the delete and then
-	//   recursively fail descendants in the same transaction.
+	//   orphan coinbase rows.
 	// Performance:
 	// - Executes as a range delete over the block-height primary key.
 	DeleteBlocksAtOrAboveHeight(ctx context.Context, blockHeight int32) (int64, error)
@@ -343,31 +341,17 @@ type Querier interface {
 	// (purpose/coin_type), and account name. Returns all address columns for
 	// filtering and processing by the application.
 	ListAddressesByAccount(ctx context.Context, arg ListAddressesByAccountParams) ([]ListAddressesByAccountRow, error)
-	// Lists the coinbase transaction rows that will become orphan roots during
-	// rollback.
-	//
-	// How:
-	// - Reads only wallet scope and row identity for confirmed coinbase
-	//   transactions at or above the rollback height.
-	// - Lets RollbackToBlock collect the orphan roots before block deletion and
-	//   then run descendant invalidation in the same SQL transaction.
-	// Performance:
-	// - Rare rollback helper. The scan is bounded by the rollback height and only
-	//   returns lightweight row identifiers.
-	ListCoinbaseRollbackRootsAtOrAboveHeight(ctx context.Context, blockHeight sql.NullInt32) ([]ListCoinbaseRollbackRootsAtOrAboveHeightRow, error)
 	// Lists all key scopes for a wallet, ordered by ID.
 	ListKeyScopesByWallet(ctx context.Context, walletID int64) ([]KeyScope, error)
-	// Lists only the live blockless transaction rows needed for conflict-root
-	// validation.
+	// Lists live unmined transactions that may directly conflict with one winner.
 	//
 	// How:
-	// - Reads from transactions only and filters to live unconfirmed rows
-	//   (`pending` or `published`).
-	// - Returns only the columns needed to validate direct conflict roots and to
-	//   deserialize candidate transactions.
+	// - Reads only blockless live rows (`pending` or `published`).
+	// - Returns raw transactions so callers can inspect inputs for wallet-owned
+	//   conflicts without re-querying each row.
 	// Performance:
-	// - Avoids loading invalid-history rows and skips extra metadata columns such as
-	//   labels or block join fields.
+	// - Uses the wallet-scoped blockless-history index and keeps the projection
+	//   narrow to replacement-validation fields.
 	ListLiveUnminedConflictCandidates(ctx context.Context, walletID int64) ([]ListLiveUnminedConflictCandidatesRow, error)
 	// Lists victim txids for a given replacement txid.
 	//
@@ -446,12 +430,13 @@ type Querier interface {
 	// Lists all unconfirmed transactions for a wallet.
 	//
 	// How:
-	// - Reads from transactions only and returns every blockless row, including
-	//   invalid history states such as `failed`, `replaced`, and `orphaned`.
-	// - Leaves it to higher layers to decide whether they want the full blockless
-	//   history view or only the live mempool subset.
-	// - Returns NULL block metadata explicitly because unmined rows have no
-	//   block.
+	// - Reads from transactions only and filters on blockless rows.
+	// - Preserves blockless history rows such as replaced, failed, or orphaned
+	//   transactions so callers can inspect the full wallet-local transaction
+	//   history even after invalidation flows or rollback.
+	// - Returns typed NULL block metadata explicitly because live unmined rows have
+	//   no block. `NULL::BYTEA AS block_hash` and `NULL::BIGINT AS block_timestamp`
+	//   keep the unmined row shape aligned with the confirmed query below.
 	// Performance:
 	// - Matches the dedicated blockless-history index while the more selective
 	//   live-only partial index stays available for conflict paths.
@@ -516,13 +501,11 @@ type Querier interface {
 	// - Targets one outpoint in one wallet; the subquery uses the unique
 	//   wallet-scoped tx hash lookup.
 	MarkUtxoSpent(ctx context.Context, arg MarkUtxoSpentParams) (int64, error)
-	// Restores one orphaned coinbase transaction to the best chain.
+	// Restores one orphaned coinbase row to a confirming block.
 	//
 	// How:
-	// - Updates `block_height` and `status` in the same statement so coinbase rows
-	//   never pass through an invalid unconfirmed state.
-	// - Restricts the update to rows that are already orphaned coinbase
-	//   transactions within the requested wallet.
+	// - Updates only blockless orphaned coinbase rows.
+	// - Reuses the provided block reference and restores the live published status.
 	// Performance:
 	// - Targets at most one row through the wallet-scoped unique tx-hash lookup.
 	ReconfirmOrphanedCoinbaseByHash(ctx context.Context, arg ReconfirmOrphanedCoinbaseByHashParams) (int64, error)
@@ -541,6 +524,10 @@ type Querier interface {
 	// - Updates wallet_sync_states directly without joining other tables.
 	// - Rewrites both synced_height and birthday_height in one statement so the
 	//   subsequent block delete does not violate `ON DELETE RESTRICT`.
+	// - Example: if `rollback_height = 195`, then any `synced_height` or
+	//   `birthday_height` at 195 or above rewinds to `new_height = 194`.
+	// - If rollback starts from height 0, callers pass `new_height = NULL` so the
+	//   sync state no longer points at any surviving block row.
 	// Performance:
 	// - Touches only wallet_sync_states rows whose heights are at or above the
 	//   rollback boundary.

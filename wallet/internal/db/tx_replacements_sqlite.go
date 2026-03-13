@@ -125,12 +125,9 @@ func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 
 		rows, err := qtx.ReconfirmOrphanedCoinbaseByHash(
 			ctx, sqlcsqlite.ReconfirmOrphanedCoinbaseByHashParams{
-				BlockHeight: sql.NullInt64{
-					Int64: int64(params.Block.Height),
-					Valid: true,
-				},
-				WalletID: int64(params.WalletID),
-				TxHash:   params.Txid[:],
+				BlockHeight: int64(params.Block.Height),
+				WalletID:    int64(params.WalletID),
+				TxHash:      params.Txid[:],
 			},
 		)
 		if err != nil {
@@ -223,7 +220,7 @@ func loadTxChainMetaSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 		return txChainMeta{}, fmt.Errorf("get transaction metadata: %w", err)
 	}
 
-	status, err := parseTxStatus(row.Status)
+	status, err := parseTxStatus(row.TxStatus)
 	if err != nil {
 		return txChainMeta{}, err
 	}
@@ -430,7 +427,7 @@ func listDirectConflictRootsSqlite(ctx context.Context,
 		}
 
 		meta, ok, err := buildDirectConflictMeta(
-			row.ID, row.TxHash, row.Status, false, row.IsCoinbase,
+			row.ID, row.TxHash, row.TxStatus, false, row.IsCoinbase,
 		)
 		if err != nil {
 			return nil, err

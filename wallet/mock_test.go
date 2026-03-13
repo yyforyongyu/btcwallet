@@ -120,9 +120,9 @@ func (m *mockStore) CreateTx(ctx context.Context,
 	return args.Error(0)
 }
 
-// UpdateTx implements the db.TxStore interface.
-func (m *mockStore) UpdateTx(ctx context.Context,
-	params db.UpdateTxParams) error {
+// UpdateTxLabel implements the db.TxStore interface.
+func (m *mockStore) UpdateTxLabel(ctx context.Context,
+	params db.UpdateTxLabelParams) error {
 
 	args := m.Called(ctx, params)
 	return args.Error(0)

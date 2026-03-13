@@ -3,6 +3,7 @@
 package itest
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -86,7 +87,7 @@ func TestTxStoreLifecycle(t *testing.T) {
 	require.Len(t, unminedTxs, 1)
 	require.Equal(t, pendingInfo.Hash, unminedTxs[0].Hash)
 
-	err = store.UpdateTx(t.Context(), db.UpdateTxParams{
+	err = store.UpdateTxLabel(t.Context(), db.UpdateTxLabelParams{
 		WalletID: walletID,
 		Txid:     pendingTx.TxHash(),
 		Label:    "renamed",
@@ -389,6 +390,704 @@ func TestCreateTxRejectsDeadWalletParents(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, orphanedParent.Block)
 	require.Equal(t, db.TxStatusOrphaned, orphanedParent.Status)
+}
+
+// TestCreateTxConfirmsExistingUnmined verifies that CreateTx reuses one live
+// unmined row when the same transaction later arrives with a confirming block.
+func TestCreateTxConfirmsExistingUnmined(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-confirm-existing-unmined")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	queries := store.Queries()
+	confirmedBlock := CreateBlockFixture(t, queries, 250)
+
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{
+			Value:    7000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       tx,
+		Received: time.Unix(1710000500, 0),
+		Status:   db.TxStatusPending,
+		Label:    "seed",
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       tx,
+		Received: time.Unix(1710000600, 0),
+		Block:    &confirmedBlock,
+		Status:   db.TxStatusPublished,
+		Label:    "replacement-label-is-ignored",
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	info, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     tx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, info.Block)
+	require.Equal(t, confirmedBlock.Height, info.Block.Height)
+	require.Equal(t, db.TxStatusPublished, info.Status)
+	require.Equal(t, "seed", info.Label)
+
+	unminedTxs, err := store.ListTxns(t.Context(), db.ListTxnsQuery{
+		WalletID:    walletID,
+		UnminedOnly: true,
+	})
+	require.NoError(t, err)
+	require.Empty(t, unminedTxs)
+
+	confirmedTxs, err := store.ListTxns(t.Context(), db.ListTxnsQuery{
+		WalletID:    walletID,
+		StartHeight: confirmedBlock.Height,
+		EndHeight:   confirmedBlock.Height,
+	})
+	require.NoError(t, err)
+	require.Len(t, confirmedTxs, 1)
+	require.Equal(t, tx.TxHash(), confirmedTxs[0].Hash)
+
+	utxo, err := store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: wire.OutPoint{Hash: tx.TxHash(), Index: 0},
+	})
+	require.NoError(t, err)
+	require.Equal(t, confirmedBlock.Height, utxo.Height)
+}
+
+// TestCreateTxRejectsDoubleSpendConflict verifies that CreateTx refuses to
+// attach a second live wallet spender to the same wallet-owned outpoint.
+func TestCreateTxRejectsDoubleSpendConflict(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-double-spend-conflict")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+
+	parentTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{
+			Value:    9000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       parentTx,
+		Received: time.Unix(1710000700, 0),
+		Status:   db.TxStatusPending,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	parentOutPoint := wire.OutPoint{Hash: parentTx.TxHash(), Index: 0}
+	firstSpender := newRegularTx(
+		[]wire.OutPoint{parentOutPoint},
+		[]*wire.TxOut{{Value: 4000, PkScript: []byte{0x51}}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       firstSpender,
+		Received: time.Unix(1710000710, 0),
+		Status:   db.TxStatusPending,
+	})
+	require.NoError(t, err)
+
+	conflictingSpender := newRegularTx(
+		[]wire.OutPoint{parentOutPoint},
+		[]*wire.TxOut{{Value: 3000, PkScript: []byte{0x52}}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       conflictingSpender,
+		Received: time.Unix(1710000720, 0),
+		Status:   db.TxStatusPending,
+	})
+	require.ErrorIs(t, err, db.ErrTxInputConflict)
+
+	_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: parentOutPoint,
+	})
+	require.ErrorIs(t, err, db.ErrUtxoNotFound)
+
+	firstInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     firstSpender.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, firstInfo.Status)
+
+	_, err = store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     conflictingSpender.TxHash(),
+	})
+	require.ErrorIs(t, err, db.ErrTxNotFound)
+}
+
+// TestCreateTxRejectsUnknownCreditAddress verifies that credited outputs must
+// resolve to one wallet-owned address.
+func TestCreateTxRejectsUnknownCreditAddress(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-unknown-credit-address")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{
+			Value:    2500,
+			PkScript: []byte{0x51},
+		}},
+	)
+
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       tx,
+		Received: time.Unix(1710000800, 0),
+		Status:   db.TxStatusPending,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.ErrorIs(t, err, db.ErrAddressNotFound)
+
+	_, err = store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     tx.TxHash(),
+	})
+	require.ErrorIs(t, err, db.ErrTxNotFound)
+}
+
+// TestCreateTxRejectsInvalidParams verifies that CreateTx wraps shared
+// validation failures before opening any backend transaction.
+func TestCreateTxRejectsInvalidParams(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-invalid-create-tx-params")
+
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Status:   db.TxStatusPending,
+	})
+	require.ErrorContains(t, err, "validate create tx params")
+}
+
+// TestCreateTxRejectsDuplicateConfirmedTransaction verifies that duplicate
+// confirmed inserts fail through the backend insert path instead of silently
+// creating a second row.
+func TestCreateTxRejectsDuplicateConfirmedTransaction(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-duplicate-confirmed-tx")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	queries := store.Queries()
+	confirmedBlock := CreateBlockFixture(t, queries, 261)
+
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 4500, PkScript: addr.ScriptPubKey}},
+	)
+	params := db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       tx,
+		Received: time.Unix(1710000850, 0),
+		Block:    &confirmedBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	}
+
+	err := store.CreateTx(t.Context(), params)
+	require.NoError(t, err)
+
+	err = store.CreateTx(t.Context(), params)
+	require.ErrorContains(t, err, "insert transaction")
+}
+
+// TestUpdateTxNotFound verifies the public not-found error for missing labels.
+func TestUpdateTxNotFound(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-update-missing-tx")
+
+	err := store.UpdateTxLabel(t.Context(), db.UpdateTxLabelParams{
+		WalletID: walletID,
+		Txid:     randomHash(),
+		Label:    "missing",
+	})
+	require.ErrorIs(t, err, db.ErrTxNotFound)
+}
+
+// TestGetAndListTxRejectCorruptedStatus verifies that transaction reads fail
+// loudly when the stored status escapes the supported enum.
+func TestGetAndListTxRejectCorruptedStatus(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-corrupted-tx-status")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	queries := store.Queries()
+	confirmedBlock := CreateBlockFixture(t, queries, 265)
+
+	pendingTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 2100, PkScript: addr.ScriptPubKey}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       pendingTx,
+		Received: time.Unix(1710000895, 0),
+		Status:   db.TxStatusPending,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	confirmedTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 3100, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       confirmedTx,
+		Received: time.Unix(1710000896, 0),
+		Block:    &confirmedBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	corruptTransactionStatus(t, store, walletID, pendingTx.TxHash(), 99)
+
+	_, err = store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     pendingTx.TxHash(),
+	})
+	require.ErrorContains(t, err, "invalid transaction status")
+
+	_, err = store.ListTxns(t.Context(), db.ListTxnsQuery{
+		WalletID:    walletID,
+		UnminedOnly: true,
+	})
+	require.ErrorContains(t, err, "invalid transaction status")
+
+	corruptTransactionStatus(t, store, walletID, confirmedTx.TxHash(), 99)
+
+	_, err = store.ListTxns(t.Context(), db.ListTxnsQuery{
+		WalletID:    walletID,
+		StartHeight: confirmedBlock.Height,
+		EndHeight:   confirmedBlock.Height,
+	})
+	require.ErrorContains(t, err, "invalid transaction status")
+}
+
+// TestDeleteTxRejectsCorruptedStatus verifies that DeleteTx rejects stored rows
+// with an invalid wallet-visible status code.
+func TestDeleteTxRejectsCorruptedStatus(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-delete-corrupted-status")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 2300, PkScript: addr.ScriptPubKey}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       tx,
+		Received: time.Unix(1710000897, 0),
+		Status:   db.TxStatusPending,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	corruptTransactionStatus(t, store, walletID, tx.TxHash(), 99)
+
+	err = store.DeleteTx(t.Context(), db.DeleteTxParams{
+		WalletID: walletID,
+		Txid:     tx.TxHash(),
+	})
+	require.ErrorContains(t, err, "invalid transaction status")
+}
+
+// TestTxReadsReturnQueryErrorsWhenClosed verifies that transaction read/update
+// methods wrap backend query errors when the underlying connection is closed.
+func TestTxReadsReturnQueryErrorsWhenClosed(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-closed-tx-reads")
+	err := store.Close()
+	require.NoError(t, err)
+
+	err = store.UpdateTxLabel(t.Context(), db.UpdateTxLabelParams{
+		WalletID: walletID,
+		Txid:     randomHash(),
+		Label:    "closed",
+	})
+	require.ErrorContains(t, err, "update transaction label")
+
+	_, err = store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     randomHash(),
+	})
+	require.ErrorContains(t, err, "get transaction")
+
+	_, err = store.ListTxns(t.Context(), db.ListTxnsQuery{
+		WalletID:    walletID,
+		UnminedOnly: true,
+	})
+	require.ErrorContains(t, err, "list unmined transactions")
+
+	_, err = store.ListTxns(t.Context(), db.ListTxnsQuery{
+		WalletID:    walletID,
+		StartHeight: 1,
+		EndHeight:   1,
+	})
+	require.ErrorContains(t, err, "list transactions by height")
+}
+
+// TestUtxoReadsReturnQueryErrorsWhenClosed verifies that UTXO read methods wrap
+// backend query errors when the underlying connection is closed.
+func TestUtxoReadsReturnQueryErrorsWhenClosed(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-closed-utxo-reads")
+	err := store.Close()
+	require.NoError(t, err)
+
+	_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: wire.OutPoint{Hash: randomHash(), Index: 0},
+	})
+	require.ErrorContains(t, err, "get utxo")
+
+	_, err = store.ListUTXOs(t.Context(), db.ListUtxosQuery{WalletID: walletID})
+	require.ErrorContains(t, err, "list utxos")
+
+	_, err = store.ListLeasedOutputs(t.Context(), walletID)
+	require.ErrorContains(t, err, "list active utxo leases")
+
+	_, err = store.Balance(t.Context(), db.BalanceParams{WalletID: walletID})
+	require.ErrorContains(t, err, "balance")
+}
+
+// TestDeleteTxRejectsConfirmedAndMissing verifies DeleteTx's live-unconfirmed
+// precondition and not-found handling.
+func TestDeleteTxRejectsConfirmedAndMissing(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-delete-confirmed-or-missing")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	queries := store.Queries()
+	confirmedBlock := CreateBlockFixture(t, queries, 260)
+
+	confirmedTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{
+			Value:    5000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       confirmedTx,
+		Received: time.Unix(1710000900, 0),
+		Block:    &confirmedBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	err = store.DeleteTx(t.Context(), db.DeleteTxParams{
+		WalletID: walletID,
+		Txid:     confirmedTx.TxHash(),
+	})
+	require.ErrorContains(t, err, "live unconfirmed transaction required")
+
+	confirmedInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     confirmedTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, confirmedInfo.Block)
+
+	err = store.DeleteTx(t.Context(), db.DeleteTxParams{
+		WalletID: walletID,
+		Txid:     randomHash(),
+	})
+	require.ErrorIs(t, err, db.ErrTxNotFound)
+}
+
+// TestDeleteTxRejectsNonLeafExternalChild verifies that DeleteTx scans the raw
+// unmined graph, not only wallet-owned credit edges, when enforcing leaf-only
+// deletion.
+func TestDeleteTxRejectsNonLeafExternalChild(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-delete-non-leaf-external-child")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+
+	parentTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{
+			{Value: 6000, PkScript: addr.ScriptPubKey},
+			{Value: 500, PkScript: []byte{0x51}},
+		},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       parentTx,
+		Received: time.Unix(1710001000, 0),
+		Status:   db.TxStatusPending,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	childTx := newRegularTx(
+		[]wire.OutPoint{{Hash: parentTx.TxHash(), Index: 1}},
+		[]*wire.TxOut{{Value: 300, PkScript: []byte{0x52}}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       childTx,
+		Received: time.Unix(1710001010, 0),
+		Status:   db.TxStatusPending,
+	})
+	require.NoError(t, err)
+
+	err = store.DeleteTx(t.Context(), db.DeleteTxParams{
+		WalletID: walletID,
+		Txid:     parentTx.TxHash(),
+	})
+	require.ErrorIs(t, err, db.ErrDeleteRequiresLeaf)
+
+	parentInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     parentTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, parentInfo.Status)
+
+	childInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     childTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, childInfo.Status)
+}
+
+// TestDeleteTxRejectsCorruptedLiveChild verifies that DeleteTx surfaces child
+// decode failures while checking the live leaf invariant.
+func TestDeleteTxRejectsCorruptedLiveChild(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-delete-corrupted-child")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+
+	parentTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 5000, PkScript: addr.ScriptPubKey}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       parentTx,
+		Received: time.Unix(1710001015, 0),
+		Status:   db.TxStatusPending,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	childTx := newRegularTx(
+		[]wire.OutPoint{{Hash: parentTx.TxHash(), Index: 0}},
+		[]*wire.TxOut{{Value: 4000, PkScript: []byte{0x51}}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       childTx,
+		Received: time.Unix(1710001020, 0),
+		Status:   db.TxStatusPending,
+	})
+	require.NoError(t, err)
+
+	corruptTransactionRawTx(t, store, walletID, childTx.TxHash(), []byte{})
+
+	err = store.DeleteTx(t.Context(), db.DeleteTxParams{
+		WalletID: walletID,
+		Txid:     parentTx.TxHash(),
+	})
+	require.ErrorContains(t, err, "decode live transaction")
+}
+
+// TestLeaseOutputMissingUtxo verifies that leasing one missing outpoint returns
+// the public not-found error.
+func TestLeaseOutputMissingUtxo(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-lease-missing-utxo")
+
+	_, err := store.LeaseOutput(t.Context(), db.LeaseOutputParams{
+		WalletID: walletID,
+		ID:       lockIDFixture(3),
+		OutPoint: wire.OutPoint{Hash: randomHash(), Index: 0},
+		Duration: time.Minute,
+	})
+	require.ErrorIs(t, err, db.ErrUtxoNotFound)
+}
+
+// TestReleaseOutputMissingUtxo verifies that releasing one missing outpoint
+// returns the public not-found error.
+func TestReleaseOutputMissingUtxo(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-release-missing-utxo")
+
+	err := store.ReleaseOutput(t.Context(), db.ReleaseOutputParams{
+		WalletID: walletID,
+		ID:       lockIDFixture(4),
+		OutPoint: wire.OutPoint{Hash: randomHash(), Index: 0},
+	})
+	require.ErrorIs(t, err, db.ErrUtxoNotFound)
+}
+
+// TestReleaseOutputTwiceIsNoOp verifies that a second release with the same lock
+// becomes a no-op after the original lease has already been removed.
+func TestReleaseOutputTwiceIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-release-output-twice")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	queries := store.Queries()
+	confirmedBlock := CreateBlockFixture(t, queries, 270)
+
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 8000, PkScript: addr.ScriptPubKey}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       tx,
+		Received: time.Unix(1710001300, 0),
+		Block:    &confirmedBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	leaseOutPoint := wire.OutPoint{Hash: tx.TxHash(), Index: 0}
+	leaseID := lockIDFixture(5)
+	_, err = store.LeaseOutput(t.Context(), db.LeaseOutputParams{
+		WalletID: walletID,
+		ID:       leaseID,
+		OutPoint: leaseOutPoint,
+		Duration: time.Hour,
+	})
+	require.NoError(t, err)
+
+	err = store.ReleaseOutput(t.Context(), db.ReleaseOutputParams{
+		WalletID: walletID,
+		ID:       leaseID,
+		OutPoint: leaseOutPoint,
+	})
+	require.NoError(t, err)
+
+	err = store.ReleaseOutput(t.Context(), db.ReleaseOutputParams{
+		WalletID: walletID,
+		ID:       leaseID,
+		OutPoint: leaseOutPoint,
+	})
+	require.NoError(t, err)
+
+	leases, err := store.ListLeasedOutputs(t.Context(), walletID)
+	require.NoError(t, err)
+	require.Empty(t, leases)
+}
+
+// TestGetUtxoAndLeaseRejectLargeOutputIndex verifies backend-specific handling
+// for outpoint indexes that exceed the supported signed SQL range.
+func TestGetUtxoAndLeaseRejectLargeOutputIndex(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-large-output-index")
+	outPoint := wire.OutPoint{Hash: randomHash(), Index: math.MaxUint32}
+
+	_, err := store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: outPoint,
+	})
+	requireLargeOutputIndexError(t, err)
+
+	_, err = store.LeaseOutput(t.Context(), db.LeaseOutputParams{
+		WalletID: walletID,
+		ID:       lockIDFixture(6),
+		OutPoint: outPoint,
+		Duration: time.Minute,
+	})
+	requireLargeOutputIndexError(t, err)
+
+	err = store.ReleaseOutput(t.Context(), db.ReleaseOutputParams{
+		WalletID: walletID,
+		ID:       lockIDFixture(6),
+		OutPoint: outPoint,
+	})
+	requireLargeOutputIndexError(t, err)
 }
 
 // TestUtxoStoreLeaseAndBalance verifies listing, leasing, releasing, and

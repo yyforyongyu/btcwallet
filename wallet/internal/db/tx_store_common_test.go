@@ -2,6 +2,8 @@ package db
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -10,6 +12,12 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/stretchr/testify/require"
+)
+
+var (
+	errTestRollbackList   = errors.New("list failed")
+	errTestRollbackClear  = errors.New("clear failed")
+	errTestRollbackUpdate = errors.New("update failed")
 )
 
 // TestSerializeDeserializeMsgTx verifies that the common serialization helpers
@@ -42,6 +50,13 @@ func TestSerializeDeserializeMsgTx(t *testing.T) {
 	require.Equal(t, rawTx, got.Bytes())
 }
 
+func TestDeserializeMsgTxInvalidRaw(t *testing.T) {
+	t.Parallel()
+
+	_, err := deserializeMsgTx([]byte{1, 2, 3})
+	require.ErrorContains(t, err, "deserialize transaction")
+}
+
 // TestParseTxStatus verifies that stored numeric values map back to the public
 // TxStatus enum and that unknown values fail loudly.
 //
@@ -68,6 +83,8 @@ func TestParseTxStatus(t *testing.T) {
 		{name: "replaced", status: 2, want: TxStatusReplaced},
 		{name: "failed", status: 3, want: TxStatusFailed},
 		{name: "orphaned", status: 4, want: TxStatusOrphaned},
+		{name: "negative", status: -1, wantErr: errInvalidTxStatus},
+		{name: "overflow", status: 256, wantErr: errInvalidTxStatus},
 		{name: "invalid", status: 9, wantErr: errInvalidTxStatus},
 	}
 
@@ -156,6 +173,14 @@ func TestValidateCreateTxParams(t *testing.T) {
 			wantErr: errCreateTxTerminalStatus,
 		},
 		{
+			name: "invalid status",
+			params: CreateTxParams{
+				Tx:     testRegularMsgTx(),
+				Status: TxStatus(9),
+			},
+			wantErr: errInvalidTxStatus,
+		},
+		{
 			name: "credit index out of range",
 			params: CreateTxParams{
 				Tx:      testRegularMsgTx(),
@@ -221,6 +246,374 @@ func TestValidateCreateTxParams(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+type rollbackTestRow struct {
+	id    int64
+	hash  []byte
+	rawTx []byte
+}
+
+type rollbackClearParams struct {
+	walletID     int64
+	descendantID int64
+}
+
+type rollbackUpdateParams struct {
+	walletID      int64
+	descendantIDs []int64
+}
+
+func TestApplyRollbackDescendantInvalidationNoDescendants(t *testing.T) {
+	t.Parallel()
+
+	rootHash := chainhash.Hash{1}
+	unrelatedHash := chainhash.Hash{9}
+	rowsByWallet := map[int64][]rollbackTestRow{
+		7: {rollbackTestRowFixture(
+			t, 10, unrelatedHash,
+			testMsgTxSpendingOutPoints(wire.OutPoint{Hash: chainhash.Hash{8}}),
+		)},
+	}
+
+	var (
+		clearCalls  []rollbackClearParams
+		updateCalls []rollbackUpdateParams
+	)
+
+	err := applyRollbackDescendantInvalidation(
+		t.Context(),
+		map[uint32]map[chainhash.Hash]struct{}{
+			7: {rootHash: {}},
+		},
+		func(_ context.Context, walletID int64) ([]rollbackTestRow, error) {
+			return rowsByWallet[walletID], nil
+		},
+		func(row rollbackTestRow) (int64, []byte, []byte) {
+			return row.id, row.hash, row.rawTx
+		},
+		func(_ context.Context, params rollbackClearParams) (int64, error) {
+			clearCalls = append(clearCalls, params)
+			return 1, nil
+		},
+		func(walletID int64, descendantID int64) rollbackClearParams {
+			return rollbackClearParams{
+				walletID:     walletID,
+				descendantID: descendantID,
+			}
+		},
+		func(_ context.Context, params rollbackUpdateParams) (int64, error) {
+			updateCalls = append(updateCalls, params)
+			return int64(len(params.descendantIDs)), nil
+		},
+		func(walletID int64, descendantIDs []int64) rollbackUpdateParams {
+			return rollbackUpdateParams{
+				walletID:      walletID,
+				descendantIDs: append([]int64(nil), descendantIDs...),
+			}
+		},
+	)
+	require.NoError(t, err)
+	require.Empty(t, clearCalls)
+	require.Empty(t, updateCalls)
+}
+
+func TestApplyRollbackDescendantInvalidationMultiWalletIsolation(t *testing.T) {
+	t.Parallel()
+
+	rootHashOne := chainhash.Hash{1}
+	rootHashTwo := chainhash.Hash{2}
+	childHashOne := chainhash.Hash{3}
+	grandchildHashOne := chainhash.Hash{4}
+	childHashTwo := chainhash.Hash{5}
+	rowsByWallet := map[int64][]rollbackTestRow{
+		1: {
+			rollbackTestRowFixture(
+				t, 11, childHashOne,
+				testMsgTxSpendingOutPoints(
+					wire.OutPoint{Hash: rootHashOne, Index: 0},
+				),
+			),
+			rollbackTestRowFixture(
+				t, 12, grandchildHashOne,
+				testMsgTxSpendingOutPoints(
+					wire.OutPoint{Hash: childHashOne, Index: 0},
+				),
+			),
+		},
+		2: {
+			rollbackTestRowFixture(
+				t, 21, childHashTwo,
+				testMsgTxSpendingOutPoints(
+					wire.OutPoint{Hash: rootHashTwo, Index: 0},
+				),
+			),
+		},
+	}
+
+	var (
+		clearCalls  []rollbackClearParams
+		updateCalls []rollbackUpdateParams
+	)
+
+	err := applyRollbackDescendantInvalidation(
+		t.Context(),
+		map[uint32]map[chainhash.Hash]struct{}{
+			1: {rootHashOne: {}},
+			2: {rootHashTwo: {}},
+		},
+		func(_ context.Context, walletID int64) ([]rollbackTestRow, error) {
+			return rowsByWallet[walletID], nil
+		},
+		func(row rollbackTestRow) (int64, []byte, []byte) {
+			return row.id, row.hash, row.rawTx
+		},
+		func(_ context.Context, params rollbackClearParams) (int64, error) {
+			clearCalls = append(clearCalls, params)
+			return 1, nil
+		},
+		func(walletID int64, descendantID int64) rollbackClearParams {
+			return rollbackClearParams{
+				walletID:     walletID,
+				descendantID: descendantID,
+			}
+		},
+		func(_ context.Context, params rollbackUpdateParams) (int64, error) {
+			updateCalls = append(updateCalls, params)
+			return int64(len(params.descendantIDs)), nil
+		},
+		func(walletID int64, descendantIDs []int64) rollbackUpdateParams {
+			return rollbackUpdateParams{
+				walletID:      walletID,
+				descendantIDs: append([]int64(nil), descendantIDs...),
+			}
+		},
+	)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []rollbackClearParams{
+		{walletID: 1, descendantID: 11},
+		{walletID: 1, descendantID: 12},
+		{walletID: 2, descendantID: 21},
+	}, clearCalls)
+	require.ElementsMatch(t, []rollbackUpdateParams{
+		{walletID: 1, descendantIDs: []int64{11, 12}},
+		{walletID: 2, descendantIDs: []int64{21}},
+	}, updateCalls)
+}
+
+func TestApplyRollbackDescendantInvalidationListError(t *testing.T) {
+	t.Parallel()
+
+	err := applyRollbackDescendantInvalidation(
+		t.Context(),
+		map[uint32]map[chainhash.Hash]struct{}{
+			7: {chainhash.Hash{1}: {}},
+		},
+		func(context.Context, int64) ([]rollbackTestRow, error) {
+			return nil, errTestRollbackList
+		},
+		func(row rollbackTestRow) (int64, []byte, []byte) {
+			return row.id, row.hash, row.rawTx
+		},
+		func(context.Context, rollbackClearParams) (int64, error) {
+			return 0, nil
+		},
+		func(walletID int64, descendantID int64) rollbackClearParams {
+			return rollbackClearParams{
+				walletID:     walletID,
+				descendantID: descendantID,
+			}
+		},
+		func(context.Context, rollbackUpdateParams) (int64, error) {
+			return 0, nil
+		},
+		func(walletID int64, descendantIDs []int64) rollbackUpdateParams {
+			return rollbackUpdateParams{
+				walletID:      walletID,
+				descendantIDs: descendantIDs,
+			}
+		},
+	)
+	require.ErrorContains(t, err, "list live rollback descendants for wallet 7")
+	require.ErrorIs(t, err, errTestRollbackList)
+}
+
+func TestApplyRollbackDescendantInvalidationDecodeHashError(t *testing.T) {
+	t.Parallel()
+
+	err := applyRollbackDescendantInvalidation(
+		t.Context(),
+		map[uint32]map[chainhash.Hash]struct{}{
+			7: {chainhash.Hash{1}: {}},
+		},
+		func(context.Context, int64) ([]rollbackTestRow, error) {
+			return []rollbackTestRow{{
+				id:    10,
+				hash:  []byte{1, 2, 3},
+				rawTx: mustSerializeTestTx(t, testRegularMsgTx()),
+			}}, nil
+		},
+		func(row rollbackTestRow) (int64, []byte, []byte) {
+			return row.id, row.hash, row.rawTx
+		},
+		func(context.Context, rollbackClearParams) (int64, error) {
+			return 0, nil
+		},
+		func(walletID int64, descendantID int64) rollbackClearParams {
+			return rollbackClearParams{
+				walletID:     walletID,
+				descendantID: descendantID,
+			}
+		},
+		func(context.Context, rollbackUpdateParams) (int64, error) {
+			return 0, nil
+		},
+		func(walletID int64, descendantIDs []int64) rollbackUpdateParams {
+			return rollbackUpdateParams{
+				walletID:      walletID,
+				descendantIDs: descendantIDs,
+			}
+		},
+	)
+	require.ErrorContains(t, err, "decode live transaction 10")
+	require.ErrorContains(t, err, "transaction hash")
+}
+
+func TestApplyRollbackDescendantInvalidationDecodeTxError(t *testing.T) {
+	t.Parallel()
+
+	hash := chainhash.Hash{2}
+
+	err := applyRollbackDescendantInvalidation(
+		t.Context(),
+		map[uint32]map[chainhash.Hash]struct{}{
+			7: {chainhash.Hash{1}: {}},
+		},
+		func(context.Context, int64) ([]rollbackTestRow, error) {
+			return []rollbackTestRow{{
+				id:    10,
+				hash:  hash[:],
+				rawTx: []byte{1, 2, 3},
+			}}, nil
+		},
+		func(row rollbackTestRow) (int64, []byte, []byte) {
+			return row.id, row.hash, row.rawTx
+		},
+		func(context.Context, rollbackClearParams) (int64, error) {
+			return 0, nil
+		},
+		func(walletID int64, descendantID int64) rollbackClearParams {
+			return rollbackClearParams{
+				walletID:     walletID,
+				descendantID: descendantID,
+			}
+		},
+		func(context.Context, rollbackUpdateParams) (int64, error) {
+			return 0, nil
+		},
+		func(walletID int64, descendantIDs []int64) rollbackUpdateParams {
+			return rollbackUpdateParams{
+				walletID:      walletID,
+				descendantIDs: descendantIDs,
+			}
+		},
+	)
+	require.ErrorContains(t, err, "decode live transaction 10")
+	require.ErrorContains(t, err, "deserialize transaction")
+}
+
+func TestApplyRollbackDescendantInvalidationClearError(t *testing.T) {
+	t.Parallel()
+
+	rootHash := chainhash.Hash{1}
+	childHash := chainhash.Hash{2}
+
+	err := applyRollbackDescendantInvalidation(
+		t.Context(),
+		map[uint32]map[chainhash.Hash]struct{}{
+			7: {rootHash: {}},
+		},
+		func(context.Context, int64) ([]rollbackTestRow, error) {
+			return []rollbackTestRow{rollbackTestRowFixture(
+				t, 10, childHash,
+				testMsgTxSpendingOutPoints(
+					wire.OutPoint{Hash: rootHash, Index: 0},
+				),
+			)}, nil
+		},
+		func(row rollbackTestRow) (int64, []byte, []byte) {
+			return row.id, row.hash, row.rawTx
+		},
+		func(context.Context, rollbackClearParams) (int64, error) {
+			return 0, errTestRollbackClear
+		},
+		func(walletID int64, descendantID int64) rollbackClearParams {
+			return rollbackClearParams{
+				walletID:     walletID,
+				descendantID: descendantID,
+			}
+		},
+		func(context.Context, rollbackUpdateParams) (int64, error) {
+			return 0, nil
+		},
+		func(walletID int64, descendantIDs []int64) rollbackUpdateParams {
+			return rollbackUpdateParams{
+				walletID:      walletID,
+				descendantIDs: descendantIDs,
+			}
+		},
+	)
+	require.ErrorContains(
+		t, err, "clear rollback descendant spends for wallet 7",
+	)
+	require.ErrorIs(t, err, errTestRollbackClear)
+}
+
+func TestApplyRollbackDescendantInvalidationUpdateError(t *testing.T) {
+	t.Parallel()
+
+	rootHash := chainhash.Hash{1}
+	childHash := chainhash.Hash{2}
+
+	err := applyRollbackDescendantInvalidation(
+		t.Context(),
+		map[uint32]map[chainhash.Hash]struct{}{
+			7: {rootHash: {}},
+		},
+		func(context.Context, int64) ([]rollbackTestRow, error) {
+			return []rollbackTestRow{rollbackTestRowFixture(
+				t, 10, childHash,
+				testMsgTxSpendingOutPoints(
+					wire.OutPoint{Hash: rootHash, Index: 0},
+				),
+			)}, nil
+		},
+		func(row rollbackTestRow) (int64, []byte, []byte) {
+			return row.id, row.hash, row.rawTx
+		},
+		func(context.Context, rollbackClearParams) (int64, error) {
+			return 1, nil
+		},
+		func(walletID int64, descendantID int64) rollbackClearParams {
+			return rollbackClearParams{
+				walletID:     walletID,
+				descendantID: descendantID,
+			}
+		},
+		func(context.Context, rollbackUpdateParams) (int64, error) {
+			return 0, errTestRollbackUpdate
+		},
+		func(walletID int64, descendantIDs []int64) rollbackUpdateParams {
+			return rollbackUpdateParams{
+				walletID:      walletID,
+				descendantIDs: descendantIDs,
+			}
+		},
+	)
+	require.ErrorContains(
+		t, err, "mark rollback descendants failed for wallet 7",
+	)
+	require.ErrorIs(t, err, errTestRollbackUpdate)
 }
 
 // TestBuildTxInfo verifies the shared row-to-domain conversion used by both
@@ -323,6 +716,26 @@ func TestBuildTxInfo_InvalidStatus(t *testing.T) {
 	require.ErrorIs(t, err, errInvalidTxStatus)
 }
 
+func TestIsLiveUnconfirmedStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status TxStatus
+		want   bool
+	}{
+		{status: TxStatusPending, want: true},
+		{status: TxStatusPublished, want: true},
+		{status: TxStatusReplaced, want: false},
+		{status: TxStatusFailed, want: false},
+		{status: TxStatusOrphaned, want: false},
+		{status: TxStatus(99), want: false},
+	}
+
+	for _, test := range tests {
+		require.Equal(t, test.want, isLiveUnconfirmedStatus(test.status))
+	}
+}
+
 // testRegularMsgTx builds a minimal non-coinbase transaction fixture for the
 // shared TxStore helper tests.
 func testRegularMsgTx() *wire.MsgTx {
@@ -353,6 +766,39 @@ func testCoinbaseMsgTx() *wire.MsgTx {
 		Sequence:         wire.MaxTxInSequenceNum,
 	})
 	tx.AddTxOut(&wire.TxOut{Value: 50, PkScript: []byte{0x51}})
+
+	return tx
+}
+
+func mustSerializeTestTx(t *testing.T, tx *wire.MsgTx) []byte {
+	t.Helper()
+
+	rawTx, err := serializeMsgTx(tx)
+	require.NoError(t, err)
+
+	return rawTx
+}
+
+func rollbackTestRowFixture(t *testing.T, id int64, hash chainhash.Hash,
+	tx *wire.MsgTx) rollbackTestRow {
+
+	t.Helper()
+
+	return rollbackTestRow{
+		id:    id,
+		hash:  hash[:],
+		rawTx: mustSerializeTestTx(t, tx),
+	}
+}
+
+func testMsgTxSpendingOutPoints(outPoints ...wire.OutPoint) *wire.MsgTx {
+	tx := wire.NewMsgTx(wire.TxVersion)
+
+	for _, outPoint := range outPoints {
+		tx.AddTxIn(&wire.TxIn{PreviousOutPoint: outPoint})
+	}
+
+	tx.AddTxOut(&wire.TxOut{Value: 1000, PkScript: []byte{0x51}})
 
 	return tx
 }

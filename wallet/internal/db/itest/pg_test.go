@@ -254,10 +254,10 @@ func insertConflictingRegularTx(t *testing.T, store *db.PostgresStore,
 				TxHash:       txHash[:],
 				RawTx:        raw.Bytes(),
 				BlockHeight:  sql.NullInt32{},
-				Status:       int16(status),
+				TxStatus:     int16(status),
 				ReceivedTime: received.UTC(),
 				IsCoinbase:   false,
-				Label:        "",
+				TxLabel:      "",
 			},
 		)
 		if err != nil {
@@ -284,4 +284,186 @@ func insertConflictingRegularTx(t *testing.T, store *db.PostgresStore,
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func insertReplacementEdge(t *testing.T, store *db.PostgresStore,
+	walletID uint32, replacedTxid chainhash.Hash,
+	replacementTxid chainhash.Hash) {
+
+	t.Helper()
+
+	replacedMeta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcpg.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   replacedTxid[:],
+		},
+	)
+	require.NoError(t, err)
+
+	replacementMeta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcpg.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   replacementTxid[:],
+		},
+	)
+	require.NoError(t, err)
+
+	_, err = store.Queries().InsertTxReplacementEdge(
+		t.Context(), sqlcpg.InsertTxReplacementEdgeParams{
+			WalletID:        int64(walletID),
+			ReplacedTxID:    replacedMeta.ID,
+			ReplacementTxID: replacementMeta.ID,
+		},
+	)
+	require.NoError(t, err)
+}
+
+func forceOrphanedCoinbaseTx(t *testing.T, store *db.PostgresStore,
+	walletID uint32, txHash chainhash.Hash) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET block_height = NULL, tx_status = $1 "+
+			"WHERE wallet_id = $2 AND tx_hash = $3",
+		int16(db.TxStatusOrphaned), int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionRawTx(t *testing.T, store *db.PostgresStore,
+	walletID uint32, txHash chainhash.Hash, rawTx []byte) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET raw_tx = $1 WHERE wallet_id = $2 AND tx_hash = $3",
+		rawTx, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionStatus(t *testing.T, store *db.PostgresStore,
+	walletID uint32, txHash chainhash.Hash, status int64) {
+
+	t.Helper()
+
+	for _, stmt := range []string{
+		"ALTER TABLE transactions DROP CONSTRAINT IF EXISTS valid_status",
+		"ALTER TABLE transactions DROP CONSTRAINT IF EXISTS check_orphaned_coinbase_only",
+		"ALTER TABLE transactions DROP CONSTRAINT IF EXISTS check_confirmed_published",
+		"ALTER TABLE transactions DROP CONSTRAINT IF EXISTS check_coinbase_not_pending",
+		"ALTER TABLE transactions DROP CONSTRAINT IF EXISTS check_coinbase_confirmation_state",
+	} {
+		_, err := store.DB().ExecContext(t.Context(), stmt)
+		require.NoError(t, err)
+	}
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET tx_status = $1 WHERE wallet_id = $2 AND tx_hash = $3",
+		status, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionHash(t *testing.T, store *db.PostgresStore,
+	walletID uint32, txHash chainhash.Hash, hash []byte) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET tx_hash = $1 WHERE wallet_id = $2 AND tx_hash = $3",
+		hash, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionBlockHeight(t *testing.T, store *db.PostgresStore,
+	walletID uint32, txHash chainhash.Hash, height int64) {
+
+	t.Helper()
+
+	blockHash := RandomHash()
+	_, err := store.DB().ExecContext(
+		t.Context(),
+		"INSERT INTO blocks (block_height, header_hash, block_timestamp) VALUES ($1, $2, $3) "+
+			"ON CONFLICT (block_height) DO UPDATE SET header_hash = EXCLUDED.header_hash, "+
+			"block_timestamp = EXCLUDED.block_timestamp",
+		height, blockHash[:], time.Now().Unix(),
+	)
+	require.NoError(t, err)
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET block_height = $1 WHERE wallet_id = $2 AND tx_hash = $3",
+		height, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptUtxoOutputIndex(t *testing.T, store *db.PostgresStore,
+	walletID uint32, txHash chainhash.Hash, oldIndex uint32, newIndex int64) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE utxos SET output_index = $1 WHERE output_index = $2 "+
+			"AND tx_id = (SELECT id FROM transactions WHERE wallet_id = $3 AND tx_hash = $4)",
+		newIndex, int64(oldIndex), int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptActiveLeaseLockID(t *testing.T, store *db.PostgresStore,
+	walletID uint32, txHash chainhash.Hash, outputIndex uint32, lockID []byte) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE utxo_leases SET lock_id = $1 WHERE wallet_id = $2 AND utxo_id = ("+
+			"SELECT u.id FROM utxos u JOIN transactions t ON t.id = u.tx_id "+
+			"WHERE t.wallet_id = $3 AND t.tx_hash = $4 AND u.output_index = $5)",
+		lockID, int64(walletID), int64(walletID), txHash[:], int64(outputIndex),
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func requireLargeOutputIndexError(t *testing.T, err error) {
+	t.Helper()
+
+	require.ErrorContains(t, err, "convert output index")
 }

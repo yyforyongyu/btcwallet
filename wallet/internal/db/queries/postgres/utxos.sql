@@ -201,7 +201,7 @@ SELECT
             )
         ),
         0
-    ))::BIGINT AS locked_balance
+    )::BIGINT AS locked_balance
 FROM transactions AS t
 INNER JOIN utxos AS u ON t.id = u.tx_id
 INNER JOIN addresses AS a ON u.address_id = a.id

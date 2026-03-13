@@ -120,7 +120,7 @@ func (s *PostgresStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 
 		rows, err := qtx.ReconfirmOrphanedCoinbaseByHash(
 			ctx, sqlcpg.ReconfirmOrphanedCoinbaseByHashParams{
-				BlockHeight: sql.NullInt32{Int32: blockHeight, Valid: true},
+				BlockHeight: blockHeight,
 				WalletID:    int64(params.WalletID),
 				TxHash:      params.Txid[:],
 			},
@@ -215,7 +215,7 @@ func loadTxChainMetaPg(ctx context.Context, qtx *sqlcpg.Queries,
 		return txChainMeta{}, fmt.Errorf("get transaction metadata: %w", err)
 	}
 
-	status, err := parseTxStatus(int64(row.Status))
+	status, err := parseTxStatus(int64(row.TxStatus))
 	if err != nil {
 		return txChainMeta{}, err
 	}
@@ -421,7 +421,7 @@ func listDirectConflictRootsPg(ctx context.Context, qtx *sqlcpg.Queries,
 		}
 
 		meta, ok, err := buildDirectConflictMeta(
-			row.ID, row.TxHash, int64(row.Status), false, row.IsCoinbase,
+			row.ID, row.TxHash, int64(row.TxStatus), false, row.IsCoinbase,
 		)
 		if err != nil {
 			return nil, err

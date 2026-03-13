@@ -13,11 +13,11 @@ func (s *Store) CreateTx(ctx context.Context,
 	return notImplemented(ctx, "CreateTx")
 }
 
-// UpdateTx is not yet implemented for kvdb.
-func (s *Store) UpdateTx(ctx context.Context,
-	_ db.UpdateTxParams) error {
+// UpdateTxLabel is not yet implemented for kvdb.
+func (s *Store) UpdateTxLabel(ctx context.Context,
+	_ db.UpdateTxLabelParams) error {
 
-	return notImplemented(ctx, "UpdateTx")
+	return notImplemented(ctx, "UpdateTxLabel")
 }
 
 // GetTx is not yet implemented for kvdb.

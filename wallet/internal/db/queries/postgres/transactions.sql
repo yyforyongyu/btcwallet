@@ -70,10 +70,10 @@ WHERE t.wallet_id = $1 AND t.tx_hash = $2;
 -- Lists all unconfirmed transactions for a wallet.
 --
 -- How:
--- - Reads from transactions only and filters on blockless rows that are still
---   in a live unconfirmed state (`pending` or `published`).
--- - Excludes orphaned/replaced/failed history so rollback-produced coinbase
---   rows do not reappear as mempool transactions.
+-- - Reads from transactions only and filters on blockless rows.
+-- - Preserves blockless history rows such as replaced, failed, or orphaned
+--   transactions so callers can inspect the full wallet-local transaction
+--   history even after invalidation flows or rollback.
 -- - Returns typed NULL block metadata explicitly because live unmined rows have
 --   no block. `NULL::BYTEA AS block_hash` and `NULL::BIGINT AS block_timestamp`
 --   keep the unmined row shape aligned with the confirmed query below.
@@ -95,7 +95,6 @@ FROM transactions AS t
 WHERE
     t.wallet_id = $1
     AND t.block_height IS NULL
-    AND t.tx_status IN (0, 1)
 ORDER BY t.received_time DESC, t.id DESC;
 
 -- name: ListTransactionsByHeightRange :many
@@ -163,6 +162,25 @@ WHERE
     AND block_height IS NULL
     AND tx_status IN (0, 1);
 
+-- name: ReconfirmOrphanedCoinbaseByHash :execrows
+-- Restores one orphaned coinbase row to a confirming block.
+--
+-- How:
+-- - Updates only blockless orphaned coinbase rows.
+-- - Reuses the provided block reference and restores the live published status.
+-- Performance:
+-- - Targets at most one row through the wallet-scoped unique tx-hash lookup.
+UPDATE transactions
+SET
+    block_height = sqlc.arg('block_height')::INTEGER,
+    tx_status = 1
+WHERE
+    wallet_id = sqlc.arg('wallet_id')
+    AND tx_hash = sqlc.arg('tx_hash')
+    AND block_height IS NULL
+    AND is_coinbase
+    AND tx_status = 4;
+
 -- name: UpdateTransactionStatusByIDs :execrows
 -- Updates the wallet-relative status for a set of transaction row IDs.
 --
@@ -218,6 +236,29 @@ WHERE
     block_height >= sqlc.arg('rollback_height')::INTEGER
     AND is_coinbase
 ORDER BY wallet_id, id;
+
+-- name: ListLiveUnminedConflictCandidates :many
+-- Lists live unmined transactions that may directly conflict with one winner.
+--
+-- How:
+-- - Reads only blockless live rows (`pending` or `published`).
+-- - Returns raw transactions so callers can inspect inputs for wallet-owned
+--   conflicts without re-querying each row.
+-- Performance:
+-- - Uses the wallet-scoped blockless-history index and keeps the projection
+--   narrow to replacement-validation fields.
+SELECT
+    id,
+    tx_hash,
+    raw_tx,
+    is_coinbase,
+    tx_status
+FROM transactions
+WHERE
+    wallet_id = $1
+    AND block_height IS NULL
+    AND tx_status IN (0, 1)
+ORDER BY id;
 
 -- name: RewindWalletSyncStateHeightsForRollback :execrows
 -- Rewrites wallet sync-state heights so they stop referencing blocks that are
