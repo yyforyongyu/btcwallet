@@ -50,6 +50,26 @@ var (
 	pgTerminateTimeout = 1 * time.Minute
 )
 
+// postgresContainerMaxConnections raises the shared postgres test container's
+// server-side connection cap above the image default (`max_connections=100`).
+//
+// Why this is needed:
+//   - The postgres itest package uses many `t.Parallel()` tests.
+//   - Each test creates its own isolated database and its own PostgresStore.
+//   - A PostgresStore intentionally keeps the production default pool sizing
+//     (`DefaultMaxConnections = 25`) so the tests exercise realistic behavior.
+//   - Each test also opens a separate admin connection while creating its
+//     per-test database.
+//
+// The resulting aggregate demand across several concurrently active tests can
+// exceed Postgres' default server limit even though no single test needs that
+// many connections. We prefer increasing the container-side limit here instead
+// of shrinking the store pool, because lowering the client pool changed test
+// behavior and caused legitimate concurrency tests to time out. A value of 200
+// gives the suite enough headroom while still keeping the cap finite so CI can
+// catch runaway connection usage.
+const postgresContainerMaxConnections = 200
+
 // TestMain ensures the shared postgres container is terminated after the
 // integration test suite completes to avoid leaking docker resources.
 func TestMain(m *testing.M) {
@@ -97,7 +117,9 @@ func DefaultPostgresConfig() PostgresConfig {
 // GetPostgresContainer returns the shared PostgreSQL container instance.
 // The container is created once and reused across all tests for performance.
 //
-// Note: postgres:18-alpine defaults max_connections to 100.
+// Note: the postgres itest suite can keep many independent store pools open at
+// once, so we raise max_connections above the image default to avoid exhausting
+// clients under the current test volume.
 func GetPostgresContainer(ctx context.Context) (*postgres.PostgresContainer, error) {
 	pgContainerOnce.Do(func() {
 		cfg := DefaultPostgresConfig()
@@ -120,6 +142,13 @@ func GetPostgresContainer(ctx context.Context) (*postgres.PostgresContainer, err
 			postgres.WithDatabase(cfg.Database),
 			postgres.WithUsername(cfg.Username),
 			postgres.WithPassword(cfg.Password),
+			testcontainers.WithCmdArgs(
+				"-c",
+				fmt.Sprintf(
+					"max_connections=%d",
+					postgresContainerMaxConnections,
+				),
+			),
 			testcontainers.WithWaitStrategyAndDeadline(
 				pgInitTimeout, waitForSQL,
 			),

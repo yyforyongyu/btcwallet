@@ -8,10 +8,16 @@ ifeq ($(db),postgres)
 IT_TAGS += test_db_postgres
 IT_DB_LABEL := PostgreSQL
 IT_DB_TYPE := postgres
+ITEST_DB_PARALLEL := 8
 else
 IT_TAGS :=
 IT_DB_LABEL := SQLite
 IT_DB_TYPE := sqlite
+ITEST_DB_PARALLEL :=
+endif
+
+ifneq ($(ITEST_DB_PARALLEL),)
+ITEST_DB_PARALLEL_FLAG := -parallel=$(ITEST_DB_PARALLEL)
 endif
 
 # Enable integration test coverage
@@ -99,5 +105,9 @@ endif
 
 UNIT_COVER := $(GOTEST) $(COVER_FLAGS) -tags="$(DEV_TAGS) $(LOG_TAGS)" $(TEST_FLAGS) $(COVER_PKG)
 
-ITEST_DB := $(GOTEST) $(ITEST_DB_COVERAGE) -tags="itest $(DEV_TAGS) $(LOG_TAGS) $(IT_TAGS)" $(TEST_FLAGS) $(PKG)/wallet/internal/db/itest
+ITEST_DB := $(GOTEST) $(ITEST_DB_COVERAGE) -tags="itest $(DEV_TAGS) $(LOG_TAGS) $(IT_TAGS)" $(TEST_FLAGS) $(ITEST_DB_PARALLEL_FLAG) $(PKG)/wallet/internal/db/itest
+ifneq ($(ITEST_DB_PARALLEL),)
+ITEST_DB_RACE := $(GOTEST) -race -tags="itest $(DEV_TAGS) $(LOG_TAGS) $(IT_TAGS)" $(TEST_FLAGS) $(ITEST_DB_PARALLEL_FLAG) $(PKG)/wallet/internal/db/itest
+else
 ITEST_DB_RACE := $(GOTEST) -race -tags="itest $(DEV_TAGS) $(LOG_TAGS) $(IT_TAGS)" $(TEST_FLAGS) $(PKG)/wallet/internal/db/itest
+endif
