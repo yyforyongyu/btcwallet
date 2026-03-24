@@ -92,10 +92,10 @@ func insertConflictingRegularTx(t *testing.T, store *db.SqliteStore,
 				TxHash:       txHash[:],
 				RawTx:        raw.Bytes(),
 				BlockHeight:  sql.NullInt64{},
-				Status:       int64(status),
+				TxStatus:     int64(status),
 				ReceivedTime: received.UTC(),
 				IsCoinbase:   false,
-				Label:        "",
+				TxLabel:      "",
 			},
 		)
 		if err != nil {
@@ -124,4 +124,97 @@ func insertConflictingRegularTx(t *testing.T, store *db.SqliteStore,
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func insertReplacementEdge(t *testing.T, store *db.SqliteStore, walletID uint32,
+	replacedTxid chainhash.Hash, replacementTxid chainhash.Hash) {
+
+	t.Helper()
+
+	replacedMeta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcsqlite.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   replacedTxid[:],
+		},
+	)
+	require.NoError(t, err)
+
+	replacementMeta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcsqlite.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   replacementTxid[:],
+		},
+	)
+	require.NoError(t, err)
+
+	_, err = store.Queries().InsertTxReplacementEdge(
+		t.Context(), sqlcsqlite.InsertTxReplacementEdgeParams{
+			WalletID:        int64(walletID),
+			ReplacedTxID:    replacedMeta.ID,
+			ReplacementTxID: replacementMeta.ID,
+		},
+	)
+	require.NoError(t, err)
+}
+
+func forceOrphanedCoinbaseTx(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET block_height = NULL, tx_status = ? "+
+			"WHERE wallet_id = ? AND tx_hash = ?",
+		int64(db.TxStatusOrphaned), int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionRawTx(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash, rawTx []byte) {
+
+	t.Helper()
+
+	result, err := store.DB().ExecContext(
+		t.Context(),
+		"UPDATE transactions SET raw_tx = ? WHERE wallet_id = ? AND tx_hash = ?",
+		rawTx, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+func corruptTransactionStatus(t *testing.T, store *db.SqliteStore,
+	walletID uint32, txHash chainhash.Hash, status int64) {
+
+	t.Helper()
+
+	tx, err := store.DB().BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(t.Context(), "PRAGMA ignore_check_constraints = ON")
+	require.NoError(t, err)
+
+	result, err := tx.ExecContext(
+		t.Context(),
+		"UPDATE transactions SET tx_status = ? WHERE wallet_id = ? AND tx_hash = ?",
+		status, int64(walletID), txHash[:],
+	)
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(t.Context(), "PRAGMA ignore_check_constraints = OFF")
+	require.NoError(t, err)
+
+	rows, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+	require.NoError(t, tx.Commit())
 }
