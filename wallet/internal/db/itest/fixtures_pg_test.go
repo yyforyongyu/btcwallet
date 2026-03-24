@@ -147,6 +147,7 @@ func getAddressID(t *testing.T, queries *sqlcpg.Queries, scriptPubKey []byte,
 	return addr.ID
 }
 
+// getAddressSecret returns the raw secret row for one address ID.
 func getAddressSecret(t *testing.T, queries *sqlcpg.Queries,
 	addressID int64) (sqlcpg.GetAddressSecretRow, error) {
 	t.Helper()
@@ -154,6 +155,8 @@ func getAddressSecret(t *testing.T, queries *sqlcpg.Queries,
 	return queries.GetAddressSecret(t.Context(), addressID)
 }
 
+// requireReplacementEdge asserts that the replacement edge audit table records
+// exactly one victim -> winner relationship for the provided hashes.
 func requireReplacementEdge(t *testing.T, queries *sqlcpg.Queries,
 	walletID uint32, replacedTxid chainhash.Hash,
 	replacementTxid chainhash.Hash) {

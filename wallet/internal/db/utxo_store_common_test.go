@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"math"
 	"testing"
 	"time"
@@ -200,6 +201,18 @@ func TestBuildUtxoInfoInvalidConfirmedHeight(t *testing.T) {
 	require.ErrorIs(t, err, errInvalidConfirmedUtxoHeight)
 }
 
+// TestBuildUtxoInfoInvalidHash verifies that buildUtxoInfo propagates malformed
+// outpoint hashes.
+func TestBuildUtxoInfoInvalidHash(t *testing.T) {
+	t.Parallel()
+
+	_, err := buildUtxoInfo(
+		[]byte{1, 2, 3}, 5, 100, []byte{0x55}, time.Unix(555, 0), false,
+		nil,
+	)
+	require.Error(t, err)
+}
+
 // TestBuildLeasedOutput verifies the shared lease row mapper for valid leases.
 //
 // Scenario:
@@ -254,4 +267,70 @@ func TestBuildLeasedOutputInvalidLockID(t *testing.T) {
 
 	// Assert: The malformed lock ID is rejected.
 	require.ErrorIs(t, err, errInvalidLockID)
+}
+
+// TestBuildLeasedOutputInvalidHash verifies that buildLeasedOutput propagates
+// malformed outpoint hashes before attempting lock decoding.
+func TestBuildLeasedOutputInvalidHash(t *testing.T) {
+	t.Parallel()
+
+	lockID := make([]byte, 32)
+	_, err := buildLeasedOutput([]byte{1, 2, 3}, 0, lockID, time.Now())
+	require.Error(t, err)
+}
+
+// TestUtxoInfoFromSqliteRowInvalidOutputIndex verifies sqlite row conversion
+// rejects negative output indexes.
+func TestUtxoInfoFromSqliteRowInvalidOutputIndex(t *testing.T) {
+	t.Parallel()
+
+	hash := chainhash.Hash{1}
+
+	_, err := utxoInfoFromSqliteRow(
+		hash[:], -1, 1000, []byte{0x51}, time.Unix(1, 0), false,
+		sql.NullInt64{},
+	)
+	require.ErrorContains(t, err, "utxo output index")
+}
+
+// TestUtxoInfoFromSqliteRowInvalidBlockHeight verifies sqlite row conversion
+// rejects negative confirmed heights.
+func TestUtxoInfoFromSqliteRowInvalidBlockHeight(t *testing.T) {
+	t.Parallel()
+
+	hash := chainhash.Hash{1}
+
+	_, err := utxoInfoFromSqliteRow(
+		hash[:], 0, 1000, []byte{0x51}, time.Unix(1, 0), false,
+		sql.NullInt64{Int64: -1, Valid: true},
+	)
+	require.ErrorContains(t, err, "utxo block height")
+}
+
+// TestUtxoInfoFromPgRowInvalidOutputIndex verifies postgres row conversion
+// rejects negative output indexes.
+func TestUtxoInfoFromPgRowInvalidOutputIndex(t *testing.T) {
+	t.Parallel()
+
+	hash := chainhash.Hash{1}
+
+	_, err := utxoInfoFromPgRow(
+		hash[:], -1, 1000, []byte{0x51}, time.Unix(1, 0), false,
+		sql.NullInt32{},
+	)
+	require.ErrorContains(t, err, "utxo output index")
+}
+
+// TestUtxoInfoFromPgRowInvalidBlockHeight verifies postgres row conversion
+// rejects negative confirmed heights.
+func TestUtxoInfoFromPgRowInvalidBlockHeight(t *testing.T) {
+	t.Parallel()
+
+	hash := chainhash.Hash{1}
+
+	_, err := utxoInfoFromPgRow(
+		hash[:], 0, 1000, []byte{0x51}, time.Unix(1, 0), false,
+		sql.NullInt32{Int32: -1, Valid: true},
+	)
+	require.ErrorContains(t, err, "utxo block height")
 }

@@ -488,8 +488,20 @@ func TestListAccountsOrdering(t *testing.T) {
 	require.Equal(t, db.ImportedAccount, accounts[3].Origin)
 }
 
-// TestAccountCreatedAtTimestamp verifies that accounts have their CreatedAt
-// field properly set and that it reflects the order of account creation.
+// TestAccountCreatedAtTimestamp verifies CreatedAt timestamps for newly created
+// accounts.
+//
+// Scenario:
+// - One wallet creates three derived accounts in sequence.
+// Setup:
+//   - Create one wallet and record a local timestamp near each account-creation
+//     call.
+//
+// Action:
+// - Create the three accounts with a delay between each insert.
+// Assertions:
+// - Every created account exposes a non-zero CreatedAt timestamp.
+// - CreatedAt tracks the local creation time and preserves creation order.
 func TestAccountCreatedAtTimestamp(t *testing.T) {
 	t.Parallel()
 
@@ -499,8 +511,14 @@ func TestAccountCreatedAtTimestamp(t *testing.T) {
 
 	scope := db.KeyScopeBIP0084
 
+	// createdAccount keeps the returned account row together with the nearby wall
+	// clock used to sanity-check CreatedAt.
 	type createdAccount struct {
-		info        db.AccountInfo
+		// info is the account row returned by CreateDerivedAccount.
+		info db.AccountInfo
+
+		// createdNear is the local timestamp captured immediately before the
+		// account was created.
 		createdNear time.Time
 	}
 
