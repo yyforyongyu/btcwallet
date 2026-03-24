@@ -337,18 +337,21 @@ type Querier interface {
 	// (purpose/coin_type), and account name. Returns all address columns for
 	// filtering and processing by the application.
 	ListAddressesByAccount(ctx context.Context, arg ListAddressesByAccountParams) ([]ListAddressesByAccountRow, error)
-	// Lists all key scopes for a wallet, ordered by ID.
-	ListKeyScopesByWallet(ctx context.Context, walletID int64) ([]KeyScope, error)
-	// Lists live unmined transactions that may directly conflict with one winner.
+	// Lists every blockless transaction row for a wallet.
 	//
 	// How:
-	// - Reads only blockless live rows (`pending` or `published`).
-	// - Returns raw transactions so callers can inspect inputs for wallet-owned
-	//   conflicts without re-querying each row.
+	// - Reads from transactions only and filters on blockless rows.
+	// - Preserves blockless history rows such as replaced, failed, or orphaned
+	//   transactions so callers can inspect the full wallet-local transaction
+	//   history even after invalidation flows or rollback.
+	// - Projects typed NULL block metadata through `LEFT JOIN blocks AS b ON 1 = 0`
+	//   so the unmined row shape stays aligned with the confirmed query below.
 	// Performance:
-	// - Uses the wallet-scoped blockless-history index and keeps the projection
-	//   narrow to replacement-validation fields.
-	ListLiveUnminedConflictCandidates(ctx context.Context, walletID int64) ([]ListLiveUnminedConflictCandidatesRow, error)
+	// - Matches the dedicated blockless-history index while the more selective
+	//   live-only partial index stays available for conflict paths.
+	ListBlocklessTransactions(ctx context.Context, walletID int64) ([]ListBlocklessTransactionsRow, error)
+	// Lists all key scopes for a wallet, ordered by ID.
+	ListKeyScopesByWallet(ctx context.Context, walletID int64) ([]KeyScope, error)
 	// Lists victim txids for a given replacement txid.
 	//
 	// How:
@@ -423,18 +426,15 @@ type Querier interface {
 	// - The `(wallet_id, block_height)` index bounds the scan before the single-row
 	//   block join.
 	ListTransactionsByHeightRange(ctx context.Context, arg ListTransactionsByHeightRangeParams) ([]ListTransactionsByHeightRangeRow, error)
-	// Lists all unconfirmed transactions for a wallet.
+	// Lists live unmined transactions that may directly conflict with one winner.
 	//
 	// How:
-	// - Reads from transactions only and filters on blockless rows.
-	// - Preserves blockless history rows such as replaced, failed, or orphaned
-	//   transactions so callers can inspect the full wallet-local transaction
-	//   history even after invalidation flows or rollback.
-	// - Projects typed NULL block metadata through `LEFT JOIN blocks AS b ON 1 = 0`
-	//   so the unmined row shape stays aligned with the confirmed query below.
+	// - Reads only blockless live rows (`pending` or `published`).
+	// - Returns raw transactions so callers can inspect inputs for wallet-owned
+	//   conflicts without re-querying each row.
 	// Performance:
-	// - Matches the dedicated blockless-history index while the more selective
-	//   live-only partial index stays available for conflict paths.
+	// - Uses the wallet-scoped blockless-history index and keeps the projection
+	//   narrow to replacement-validation fields.
 	ListUnminedTransactions(ctx context.Context, walletID int64) ([]ListUnminedTransactionsRow, error)
 	// Lists unspent UTXOs that match the provided filters.
 	//

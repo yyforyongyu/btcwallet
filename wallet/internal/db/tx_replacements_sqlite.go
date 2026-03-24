@@ -25,20 +25,20 @@ func (s *SqliteStore) ApplyTxReplacement(ctx context.Context,
 		return applyTxReplacementCommon(
 			ctx, params,
 			func(ctx context.Context,
-				txid chainhash.Hash) (txChainMeta, error) {
+				txid chainhash.Hash) (txGraphMeta, error) {
 
-				return loadTxChainMetaSqlite(
+				return loadTxGraphMetaSqlite(
 					ctx, qtx, params.WalletID, txid,
 				)
 			},
 			func(ctx context.Context,
-				txids []chainhash.Hash) ([]txChainMeta, error) {
+				txids []chainhash.Hash) ([]txGraphMeta, error) {
 
-				return loadTxChainMetasSqlite(
+				return loadTxGraphMetasSqlite(
 					ctx, qtx, params.WalletID, txids,
 				)
 			},
-			buildTxChainHooksSqlite(qtx, params.WalletID),
+			buildTxGraphHooksSqlite(qtx, params.WalletID),
 		)
 	})
 }
@@ -55,31 +55,31 @@ func (s *SqliteStore) ApplyTxFailure(ctx context.Context,
 		return applyTxFailureCommon(
 			ctx, params,
 			func(ctx context.Context,
-				txid chainhash.Hash) (txChainMeta, error) {
+				txid chainhash.Hash) (txGraphMeta, error) {
 
-				return loadTxChainMetaSqlite(
+				return loadTxGraphMetaSqlite(
 					ctx, qtx, params.WalletID, txid,
 				)
 			},
 			func(ctx context.Context,
-				txids []chainhash.Hash) ([]txChainMeta, error) {
+				txids []chainhash.Hash) ([]txGraphMeta, error) {
 
-				return loadTxChainMetasSqlite(
+				return loadTxGraphMetasSqlite(
 					ctx, qtx, params.WalletID, txids,
 				)
 			},
-			buildTxChainHooksSqlite(qtx, params.WalletID),
+			buildTxGraphHooksSqlite(qtx, params.WalletID),
 		)
 	})
 }
 
-// OrphanTxChain recursively fails every descendant of the provided orphaned
+// OrphanTxGraph recursively fails every descendant of the provided orphaned
 // coinbase roots while keeping the roots themselves in the orphaned state.
-func (s *SqliteStore) OrphanTxChain(ctx context.Context,
-	params OrphanTxChainParams) error {
+func (s *SqliteStore) OrphanTxGraph(ctx context.Context,
+	params OrphanTxGraphParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		roots, err := loadTxChainMetasSqlite(
+		roots, err := loadTxGraphMetasSqlite(
 			ctx, qtx, params.WalletID, params.Txids,
 		)
 		if err != nil {
@@ -91,29 +91,36 @@ func (s *SqliteStore) OrphanTxChain(ctx context.Context,
 			return err
 		}
 
-		return applyTxChainInvalidation(
+		return applyTxGraphInvalidation(
 			ctx, txIDsFromMetas(roots), TxStatusOrphaned,
-			buildTxChainHooksSqlite(qtx, params.WalletID),
+			buildTxGraphHooksSqlite(qtx, params.WalletID),
 		)
 	})
 }
 
 // ReconfirmOrphanedCoinbase restores one orphaned coinbase transaction to a new
-// confirming block inside one SQL transaction. This is intentionally a
-// root-only transition: coinbase spends require maturity, so the supported
-// reconfirmation path assumes no descendant branch needs replay.
+// confirming block inside one SQL transaction. This remains a root-only
+// transition, so the write rejects any coinbase row that still has stored
+// descendants instead of trying to replay that branch.
 func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	params ReconfirmOrphanedCoinbaseParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		meta, err := loadTxChainMetaSqlite(
+		meta, err := loadTxGraphMetaSqlite(
 			ctx, qtx, params.WalletID, params.Txid,
 		)
 		if err != nil {
 			return err
 		}
 
-		err = validateCoinbaseReconfirmation(meta)
+		err = validateCoinbaseReconfirmation(
+			ctx, meta,
+			func(ctx context.Context, txid chainhash.Hash) ([]int64, error) {
+				return listStoredDescendantTxIDsSqlite(
+					ctx, qtx, params.WalletID, txid,
+				)
+			},
+		)
 		if err != nil {
 			return err
 		}
@@ -143,53 +150,57 @@ func (s *SqliteStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	})
 }
 
-// buildTxChainHooksSqlite binds the shared replacement helpers to the sqlite
+func listStoredDescendantTxIDsSqlite(ctx context.Context,
+	qtx *sqlcsqlite.Queries, walletID uint32,
+	rootTxid chainhash.Hash) ([]int64, error) {
+
+	rows, err := qtx.ListBlocklessTransactions(ctx, int64(walletID))
+	if err != nil {
+		return nil, fmt.Errorf("list unmined transactions: %w", err)
+	}
+
+	candidates, err := buildLiveTxRecords(
+		rows,
+		func(
+			row sqlcsqlite.ListBlocklessTransactionsRow,
+		) (int64, []byte, []byte) {
+
+			return row.ID, row.TxHash, row.RawTx
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return collectDescendantTxIDs(
+		map[chainhash.Hash]struct{}{rootTxid: {}}, candidates,
+	), nil
+}
+
+// buildTxGraphHooksSqlite binds the shared replacement helpers to the sqlite
 // query set active for the surrounding SQL transaction.
-//
-//nolint:dupl // Backend-specific sqlc hooks differ only in generated types.
-func buildTxChainHooksSqlite(qtx *sqlcsqlite.Queries,
-	walletID uint32) txChainHooks {
+func buildTxGraphHooksSqlite(qtx *sqlcsqlite.Queries,
+	walletID uint32) txGraphHooks {
 
-	return buildTxChainHooks(
-		func(ctx context.Context, parentID int64) ([]int64, error) {
-			return listChildTxIDsSqlite(ctx, qtx, walletID, parentID)
-		},
-		func(ctx context.Context, txID int64) error {
-			return clearSpentByTxIDSqlite(ctx, qtx, walletID, txID)
-		},
-		func(ctx context.Context, status TxStatus,
-			txIDs []int64) error {
-
-			return updateTxStatusSqlite(ctx, qtx, walletID, status, txIDs)
-		},
-		func(ctx context.Context, txid chainhash.Hash,
-			txID int64) error {
-
-			return reclaimInputsByTxidSqlite(ctx, qtx, walletID, txid, txID)
-		},
-		func(ctx context.Context, replacedTxID int64,
-			replacementTxID int64) error {
-
-			return recordReplacementEdgeSqlite(
-				ctx, qtx, walletID, replacedTxID, replacementTxID,
-			)
-		},
-		func(ctx context.Context, txid chainhash.Hash) ([]txChainMeta, error) {
-			return listDirectConflictRootsByTxidSqlite(
-				ctx, qtx, walletID, txid,
-			)
-		},
+	return buildTxGraphHooksFor(
+		qtx, walletID,
+		listChildTxIDsSqlite,
+		clearSpentByTxIDSqlite,
+		updateTxStatusSqlite,
+		reclaimInputsByTxidSqlite,
+		recordReplacementEdgeSqlite,
+		listDirectConflictRootsByTxidSqlite,
 	)
 }
 
-// loadTxChainMetasSqlite resolves one metadata row per requested transaction
+// loadTxGraphMetasSqlite resolves one metadata row per requested transaction
 // hash for the shared invalidation flows.
-func loadTxChainMetasSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
-	walletID uint32, txids []chainhash.Hash) ([]txChainMeta, error) {
+func loadTxGraphMetasSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
+	walletID uint32, txids []chainhash.Hash) ([]txGraphMeta, error) {
 
-	metas := make([]txChainMeta, len(txids))
+	metas := make([]txGraphMeta, len(txids))
 	for i, txid := range txids {
-		meta, err := loadTxChainMetaSqlite(ctx, qtx, walletID, txid)
+		meta, err := loadTxGraphMetaSqlite(ctx, qtx, walletID, txid)
 		if err != nil {
 			return nil, err
 		}
@@ -200,10 +211,10 @@ func loadTxChainMetasSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	return metas, nil
 }
 
-// loadTxChainMetaSqlite loads the wallet-scoped metadata needed to validate one
+// loadTxGraphMetaSqlite loads the wallet-scoped metadata needed to validate one
 // transaction's replacement or orphaning state.
-func loadTxChainMetaSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
-	walletID uint32, txid chainhash.Hash) (txChainMeta, error) {
+func loadTxGraphMetaSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
+	walletID uint32, txid chainhash.Hash) (txGraphMeta, error) {
 
 	row, err := qtx.GetTransactionMetaByHash(
 		ctx, sqlcsqlite.GetTransactionMetaByHashParams{
@@ -213,19 +224,19 @@ func loadTxChainMetaSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return txChainMeta{}, fmt.Errorf("transaction %s: %w", txid,
+			return txGraphMeta{}, fmt.Errorf("transaction %s: %w", txid,
 				ErrTxNotFound)
 		}
 
-		return txChainMeta{}, fmt.Errorf("get transaction metadata: %w", err)
+		return txGraphMeta{}, fmt.Errorf("get transaction metadata: %w", err)
 	}
 
 	status, err := parseTxStatus(row.TxStatus)
 	if err != nil {
-		return txChainMeta{}, err
+		return txGraphMeta{}, err
 	}
 
-	return txChainMeta{
+	return txGraphMeta{
 		ID:         row.ID,
 		Txid:       txid,
 		Status:     status,
@@ -369,7 +380,7 @@ func reclaimInputsByTxidSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 // the complete live direct loser set for its wallet-owned inputs.
 func listDirectConflictRootsByTxidSqlite(ctx context.Context,
 	qtx *sqlcsqlite.Queries, walletID uint32,
-	txid chainhash.Hash) ([]txChainMeta, error) {
+	txid chainhash.Hash) ([]txGraphMeta, error) {
 
 	row, err := qtx.GetTransactionByHash(
 		ctx, sqlcsqlite.GetTransactionByHashParams{
@@ -395,11 +406,9 @@ func listDirectConflictRootsByTxidSqlite(ctx context.Context,
 
 // listDirectConflictRootsSqlite scans live unconfirmed wallet transactions and
 // returns those that directly conflict with the winner on wallet-owned inputs.
-//
-
 func listDirectConflictRootsSqlite(ctx context.Context,
 	qtx *sqlcsqlite.Queries, walletID uint32, winnerID int64,
-	tx *wire.MsgTx) ([]txChainMeta, error) {
+	tx *wire.MsgTx) ([]txGraphMeta, error) {
 
 	walletOwnedInputs, err := listWalletOwnedInputsSqlite(
 		ctx, qtx, walletID, tx,
@@ -412,14 +421,14 @@ func listDirectConflictRootsSqlite(ctx context.Context,
 		return nil, nil
 	}
 
-	rows, err := qtx.ListLiveUnminedConflictCandidates(ctx, int64(walletID))
+	rows, err := qtx.ListUnminedTransactions(ctx, int64(walletID))
 	if err != nil {
 		return nil, fmt.Errorf(
 			"list live conflict candidates for root validation: %w", err,
 		)
 	}
 
-	roots := make([]txChainMeta, 0, len(rows))
+	roots := make([]txGraphMeta, 0, len(rows))
 
 	for _, row := range rows {
 		if row.ID == winnerID {

@@ -196,7 +196,7 @@ func (s *PostgresStore) ListTxns(ctx context.Context,
 func (s *PostgresStore) listUnminedTxnsPg(ctx context.Context,
 	walletID uint32) ([]TxInfo, error) {
 
-	rows, err := s.queries.ListUnminedTransactions(ctx, int64(walletID))
+	rows, err := s.queries.ListBlocklessTransactions(ctx, int64(walletID))
 	if err != nil {
 		return nil, fmt.Errorf("list unmined transactions: %w", err)
 	}
@@ -337,7 +337,7 @@ func (s *PostgresStore) DeleteTx(ctx context.Context,
 func ensureDeleteLeafPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32, txHash chainhash.Hash, txID int64) error {
 
-	rows, err := qtx.ListUnminedTransactions(ctx, int64(walletID))
+	rows, err := qtx.ListBlocklessTransactions(ctx, int64(walletID))
 	if err != nil {
 		return fmt.Errorf("list live transactions: %w", err)
 	}
@@ -457,8 +457,8 @@ func (s *PostgresStore) RollbackToBlock(ctx context.Context,
 		err = applyRollbackDescendantInvalidation(
 			ctx,
 			rootHashesByWallet,
-			qtx.ListUnminedTransactions,
-			func(row sqlcpg.ListUnminedTransactionsRow) (
+			qtx.ListBlocklessTransactions,
+			func(row sqlcpg.ListBlocklessTransactionsRow) (
 				int64, []byte, []byte,
 			) {
 

@@ -66,8 +66,8 @@ FROM transactions AS t
 LEFT JOIN blocks AS b ON t.block_height = b.block_height
 WHERE t.wallet_id = ? AND t.tx_hash = ?;
 
--- name: ListUnminedTransactions :many
--- Lists all unconfirmed transactions for a wallet.
+-- name: ListBlocklessTransactions :many
+-- Lists every blockless transaction row for a wallet.
 --
 -- How:
 -- - Reads from transactions only and filters on blockless rows.
@@ -236,7 +236,7 @@ WHERE
     AND is_coinbase
 ORDER BY wallet_id, id;
 
--- name: ListLiveUnminedConflictCandidates :many
+-- name: ListUnminedTransactions :many
 -- Lists live unmined transactions that may directly conflict with one winner.
 --
 -- How:
@@ -256,8 +256,7 @@ FROM transactions
 WHERE
     wallet_id = ?
     AND block_height IS NULL
-    AND tx_status IN (0, 1)
-ORDER BY id;
+    AND tx_status IN (0, 1);
 
 -- name: RewindWalletSyncStateHeightsForRollback :execrows
 -- Rewrites wallet sync-state heights so they stop referencing blocks that are

@@ -201,11 +201,11 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listAddressesByAccountStmt, err = db.PrepareContext(ctx, ListAddressesByAccount); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAddressesByAccount: %w", err)
 	}
+	if q.listBlocklessTransactionsStmt, err = db.PrepareContext(ctx, ListBlocklessTransactions); err != nil {
+		return nil, fmt.Errorf("error preparing query ListBlocklessTransactions: %w", err)
+	}
 	if q.listKeyScopesByWalletStmt, err = db.PrepareContext(ctx, ListKeyScopesByWallet); err != nil {
 		return nil, fmt.Errorf("error preparing query ListKeyScopesByWallet: %w", err)
-	}
-	if q.listLiveUnminedConflictCandidatesStmt, err = db.PrepareContext(ctx, ListLiveUnminedConflictCandidates); err != nil {
-		return nil, fmt.Errorf("error preparing query ListLiveUnminedConflictCandidates: %w", err)
 	}
 	if q.listReplacedTxHashesByReplacementTxHashStmt, err = db.PrepareContext(ctx, ListReplacedTxHashesByReplacementTxHash); err != nil {
 		return nil, fmt.Errorf("error preparing query ListReplacedTxHashesByReplacementTxHash: %w", err)
@@ -570,14 +570,14 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listAddressesByAccountStmt: %w", cerr)
 		}
 	}
+	if q.listBlocklessTransactionsStmt != nil {
+		if cerr := q.listBlocklessTransactionsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listBlocklessTransactionsStmt: %w", cerr)
+		}
+	}
 	if q.listKeyScopesByWalletStmt != nil {
 		if cerr := q.listKeyScopesByWalletStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listKeyScopesByWalletStmt: %w", cerr)
-		}
-	}
-	if q.listLiveUnminedConflictCandidatesStmt != nil {
-		if cerr := q.listLiveUnminedConflictCandidatesStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing listLiveUnminedConflictCandidatesStmt: %w", cerr)
 		}
 	}
 	if q.listReplacedTxHashesByReplacementTxHashStmt != nil {
@@ -783,8 +783,8 @@ type Queries struct {
 	listActiveUtxoLeasesStmt                    *sql.Stmt
 	listAddressTypesStmt                        *sql.Stmt
 	listAddressesByAccountStmt                  *sql.Stmt
+	listBlocklessTransactionsStmt               *sql.Stmt
 	listKeyScopesByWalletStmt                   *sql.Stmt
-	listLiveUnminedConflictCandidatesStmt       *sql.Stmt
 	listReplacedTxHashesByReplacementTxHashStmt *sql.Stmt
 	listReplacedTxIDsByReplacementTxIDStmt      *sql.Stmt
 	listReplacementTxHashesByReplacedTxHashStmt *sql.Stmt
@@ -871,8 +871,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listActiveUtxoLeasesStmt:                    q.listActiveUtxoLeasesStmt,
 		listAddressTypesStmt:                        q.listAddressTypesStmt,
 		listAddressesByAccountStmt:                  q.listAddressesByAccountStmt,
+		listBlocklessTransactionsStmt:               q.listBlocklessTransactionsStmt,
 		listKeyScopesByWalletStmt:                   q.listKeyScopesByWalletStmt,
-		listLiveUnminedConflictCandidatesStmt:       q.listLiveUnminedConflictCandidatesStmt,
 		listReplacedTxHashesByReplacementTxHashStmt: q.listReplacedTxHashesByReplacementTxHashStmt,
 		listReplacedTxIDsByReplacementTxIDStmt:      q.listReplacedTxIDsByReplacementTxIDStmt,
 		listReplacementTxHashesByReplacedTxHashStmt: q.listReplacementTxHashesByReplacedTxHashStmt,

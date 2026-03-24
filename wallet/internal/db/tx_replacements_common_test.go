@@ -9,19 +9,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var (
+	errTestLoadWinner       = errors.New("load winner failed")
+	errTestLoadVictims      = errors.New("load victims failed")
+	errTestRecordEdge       = errors.New("record failed")
+	errTestReclaimInputs    = errors.New("reclaim failed")
+	errTestLoadRoots        = errors.New("load roots failed")
+	errTestListDirectRoots  = errors.New("list direct roots failed")
+	errTestListChildren     = errors.New("list children failed")
+	errTestCollect          = errors.New("collect failed")
+	errTestClearRoot        = errors.New("clear root failed")
+	errTestClearDescendant  = errors.New("clear descendant failed")
+	errTestUpdateRoot       = errors.New("update root failed")
+	errTestUpdateDescendant = errors.New("update descendant failed")
+	errTestUpdate           = errors.New("update failed")
+)
+
 var errUnexpectedTraversalCall = errors.New("unexpected traversal call")
 
-// TestCollectTxChainDescendantIDs verifies the shared descendant graph walk.
+// TestCollectTxGraphDescendantIDs verifies the shared descendant graph walk.
 //
 // Scenario:
 // - One spend graph contains a shared descendant reachable from two parents.
 // Setup:
 // - Build one in-memory child map that models the wallet spend graph.
 // Action:
-// - Traverse descendants from the root with collectTxChainDescendantIDs.
+// - Traverse descendants from the root with collectTxGraphDescendantIDs.
 // Assertions:
 // - Each descendant is returned once in breadth-first discovery order.
-func TestCollectTxChainDescendantIDs(t *testing.T) {
+func TestCollectTxGraphDescendantIDs(t *testing.T) {
 	t.Parallel()
 
 	children := map[int64][]int64{
@@ -32,7 +48,7 @@ func TestCollectTxChainDescendantIDs(t *testing.T) {
 		5: nil,
 	}
 
-	descendants, err := collectTxChainDescendantIDs(
+	descendants, err := collectTxGraphDescendantIDs(
 		t.Context(), []int64{1},
 		func(_ context.Context, parentID int64) ([]int64, error) {
 			return children[parentID], nil
@@ -42,7 +58,7 @@ func TestCollectTxChainDescendantIDs(t *testing.T) {
 	require.Equal(t, []int64{2, 3, 4, 5}, descendants)
 }
 
-// TestApplyTxChainInvalidation verifies the shared invalidation walk.
+// TestApplyTxGraphInvalidation verifies the shared invalidation walk.
 //
 // Scenario:
 // - One root transaction has a two-level descendant chain.
@@ -53,15 +69,15 @@ func TestCollectTxChainDescendantIDs(t *testing.T) {
 // Assertions:
 // - Root and descendant inputs are cleared in graph order.
 // - Roots receive the requested status while descendants become failed.
-func TestApplyTxChainInvalidation(t *testing.T) {
+func TestApplyTxGraphInvalidation(t *testing.T) {
 	t.Parallel()
 
 	var cleared []int64
 
 	statusUpdates := make(map[TxStatus][]int64)
 
-	err := applyTxChainInvalidation(
-		t.Context(), []int64{1}, TxStatusReplaced, txChainHooks{
+	err := applyTxGraphInvalidation(
+		t.Context(), []int64{1}, TxStatusReplaced, txGraphHooks{
 			ListChildren: func(_ context.Context, txID int64) ([]int64, error) {
 				switch txID {
 				case 1:
@@ -90,6 +106,438 @@ func TestApplyTxChainInvalidation(t *testing.T) {
 	require.Equal(t, []int64{2, 3}, statusUpdates[TxStatusFailed])
 }
 
+func TestApplyTxReplacementCommonSuccess(t *testing.T) {
+	t.Parallel()
+
+	type statusUpdateCall struct {
+		status TxStatus
+		txIDs  []int64
+	}
+
+	winner := txGraphMeta{
+		ID: 1, Txid: chainhash.Hash{1}, Status: TxStatusPublished,
+	}
+	victimOne := txGraphMeta{
+		ID: 2, Txid: chainhash.Hash{2}, Status: TxStatusPublished,
+	}
+	victimTwo := txGraphMeta{
+		ID: 3, Txid: chainhash.Hash{3}, Status: TxStatusPublished,
+	}
+
+	var (
+		cleared          []int64
+		replacementEdges [][2]int64
+		statusUpdates    []statusUpdateCall
+	)
+
+	reclaimCalls := 0
+
+	err := applyTxReplacementCommon(
+		t.Context(),
+		ApplyTxReplacementParams{
+			ReplacementTxid: winner.Txid,
+			ReplacedTxids:   []chainhash.Hash{victimTwo.Txid, victimOne.Txid},
+		},
+		func(context.Context, chainhash.Hash) (txGraphMeta, error) {
+			return winner, nil
+		},
+		func(context.Context, []chainhash.Hash) ([]txGraphMeta, error) {
+			return []txGraphMeta{victimOne, victimTwo}, nil
+		},
+		txGraphHooks{
+			ListChildren: func(_ context.Context, txID int64) ([]int64, error) {
+				switch txID {
+				case victimOne.ID:
+					return []int64{4}, nil
+				case victimTwo.ID:
+					return []int64{5}, nil
+				default:
+					return nil, nil
+				}
+			},
+			ClearSpentByTx: func(_ context.Context, txID int64) error {
+				cleared = append(cleared, txID)
+				return nil
+			},
+			UpdateStatus: func(_ context.Context, status TxStatus,
+				txIDs []int64) error {
+
+				statusUpdates = append(statusUpdates, statusUpdateCall{
+					status: status,
+					txIDs:  append([]int64(nil), txIDs...),
+				})
+
+				return nil
+			},
+			ReclaimInputsByTxid: func(_ context.Context,
+				txid chainhash.Hash, txID int64) error {
+
+				reclaimCalls++
+				require.Equal(t, winner.Txid, txid)
+				require.Equal(t, winner.ID, txID)
+
+				return nil
+			},
+			RecordReplacementEdge: func(_ context.Context,
+				replacedTxID, replacementTxID int64) error {
+
+				replacementEdges = append(
+					replacementEdges, [2]int64{replacedTxID, replacementTxID},
+				)
+
+				return nil
+			},
+			ListDirectConflictRootsByTxid: func(_ context.Context,
+				txid chainhash.Hash) ([]txGraphMeta, error) {
+
+				require.Equal(t, winner.Txid, txid)
+				return []txGraphMeta{victimOne, victimTwo}, nil
+			},
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []int64{2, 3, 4, 5}, cleared)
+	require.ElementsMatch(t, [][2]int64{{2, 1}, {3, 1}}, replacementEdges)
+	require.Len(t, statusUpdates, 2)
+	require.Equal(t, TxStatusReplaced, statusUpdates[0].status)
+	require.Equal(t, []int64{2, 3}, statusUpdates[0].txIDs)
+	require.Equal(t, TxStatusFailed, statusUpdates[1].status)
+	require.Equal(t, []int64{4, 5}, statusUpdates[1].txIDs)
+	require.Equal(t, 1, reclaimCalls)
+}
+
+func TestApplyTxFailureCommonSuccess(t *testing.T) {
+	t.Parallel()
+
+	type statusUpdateCall struct {
+		status TxStatus
+		txIDs  []int64
+	}
+
+	winner := txGraphMeta{
+		ID: 1, Txid: chainhash.Hash{1}, Status: TxStatusPublished,
+	}
+	rootOne := txGraphMeta{
+		ID: 2, Txid: chainhash.Hash{2}, Status: TxStatusPending,
+	}
+	rootTwo := txGraphMeta{
+		ID: 3, Txid: chainhash.Hash{3}, Status: TxStatusPublished,
+	}
+
+	var (
+		cleared       []int64
+		statusUpdates []statusUpdateCall
+	)
+
+	reclaimCalls := 0
+
+	err := applyTxFailureCommon(
+		t.Context(),
+		ApplyTxFailureParams{
+			ConflictingTxid: winner.Txid,
+			FailedTxids:     []chainhash.Hash{rootOne.Txid, rootTwo.Txid},
+		},
+		func(context.Context, chainhash.Hash) (txGraphMeta, error) {
+			return winner, nil
+		},
+		func(context.Context, []chainhash.Hash) ([]txGraphMeta, error) {
+			return []txGraphMeta{rootOne, rootTwo}, nil
+		},
+		txGraphHooks{
+			ListChildren: func(_ context.Context, txID int64) ([]int64, error) {
+				switch txID {
+				case rootOne.ID:
+					return []int64{4}, nil
+				case 4:
+					return []int64{5}, nil
+				default:
+					return nil, nil
+				}
+			},
+			ClearSpentByTx: func(_ context.Context, txID int64) error {
+				cleared = append(cleared, txID)
+				return nil
+			},
+			UpdateStatus: func(_ context.Context, status TxStatus,
+				txIDs []int64) error {
+
+				statusUpdates = append(statusUpdates, statusUpdateCall{
+					status: status,
+					txIDs:  append([]int64(nil), txIDs...),
+				})
+
+				return nil
+			},
+			ReclaimInputsByTxid: func(_ context.Context,
+				txid chainhash.Hash, txID int64) error {
+
+				reclaimCalls++
+				require.Equal(t, winner.Txid, txid)
+				require.Equal(t, winner.ID, txID)
+
+				return nil
+			},
+			ListDirectConflictRootsByTxid: func(_ context.Context,
+				txid chainhash.Hash) ([]txGraphMeta, error) {
+
+				require.Equal(t, winner.Txid, txid)
+				return []txGraphMeta{rootOne, rootTwo}, nil
+			},
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []int64{2, 3, 4, 5}, cleared)
+	require.Len(t, statusUpdates, 2)
+	require.Equal(t, TxStatusFailed, statusUpdates[0].status)
+	require.Equal(t, []int64{2, 3}, statusUpdates[0].txIDs)
+	require.Equal(t, TxStatusFailed, statusUpdates[1].status)
+	require.Equal(t, []int64{4, 5}, statusUpdates[1].txIDs)
+	require.Equal(t, 1, reclaimCalls)
+}
+
+func TestApplyTxReplacementCommonErrorPaths(t *testing.T) {
+	t.Parallel()
+
+	winner := txGraphMeta{
+		ID: 1, Txid: chainhash.Hash{1}, Status: TxStatusPublished,
+	}
+	victim := txGraphMeta{
+		ID: 2, Txid: chainhash.Hash{2}, Status: TxStatusPublished,
+	}
+
+	tests := []struct {
+		name       string
+		loadWinner func(context.Context, chainhash.Hash) (txGraphMeta, error)
+		loadVictim func(
+			context.Context, []chainhash.Hash,
+		) ([]txGraphMeta, error)
+		hooks   txGraphHooks
+		wantErr error
+	}{
+		{
+			name: "winner load error",
+			loadWinner: func(context.Context,
+				chainhash.Hash) (txGraphMeta, error) {
+
+				return txGraphMeta{}, errTestLoadWinner
+			},
+			loadVictim: func(context.Context,
+				[]chainhash.Hash) ([]txGraphMeta, error) {
+
+				return nil, errUnexpectedTraversalCall
+			},
+			wantErr: errTestLoadWinner,
+		},
+		{
+			name: "victim load error",
+			loadWinner: func(context.Context,
+				chainhash.Hash) (txGraphMeta, error) {
+
+				return winner, nil
+			},
+			loadVictim: func(context.Context,
+				[]chainhash.Hash) ([]txGraphMeta, error) {
+
+				return nil, errTestLoadVictims
+			},
+			wantErr: errTestLoadVictims,
+		},
+		{
+			name: "record edge error",
+			loadWinner: func(context.Context,
+				chainhash.Hash) (txGraphMeta, error) {
+
+				return winner, nil
+			},
+			loadVictim: func(context.Context,
+				[]chainhash.Hash) ([]txGraphMeta, error) {
+
+				return []txGraphMeta{victim}, nil
+			},
+			hooks: txGraphHooks{
+				ListDirectConflictRootsByTxid: func(context.Context,
+					chainhash.Hash) ([]txGraphMeta, error) {
+
+					return []txGraphMeta{victim}, nil
+				},
+				RecordReplacementEdge: func(
+					context.Context, int64, int64,
+				) error {
+
+					return errTestRecordEdge
+				},
+			},
+			wantErr: errTestRecordEdge,
+		},
+		{
+			name: "reclaim error",
+			loadWinner: func(context.Context,
+				chainhash.Hash) (txGraphMeta, error) {
+
+				return winner, nil
+			},
+			loadVictim: func(context.Context,
+				[]chainhash.Hash) ([]txGraphMeta, error) {
+
+				return []txGraphMeta{victim}, nil
+			},
+			hooks: txGraphHooks{
+				ListDirectConflictRootsByTxid: func(context.Context,
+					chainhash.Hash) ([]txGraphMeta, error) {
+
+					return []txGraphMeta{victim}, nil
+				},
+				ListChildren: func(context.Context, int64) ([]int64, error) {
+					return nil, nil
+				},
+				ClearSpentByTx: func(context.Context, int64) error {
+					return nil
+				},
+				UpdateStatus: func(context.Context, TxStatus, []int64) error {
+					return nil
+				},
+				RecordReplacementEdge: func(
+					context.Context, int64, int64,
+				) error {
+
+					return nil
+				},
+				ReclaimInputsByTxid: func(context.Context,
+					chainhash.Hash, int64) error {
+
+					return errTestReclaimInputs
+				},
+			},
+			wantErr: errTestReclaimInputs,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := applyTxReplacementCommon(
+				t.Context(),
+				ApplyTxReplacementParams{ReplacementTxid: winner.Txid},
+				test.loadWinner, test.loadVictim, test.hooks,
+			)
+			require.ErrorIs(t, err, test.wantErr)
+		})
+	}
+}
+
+func TestApplyTxFailureCommonErrorPaths(t *testing.T) {
+	t.Parallel()
+
+	winner := txGraphMeta{
+		ID: 1, Txid: chainhash.Hash{1}, Status: TxStatusPublished,
+	}
+	root := txGraphMeta{ID: 2, Txid: chainhash.Hash{2}, Status: TxStatusPending}
+
+	tests := []struct {
+		name       string
+		loadWinner func(context.Context, chainhash.Hash) (txGraphMeta, error)
+		loadRoots  func(
+			context.Context, []chainhash.Hash,
+		) ([]txGraphMeta, error)
+		hooks   txGraphHooks
+		wantErr error
+	}{
+		{
+			name: "winner load error",
+			loadWinner: func(context.Context,
+				chainhash.Hash) (txGraphMeta, error) {
+
+				return txGraphMeta{}, errTestLoadWinner
+			},
+			loadRoots: func(context.Context,
+				[]chainhash.Hash) ([]txGraphMeta, error) {
+
+				return nil, errUnexpectedTraversalCall
+			},
+			wantErr: errTestLoadWinner,
+		},
+		{
+			name: "roots load error",
+			loadWinner: func(context.Context,
+				chainhash.Hash) (txGraphMeta, error) {
+
+				return winner, nil
+			},
+			loadRoots: func(context.Context,
+				[]chainhash.Hash) ([]txGraphMeta, error) {
+
+				return nil, errTestLoadRoots
+			},
+			wantErr: errTestLoadRoots,
+		},
+		{
+			name: "validation error",
+			loadWinner: func(context.Context,
+				chainhash.Hash) (txGraphMeta, error) {
+
+				return txGraphMeta{
+					Txid: winner.Txid, Status: TxStatusFailed,
+				}, nil
+			},
+			loadRoots: func(context.Context,
+				[]chainhash.Hash) ([]txGraphMeta, error) {
+
+				return []txGraphMeta{root}, nil
+			},
+			wantErr: errFailureWinnerInvalid,
+		},
+		{
+			name: "reclaim error",
+			loadWinner: func(context.Context,
+				chainhash.Hash) (txGraphMeta, error) {
+
+				return winner, nil
+			},
+			loadRoots: func(context.Context,
+				[]chainhash.Hash) ([]txGraphMeta, error) {
+
+				return []txGraphMeta{root}, nil
+			},
+			hooks: txGraphHooks{
+				ListDirectConflictRootsByTxid: func(context.Context,
+					chainhash.Hash) ([]txGraphMeta, error) {
+
+					return []txGraphMeta{root}, nil
+				},
+				ListChildren: func(context.Context, int64) ([]int64, error) {
+					return nil, nil
+				},
+				ClearSpentByTx: func(context.Context, int64) error {
+					return nil
+				},
+				UpdateStatus: func(context.Context, TxStatus, []int64) error {
+					return nil
+				},
+				ReclaimInputsByTxid: func(context.Context,
+					chainhash.Hash, int64) error {
+
+					return errTestReclaimInputs
+				},
+			},
+			wantErr: errTestReclaimInputs,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := applyTxFailureCommon(
+				t.Context(),
+				ApplyTxFailureParams{ConflictingTxid: winner.Txid},
+				test.loadWinner, test.loadRoots, test.hooks,
+			)
+			require.ErrorIs(t, err, test.wantErr)
+		})
+	}
+}
+
 // TestValidateReplacementPlan verifies shared replacement root validation.
 //
 // Scenario:
@@ -107,25 +555,25 @@ func TestApplyTxChainInvalidation(t *testing.T) {
 func TestValidateReplacementPlan(t *testing.T) {
 	t.Parallel()
 
-	winner := txChainMeta{
+	winner := txGraphMeta{
 		Txid:   chainhash.Hash{1},
 		Status: TxStatusPublished,
 	}
-	victim := txChainMeta{
+	victim := txGraphMeta{
 		Txid:   chainhash.Hash{2},
 		Status: TxStatusPublished,
 	}
 
 	tests := []struct {
 		name    string
-		winner  txChainMeta
-		victims []txChainMeta
+		winner  txGraphMeta
+		victims []txGraphMeta
 		wantErr error
 	}{
 		{
 			name:    "valid plan",
 			winner:  winner,
-			victims: []txChainMeta{victim},
+			victims: []txGraphMeta{victim},
 		},
 		{
 			name:    "missing victims",
@@ -135,29 +583,29 @@ func TestValidateReplacementPlan(t *testing.T) {
 		{
 			name:    "self replacement",
 			winner:  winner,
-			victims: []txChainMeta{winner},
+			victims: []txGraphMeta{winner},
 			wantErr: errSelfConflict,
 		},
 		{
 			name:    "winner missing live status",
-			winner:  txChainMeta{Txid: chainhash.Hash{3}, Status: TxStatus(9)},
-			victims: []txChainMeta{victim},
+			winner:  txGraphMeta{Txid: chainhash.Hash{3}, Status: TxStatus(9)},
+			victims: []txGraphMeta{victim},
 			wantErr: errReplacementWinnerInvalid,
 		},
 		{
 			name: "winner already confirmed",
-			winner: txChainMeta{
+			winner: txGraphMeta{
 				Txid:     chainhash.Hash{6},
 				Status:   TxStatusPublished,
 				HasBlock: true,
 			},
-			victims: []txChainMeta{victim},
+			victims: []txGraphMeta{victim},
 			wantErr: errReplacementWinnerInvalid,
 		},
 		{
 			name:   "victim already confirmed",
 			winner: winner,
-			victims: []txChainMeta{{
+			victims: []txGraphMeta{{
 				Txid:     chainhash.Hash{4},
 				Status:   TxStatusPublished,
 				HasBlock: true,
@@ -167,7 +615,7 @@ func TestValidateReplacementPlan(t *testing.T) {
 		{
 			name:   "victim already terminal",
 			winner: winner,
-			victims: []txChainMeta{{
+			victims: []txGraphMeta{{
 				Txid:   chainhash.Hash{5},
 				Status: TxStatusReplaced,
 			}},
@@ -176,7 +624,7 @@ func TestValidateReplacementPlan(t *testing.T) {
 		{
 			name:   "victim still pending",
 			winner: winner,
-			victims: []txChainMeta{{
+			victims: []txGraphMeta{{
 				Txid:   chainhash.Hash{7},
 				Status: TxStatusPending,
 			}},
@@ -220,19 +668,19 @@ func TestValidateReplacementPlan(t *testing.T) {
 func TestValidateFailurePlan(t *testing.T) {
 	t.Parallel()
 
-	winner := txChainMeta{Txid: chainhash.Hash{1}, Status: TxStatusPublished}
-	failedRoot := txChainMeta{Txid: chainhash.Hash{2}, Status: TxStatusPending}
+	winner := txGraphMeta{Txid: chainhash.Hash{1}, Status: TxStatusPublished}
+	failedRoot := txGraphMeta{Txid: chainhash.Hash{2}, Status: TxStatusPending}
 
 	tests := []struct {
 		name    string
-		winner  txChainMeta
-		roots   []txChainMeta
+		winner  txGraphMeta
+		roots   []txGraphMeta
 		wantErr error
 	}{
 		{
 			name:   "valid plan",
 			winner: winner,
-			roots:  []txChainMeta{failedRoot},
+			roots:  []txGraphMeta{failedRoot},
 		},
 		{
 			name:    "missing roots",
@@ -242,13 +690,13 @@ func TestValidateFailurePlan(t *testing.T) {
 		{
 			name:    "self conflict",
 			winner:  winner,
-			roots:   []txChainMeta{winner},
+			roots:   []txGraphMeta{winner},
 			wantErr: errSelfConflict,
 		},
 		{
 			name:   "coinbase root invalid",
 			winner: winner,
-			roots: []txChainMeta{{
+			roots: []txGraphMeta{{
 				Txid:       chainhash.Hash{4},
 				Status:     TxStatusPending,
 				IsCoinbase: true,
@@ -258,7 +706,7 @@ func TestValidateFailurePlan(t *testing.T) {
 		{
 			name:   "terminal root invalid",
 			winner: winner,
-			roots: []txChainMeta{{
+			roots: []txGraphMeta{{
 				Txid:   chainhash.Hash{5},
 				Status: TxStatusFailed,
 			}},
@@ -301,23 +749,23 @@ func TestValidateFailurePlan(t *testing.T) {
 func TestValidateOrphanPlan(t *testing.T) {
 	t.Parallel()
 
-	orphanRoot := txChainMeta{
+	orphanRoot := txGraphMeta{
 		Txid:       chainhash.Hash{3},
 		Status:     TxStatusOrphaned,
 		IsCoinbase: true,
 	}
-	failedRoot := txChainMeta{Txid: chainhash.Hash{2}, Status: TxStatusPending}
+	failedRoot := txGraphMeta{Txid: chainhash.Hash{2}, Status: TxStatusPending}
 
 	// Arrange: Build one valid and one invalid orphan-root set.
 
 	// Act: Validate the supported orphan plan.
-	err := validateOrphanPlan([]txChainMeta{orphanRoot})
+	err := validateOrphanPlan([]txGraphMeta{orphanRoot})
 
 	// Assert: The orphaned coinbase root is accepted.
 	require.NoError(t, err)
 
 	// Act: Validate one invalid non-orphan root.
-	err = validateOrphanPlan([]txChainMeta{failedRoot})
+	err = validateOrphanPlan([]txGraphMeta{failedRoot})
 
 	// Assert: Non-orphan roots are rejected.
 	require.ErrorIs(t, err, errOrphanRootInvalid)
@@ -339,26 +787,75 @@ func TestValidateOrphanPlan(t *testing.T) {
 func TestValidateCoinbaseReconfirmation(t *testing.T) {
 	t.Parallel()
 
-	orphanRoot := txChainMeta{
+	orphanRoot := txGraphMeta{
 		Txid:       chainhash.Hash{3},
 		Status:     TxStatusOrphaned,
 		IsCoinbase: true,
 	}
-	failedRoot := txChainMeta{Txid: chainhash.Hash{2}, Status: TxStatusPending}
+	failedRoot := txGraphMeta{Txid: chainhash.Hash{2}, Status: TxStatusPending}
 
 	// Arrange: Build one valid orphaned coinbase and one invalid row.
 
 	// Act: Validate the supported orphaned-coinbase target.
-	err := validateCoinbaseReconfirmation(orphanRoot)
+	err := validateCoinbaseReconfirmation(
+		t.Context(), orphanRoot,
+		func(context.Context, chainhash.Hash) ([]int64, error) {
+			return nil, nil
+		},
+	)
 
 	// Assert: The orphaned coinbase root is accepted.
 	require.NoError(t, err)
 
 	// Act: Validate an invalid non-orphaned row.
-	err = validateCoinbaseReconfirmation(failedRoot)
+	err = validateCoinbaseReconfirmation(
+		t.Context(), failedRoot,
+		func(context.Context, chainhash.Hash) ([]int64, error) {
+			return nil, nil
+		},
+	)
 
 	// Assert: Non-orphaned roots are rejected.
 	require.ErrorIs(t, err, errCoinbaseReconfirmationInvalid)
+}
+
+// TestValidateCoinbaseReconfirmationRejectsStoredDescendants verifies that the
+// root-only reconfirmation path rejects orphaned coinbase rows with stored
+// descendants.
+func TestValidateCoinbaseReconfirmationRejectsStoredDescendants(t *testing.T) {
+	t.Parallel()
+
+	orphanRoot := txGraphMeta{
+		Txid:       chainhash.Hash{3},
+		Status:     TxStatusOrphaned,
+		IsCoinbase: true,
+	}
+
+	err := validateCoinbaseReconfirmation(
+		t.Context(), orphanRoot,
+		func(context.Context, chainhash.Hash) ([]int64, error) {
+			return []int64{11}, nil
+		},
+	)
+	require.ErrorIs(t, err, errCoinbaseReconfirmationHasDescendants)
+}
+
+func TestValidateCoinbaseReconfirmationDescendantLookupError(t *testing.T) {
+	t.Parallel()
+
+	orphanRoot := txGraphMeta{
+		Txid:       chainhash.Hash{3},
+		Status:     TxStatusOrphaned,
+		IsCoinbase: true,
+	}
+
+	err := validateCoinbaseReconfirmation(
+		t.Context(), orphanRoot,
+		func(context.Context, chainhash.Hash) ([]int64, error) {
+			return nil, errTestListChildren
+		},
+	)
+	require.ErrorIs(t, err, errTestListChildren)
 }
 
 // TestApplyTxReplacementCommonRejectsDescendantRoot verifies direct replacement
@@ -380,17 +877,17 @@ func TestValidateCoinbaseReconfirmation(t *testing.T) {
 func TestApplyTxReplacementCommonRejectsDescendantRoot(t *testing.T) {
 	t.Parallel()
 
-	winner := txChainMeta{
+	winner := txGraphMeta{
 		ID:     1,
 		Txid:   chainhash.Hash{1},
 		Status: TxStatusPublished,
 	}
-	victim := txChainMeta{
+	victim := txGraphMeta{
 		ID:     2,
 		Txid:   chainhash.Hash{2},
 		Status: TxStatusPublished,
 	}
-	descendant := txChainMeta{
+	descendant := txGraphMeta{
 		ID:     3,
 		Txid:   chainhash.Hash{3},
 		Status: TxStatusPublished,
@@ -400,17 +897,17 @@ func TestApplyTxReplacementCommonRejectsDescendantRoot(t *testing.T) {
 	err := applyTxReplacementCommon(
 		t.Context(),
 		ApplyTxReplacementParams{ReplacementTxid: winner.Txid},
-		func(context.Context, chainhash.Hash) (txChainMeta, error) {
+		func(context.Context, chainhash.Hash) (txGraphMeta, error) {
 			return winner, nil
 		},
-		func(context.Context, []chainhash.Hash) ([]txChainMeta, error) {
-			return []txChainMeta{victim, descendant}, nil
+		func(context.Context, []chainhash.Hash) ([]txGraphMeta, error) {
+			return []txGraphMeta{victim, descendant}, nil
 		},
-		txChainHooks{
+		txGraphHooks{
 			ListDirectConflictRootsByTxid: func(context.Context,
-				chainhash.Hash) ([]txChainMeta, error) {
+				chainhash.Hash) ([]txGraphMeta, error) {
 
-				return []txChainMeta{victim}, nil
+				return []txGraphMeta{victim}, nil
 			},
 			RecordReplacementEdge: func(context.Context, int64, int64) error {
 				called = true
@@ -439,17 +936,17 @@ func TestApplyTxReplacementCommonRejectsDescendantRoot(t *testing.T) {
 func TestApplyTxReplacementCommonRejectsIncompleteRootSet(t *testing.T) {
 	t.Parallel()
 
-	winner := txChainMeta{
+	winner := txGraphMeta{
 		ID:     1,
 		Txid:   chainhash.Hash{1},
 		Status: TxStatusPublished,
 	}
-	victimOne := txChainMeta{
+	victimOne := txGraphMeta{
 		ID:     2,
 		Txid:   chainhash.Hash{2},
 		Status: TxStatusPublished,
 	}
-	victimTwo := txChainMeta{
+	victimTwo := txGraphMeta{
 		ID:     3,
 		Txid:   chainhash.Hash{3},
 		Status: TxStatusPublished,
@@ -459,17 +956,17 @@ func TestApplyTxReplacementCommonRejectsIncompleteRootSet(t *testing.T) {
 	err := applyTxReplacementCommon(
 		t.Context(),
 		ApplyTxReplacementParams{ReplacementTxid: winner.Txid},
-		func(context.Context, chainhash.Hash) (txChainMeta, error) {
+		func(context.Context, chainhash.Hash) (txGraphMeta, error) {
 			return winner, nil
 		},
-		func(context.Context, []chainhash.Hash) ([]txChainMeta, error) {
-			return []txChainMeta{victimOne}, nil
+		func(context.Context, []chainhash.Hash) ([]txGraphMeta, error) {
+			return []txGraphMeta{victimOne}, nil
 		},
-		txChainHooks{
+		txGraphHooks{
 			ListDirectConflictRootsByTxid: func(context.Context,
-				chainhash.Hash) ([]txChainMeta, error) {
+				chainhash.Hash) ([]txGraphMeta, error) {
 
-				return []txChainMeta{victimOne, victimTwo}, nil
+				return []txGraphMeta{victimOne, victimTwo}, nil
 			},
 			RecordReplacementEdge: func(context.Context, int64, int64) error {
 				called = true
@@ -498,17 +995,17 @@ func TestApplyTxReplacementCommonRejectsIncompleteRootSet(t *testing.T) {
 func TestApplyTxFailureCommonRejectsUnrelatedRoot(t *testing.T) {
 	t.Parallel()
 
-	winner := txChainMeta{
+	winner := txGraphMeta{
 		ID:     1,
 		Txid:   chainhash.Hash{1},
 		Status: TxStatusPublished,
 	}
-	loser := txChainMeta{
+	loser := txGraphMeta{
 		ID:     2,
 		Txid:   chainhash.Hash{2},
 		Status: TxStatusPending,
 	}
-	unrelated := txChainMeta{
+	unrelated := txGraphMeta{
 		ID:     3,
 		Txid:   chainhash.Hash{3},
 		Status: TxStatusPending,
@@ -518,17 +1015,17 @@ func TestApplyTxFailureCommonRejectsUnrelatedRoot(t *testing.T) {
 	err := applyTxFailureCommon(
 		t.Context(),
 		ApplyTxFailureParams{ConflictingTxid: winner.Txid},
-		func(context.Context, chainhash.Hash) (txChainMeta, error) {
+		func(context.Context, chainhash.Hash) (txGraphMeta, error) {
 			return winner, nil
 		},
-		func(context.Context, []chainhash.Hash) ([]txChainMeta, error) {
-			return []txChainMeta{loser, unrelated}, nil
+		func(context.Context, []chainhash.Hash) ([]txGraphMeta, error) {
+			return []txGraphMeta{loser, unrelated}, nil
 		},
-		txChainHooks{
+		txGraphHooks{
 			ListDirectConflictRootsByTxid: func(context.Context,
-				chainhash.Hash) ([]txChainMeta, error) {
+				chainhash.Hash) ([]txGraphMeta, error) {
 
-				return []txChainMeta{loser}, nil
+				return []txGraphMeta{loser}, nil
 			},
 			ReclaimInputsByTxid: func(context.Context,
 				chainhash.Hash, int64) error {
@@ -557,17 +1054,17 @@ func TestApplyTxFailureCommonRejectsUnrelatedRoot(t *testing.T) {
 func TestApplyTxFailureCommonRejectsIncompleteRootSet(t *testing.T) {
 	t.Parallel()
 
-	winner := txChainMeta{
+	winner := txGraphMeta{
 		ID:     1,
 		Txid:   chainhash.Hash{1},
 		Status: TxStatusPublished,
 	}
-	loserOne := txChainMeta{
+	loserOne := txGraphMeta{
 		ID:     2,
 		Txid:   chainhash.Hash{2},
 		Status: TxStatusPending,
 	}
-	loserTwo := txChainMeta{
+	loserTwo := txGraphMeta{
 		ID:     3,
 		Txid:   chainhash.Hash{3},
 		Status: TxStatusPending,
@@ -577,17 +1074,17 @@ func TestApplyTxFailureCommonRejectsIncompleteRootSet(t *testing.T) {
 	err := applyTxFailureCommon(
 		t.Context(),
 		ApplyTxFailureParams{ConflictingTxid: winner.Txid},
-		func(context.Context, chainhash.Hash) (txChainMeta, error) {
+		func(context.Context, chainhash.Hash) (txGraphMeta, error) {
 			return winner, nil
 		},
-		func(context.Context, []chainhash.Hash) ([]txChainMeta, error) {
-			return []txChainMeta{loserOne}, nil
+		func(context.Context, []chainhash.Hash) ([]txGraphMeta, error) {
+			return []txGraphMeta{loserOne}, nil
 		},
-		txChainHooks{
+		txGraphHooks{
 			ListDirectConflictRootsByTxid: func(context.Context,
-				chainhash.Hash) ([]txChainMeta, error) {
+				chainhash.Hash) ([]txGraphMeta, error) {
 
-				return []txChainMeta{loserOne, loserTwo}, nil
+				return []txGraphMeta{loserOne, loserTwo}, nil
 			},
 			ReclaimInputsByTxid: func(context.Context,
 				chainhash.Hash, int64) error {
@@ -601,7 +1098,192 @@ func TestApplyTxFailureCommonRejectsIncompleteRootSet(t *testing.T) {
 	require.False(t, called)
 }
 
-// TestCollectTxChainDescendantIDsContext verifies traversal cancellation
+func TestValidateDirectConflictRoots(t *testing.T) {
+	t.Parallel()
+
+	winnerTxid := chainhash.Hash{1}
+	rootOne := txGraphMeta{ID: 2, Txid: chainhash.Hash{2}}
+	rootTwo := txGraphMeta{ID: 3, Txid: chainhash.Hash{3}}
+
+	tests := []struct {
+		name    string
+		roots   []txGraphMeta
+		list    func(context.Context, chainhash.Hash) ([]txGraphMeta, error)
+		wantErr error
+	}{
+		{
+			name:  "success",
+			roots: []txGraphMeta{rootTwo, rootOne},
+			list: func(_ context.Context,
+				txid chainhash.Hash) ([]txGraphMeta, error) {
+
+				require.Equal(t, winnerTxid, txid)
+				return []txGraphMeta{rootOne, rootTwo}, nil
+			},
+		},
+		{
+			name:  "list error",
+			roots: []txGraphMeta{rootOne},
+			list: func(context.Context,
+				chainhash.Hash) ([]txGraphMeta, error) {
+
+				return nil, errTestListDirectRoots
+			},
+			wantErr: errTestListDirectRoots,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateDirectConflictRoots(
+				t.Context(), winnerTxid, test.roots, test.list,
+				errReplacementVictimNotDirect,
+				errReplacementVictimSetIncomplete,
+			)
+			if test.wantErr != nil {
+				require.ErrorIs(t, err, test.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestValidateOrphanPlanEmptyRoots(t *testing.T) {
+	t.Parallel()
+
+	err := validateOrphanPlan(nil)
+	require.ErrorIs(t, err, errOrphanRootInvalid)
+}
+
+func TestBuildDirectConflictMeta(t *testing.T) {
+	t.Parallel()
+
+	hash := chainhash.Hash{9}
+	tests := []struct {
+		name       string
+		statusCode int64
+		txHash     []byte
+		hasBlock   bool
+		isCoinbase bool
+		want       txGraphMeta
+		wantOK     bool
+		wantErr    error
+	}{
+		{
+			name:       "live pending regular",
+			statusCode: int64(TxStatusPending),
+			txHash:     hash[:],
+			want: txGraphMeta{
+				ID:     11,
+				Txid:   hash,
+				Status: TxStatusPending,
+			},
+			wantOK: true,
+		},
+		{
+			name:       "confirmed filtered",
+			statusCode: int64(TxStatusPublished),
+			txHash:     hash[:],
+			hasBlock:   true,
+		},
+		{
+			name:       "coinbase filtered",
+			statusCode: int64(TxStatusPublished),
+			txHash:     hash[:],
+			isCoinbase: true,
+		},
+		{
+			name:       "terminal filtered",
+			statusCode: int64(TxStatusFailed),
+			txHash:     hash[:],
+		},
+		{
+			name:       "invalid status",
+			statusCode: 9,
+			txHash:     hash[:],
+			wantErr:    errInvalidTxStatus,
+		},
+		{
+			name:       "invalid hash",
+			statusCode: int64(TxStatusPending),
+			txHash:     []byte{1, 2, 3},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			meta, ok, err := buildDirectConflictMeta(
+				11, test.txHash, test.statusCode, test.hasBlock,
+				test.isCoinbase,
+			)
+			if test.wantErr != nil {
+				require.ErrorIs(t, err, test.wantErr)
+				return
+			}
+
+			if test.name == "invalid hash" {
+				require.ErrorContains(t, err, "transaction hash")
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, test.wantOK, ok)
+			require.Equal(t, test.want, meta)
+		})
+	}
+}
+
+func TestTxIDsFromMetas(t *testing.T) {
+	t.Parallel()
+
+	ids := txIDsFromMetas([]txGraphMeta{{ID: 4}, {ID: 5}, {ID: 4}, {ID: 6}})
+	require.Equal(t, []int64{4, 5, 6}, ids)
+}
+
+func TestCollectTxGraphDescendantIDsDeduplicatesRoots(t *testing.T) {
+	t.Parallel()
+
+	descendants, err := collectTxGraphDescendantIDs(
+		t.Context(), []int64{1, 1},
+		func(_ context.Context, parentID int64) ([]int64, error) {
+			if parentID == 1 {
+				return []int64{2}, nil
+			}
+
+			return nil, nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []int64{2}, descendants)
+}
+
+func TestIsLiveTxStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status TxStatus
+		want   bool
+	}{
+		{status: TxStatusPending, want: true},
+		{status: TxStatusPublished, want: true},
+		{status: TxStatusReplaced, want: false},
+		{status: TxStatusFailed, want: false},
+		{status: TxStatusOrphaned, want: false},
+		{status: TxStatus(99), want: false},
+	}
+
+	for _, test := range tests {
+		require.Equal(t, test.want, isLiveTxStatus(test.status))
+	}
+}
+
+// TestCollectTxGraphDescendantIDsContext verifies traversal cancellation
 // handling.
 //
 // Scenario:
@@ -609,20 +1291,228 @@ func TestApplyTxFailureCommonRejectsIncompleteRootSet(t *testing.T) {
 // Setup:
 // - Create one canceled context and one child callback that must not run.
 // Action:
-// - Start collectTxChainDescendantIDs with the canceled context.
+// - Start collectTxGraphDescendantIDs with the canceled context.
 // Assertions:
 // - The walk returns context.Canceled without visiting any nodes.
-func TestCollectTxChainDescendantIDsContext(t *testing.T) {
+func TestCollectTxGraphDescendantIDsContext(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	_, err := collectTxChainDescendantIDs(
+	_, err := collectTxGraphDescendantIDs(
 		ctx, []int64{1},
 		func(_ context.Context, _ int64) ([]int64, error) {
 			return nil, errUnexpectedTraversalCall
 		},
 	)
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestCollectTxGraphDescendantIDsChildError(t *testing.T) {
+	t.Parallel()
+
+	_, err := collectTxGraphDescendantIDs(
+		t.Context(), []int64{1},
+		func(_ context.Context, _ int64) ([]int64, error) {
+			return nil, errTestListChildren
+		},
+	)
+	require.ErrorIs(t, err, errTestListChildren)
+}
+
+func TestApplyTxGraphInvalidationErrorPaths(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		hooks   txGraphHooks
+		wantErr error
+	}{
+		{
+			name: "collect error",
+			hooks: txGraphHooks{
+				ListChildren: func(context.Context, int64) ([]int64, error) {
+					return nil, errTestCollect
+				},
+			},
+			wantErr: errTestCollect,
+		},
+		{
+			name: "clear root error",
+			hooks: txGraphHooks{
+				ListChildren: func(context.Context, int64) ([]int64, error) {
+					return nil, nil
+				},
+				ClearSpentByTx: func(context.Context, int64) error {
+					return errTestClearRoot
+				},
+			},
+			wantErr: errTestClearRoot,
+		},
+		{
+			name: "clear descendant error",
+			hooks: txGraphHooks{
+				ListChildren: func(
+					_ context.Context, txID int64,
+				) ([]int64, error) {
+
+					if txID == 1 {
+						return []int64{2}, nil
+					}
+
+					return nil, nil
+				},
+				ClearSpentByTx: func(_ context.Context, txID int64) error {
+					if txID == 2 {
+						return errTestClearDescendant
+					}
+
+					return nil
+				},
+			},
+			wantErr: errTestClearDescendant,
+		},
+		{
+			name: "update root status error",
+			hooks: txGraphHooks{
+				ListChildren: func(context.Context, int64) ([]int64, error) {
+					return nil, nil
+				},
+				ClearSpentByTx: func(context.Context, int64) error {
+					return nil
+				},
+				UpdateStatus: func(_ context.Context, status TxStatus,
+					_ []int64) error {
+
+					if status == TxStatusReplaced {
+						return errTestUpdateRoot
+					}
+
+					return nil
+				},
+			},
+			wantErr: errTestUpdateRoot,
+		},
+		{
+			name: "update descendant status error",
+			hooks: txGraphHooks{
+				ListChildren: func(
+					_ context.Context, txID int64,
+				) ([]int64, error) {
+
+					if txID == 1 {
+						return []int64{2}, nil
+					}
+
+					return nil, nil
+				},
+				ClearSpentByTx: func(context.Context, int64) error {
+					return nil
+				},
+				UpdateStatus: func(_ context.Context, status TxStatus,
+					ids []int64) error {
+
+					if status == TxStatusFailed &&
+						len(ids) == 1 && ids[0] == 2 {
+
+						return errTestUpdateDescendant
+					}
+
+					return nil
+				},
+			},
+			wantErr: errTestUpdateDescendant,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := applyTxGraphInvalidation(
+				t.Context(), []int64{1}, TxStatusReplaced, test.hooks,
+			)
+			require.ErrorIs(t, err, test.wantErr)
+		})
+	}
+}
+
+func TestApplyTxReplacementCommonInvalidationError(t *testing.T) {
+	t.Parallel()
+
+	winner := txGraphMeta{
+		ID: 1, Txid: chainhash.Hash{1}, Status: TxStatusPublished,
+	}
+	victim := txGraphMeta{
+		ID: 2, Txid: chainhash.Hash{2}, Status: TxStatusPublished,
+	}
+
+	err := applyTxReplacementCommon(
+		t.Context(),
+		ApplyTxReplacementParams{ReplacementTxid: winner.Txid},
+		func(context.Context, chainhash.Hash) (txGraphMeta, error) {
+			return winner, nil
+		},
+		func(context.Context, []chainhash.Hash) ([]txGraphMeta, error) {
+			return []txGraphMeta{victim}, nil
+		},
+		txGraphHooks{
+			ListDirectConflictRootsByTxid: func(context.Context,
+				chainhash.Hash) ([]txGraphMeta, error) {
+
+				return []txGraphMeta{victim}, nil
+			},
+			RecordReplacementEdge: func(context.Context, int64, int64) error {
+				return nil
+			},
+			ListChildren: func(context.Context, int64) ([]int64, error) {
+				return nil, nil
+			},
+			ClearSpentByTx: func(context.Context, int64) error {
+				return nil
+			},
+			UpdateStatus: func(context.Context, TxStatus, []int64) error {
+				return errTestUpdate
+			},
+		},
+	)
+	require.ErrorIs(t, err, errTestUpdate)
+}
+
+func TestApplyTxFailureCommonInvalidationError(t *testing.T) {
+	t.Parallel()
+
+	winner := txGraphMeta{
+		ID: 1, Txid: chainhash.Hash{1}, Status: TxStatusPublished,
+	}
+	root := txGraphMeta{ID: 2, Txid: chainhash.Hash{2}, Status: TxStatusPending}
+
+	err := applyTxFailureCommon(
+		t.Context(),
+		ApplyTxFailureParams{ConflictingTxid: winner.Txid},
+		func(context.Context, chainhash.Hash) (txGraphMeta, error) {
+			return winner, nil
+		},
+		func(context.Context, []chainhash.Hash) ([]txGraphMeta, error) {
+			return []txGraphMeta{root}, nil
+		},
+		txGraphHooks{
+			ListDirectConflictRootsByTxid: func(context.Context,
+				chainhash.Hash) ([]txGraphMeta, error) {
+
+				return []txGraphMeta{root}, nil
+			},
+			ListChildren: func(context.Context, int64) ([]int64, error) {
+				return nil, nil
+			},
+			ClearSpentByTx: func(context.Context, int64) error {
+				return nil
+			},
+			UpdateStatus: func(context.Context, TxStatus, []int64) error {
+				return errTestUpdate
+			},
+		},
+	)
+	require.ErrorIs(t, err, errTestUpdate)
 }

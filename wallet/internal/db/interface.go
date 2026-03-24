@@ -106,12 +106,9 @@ var (
 //
 // TODO(yy): Break down wallet managers into independent components.
 //
-// TODO(yy): Remove the linter ignore once Store grows beyond UTXOStore.
-//
-//nolint:iface // Transitional alias until Store grows beyond UTXOStore.
-type Store interface {
-	UTXOStore
-}
+// TODO(yy): Replace this alias with a purpose-built consumer interface once the
+// wallet managers are broken into independent components.
+type Store = UTXOStore
 
 // WalletStore defines the methods for wallet-level operations.
 type WalletStore interface {
@@ -333,19 +330,18 @@ type TxReplacementStore interface {
 	// spent-input edges.
 	ApplyTxFailure(ctx context.Context, params ApplyTxFailureParams) error
 
-	// OrphanTxChain keeps the supplied coinbase roots orphaned while
+	// OrphanTxGraph keeps the supplied coinbase roots orphaned while
 	// recursively failing every descendant branch that depends on those roots.
-	OrphanTxChain(ctx context.Context, params OrphanTxChainParams) error
+	OrphanTxGraph(ctx context.Context, params OrphanTxGraphParams) error
 
 	// ReconfirmOrphanedCoinbase restores one orphaned coinbase root to a new
 	// confirming block without replaying any descendant branch.
+	// The call rejects roots that still have stored descendants.
 	ReconfirmOrphanedCoinbase(ctx context.Context,
 		params ReconfirmOrphanedCoinbaseParams) error
 }
 
 // UTXOStore defines the database actions for managing the UTXO set.
-//
-//nolint:iface // Store is a transitional wrapper over UTXOStore.
 type UTXOStore interface {
 	// GetUtxo retrieves a single unspent transaction output (UTXO) by its
 	// outpoint. It returns a UtxoInfo struct containing the UTXO's details

@@ -941,6 +941,72 @@ type DeleteTxParams struct {
 	Txid chainhash.Hash
 }
 
+// ApplyTxReplacementParams describes one unconfirmed replacement winner and the
+// direct victim transactions that it invalidates.
+type ApplyTxReplacementParams struct {
+	// WalletID scopes the replacement flow to one wallet.
+	WalletID uint32
+
+	// ReplacementTxid identifies the live unconfirmed transaction that wins the
+	// direct mempool conflict and must own the spent-input edges after the flow
+	// completes.
+	ReplacementTxid chainhash.Hash
+
+	// ReplacedTxids lists the complete direct victim set for the conflict. Each
+	// listed tx must currently spend at least one wallet-owned input that the
+	// winner also spends. Descendants are discovered automatically from the
+	// stored spend graph.
+	ReplacedTxids []chainhash.Hash
+}
+
+// ApplyTxFailureParams describes a conflict winner and one or more direct loser
+// transactions that should become failed.
+type ApplyTxFailureParams struct {
+	// WalletID scopes the failure flow to one wallet.
+	WalletID uint32
+
+	// ConflictingTxid identifies the transaction that wins the conflict.
+	// It must own the affected spent-input edges after the flow completes.
+	ConflictingTxid chainhash.Hash
+
+	// FailedTxids lists the complete direct loser set. Each listed tx must
+	// currently spend at least one wallet-owned input that the winner also
+	// spends. Descendants are discovered automatically from the stored spend
+	// graph.
+	FailedTxids []chainhash.Hash
+}
+
+// OrphanTxGraphParams identifies orphaned coinbase roots whose descendants must
+// be marked failed.
+type OrphanTxGraphParams struct {
+	// WalletID scopes the orphan propagation to one wallet.
+	WalletID uint32
+
+	// Txids lists the already-orphaned coinbase transactions.
+	// They form the roots of the invalidation walk.
+	Txids []chainhash.Hash
+}
+
+// ReconfirmOrphanedCoinbaseParams identifies one orphaned coinbase transaction
+// that should be restored to the best chain.
+//
+// This is intentionally a root-only transition. Bitcoin requires 100
+// confirmations before a coinbase output becomes spendable, so any stored
+// descendant branch implies a reorg deeper than the coinbase maturity window.
+// Reorgs of that depth are treated as practically out of scope for the SQL
+// model: callers may restore the orphaned coinbase root itself, but only when
+// no stored descendant branch still depends on it.
+type ReconfirmOrphanedCoinbaseParams struct {
+	// WalletID scopes the reconfirmation to one wallet.
+	WalletID uint32
+
+	// Txid identifies the orphaned coinbase transaction to restore.
+	Txid chainhash.Hash
+
+	// Block identifies the block that now confirms the coinbase transaction.
+	Block Block
+}
+
 // --------------------
 // UTXOStore Types
 // --------------------

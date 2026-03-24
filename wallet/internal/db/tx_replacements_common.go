@@ -101,78 +101,21 @@ var (
 		"orphaned coinbase state changed before reconfirmation",
 	)
 
+	// errCoinbaseReconfirmationHasDescendants indicates that root-only coinbase
+	// reconfirmation was attempted while a dependent descendant branch is still
+	// stored.
+	errCoinbaseReconfirmationHasDescendants = errors.New(
+		"coinbase reconfirmation requires no stored descendants",
+	)
+
 	// errWinnerInputNotReclaimed indicates that a winner transaction still does
 	// not own one of its wallet-owned inputs after invalidation completed.
 	errWinnerInputNotReclaimed = errors.New("winner input was not reclaimed")
 )
 
-// ApplyTxReplacementParams describes one unconfirmed replacement winner and the
-// direct victim transactions that it invalidates.
-type ApplyTxReplacementParams struct {
-	// WalletID scopes the replacement flow to one wallet.
-	WalletID uint32
-
-	// ReplacementTxid identifies the live unconfirmed transaction
-	// that wins the direct mempool conflict and must own the
-	// spent-input edges after the flow completes.
-	ReplacementTxid chainhash.Hash
-
-	// ReplacedTxids lists the complete direct victim set for the
-	// conflict. Each listed tx must currently spend at least one
-	// wallet-owned input that the winner also spends. Descendants are
-	// discovered automatically from the stored spend graph.
-	ReplacedTxids []chainhash.Hash
-}
-
-// ApplyTxFailureParams describes a conflict winner and one or more direct loser
-// transactions that should become failed.
-type ApplyTxFailureParams struct {
-	// WalletID scopes the failure flow to one wallet.
-	WalletID uint32
-
-	// ConflictingTxid identifies the transaction that wins the
-	// conflict and must own the affected spent-input edges after
-	// the flow completes.
-	ConflictingTxid chainhash.Hash
-
-	// FailedTxids lists the complete direct loser set. Each listed tx
-	// must currently spend at least one wallet-owned input that the
-	// winner also spends. Descendants are discovered automatically
-	// from the stored spend graph.
-	FailedTxids []chainhash.Hash
-}
-
-// OrphanTxChainParams identifies orphaned coinbase roots whose descendants must
-// be marked failed.
-type OrphanTxChainParams struct {
-	// WalletID scopes the orphan propagation to one wallet.
-	WalletID uint32
-
-	// Txids lists the already-orphaned coinbase transactions that
-	// form the roots of the invalidation walk.
-	Txids []chainhash.Hash
-}
-
-// ReconfirmOrphanedCoinbaseParams identifies one orphaned coinbase transaction
-// that should be restored to the best chain.
-//
-// This is intentionally a root-only transition. Coinbase spends require
-// maturity, so descendant replay during reconfirmation is treated as out of
-// scope for the supported SQL model.
-type ReconfirmOrphanedCoinbaseParams struct {
-	// WalletID scopes the reconfirmation to one wallet.
-	WalletID uint32
-
-	// Txid identifies the orphaned coinbase transaction to restore.
-	Txid chainhash.Hash
-
-	// Block identifies the block that now confirms the coinbase transaction.
-	Block Block
-}
-
-// txChainMeta stores the transaction facts needed by the replacement and
+// txGraphMeta stores the transaction facts needed by the replacement and
 // invalidation flows without exposing backend-specific sqlc row types.
-type txChainMeta struct {
+type txGraphMeta struct {
 	// ID is the wallet-scoped transaction row ID.
 	ID int64
 
@@ -189,9 +132,9 @@ type txChainMeta struct {
 	IsCoinbase bool
 }
 
-// txChainHooks provides the backend-specific operations needed by the common
+// txGraphHooks provides the backend-specific operations needed by the common
 // graph-walk and status-update logic.
-type txChainHooks struct {
+type txGraphHooks struct {
 	// ListChildren returns the direct child transaction IDs of one parent.
 	ListChildren func(context.Context, int64) ([]int64, error)
 
@@ -215,22 +158,22 @@ type txChainHooks struct {
 	// direct loser set for a winner transaction by examining the
 	// wallet-owned inputs in conflict with it.
 	ListDirectConflictRootsByTxid func(context.Context,
-		chainhash.Hash) ([]txChainMeta, error)
+		chainhash.Hash) ([]txGraphMeta, error)
 }
 
-// buildTxChainHooks wires backend-specific replacement callbacks
-// into the shared txChainHooks container.
-func buildTxChainHooks(
+// buildTxGraphHooks wires backend-specific replacement callbacks
+// into the shared txGraphHooks container.
+func buildTxGraphHooks(
 	listChildren func(context.Context, int64) ([]int64, error),
 	clearSpentByTx func(context.Context, int64) error,
 	updateStatus func(context.Context, TxStatus, []int64) error,
 	reclaimInputsByTxid func(context.Context, chainhash.Hash, int64) error,
 	recordReplacementEdge func(context.Context, int64, int64) error,
 	listDirectConflictRootsByTxid func(context.Context,
-		chainhash.Hash) ([]txChainMeta, error),
-) txChainHooks {
+		chainhash.Hash) ([]txGraphMeta, error),
+) txGraphHooks {
 
-	return txChainHooks{
+	return txGraphHooks{
 		ListChildren:                  listChildren,
 		ClearSpentByTx:                clearSpentByTx,
 		UpdateStatus:                  updateStatus,
@@ -240,13 +183,53 @@ func buildTxChainHooks(
 	}
 }
 
+// buildTxGraphHooksFor binds one backend query handle and wallet scope to the
+// shared graph-hook container.
+func buildTxGraphHooksFor[Q any](qtx Q, walletID uint32,
+	listChildren func(context.Context, Q, uint32, int64) ([]int64, error),
+	clearSpentByTx func(context.Context, Q, uint32, int64) error,
+	updateStatus func(context.Context, Q, uint32, TxStatus, []int64) error,
+	reclaimInputsByTxid func(
+		context.Context, Q, uint32, chainhash.Hash, int64,
+	) error,
+	recordReplacementEdge func(context.Context, Q, uint32, int64, int64) error,
+	listDirectConflictRootsByTxid func(
+		context.Context, Q, uint32, chainhash.Hash,
+	) ([]txGraphMeta, error)) txGraphHooks {
+
+	return buildTxGraphHooks(
+		func(ctx context.Context, parentID int64) ([]int64, error) {
+			return listChildren(ctx, qtx, walletID, parentID)
+		},
+		func(ctx context.Context, txID int64) error {
+			return clearSpentByTx(ctx, qtx, walletID, txID)
+		},
+		func(ctx context.Context, status TxStatus, txIDs []int64) error {
+			return updateStatus(ctx, qtx, walletID, status, txIDs)
+		},
+		func(ctx context.Context, txid chainhash.Hash, txID int64) error {
+			return reclaimInputsByTxid(ctx, qtx, walletID, txid, txID)
+		},
+		func(ctx context.Context, replacedTxID int64,
+			replacementTxID int64) error {
+
+			return recordReplacementEdge(
+				ctx, qtx, walletID, replacedTxID, replacementTxID,
+			)
+		},
+		func(ctx context.Context, txid chainhash.Hash) ([]txGraphMeta, error) {
+			return listDirectConflictRootsByTxid(ctx, qtx, walletID, txid)
+		},
+	)
+}
+
 // applyTxReplacementCommon executes the shared replacement flow once the caller
 // has bound backend-specific metadata and query hooks.
 func applyTxReplacementCommon(ctx context.Context,
 	params ApplyTxReplacementParams,
-	loadWinner func(context.Context, chainhash.Hash) (txChainMeta, error),
-	loadVictims func(context.Context, []chainhash.Hash) ([]txChainMeta, error),
-	hooks txChainHooks) error {
+	loadWinner func(context.Context, chainhash.Hash) (txGraphMeta, error),
+	loadVictims func(context.Context, []chainhash.Hash) ([]txGraphMeta, error),
+	hooks txGraphHooks) error {
 
 	winner, err := loadWinner(ctx, params.ReplacementTxid)
 	if err != nil {
@@ -280,7 +263,7 @@ func applyTxReplacementCommon(ctx context.Context,
 		}
 	}
 
-	err = applyTxChainInvalidation(
+	err = applyTxGraphInvalidation(
 		ctx, txIDsFromMetas(victims), TxStatusReplaced, hooks,
 	)
 	if err != nil {
@@ -295,9 +278,9 @@ func applyTxReplacementCommon(ctx context.Context,
 // applyTxFailureCommon executes the shared direct-conflict failure flow once
 // the caller has bound backend-specific metadata and query hooks.
 func applyTxFailureCommon(ctx context.Context, params ApplyTxFailureParams,
-	loadWinner func(context.Context, chainhash.Hash) (txChainMeta, error),
-	loadRoots func(context.Context, []chainhash.Hash) ([]txChainMeta, error),
-	hooks txChainHooks) error {
+	loadWinner func(context.Context, chainhash.Hash) (txGraphMeta, error),
+	loadRoots func(context.Context, []chainhash.Hash) ([]txGraphMeta, error),
+	hooks txGraphHooks) error {
 
 	winner, err := loadWinner(ctx, params.ConflictingTxid)
 	if err != nil {
@@ -324,7 +307,7 @@ func applyTxFailureCommon(ctx context.Context, params ApplyTxFailureParams,
 		return err
 	}
 
-	err = applyTxChainInvalidation(
+	err = applyTxGraphInvalidation(
 		ctx, txIDsFromMetas(roots), TxStatusFailed, hooks,
 	)
 	if err != nil {
@@ -337,7 +320,7 @@ func applyTxFailureCommon(ctx context.Context, params ApplyTxFailureParams,
 }
 
 // validateReplacementPlan checks the root invariants for a replacement flow.
-func validateReplacementPlan(winner txChainMeta, victims []txChainMeta) error {
+func validateReplacementPlan(winner txGraphMeta, victims []txGraphMeta) error {
 	if len(victims) == 0 {
 		return errReplacementRequiresVictims
 	}
@@ -363,7 +346,7 @@ func validateReplacementPlan(winner txChainMeta, victims []txChainMeta) error {
 }
 
 // validateFailurePlan checks the root invariants for a direct conflict failure.
-func validateFailurePlan(winner txChainMeta, failed []txChainMeta) error {
+func validateFailurePlan(winner txGraphMeta, failed []txGraphMeta) error {
 	if len(failed) == 0 {
 		return errFailureRequiresRoots
 	}
@@ -391,9 +374,9 @@ func validateFailurePlan(winner txChainMeta, failed []txChainMeta) error {
 // validateDirectConflictRoots ensures that the caller supplied exactly the live
 // direct loser set for the winner's wallet-owned inputs.
 func validateDirectConflictRoots(ctx context.Context, winnerTxid chainhash.Hash,
-	roots []txChainMeta,
+	roots []txGraphMeta,
 	listDirectConflictRootsByTxid func(context.Context,
-		chainhash.Hash) ([]txChainMeta, error),
+		chainhash.Hash) ([]txGraphMeta, error),
 	rootErr error, missingRootErr error) error {
 
 	directRoots, err := listDirectConflictRootsByTxid(ctx, winnerTxid)
@@ -402,7 +385,7 @@ func validateDirectConflictRoots(ctx context.Context, winnerTxid chainhash.Hash,
 			winnerTxid, err)
 	}
 
-	directRootSet := make(map[int64]txChainMeta, len(directRoots))
+	directRootSet := make(map[int64]txGraphMeta, len(directRoots))
 	for _, directRoot := range directRoots {
 		directRootSet[directRoot.ID] = directRoot
 	}
@@ -431,26 +414,26 @@ func validateDirectConflictRoots(ctx context.Context, winnerTxid chainhash.Hash,
 }
 
 // buildDirectConflictMeta converts one backend row into the shared
-// txChainMeta shape and filters out rows that cannot be direct live conflict
+// txGraphMeta shape and filters out rows that cannot be direct live conflict
 // roots.
 func buildDirectConflictMeta(id int64, txHashBytes []byte, statusCode int64,
-	hasBlock bool, isCoinbase bool) (txChainMeta, bool, error) {
+	hasBlock bool, isCoinbase bool) (txGraphMeta, bool, error) {
 
 	status, err := parseTxStatus(statusCode)
 	if err != nil {
-		return txChainMeta{}, false, err
+		return txGraphMeta{}, false, err
 	}
 
 	if hasBlock || isCoinbase || !isLiveTxStatus(status) {
-		return txChainMeta{}, false, nil
+		return txGraphMeta{}, false, nil
 	}
 
 	txHash, err := chainhash.NewHash(txHashBytes)
 	if err != nil {
-		return txChainMeta{}, false, fmt.Errorf("transaction hash: %w", err)
+		return txGraphMeta{}, false, fmt.Errorf("transaction hash: %w", err)
 	}
 
-	return txChainMeta{
+	return txGraphMeta{
 		ID:         id,
 		Txid:       *txHash,
 		Status:     status,
@@ -474,7 +457,7 @@ func txSpendsAnyOutpoint(tx *wire.MsgTx,
 }
 
 // validateOrphanPlan checks the root invariants for orphan descendant failure.
-func validateOrphanPlan(roots []txChainMeta) error {
+func validateOrphanPlan(roots []txGraphMeta) error {
 	if len(roots) == 0 {
 		return errOrphanRootInvalid
 	}
@@ -490,11 +473,26 @@ func validateOrphanPlan(roots []txChainMeta) error {
 }
 
 // validateCoinbaseReconfirmation checks that the row can be restored from the
-// orphaned coinbase state.
-func validateCoinbaseReconfirmation(meta txChainMeta) error {
+// orphaned coinbase state without exposing an already-stored descendant branch
+// as live again.
+func validateCoinbaseReconfirmation(ctx context.Context, meta txGraphMeta,
+	listDescendantTxIDs func(context.Context,
+		chainhash.Hash) ([]int64, error)) error {
+
 	if !meta.IsCoinbase || meta.HasBlock || meta.Status != TxStatusOrphaned {
 		return fmt.Errorf("transaction %s: %w", meta.Txid,
 			errCoinbaseReconfirmationInvalid)
+	}
+
+	descendantIDs, err := listDescendantTxIDs(ctx, meta.Txid)
+	if err != nil {
+		return fmt.Errorf("list descendants for transaction %s: %w",
+			meta.Txid, err)
+	}
+
+	if len(descendantIDs) > 0 {
+		return fmt.Errorf("transaction %s: %w", meta.Txid,
+			errCoinbaseReconfirmationHasDescendants)
 	}
 
 	return nil
@@ -502,7 +500,7 @@ func validateCoinbaseReconfirmation(meta txChainMeta) error {
 
 // validateReplacementWinner checks that the replacement winner remains a live
 // unconfirmed regular transaction that can safely reclaim wallet-owned inputs.
-func validateReplacementWinner(meta txChainMeta) error {
+func validateReplacementWinner(meta txGraphMeta) error {
 	if meta.IsCoinbase || meta.HasBlock || !isLiveTxStatus(meta.Status) {
 		return fmt.Errorf("transaction %s: %w", meta.Txid,
 			errReplacementWinnerInvalid)
@@ -513,7 +511,7 @@ func validateReplacementWinner(meta txChainMeta) error {
 
 // validateReplacementVictim checks that a replacement victim is still a
 // published unconfirmed regular transaction.
-func validateReplacementVictim(meta txChainMeta) error {
+func validateReplacementVictim(meta txGraphMeta) error {
 	if meta.IsCoinbase || meta.HasBlock || meta.Status != TxStatusPublished {
 		return fmt.Errorf("transaction %s: %w", meta.Txid,
 			errReplacementVictimInvalid)
@@ -524,7 +522,7 @@ func validateReplacementVictim(meta txChainMeta) error {
 
 // validateFailureWinner checks that the conflict winner remains eligible to
 // reclaim wallet-owned inputs after losers are failed.
-func validateFailureWinner(meta txChainMeta) error {
+func validateFailureWinner(meta txGraphMeta) error {
 	if meta.IsCoinbase || !isLiveTxStatus(meta.Status) {
 		return fmt.Errorf("transaction %s: %w", meta.Txid,
 			errFailureWinnerInvalid)
@@ -535,7 +533,7 @@ func validateFailureWinner(meta txChainMeta) error {
 
 // validateFailureRoot checks that a direct conflict loser is still an
 // unconfirmed live regular transaction.
-func validateFailureRoot(meta txChainMeta) error {
+func validateFailureRoot(meta txGraphMeta) error {
 	if meta.IsCoinbase || meta.HasBlock || !isLiveTxStatus(meta.Status) {
 		return fmt.Errorf("transaction %s: %w", meta.Txid,
 			errFailureRootInvalid)
@@ -546,7 +544,7 @@ func validateFailureRoot(meta txChainMeta) error {
 
 // validateOrphanRoot checks that orphan propagation starts from an already
 // orphaned coinbase root.
-func validateOrphanRoot(meta txChainMeta) error {
+func validateOrphanRoot(meta txGraphMeta) error {
 	if !meta.IsCoinbase || meta.HasBlock || meta.Status != TxStatusOrphaned {
 		return fmt.Errorf("transaction %s: %w", meta.Txid,
 			errOrphanRootInvalid)
@@ -555,12 +553,12 @@ func validateOrphanRoot(meta txChainMeta) error {
 	return nil
 }
 
-// collectTxChainDescendantIDs performs an iterative breadth-first walk over the
+// collectTxGraphDescendantIDs performs an iterative breadth-first walk over the
 // spend graph and returns each discovered descendant exactly once.
 //
 // The queue-based traversal never recurses, so even very deep invalidation
 // chains do not risk call-stack growth.
-func collectTxChainDescendantIDs(ctx context.Context, rootIDs []int64,
+func collectTxGraphDescendantIDs(ctx context.Context, rootIDs []int64,
 	listChildren func(context.Context, int64) ([]int64, error),
 ) ([]int64, error) {
 
@@ -605,12 +603,12 @@ func collectTxChainDescendantIDs(ctx context.Context, rootIDs []int64,
 	return descendants, nil
 }
 
-// applyTxChainInvalidation clears spent-input edges for the provided roots and
+// applyTxGraphInvalidation clears spent-input edges for the provided roots and
 // their descendants, then applies the requested terminal statuses.
-func applyTxChainInvalidation(ctx context.Context, rootIDs []int64,
-	rootStatus TxStatus, hooks txChainHooks) error {
+func applyTxGraphInvalidation(ctx context.Context, rootIDs []int64,
+	rootStatus TxStatus, hooks txGraphHooks) error {
 
-	descendants, err := collectTxChainDescendantIDs(
+	descendants, err := collectTxGraphDescendantIDs(
 		ctx, rootIDs, hooks.ListChildren,
 	)
 	if err != nil {
@@ -649,7 +647,7 @@ func applyTxChainInvalidation(ctx context.Context, rootIDs []int64,
 
 // txIDsFromMetas extracts the wallet-scoped row IDs needed by batch update
 // helpers from the shared metadata slice.
-func txIDsFromMetas(metas []txChainMeta) []int64 {
+func txIDsFromMetas(metas []txGraphMeta) []int64 {
 	ids := make([]int64, 0, len(metas))
 	seen := make(map[int64]struct{}, len(metas))
 

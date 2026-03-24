@@ -176,7 +176,7 @@ func (s *SqliteStore) ListTxns(ctx context.Context,
 func (s *SqliteStore) listUnminedTxnsSqlite(ctx context.Context,
 	walletID uint32) ([]TxInfo, error) {
 
-	rows, err := s.queries.ListUnminedTransactions(ctx, int64(walletID))
+	rows, err := s.queries.ListBlocklessTransactions(ctx, int64(walletID))
 	if err != nil {
 		return nil, fmt.Errorf("list unmined transactions: %w", err)
 	}
@@ -308,7 +308,7 @@ func (s *SqliteStore) DeleteTx(ctx context.Context,
 func ensureDeleteLeafSqlite(ctx context.Context, qtx *sqlcsqlite.Queries,
 	walletID uint32, txHash chainhash.Hash, txID int64) error {
 
-	rows, err := qtx.ListUnminedTransactions(ctx, int64(walletID))
+	rows, err := qtx.ListBlocklessTransactions(ctx, int64(walletID))
 	if err != nil {
 		return fmt.Errorf("list live transactions: %w", err)
 	}
@@ -420,8 +420,8 @@ func (s *SqliteStore) RollbackToBlock(ctx context.Context,
 		err = applyRollbackDescendantInvalidation(
 			ctx,
 			rootHashesByWallet,
-			qtx.ListUnminedTransactions,
-			func(row sqlcsqlite.ListUnminedTransactionsRow) (
+			qtx.ListBlocklessTransactions,
+			func(row sqlcsqlite.ListBlocklessTransactionsRow) (
 				int64, []byte, []byte,
 			) {
 

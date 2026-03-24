@@ -532,7 +532,7 @@ func TestApplyTxFailure(t *testing.T) {
 
 	insertConflictingRegularTx(
 		t, store, walletID, winnerTx, time.Unix(1710003030, 0),
-		db.TxStatusPublished, []db.CreditData{{Index: 0}},
+		db.TxStatusPublished, walletCredits(0),
 	)
 
 	// Act: Apply the failure flow against the direct loser root.
@@ -1070,6 +1070,122 @@ func TestRollbackToBlockInvalidatesOrphanedCoinbaseDescendants(t *testing.T) {
 	require.ErrorIs(t, err, db.ErrUtxoNotFound)
 }
 
+// TestApplyTxReplacementRejectsMissingWinner verifies that replacement flows
+// fail when the winner transaction cannot be loaded.
+func TestApplyTxReplacementRejectsMissingWinner(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-replacement-missing-winner")
+
+	err := store.ApplyTxReplacement(t.Context(), db.ApplyTxReplacementParams{
+		WalletID:        walletID,
+		ReplacementTxid: RandomHash(),
+		ReplacedTxids:   []chainhash.Hash{RandomHash()},
+	})
+	require.ErrorIs(t, err, db.ErrTxNotFound)
+}
+
+// TestApplyTxReplacementRejectsMissingVictim verifies that replacement flows
+// fail when any requested victim transaction cannot be loaded.
+func TestApplyTxReplacementRejectsMissingVictim(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-replacement-missing-victim")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	winnerTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 4000, PkScript: addr.ScriptPubKey}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       winnerTx,
+		Received: time.Unix(1710003200, 0),
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	err = store.ApplyTxReplacement(t.Context(), db.ApplyTxReplacementParams{
+		WalletID:        walletID,
+		ReplacementTxid: winnerTx.TxHash(),
+		ReplacedTxids:   []chainhash.Hash{RandomHash()},
+	})
+	require.ErrorIs(t, err, db.ErrTxNotFound)
+}
+
+// TestApplyTxReplacementRejectsCorruptedConflictCandidate verifies that direct
+// root discovery fails loudly when one conflicting candidate cannot be decoded.
+func TestApplyTxReplacementRejectsCorruptedConflictCandidate(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-corrupted-replacement-candidate")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	tipBlock := CreateBlockFixture(t, queries, 310)
+	err := store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+		WalletID: walletID,
+		SyncedTo: &tipBlock,
+	})
+	require.NoError(t, err)
+
+	fundingBlock := CreateBlockFixture(t, queries, 300)
+	fundingTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{
+			Value:    9000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       fundingTx,
+		Received: time.Unix(1710003210, 0),
+		Block:    &fundingBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	fundingOutPoint := wire.OutPoint{Hash: fundingTx.TxHash(), Index: 0}
+	victimTx := newRegularTx(
+		[]wire.OutPoint{fundingOutPoint},
+		[]*wire.TxOut{{Value: 8000, PkScript: addr.ScriptPubKey}},
+	)
+	insertConflictingRegularTx(
+		t, store, walletID, victimTx, time.Unix(1710003220, 0),
+		db.TxStatusPublished, walletCredits(0),
+	)
+
+	winnerTx := newRegularTx(
+		[]wire.OutPoint{fundingOutPoint},
+		[]*wire.TxOut{{Value: 7900, PkScript: []byte{0x51}}},
+	)
+	insertConflictingRegularTx(
+		t, store, walletID, winnerTx, time.Unix(1710003230, 0),
+		db.TxStatusPublished, walletCredits(),
+	)
+
+	corruptTransactionRawTx(t, store, walletID, victimTx.TxHash(), []byte{})
+
+	err = store.ApplyTxReplacement(t.Context(), db.ApplyTxReplacementParams{
+		WalletID:        walletID,
+		ReplacementTxid: winnerTx.TxHash(),
+		ReplacedTxids:   []chainhash.Hash{victimTx.TxHash()},
+	})
+	require.ErrorContains(t, err, "deserialize transaction")
+}
+
 // TestRollbackToBlockAndReconfirmOrphanedCoinbase verifies the supported
 // root-only rollback and reconfirmation flow for an immature coinbase.
 //
@@ -1191,6 +1307,122 @@ func TestRollbackToBlockAndReconfirmOrphanedCoinbase(t *testing.T) {
 	require.Equal(t, reconfirmBlock.Height, restoredCoinbase.Height)
 }
 
+// TestReconfirmOrphanedCoinbaseRejectsStoredDescendants verifies that the
+// root-only reconfirmation path rejects an orphaned coinbase once a descendant
+// branch has been recorded and later invalidated by rollback.
+func TestReconfirmOrphanedCoinbaseRejectsStoredDescendants(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-reconfirm-stored-descendants")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+
+	_ = CreateBlockFixture(t, queries, 99)
+	tipBlock := CreateBlockFixture(t, queries, 205)
+	err := store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+		WalletID: walletID,
+		SyncedTo: &tipBlock,
+	})
+	require.NoError(t, err)
+
+	coinbaseBlock := CreateBlockFixture(t, queries, 100)
+	coinbaseTx := newCoinbaseTx([]*wire.TxOut{{
+		Value:    50000,
+		PkScript: addr.ScriptPubKey,
+	}})
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       coinbaseTx,
+		Received: time.Unix(1710004250, 0),
+		Block:    &coinbaseBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	coinbaseOutPoint := wire.OutPoint{Hash: coinbaseTx.TxHash(), Index: 0}
+	childBlock := CreateBlockFixture(t, queries, 201)
+	childTx := newRegularTx(
+		[]wire.OutPoint{coinbaseOutPoint},
+		[]*wire.TxOut{{Value: 30000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       childTx,
+		Received: time.Unix(1710004260, 0),
+		Block:    &childBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	childOutPoint := wire.OutPoint{Hash: childTx.TxHash(), Index: 0}
+	descendantBlock := CreateBlockFixture(t, queries, 202)
+	descendantTx := newRegularTx(
+		[]wire.OutPoint{childOutPoint},
+		[]*wire.TxOut{{Value: 20000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       descendantTx,
+		Received: time.Unix(1710004270, 0),
+		Block:    &descendantBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	err = store.RollbackToBlock(t.Context(), coinbaseBlock.Height)
+	require.NoError(t, err)
+
+	reconfirmBlock := CreateBlockFixture(t, queries, 101)
+	err = store.ReconfirmOrphanedCoinbase(
+		t.Context(), db.ReconfirmOrphanedCoinbaseParams{
+			WalletID: walletID,
+			Txid:     coinbaseTx.TxHash(),
+			Block:    reconfirmBlock,
+		},
+	)
+	require.ErrorContains(
+		t, err, "coinbase reconfirmation requires no stored descendants",
+	)
+
+	coinbaseInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     coinbaseTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusOrphaned, coinbaseInfo.Status)
+	require.Nil(t, coinbaseInfo.Block)
+
+	childInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     childTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusFailed, childInfo.Status)
+	require.Nil(t, childInfo.Block)
+
+	descendantInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     descendantTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusFailed, descendantInfo.Status)
+	require.Nil(t, descendantInfo.Block)
+
+	_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: coinbaseOutPoint,
+	})
+	require.ErrorIs(t, err, db.ErrUtxoNotFound)
+}
+
 // TestReconfirmOrphanedCoinbaseRejectsMismatchedExistingBlock verifies that
 // reconfirmation fails when the target height is already occupied by different
 // block metadata.
@@ -1279,6 +1511,368 @@ func TestReconfirmOrphanedCoinbaseRejectsMismatchedExistingBlock(t *testing.T) {
 	require.Nil(t, coinbaseInfo.Block)
 }
 
+// TestOrphanTxGraph verifies the direct orphan wrapper for already-orphaned
+// coinbase roots with still-live descendants.
+func TestOrphanTxGraph(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-direct-orphan-chain")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	coinbaseBlock := CreateBlockFixture(t, queries, 300)
+
+	coinbaseTx := newCoinbaseTx([]*wire.TxOut{{
+		Value:    50000,
+		PkScript: addr.ScriptPubKey,
+	}})
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       coinbaseTx,
+		Received: time.Unix(1710004400, 0),
+		Block:    &coinbaseBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	childTx := newRegularTx(
+		[]wire.OutPoint{{Hash: coinbaseTx.TxHash(), Index: 0}},
+		[]*wire.TxOut{{
+			Value:    49000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       childTx,
+		Received: time.Unix(1710004410, 0),
+		Status:   db.TxStatusPending,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	descendantTx := newRegularTx(
+		[]wire.OutPoint{{Hash: childTx.TxHash(), Index: 0}},
+		[]*wire.TxOut{{
+			Value:    48000,
+			PkScript: []byte{0x51},
+		}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       descendantTx,
+		Received: time.Unix(1710004420, 0),
+		Status:   db.TxStatusPending,
+	})
+	require.NoError(t, err)
+
+	forceOrphanedCoinbaseTx(t, store, walletID, coinbaseTx.TxHash())
+
+	err = store.OrphanTxGraph(t.Context(), db.OrphanTxGraphParams{
+		WalletID: walletID,
+		Txids:    []chainhash.Hash{coinbaseTx.TxHash()},
+	})
+	require.NoError(t, err)
+
+	coinbaseInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     coinbaseTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusOrphaned, coinbaseInfo.Status)
+	require.Nil(t, coinbaseInfo.Block)
+
+	childInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     childTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusFailed, childInfo.Status)
+
+	descendantInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     descendantTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusFailed, descendantInfo.Status)
+
+	_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: wire.OutPoint{Hash: childTx.TxHash(), Index: 0},
+	})
+	require.ErrorIs(t, err, db.ErrUtxoNotFound)
+}
+
+// TestOrphanTxGraphRejectsLiveRoot verifies that orphan propagation requires an
+// already-orphaned coinbase root.
+func TestOrphanTxGraphRejectsLiveRoot(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-orphan-live-root")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	liveTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 5000, PkScript: addr.ScriptPubKey}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       liveTx,
+		Received: time.Unix(1710004500, 0),
+		Status:   db.TxStatusPending,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	err = store.OrphanTxGraph(t.Context(), db.OrphanTxGraphParams{
+		WalletID: walletID,
+		Txids:    []chainhash.Hash{liveTx.TxHash()},
+	})
+	require.ErrorContains(t, err, "orphan root must be an orphaned coinbase transaction")
+
+	info, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     liveTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPending, info.Status)
+}
+
+// TestOrphanTxGraphRejectsMissingRoot verifies the direct wrapper's not-found
+// path when one requested orphan root does not exist.
+func TestOrphanTxGraphRejectsMissingRoot(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-orphan-missing-root")
+
+	err := store.OrphanTxGraph(t.Context(), db.OrphanTxGraphParams{
+		WalletID: walletID,
+		Txids:    []chainhash.Hash{RandomHash()},
+	})
+	require.ErrorIs(t, err, db.ErrTxNotFound)
+}
+
+// TestApplyTxReplacementRejectsCorruptedWinnerRawTx verifies that direct-root
+// validation fails loudly when the stored winner transaction cannot be decoded.
+func TestApplyTxReplacementRejectsCorruptedWinnerRawTx(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-replacement-corrupted-winner")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	tipBlock := CreateBlockFixture(t, queries, 305)
+	err := store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+		WalletID: walletID,
+		SyncedTo: &tipBlock,
+	})
+	require.NoError(t, err)
+
+	fundingBlock := CreateBlockFixture(t, queries, 300)
+	fundingTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{
+			Value:    8000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       fundingTx,
+		Received: time.Unix(1710004650, 0),
+		Block:    &fundingBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	fundingOutPoint := wire.OutPoint{Hash: fundingTx.TxHash(), Index: 0}
+	victimTx := newRegularTx(
+		[]wire.OutPoint{fundingOutPoint},
+		[]*wire.TxOut{{
+			Value:    7000,
+			PkScript: addr.ScriptPubKey,
+		}},
+	)
+	insertConflictingRegularTx(
+		t, store, walletID, victimTx, time.Unix(1710004660, 0),
+		db.TxStatusPublished, walletCredits(0),
+	)
+
+	winnerTx := newRegularTx(
+		[]wire.OutPoint{fundingOutPoint},
+		[]*wire.TxOut{{
+			Value:    6900,
+			PkScript: []byte{0x51},
+		}},
+	)
+	insertConflictingRegularTx(
+		t, store, walletID, winnerTx, time.Unix(1710004670, 0),
+		db.TxStatusPublished, walletCredits(),
+	)
+
+	corruptTransactionRawTx(t, store, walletID, winnerTx.TxHash(), []byte{})
+
+	err = store.ApplyTxReplacement(t.Context(), db.ApplyTxReplacementParams{
+		WalletID:        walletID,
+		ReplacementTxid: winnerTx.TxHash(),
+		ReplacedTxids:   []chainhash.Hash{victimTx.TxHash()},
+	})
+	require.ErrorContains(t, err, "deserialize transaction")
+}
+
+// TestApplyTxReplacementRejectsCorruptedWinnerStatus verifies that replacement
+// flows reject a stored winner row whose status no longer decodes.
+// TestApplyTxReplacementRejectsCorruptedWinnerStatus verifies that replacement
+// validation fails when the stored winner status no longer decodes.
+func TestApplyTxReplacementRejectsCorruptedWinnerStatus(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-replacement-corrupted-status")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	winnerTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 4000, PkScript: addr.ScriptPubKey}},
+	)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       winnerTx,
+		Received: time.Unix(1710004680, 0),
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	corruptTransactionStatus(t, store, walletID, winnerTx.TxHash(), 99)
+
+	err = store.ApplyTxReplacement(t.Context(), db.ApplyTxReplacementParams{
+		WalletID:        walletID,
+		ReplacementTxid: winnerTx.TxHash(),
+		ReplacedTxids:   []chainhash.Hash{RandomHash()},
+	})
+	require.ErrorContains(t, err, "invalid transaction status")
+}
+
+// TestApplyTxReplacementRejectsLargeWinnerInputIndex verifies that direct-root
+// discovery rejects winner inputs that exceed the signed SQL outpoint range.
+func TestApplyTxReplacementRejectsLargeWinnerInputIndex(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-replacement-large-winner-index")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	victimTx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 2000, PkScript: []byte{0x51}}},
+	)
+	insertConflictingRegularTx(
+		t, store, walletID, victimTx, time.Unix(1710004690, 0),
+		db.TxStatusPublished, walletCredits(),
+	)
+
+	winnerTx := newRegularTx(
+		[]wire.OutPoint{{Hash: randomHash(), Index: ^uint32(0)}},
+		[]*wire.TxOut{{Value: 1900, PkScript: []byte{0x52}}},
+	)
+	insertConflictingRegularTx(
+		t, store, walletID, winnerTx, time.Unix(1710004700, 0),
+		db.TxStatusPublished, walletCredits(),
+	)
+
+	err := store.ApplyTxReplacement(t.Context(), db.ApplyTxReplacementParams{
+		WalletID:        walletID,
+		ReplacementTxid: winnerTx.TxHash(),
+		ReplacedTxids:   []chainhash.Hash{victimTx.TxHash()},
+	})
+	require.ErrorContains(t, err, "convert input outpoint index 0")
+}
+
+// TestReconfirmOrphanedCoinbaseRejectsMissingTx verifies the direct wrapper's
+// not-found path before any block mutation occurs.
+func TestReconfirmOrphanedCoinbaseRejectsMissingTx(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-reconfirm-missing")
+
+	err := store.ReconfirmOrphanedCoinbase(
+		t.Context(), db.ReconfirmOrphanedCoinbaseParams{
+			WalletID: walletID,
+			Txid:     RandomHash(),
+			Block:    NewBlockFixture(301),
+		},
+	)
+	require.ErrorIs(t, err, db.ErrTxNotFound)
+}
+
+// TestReconfirmOrphanedCoinbaseRejectsLiveTx verifies that reconfirmation only
+// accepts already-orphaned coinbase rows.
+func TestReconfirmOrphanedCoinbaseRejectsLiveTx(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-reconfirm-live-tx")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	coinbaseBlock := CreateBlockFixture(t, queries, 302)
+	coinbaseTx := newCoinbaseTx([]*wire.TxOut{{
+		Value:    50000,
+		PkScript: addr.ScriptPubKey,
+	}})
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       coinbaseTx,
+		Received: time.Unix(1710004600, 0),
+		Block:    &coinbaseBlock,
+		Status:   db.TxStatusPublished,
+		Credits:  walletCredits(0),
+	})
+	require.NoError(t, err)
+
+	err = store.ReconfirmOrphanedCoinbase(
+		t.Context(), db.ReconfirmOrphanedCoinbaseParams{
+			WalletID: walletID,
+			Txid:     coinbaseTx.TxHash(),
+			Block:    NewBlockFixture(303),
+		},
+	)
+	require.ErrorContains(t, err, "coinbase reconfirmation requires an orphaned coinbase transaction")
+
+	info, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     coinbaseTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPublished, info.Status)
+	require.NotNil(t, info.Block)
+	require.Equal(t, coinbaseBlock.Height, info.Block.Height)
+}
+
+// walletCredits builds the credited-output map expected by CreateTx helpers.
 func walletCredits(indexes ...uint32) map[uint32]btcutil.Address {
 	credits := make(map[uint32]btcutil.Address, len(indexes))
 	for _, index := range indexes {

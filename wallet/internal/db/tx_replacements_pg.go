@@ -25,16 +25,16 @@ func (s *PostgresStore) ApplyTxReplacement(ctx context.Context,
 		return applyTxReplacementCommon(
 			ctx, params,
 			func(ctx context.Context,
-				txid chainhash.Hash) (txChainMeta, error) {
+				txid chainhash.Hash) (txGraphMeta, error) {
 
-				return loadTxChainMetaPg(ctx, qtx, params.WalletID, txid)
+				return loadTxGraphMetaPg(ctx, qtx, params.WalletID, txid)
 			},
 			func(ctx context.Context,
-				txids []chainhash.Hash) ([]txChainMeta, error) {
+				txids []chainhash.Hash) ([]txGraphMeta, error) {
 
-				return loadTxChainMetasPg(ctx, qtx, params.WalletID, txids)
+				return loadTxGraphMetasPg(ctx, qtx, params.WalletID, txids)
 			},
-			buildTxChainHooksPg(qtx, params.WalletID),
+			buildTxGraphHooksPg(qtx, params.WalletID),
 		)
 	})
 }
@@ -51,27 +51,27 @@ func (s *PostgresStore) ApplyTxFailure(ctx context.Context,
 		return applyTxFailureCommon(
 			ctx, params,
 			func(ctx context.Context,
-				txid chainhash.Hash) (txChainMeta, error) {
+				txid chainhash.Hash) (txGraphMeta, error) {
 
-				return loadTxChainMetaPg(ctx, qtx, params.WalletID, txid)
+				return loadTxGraphMetaPg(ctx, qtx, params.WalletID, txid)
 			},
 			func(ctx context.Context,
-				txids []chainhash.Hash) ([]txChainMeta, error) {
+				txids []chainhash.Hash) ([]txGraphMeta, error) {
 
-				return loadTxChainMetasPg(ctx, qtx, params.WalletID, txids)
+				return loadTxGraphMetasPg(ctx, qtx, params.WalletID, txids)
 			},
-			buildTxChainHooksPg(qtx, params.WalletID),
+			buildTxGraphHooksPg(qtx, params.WalletID),
 		)
 	})
 }
 
-// OrphanTxChain recursively fails every descendant of the provided orphaned
+// OrphanTxGraph recursively fails every descendant of the provided orphaned
 // coinbase roots while keeping the roots themselves in the orphaned state.
-func (s *PostgresStore) OrphanTxChain(ctx context.Context,
-	params OrphanTxChainParams) error {
+func (s *PostgresStore) OrphanTxGraph(ctx context.Context,
+	params OrphanTxGraphParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
-		roots, err := loadTxChainMetasPg(
+		roots, err := loadTxGraphMetasPg(
 			ctx, qtx, params.WalletID, params.Txids,
 		)
 		if err != nil {
@@ -83,27 +83,34 @@ func (s *PostgresStore) OrphanTxChain(ctx context.Context,
 			return err
 		}
 
-		return applyTxChainInvalidation(
+		return applyTxGraphInvalidation(
 			ctx, txIDsFromMetas(roots), TxStatusOrphaned,
-			buildTxChainHooksPg(qtx, params.WalletID),
+			buildTxGraphHooksPg(qtx, params.WalletID),
 		)
 	})
 }
 
 // ReconfirmOrphanedCoinbase restores one orphaned coinbase transaction to a new
-// confirming block inside one SQL transaction. This is intentionally a
-// root-only transition: coinbase spends require maturity, so the supported
-// reconfirmation path assumes no descendant branch needs replay.
+// confirming block inside one SQL transaction. This remains a root-only
+// transition, so the write rejects any coinbase row that still has stored
+// descendants instead of trying to replay that branch.
 func (s *PostgresStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	params ReconfirmOrphanedCoinbaseParams) error {
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcpg.Queries) error {
-		meta, err := loadTxChainMetaPg(ctx, qtx, params.WalletID, params.Txid)
+		meta, err := loadTxGraphMetaPg(ctx, qtx, params.WalletID, params.Txid)
 		if err != nil {
 			return err
 		}
 
-		err = validateCoinbaseReconfirmation(meta)
+		err = validateCoinbaseReconfirmation(
+			ctx, meta,
+			func(ctx context.Context, txid chainhash.Hash) ([]int64, error) {
+				return listStoredDescendantTxIDsPg(
+					ctx, qtx, params.WalletID, txid,
+				)
+			},
+		)
 		if err != nil {
 			return err
 		}
@@ -138,52 +145,52 @@ func (s *PostgresStore) ReconfirmOrphanedCoinbase(ctx context.Context,
 	})
 }
 
-// buildTxChainHooksPg binds the shared replacement helpers to the postgres
+func listStoredDescendantTxIDsPg(ctx context.Context, qtx *sqlcpg.Queries,
+	walletID uint32, rootTxid chainhash.Hash) ([]int64, error) {
+
+	rows, err := qtx.ListBlocklessTransactions(ctx, int64(walletID))
+	if err != nil {
+		return nil, fmt.Errorf("list unmined transactions: %w", err)
+	}
+
+	candidates, err := buildLiveTxRecords(
+		rows,
+		func(row sqlcpg.ListBlocklessTransactionsRow) (int64, []byte, []byte) {
+			return row.ID, row.TxHash, row.RawTx
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return collectDescendantTxIDs(
+		map[chainhash.Hash]struct{}{rootTxid: {}}, candidates,
+	), nil
+}
+
+// buildTxGraphHooksPg binds the shared replacement helpers to the postgres
 // query set active for the surrounding SQL transaction.
-//
-//nolint:dupl // Backend-specific sqlc hooks differ only in generated types.
-func buildTxChainHooksPg(qtx *sqlcpg.Queries, walletID uint32) txChainHooks {
-	return buildTxChainHooks(
-		func(ctx context.Context, parentID int64) ([]int64, error) {
-			return listChildTxIDsPg(ctx, qtx, walletID, parentID)
-		},
-		func(ctx context.Context, txID int64) error {
-			return clearSpentByTxIDPg(ctx, qtx, walletID, txID)
-		},
-		func(ctx context.Context, status TxStatus,
-			txIDs []int64) error {
-
-			return updateTxStatusPg(ctx, qtx, walletID, status, txIDs)
-		},
-		func(ctx context.Context, txid chainhash.Hash,
-			txID int64) error {
-
-			return reclaimInputsByTxidPg(ctx, qtx, walletID, txid, txID)
-		},
-		func(ctx context.Context, replacedTxID int64,
-			replacementTxID int64) error {
-
-			return recordReplacementEdgePg(
-				ctx, qtx, walletID, replacedTxID, replacementTxID,
-			)
-		},
-		func(ctx context.Context, txid chainhash.Hash) ([]txChainMeta, error) {
-			return listDirectConflictRootsByTxidPg(
-				ctx, qtx, walletID, txid,
-			)
-		},
+func buildTxGraphHooksPg(qtx *sqlcpg.Queries, walletID uint32) txGraphHooks {
+	return buildTxGraphHooksFor(
+		qtx, walletID,
+		listChildTxIDsPg,
+		clearSpentByTxIDPg,
+		updateTxStatusPg,
+		reclaimInputsByTxidPg,
+		recordReplacementEdgePg,
+		listDirectConflictRootsByTxidPg,
 	)
 }
 
-// loadTxChainMetasPg resolves one metadata row per requested transaction hash
+// loadTxGraphMetasPg resolves one metadata row per requested transaction hash
 // for the shared invalidation flows.
-func loadTxChainMetasPg(ctx context.Context, qtx *sqlcpg.Queries,
+func loadTxGraphMetasPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32,
-	txids []chainhash.Hash) ([]txChainMeta, error) {
+	txids []chainhash.Hash) ([]txGraphMeta, error) {
 
-	metas := make([]txChainMeta, len(txids))
+	metas := make([]txGraphMeta, len(txids))
 	for i, txid := range txids {
-		meta, err := loadTxChainMetaPg(ctx, qtx, walletID, txid)
+		meta, err := loadTxGraphMetaPg(ctx, qtx, walletID, txid)
 		if err != nil {
 			return nil, err
 		}
@@ -194,11 +201,11 @@ func loadTxChainMetasPg(ctx context.Context, qtx *sqlcpg.Queries,
 	return metas, nil
 }
 
-// loadTxChainMetaPg loads the wallet-scoped metadata needed to validate one
+// loadTxGraphMetaPg loads the wallet-scoped metadata needed to validate one
 // transaction's replacement or orphaning state.
-func loadTxChainMetaPg(ctx context.Context, qtx *sqlcpg.Queries,
+func loadTxGraphMetaPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32,
-	txid chainhash.Hash) (txChainMeta, error) {
+	txid chainhash.Hash) (txGraphMeta, error) {
 
 	row, err := qtx.GetTransactionMetaByHash(
 		ctx, sqlcpg.GetTransactionMetaByHashParams{
@@ -208,19 +215,19 @@ func loadTxChainMetaPg(ctx context.Context, qtx *sqlcpg.Queries,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return txChainMeta{}, fmt.Errorf("transaction %s: %w", txid,
+			return txGraphMeta{}, fmt.Errorf("transaction %s: %w", txid,
 				ErrTxNotFound)
 		}
 
-		return txChainMeta{}, fmt.Errorf("get transaction metadata: %w", err)
+		return txGraphMeta{}, fmt.Errorf("get transaction metadata: %w", err)
 	}
 
 	status, err := parseTxStatus(int64(row.TxStatus))
 	if err != nil {
-		return txChainMeta{}, err
+		return txGraphMeta{}, err
 	}
 
-	return txChainMeta{
+	return txGraphMeta{
 		ID:         row.ID,
 		Txid:       txid,
 		Status:     status,
@@ -365,7 +372,7 @@ func reclaimInputsByTxidPg(ctx context.Context, qtx *sqlcpg.Queries,
 // complete live direct loser set for its wallet-owned inputs.
 func listDirectConflictRootsByTxidPg(ctx context.Context,
 	qtx *sqlcpg.Queries, walletID uint32,
-	txid chainhash.Hash) ([]txChainMeta, error) {
+	txid chainhash.Hash) ([]txGraphMeta, error) {
 
 	row, err := qtx.GetTransactionByHash(
 		ctx, sqlcpg.GetTransactionByHashParams{
@@ -391,11 +398,9 @@ func listDirectConflictRootsByTxidPg(ctx context.Context,
 
 // listDirectConflictRootsPg scans live unconfirmed wallet transactions and
 // returns those that directly conflict with the winner on wallet-owned inputs.
-//
-
 func listDirectConflictRootsPg(ctx context.Context, qtx *sqlcpg.Queries,
 	walletID uint32, winnerID int64,
-	tx *wire.MsgTx) ([]txChainMeta, error) {
+	tx *wire.MsgTx) ([]txGraphMeta, error) {
 
 	walletOwnedInputs, err := listWalletOwnedInputsPg(ctx, qtx, walletID, tx)
 	if err != nil {
@@ -406,14 +411,14 @@ func listDirectConflictRootsPg(ctx context.Context, qtx *sqlcpg.Queries,
 		return nil, nil
 	}
 
-	rows, err := qtx.ListLiveUnminedConflictCandidates(ctx, int64(walletID))
+	rows, err := qtx.ListUnminedTransactions(ctx, int64(walletID))
 	if err != nil {
 		return nil, fmt.Errorf(
 			"list live conflict candidates for root validation: %w", err,
 		)
 	}
 
-	roots := make([]txChainMeta, 0, len(rows))
+	roots := make([]txGraphMeta, 0, len(rows))
 
 	for _, row := range rows {
 		if row.ID == winnerID {

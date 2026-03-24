@@ -266,54 +266,72 @@ func (q *Queries) InsertTransaction(ctx context.Context, arg InsertTransactionPa
 	return id, err
 }
 
-const ListLiveUnminedConflictCandidates = `-- name: ListLiveUnminedConflictCandidates :many
+const ListBlocklessTransactions = `-- name: ListBlocklessTransactions :many
 SELECT
-    id,
-    tx_hash,
-    raw_tx,
-    is_coinbase,
-    tx_status
-FROM transactions
+    t.id,
+    t.tx_hash,
+    t.raw_tx,
+    t.received_time,
+    t.block_height,
+    b.header_hash AS block_hash,
+    b.block_timestamp,
+    t.is_coinbase,
+    t.tx_status,
+    t.tx_label
+FROM transactions AS t
+LEFT JOIN blocks AS b ON 1 = 0
 WHERE
-    wallet_id = ?
-    AND block_height IS NULL
-    AND tx_status IN (0, 1)
-ORDER BY id
+    t.wallet_id = ?
+    AND t.block_height IS NULL
+ORDER BY t.received_time DESC, t.id DESC
 `
 
-type ListLiveUnminedConflictCandidatesRow struct {
-	ID         int64
-	TxHash     []byte
-	RawTx      []byte
-	IsCoinbase bool
-	TxStatus   int64
+type ListBlocklessTransactionsRow struct {
+	ID             int64
+	TxHash         []byte
+	RawTx          []byte
+	ReceivedTime   time.Time
+	BlockHeight    sql.NullInt64
+	BlockHash      []byte
+	BlockTimestamp sql.NullInt64
+	IsCoinbase     bool
+	TxStatus       int64
+	TxLabel        string
 }
 
-// Lists live unmined transactions that may directly conflict with one winner.
+// Lists every blockless transaction row for a wallet.
 //
 // How:
-//   - Reads only blockless live rows (`pending` or `published`).
-//   - Returns raw transactions so callers can inspect inputs for wallet-owned
-//     conflicts without re-querying each row.
+//   - Reads from transactions only and filters on blockless rows.
+//   - Preserves blockless history rows such as replaced, failed, or orphaned
+//     transactions so callers can inspect the full wallet-local transaction
+//     history even after invalidation flows or rollback.
+//   - Projects typed NULL block metadata through `LEFT JOIN blocks AS b ON 1 = 0`
+//     so the unmined row shape stays aligned with the confirmed query below.
 //
 // Performance:
-//   - Uses the wallet-scoped blockless-history index and keeps the projection
-//     narrow to replacement-validation fields.
-func (q *Queries) ListLiveUnminedConflictCandidates(ctx context.Context, walletID int64) ([]ListLiveUnminedConflictCandidatesRow, error) {
-	rows, err := q.query(ctx, q.listLiveUnminedConflictCandidatesStmt, ListLiveUnminedConflictCandidates, walletID)
+//   - Matches the dedicated blockless-history index while the more selective
+//     live-only partial index stays available for conflict paths.
+func (q *Queries) ListBlocklessTransactions(ctx context.Context, walletID int64) ([]ListBlocklessTransactionsRow, error) {
+	rows, err := q.query(ctx, q.listBlocklessTransactionsStmt, ListBlocklessTransactions, walletID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListLiveUnminedConflictCandidatesRow
+	var items []ListBlocklessTransactionsRow
 	for rows.Next() {
-		var i ListLiveUnminedConflictCandidatesRow
+		var i ListBlocklessTransactionsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TxHash,
 			&i.RawTx,
+			&i.ReceivedTime,
+			&i.BlockHeight,
+			&i.BlockHash,
+			&i.BlockTimestamp,
 			&i.IsCoinbase,
 			&i.TxStatus,
+			&i.TxLabel,
 		); err != nil {
 			return nil, err
 		}
@@ -466,50 +484,36 @@ func (q *Queries) ListTransactionsByHeightRange(ctx context.Context, arg ListTra
 
 const ListUnminedTransactions = `-- name: ListUnminedTransactions :many
 SELECT
-    t.id,
-    t.tx_hash,
-    t.raw_tx,
-    t.received_time,
-    t.block_height,
-    b.header_hash AS block_hash,
-    b.block_timestamp,
-    t.is_coinbase,
-    t.tx_status,
-    t.tx_label
-FROM transactions AS t
-LEFT JOIN blocks AS b ON 1 = 0
+    id,
+    tx_hash,
+    raw_tx,
+    is_coinbase,
+    tx_status
+FROM transactions
 WHERE
-    t.wallet_id = ?
-    AND t.block_height IS NULL
-ORDER BY t.received_time DESC, t.id DESC
+    wallet_id = ?
+    AND block_height IS NULL
+    AND tx_status IN (0, 1)
 `
 
 type ListUnminedTransactionsRow struct {
-	ID             int64
-	TxHash         []byte
-	RawTx          []byte
-	ReceivedTime   time.Time
-	BlockHeight    sql.NullInt64
-	BlockHash      []byte
-	BlockTimestamp sql.NullInt64
-	IsCoinbase     bool
-	TxStatus       int64
-	TxLabel        string
+	ID         int64
+	TxHash     []byte
+	RawTx      []byte
+	IsCoinbase bool
+	TxStatus   int64
 }
 
-// Lists all unconfirmed transactions for a wallet.
+// Lists live unmined transactions that may directly conflict with one winner.
 //
 // How:
-//   - Reads from transactions only and filters on blockless rows.
-//   - Preserves blockless history rows such as replaced, failed, or orphaned
-//     transactions so callers can inspect the full wallet-local transaction
-//     history even after invalidation flows or rollback.
-//   - Projects typed NULL block metadata through `LEFT JOIN blocks AS b ON 1 = 0`
-//     so the unmined row shape stays aligned with the confirmed query below.
+//   - Reads only blockless live rows (`pending` or `published`).
+//   - Returns raw transactions so callers can inspect inputs for wallet-owned
+//     conflicts without re-querying each row.
 //
 // Performance:
-//   - Matches the dedicated blockless-history index while the more selective
-//     live-only partial index stays available for conflict paths.
+//   - Uses the wallet-scoped blockless-history index and keeps the projection
+//     narrow to replacement-validation fields.
 func (q *Queries) ListUnminedTransactions(ctx context.Context, walletID int64) ([]ListUnminedTransactionsRow, error) {
 	rows, err := q.query(ctx, q.listUnminedTransactionsStmt, ListUnminedTransactions, walletID)
 	if err != nil {
@@ -523,13 +527,8 @@ func (q *Queries) ListUnminedTransactions(ctx context.Context, walletID int64) (
 			&i.ID,
 			&i.TxHash,
 			&i.RawTx,
-			&i.ReceivedTime,
-			&i.BlockHeight,
-			&i.BlockHash,
-			&i.BlockTimestamp,
 			&i.IsCoinbase,
 			&i.TxStatus,
-			&i.TxLabel,
 		); err != nil {
 			return nil, err
 		}
