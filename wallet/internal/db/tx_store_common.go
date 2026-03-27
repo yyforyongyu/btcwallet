@@ -336,3 +336,208 @@ func createTxWithOps(ctx context.Context, req createTxRequest,
 
 	return nil
 }
+
+// prepareUpdateTxBlockHeight validates the optional confirming block reference
+// for one UpdateTx state patch and returns the backend-specific nullable block
+// height wrapper to store on the row.
+func prepareUpdateTxBlockHeight[heightT, nullHeightT any](ctx context.Context,
+	block *Block,
+	requireBlock func(context.Context, *Block) (heightT, error),
+	newNullHeight func(heightT) nullHeightT) (nullHeightT, error) {
+
+	var zeroNullHeight nullHeightT
+
+	if block == nil {
+		return zeroNullHeight, nil
+	}
+
+	height, err := requireBlock(ctx, block)
+	if err != nil {
+		return zeroNullHeight,
+			fmt.Errorf("require confirming block: %w", err)
+	}
+
+	return newNullHeight(height), nil
+}
+
+// validateUpdateTxParams checks that UpdateTx received at least one mutable
+// field and that any requested state transition satisfies the transaction table
+// invariants.
+func validateUpdateTxParams(params UpdateTxParams, isCoinbase bool) error {
+	if params.Label == nil && params.State == nil {
+		return fmt.Errorf("%w: UpdateTx requires at least one field",
+			ErrInvalidParam)
+	}
+
+	if params.State != nil {
+		return validateUpdateTxState(*params.State, isCoinbase)
+	}
+
+	return nil
+}
+
+// validateUpdateTxState checks the block/status combinations UpdateTx may store
+// on an existing row.
+func validateUpdateTxState(state UpdateTxState, isCoinbase bool) error {
+	_, err := parseTxStatus(int64(state.Status))
+	if err != nil {
+		return fmt.Errorf("%w: status %d is not supported: %w",
+			ErrInvalidParam, state.Status, ErrInvalidStatus)
+	}
+
+	// Only disconnected coinbase rows become orphaned. Ordinary
+	// transactions use the replaced/failed states instead, so UpdateTx
+	// must reject orphaned transitions for non-coinbase history.
+	if !isCoinbase && state.Status == TxStatusOrphaned {
+		return fmt.Errorf("%w: non-coinbase txns cannot be orphaned: %w",
+			ErrInvalidParam, ErrInvalidStatus)
+	}
+
+	// Any row with a confirming block represents mined history, and mined
+	// wallet history is always published from the wallet's point of view.
+	if state.Block != nil && state.Status != TxStatusPublished {
+		return fmt.Errorf("%w: confirmed txns must be published: %w",
+			ErrInvalidParam, ErrInvalidStatus)
+	}
+
+	// A unmined coinbase row only appears after rollback disconnects its block,
+	// at which point the row must be marked orphaned rather than treated as an
+	// active unmined transaction.
+	if isCoinbase && state.Block == nil && state.Status != TxStatusOrphaned {
+		return fmt.Errorf("%w: unmined coinbase txns must be orphaned: %w",
+			ErrInvalidParam, ErrInvalidStatus)
+	}
+
+	return nil
+}
+
+// updateTxOps is the minimal backend adapter the shared UpdateTx workflow
+// needs.
+//
+// UpdateTx first loads the existing row metadata so it can validate the patch,
+// then optionally prepares any block/state params, and finally applies the
+// label update and state update in one SQL transaction.
+type updateTxOps interface {
+	// loadIsCoinbase returns whether the existing row is coinbase history
+	// so the shared validation can enforce orphaning rules correctly.
+	loadIsCoinbase(ctx context.Context, walletID uint32,
+		txHash chainhash.Hash) (bool, error)
+
+	// prepareState validates and caches any backend-specific block/status
+	// params needed for the later row update.
+	prepareState(ctx context.Context, state UpdateTxState) error
+
+	// updateLabel applies one user-visible label patch.
+	updateLabel(ctx context.Context, walletID uint32, txHash chainhash.Hash,
+		label string) error
+
+	// updateState applies one block/status patch after prepareState succeeds.
+	updateState(ctx context.Context, walletID uint32, txHash chainhash.Hash,
+		state UpdateTxState) error
+}
+
+var errUpdateTxTargetNotFound = errors.New(
+	"update transaction target not found",
+)
+
+// prepareUpdateTxStateParams validates the requested state patch and returns
+// the backend-specific block-height/status values that the later SQL update
+// needs.
+func prepareUpdateTxStateParams[heightT, nullHeightT, statusT any](
+	ctx context.Context, state UpdateTxState,
+	newStatus func(TxStatus) statusT,
+	requireBlock func(context.Context, *Block) (heightT, error),
+	newNullHeight func(heightT) nullHeightT) (nullHeightT, statusT, error) {
+
+	blockHeight, err := prepareUpdateTxBlockHeight(
+		ctx, state.Block, requireBlock, newNullHeight,
+	)
+	if err != nil {
+		var zeroStatus statusT
+
+		return blockHeight, zeroStatus, err
+	}
+
+	return blockHeight, newStatus(state.Status), nil
+}
+
+// loadUpdateTxIsCoinbase loads the coinbase bit from one existing transaction
+// row and maps backend not-found cases to ErrTxNotFound.
+func loadUpdateTxIsCoinbase(ctx context.Context, txHash chainhash.Hash,
+	load func(context.Context) (bool, error)) (bool, error) {
+
+	isCoinbase, err := load(ctx)
+	if err != nil {
+		if errors.Is(err, errUpdateTxTargetNotFound) {
+			return false, fmt.Errorf("transaction %s: %w", txHash,
+				ErrTxNotFound)
+		}
+
+		return false, err
+	}
+
+	return isCoinbase, nil
+}
+
+// applyUpdateTxRows checks the affected-row count for one backend UpdateTx
+// write and maps zero-row results to ErrTxNotFound.
+func applyUpdateTxRows(ctx context.Context, txHash chainhash.Hash,
+	action string, update func(context.Context) (int64, error)) error {
+
+	rows, err := update(ctx)
+	if err != nil {
+		return fmt.Errorf("%s row: %w", action, err)
+	}
+
+	if rows == 0 {
+		return fmt.Errorf("transaction %s: %w", txHash, ErrTxNotFound)
+	}
+
+	return nil
+}
+
+// updateTxWithOps runs the shared UpdateTx patch workflow inside one backend-
+// specific SQL transaction.
+//
+// The helper validates the existing row first, prepares any requested state
+// patch next, and then applies the label patch and state patch in that order.
+// That keeps block validation and row mutation inside one transaction while
+// still allowing callers to update either field independently.
+func updateTxWithOps(ctx context.Context, params UpdateTxParams,
+	ops updateTxOps) error {
+
+	isCoinbase, err := ops.loadIsCoinbase(
+		ctx, params.WalletID, params.Txid,
+	)
+	if err != nil {
+		return fmt.Errorf("load update transaction target: %w", err)
+	}
+
+	err = validateUpdateTxParams(params, isCoinbase)
+	if err != nil {
+		return err
+	}
+
+	if params.State != nil {
+		err = ops.prepareState(ctx, *params.State)
+		if err != nil {
+			return fmt.Errorf("prepare transaction state update: %w", err)
+		}
+	}
+
+	if params.Label != nil {
+		err = ops.updateLabel(ctx, params.WalletID, params.Txid, *params.Label)
+		if err != nil {
+			return fmt.Errorf("update transaction label: %w", err)
+		}
+	}
+
+	if params.State != nil {
+		err = ops.updateState(ctx, params.WalletID, params.Txid, *params.State)
+		if err != nil {
+			return fmt.Errorf("update transaction state: %w", err)
+		}
+	}
+
+	return nil
+}
