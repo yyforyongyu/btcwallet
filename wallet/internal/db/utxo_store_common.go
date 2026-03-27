@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -28,6 +29,19 @@ var (
 	// errLeaseOutputNoRow indicates that the backend lease write found no
 	// leasable current UTXO row for the requested outpoint.
 	errLeaseOutputNoRow = errors.New("lease output no row")
+
+	// errReleaseOutputUtxoNotFound indicates that ReleaseOutput could not
+	// resolve the requested outpoint to a current wallet-owned UTXO row.
+	errReleaseOutputUtxoNotFound = errors.New(
+		"release output utxo not found",
+	)
+
+	// errReleaseOutputNoActiveLease indicates that the target UTXO no longer
+	// has an active lease row by the time ReleaseOutput checks the fallback
+	// path.
+	errReleaseOutputNoActiveLease = errors.New(
+		"release output no active lease",
+	)
 )
 
 // buildOutPoint converts database tx-hash and output-index fields into a
@@ -190,4 +204,73 @@ func leaseOutputWithOps(ctx context.Context, params LeaseOutputParams,
 
 	return nil, fmt.Errorf("utxo %s: %w", params.OutPoint,
 		ErrOutputAlreadyLeased)
+}
+
+// releaseOutputOps is the backend adapter the shared ReleaseOutput workflow
+// uses.
+//
+// The shared release flow resolves the wallet-owned outpoint first, attempts
+// the lease delete second, and only falls back to the active-lock lookup when
+// the delete reports that no row was removed.
+type releaseOutputOps interface {
+	// lookupUtxoID resolves the current wallet-owned outpoint to its stable
+	// UTXO row ID.
+	lookupUtxoID(ctx context.Context, params ReleaseOutputParams) (int64, error)
+
+	// release attempts to delete the lease row for the provided UTXO ID and
+	// lock ID, returning the number of deleted rows.
+	release(ctx context.Context, walletID uint32, utxoID int64,
+		lockID [32]byte) (int64, error)
+
+	// activeLockID returns the currently active lock ID for the provided UTXO
+	// ID.
+	activeLockID(ctx context.Context, walletID uint32, utxoID int64,
+		nowUTC time.Time) ([]byte, error)
+}
+
+// releaseOutputWithOps runs the backend-independent ReleaseOutput workflow once
+// the caller has opened a backend-specific SQL transaction.
+func releaseOutputWithOps(ctx context.Context, params ReleaseOutputParams,
+	ops releaseOutputOps) error {
+
+	nowUTC := time.Now().UTC()
+
+	utxoID, err := ops.lookupUtxoID(ctx, params)
+	if err != nil {
+		if errors.Is(err, errReleaseOutputUtxoNotFound) {
+			return fmt.Errorf("utxo %s: %w", params.OutPoint,
+				ErrUtxoNotFound)
+		}
+
+		return fmt.Errorf("lookup utxo for release: %w", err)
+	}
+
+	rows, err := ops.release(ctx, params.WalletID, utxoID, params.ID)
+	if err != nil {
+		return fmt.Errorf("release utxo lease: %w", err)
+	}
+
+	if rows != 0 {
+		return nil
+	}
+
+	// No row was deleted, so either the lease already expired or was released,
+	// or a different active lock still owns this UTXO.
+	activeLockID, err := ops.activeLockID(
+		ctx, params.WalletID, utxoID, nowUTC,
+	)
+	if err != nil {
+		if errors.Is(err, errReleaseOutputNoActiveLease) {
+			return nil
+		}
+
+		return fmt.Errorf("lookup active utxo lease: %w", err)
+	}
+
+	if !bytes.Equal(activeLockID, params.ID[:]) {
+		return fmt.Errorf("utxo %s: %w", params.OutPoint,
+			ErrOutputUnlockNotAllowed)
+	}
+
+	return nil
 }
