@@ -992,6 +992,102 @@ func TestDeleteTxRejectsNonLeafTx(t *testing.T) {
 	require.True(t, ok)
 }
 
+// TestRollbackToBlockFailsCoinbaseDescendants verifies that RollbackToBlock
+// marks every unmined descendant of a disconnected coinbase root as failed and
+// clears the recorded spend edges they had claimed.
+//
+// Scenario:
+//   - One confirmed coinbase credit has one unmined child spender and one
+//     unmined grandchild spender beneath it.
+//
+// Setup:
+//   - Create one wallet-owned coinbase output and confirm it in one block.
+//   - Insert one child transaction that spends that output and creates one new
+//     wallet-owned credit.
+//   - Insert one grandchild that spends the child's wallet-owned output.
+//
+// Action:
+//   - Roll back the block that confirmed the coinbase root.
+//
+// Assertions:
+//   - Both unmined descendants become failed.
+//   - The spend edges from the coinbase root and child are cleared.
+func TestRollbackToBlockFailsCoinbaseDescendants(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-rollback-coinbase-descendants")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+	queries := store.Queries()
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+	coinbaseTx := newCoinbaseTx(addr.ScriptPubKey)
+
+	block := CreateBlockFixture(t, queries, 300)
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       coinbaseTx,
+		Received: time.Unix(1710001200, 0),
+		Block:    &block,
+		Status:   db.TxStatusPublished,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	childTx := newRegularTx(
+		[]wire.OutPoint{{Hash: coinbaseTx.TxHash(), Index: 0}},
+		[]*wire.TxOut{{Value: 4000, PkScript: addr.ScriptPubKey}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       childTx,
+		Received: time.Unix(1710001210, 0),
+		Status:   db.TxStatusPending,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	grandchildTx := newRegularTx(
+		[]wire.OutPoint{{Hash: childTx.TxHash(), Index: 0}},
+		[]*wire.TxOut{{Value: 3000, PkScript: []byte{0x51}}},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       grandchildTx,
+		Received: time.Unix(1710001220, 0),
+		Status:   db.TxStatusPending,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, childSpendingTxIDs(t, store, walletID, coinbaseTx.TxHash()),
+		1)
+	require.Len(t, childSpendingTxIDs(t, store, walletID, childTx.TxHash()), 1)
+
+	err = store.RollbackToBlock(t.Context(), block.Height)
+	require.NoError(t, err)
+
+	childInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     childTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusFailed, childInfo.Status)
+	require.Nil(t, childInfo.Block)
+
+	grandchildInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     grandchildTx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusFailed, grandchildInfo.Status)
+	require.Nil(t, grandchildInfo.Block)
+
+	require.Empty(t, childSpendingTxIDs(t, store, walletID, coinbaseTx.TxHash()))
+	require.Empty(t, childSpendingTxIDs(t, store, walletID, childTx.TxHash()))
+}
+
 // newCoinbaseTx builds a simple coinbase fixture transaction.
 func newCoinbaseTx(pkScript []byte) *wire.MsgTx {
 	tx := wire.NewMsgTx(2)
