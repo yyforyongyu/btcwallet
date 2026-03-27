@@ -6,7 +6,7 @@
 -- - Resolves the outpoint to a current UTXO row and writes the lease in the
 --   same statement.
 -- - Rechecks that the outpoint is still unspent and its parent transaction is
---   still in a live state (`pending` or `published`) at write time.
+--   still in `pending` or `published` status at write time.
 -- - Uses one `INSERT .. ON CONFLICT DO UPDATE` statement so creation, renewal,
 --   and expired-lease takeover all happen atomically.
 -- Lease semantics:
@@ -49,7 +49,10 @@ SET
 WHERE
 utxo_leases.wallet_id = excluded.wallet_id
 AND (
-    utxo_leases.expires_at <= sqlc.arg('now_utc')
+    -- ?6 is the generated bind slot for now_utc; sqlc leaves a literal
+    -- sqlc.arg('now_utc') here, so this predicate must stay aligned with
+    -- the arg ordering above.
+    utxo_leases.expires_at <= ?6
     OR utxo_leases.lock_id = excluded.lock_id
 )
 RETURNING expires_at;
@@ -91,7 +94,7 @@ WHERE
 --   can be returned as network outpoints.
 -- - Filters out expired rows using the caller-supplied UTC timestamp.
 -- - Restricts the result to outputs that are still unspent and whose parent
---   transaction is still in a live state (`pending` or `published`).
+--   transaction is still in `pending` or `published` status.
 -- Performance:
 -- - Restricts first by wallet and expiration, then joins only the surviving
 --   lease rows back to utxos/transactions.

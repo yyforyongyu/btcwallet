@@ -742,7 +742,7 @@ const (
 	// caller whether the transaction is mined. Keeping both under
 	// TxStatusPublished avoids contradictory combinations such as
 	// "confirmed but not published" and keeps this field focused on whether the
-	// wallet still treats the transaction as live.
+	// wallet still treats the transaction as valid.
 	TxStatusPublished
 
 	// TxStatusReplaced indicates a transaction that was invalidated by a
@@ -858,44 +858,33 @@ type CreateTxParams struct {
 	// Label is an optional label for the transaction.
 	Label string
 
-	// Credits lists the outputs of the transaction that are controlled by
-	// the wallet.
-	Credits []CreditData
+	// Credits maps wallet-owned output indexes to their display addresses.
+	//
+	// The output index is the map key, so duplicate credited outputs are
+	// impossible by construction.
+	//
+	// NOTE: The address value is for display only. The database layer still
+	// matches ownership by the output's script_pub_key
+	// (`params.Tx.TxOut[index].PkScript`), which is the canonical key
+	// used by the address schema.
+	Credits map[uint32]btcutil.Address
 }
 
-// CreditData contains the information needed to record a transaction credit.
-// It acts as an explicit instruction to the CreateTx method, identifying which
-// of the transaction's outputs belongs to the wallet and should be recorded as
-// a new UTXO. This serves as a performance optimization, preventing the
-// database layer from needing to parse every transaction output and query the
-// address manager to determine ownership.
-type CreditData struct {
-	// Index is the output index of the credit.
-	Index uint32
+// UpdateTxState contains one requested transaction-state change.
+type UpdateTxState struct {
+	// Block records the transaction as confirmed in the provided block.
+	//
+	// Nil clears any current block assignment and returns the row to an unmined
+	// state.
+	Block *Block
 
-	// Address is the address that received the credit.
-	//
-	// NOTE: This field is for display only. The database layer should match the
-	// credit to an address row by the output's script_pub_key
-	// (`params.Tx.TxOut[Index].PkScript`), which is the canonical key
-	// used by the address schema. This is especially important for
-	// imported or script-based addresses, where wallet ownership is
-	// defined by the stored script material rather than by one canonical
-	// encoded address string.
-	//
-	// Examples:
-	// - A standard P2WPKH credit usually has one obvious bech32 address for UI
-	//   display, but the wallet still keys ownership off the exact witness
-	//   program bytes recorded in script_pub_key.
-	// - An imported script address (`waddrmgr.Script`,
-	//   `waddrmgr.WitnessScript`, or `waddrmgr.TaprootScript`) is owned because
-	//   the wallet imported the script material; the encoded address, if
-	//   any, is only a presentation form of that script.
-	Address btcutil.Address
+	// Status is the wallet-relative transaction state to store together with
+	// the requested block assignment.
+	Status TxStatus
 }
 
-// UpdateTxLabelParams contains the parameters for updating a transaction label.
-type UpdateTxLabelParams struct {
+// UpdateTxParams contains the mutable fields that UpdateTx may patch.
+type UpdateTxParams struct {
 	// WalletID is the ID of the wallet containing the transaction.
 	//
 	// NOTE: uint32 is used to ensure compatibility with standard SQL
@@ -905,10 +894,17 @@ type UpdateTxLabelParams struct {
 	// Txid is the hash of the transaction to update.
 	Txid chainhash.Hash
 
-	// Label is the new label for the transaction.
+	// Label optionally replaces the stored user-visible label.
 	//
-	// The empty string is a valid value and clears any prior label.
-	Label string
+	// Nil leaves the label unchanged. The empty string is a valid value and
+	// clears any prior label.
+	Label *string
+
+	// State optionally replaces the stored block/status view of the
+	// transaction.
+	//
+	// Nil leaves the chain-state metadata unchanged.
+	State *UpdateTxState
 }
 
 // GetTxQuery contains the parameters for querying a transaction. While a
@@ -944,9 +940,16 @@ type ListTxnsQuery struct {
 	// EndHeight is the ending block height for the query.
 	EndHeight uint32
 
-	// UnminedOnly, if true, will return only unmined (unconfirmed)
-	// transactions. If this is set, StartHeight and EndHeight will be
-	// ignored.
+	// UnminedOnly, if true, switches ListTxns onto the dedicated no-confirming-
+	// block read path.
+	//
+	// This path returns the active unmined set together with retained invalid
+	// history rows that also no longer have a confirming block, such as
+	// orphaned or failed transactions after rollback.
+	//
+	// This is not equivalent to using zero confirmations. The confirmed
+	// height-range query cannot express "only rows with no block", so
+	// StartHeight and EndHeight are ignored when this flag is set.
 	UnminedOnly bool
 }
 
@@ -1070,7 +1073,7 @@ type LeasedOutput struct {
 // BalanceResult represents one wallet-scoped balance view after applying the
 // requested filters.
 type BalanceResult struct {
-	// Total is the sum of every matching live UTXO, including leased outputs.
+	// Total is the sum of every matching UTXO, including leased outputs.
 	Total btcutil.Amount
 
 	// Locked is the subset of Total currently covered by active output leases.
