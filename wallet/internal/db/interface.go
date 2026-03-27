@@ -315,14 +315,14 @@ type TxStore interface {
 	// unconfirmed-deletion path.
 	DeleteTx(ctx context.Context, params DeleteTxParams) error
 
-	// InvalidateUnminedTx invalidates one unmined transaction branch as a single
-	// atomic wallet event.
+	// InvalidateUnminedTx invalidates one unmined transaction branch as a
+	// single atomic wallet event.
 	//
 	// This method is intended for system-driven cleanup when a wallet-owned
 	// unmined transaction is no longer valid, for example after publisher-side
 	// rejection or conflict handling. Implementations must invalidate the root
-	// transaction and reconcile any dependent descendant state inside one database
-	// transaction.
+	// transaction and reconcile any dependent descendant state inside one
+	// database transaction.
 	InvalidateUnminedTx(ctx context.Context,
 		params InvalidateUnminedTxParams) error
 

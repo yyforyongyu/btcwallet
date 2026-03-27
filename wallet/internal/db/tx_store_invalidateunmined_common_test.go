@@ -14,8 +14,10 @@ var errUnexpectedInvalidateCall = errors.New("unexpected invalidate call")
 
 // invalidateUnminedTxOpsFuncs is a test double for invalidateUnminedTxOps.
 type invalidateUnminedTxOpsFuncs struct {
-	loadTargetFn             func(context.Context, uint32, chainhash.Hash) (invalidateUnminedTxTarget, error)
-	listUnminedTxRecordsFn   func(context.Context, int64) ([]unminedTxRecord, error)
+	loadTargetFn func(context.Context, uint32,
+		chainhash.Hash) (invalidateUnminedTxTarget, error)
+	listUnminedTxRecordsFn func(context.Context,
+		int64) ([]unminedTxRecord, error)
 	clearSpentUtxosFn        func(context.Context, int64, int64) error
 	markTransactionsFailedFn func(context.Context, int64, []int64) error
 }
@@ -168,8 +170,10 @@ func TestInvalidateUnminedTxWithOps(t *testing.T) {
 		},
 	}
 
-	var cleared []int64
-	var failedIDs []int64
+	var (
+		cleared   []int64
+		failedIDs []int64
+	)
 
 	err := invalidateUnminedTxWithOps(
 		t.Context(),
@@ -189,7 +193,11 @@ func TestInvalidateUnminedTxWithOps(t *testing.T) {
 
 				return candidates, nil
 			},
-			clearSpentUtxosFn: func(_ context.Context, _ int64, txID int64) error {
+			clearSpentUtxosFn: func(
+				_ context.Context,
+				_ int64,
+				txID int64) error {
+
 				cleared = append(cleared, txID)
 				return nil
 			},

@@ -24,7 +24,9 @@ func TestInvalidateUnminedTxSuccess(t *testing.T) {
 	store := NewStore(dbConn, txStore)
 
 	txMsg := &wire.MsgTx{Version: 1}
-	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{1}}})
+	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash: chainhash.Hash{1},
+	}})
 	txMsg.AddTxOut(&wire.TxOut{Value: 1000, PkScript: []byte{0x51}})
 	rec, err := wtxmgr.NewTxRecordFromMsgTx(txMsg, time.Now())
 	require.NoError(t, err)
@@ -68,7 +70,9 @@ func TestInvalidateUnminedTxRejectsConfirmed(t *testing.T) {
 	store := NewStore(dbConn, txStore)
 
 	txMsg := &wire.MsgTx{Version: 1}
-	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{2}}})
+	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash: chainhash.Hash{2},
+	}})
 	txMsg.AddTxOut(&wire.TxOut{Value: 1000, PkScript: []byte{0x51}})
 	rec, err := wtxmgr.NewTxRecordFromMsgTx(txMsg, time.Now())
 	require.NoError(t, err)

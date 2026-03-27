@@ -9,8 +9,8 @@ import (
 )
 
 var (
-	// ErrInvalidateRequiresUnmined indicates that InvalidateUnminedTx only accepts
-	// current unmined pending or published transactions.
+	// ErrInvalidateRequiresUnmined indicates that InvalidateUnminedTx only
+	// accepts current unmined pending or published transactions.
 	ErrInvalidateRequiresUnmined = errors.New(
 		"invalidate requires an unmined pending or published transaction",
 	)
@@ -33,16 +33,17 @@ type invalidateUnminedTxOps interface {
 	loadTarget(ctx context.Context, walletID uint32,
 		txHash chainhash.Hash) (invalidateUnminedTxTarget, error)
 
-	// listUnminedTxRecords loads the wallet's active unmined transaction rows in
-	// the normalized shape the descendant walk expects.
+	// listUnminedTxRecords loads the wallet's active unmined transaction rows
+	// in the normalized shape the descendant walk expects.
 	listUnminedTxRecords(ctx context.Context,
 		walletID int64) ([]unminedTxRecord, error)
 
-	// clearSpentUtxos restores any wallet-owned parent outputs spent by the given
-	// transaction row.
+	// clearSpentUtxos restores any wallet-owned parent outputs spent by the
+	// given transaction row.
 	clearSpentUtxos(ctx context.Context, walletID int64, txID int64) error
 
-	// markTransactionsFailed batch-marks the provided transaction rows as failed.
+	// markTransactionsFailed batch-marks the provided transaction rows as
+	// failed.
 	markTransactionsFailed(ctx context.Context, walletID int64,
 		txIDs []int64) error
 }
@@ -67,6 +68,7 @@ func invalidateUnminedTxRootsWithOps(ctx context.Context, walletID uint32,
 	ops invalidateUnminedTxOps) error {
 
 	rootHashes := make(map[chainhash.Hash]struct{}, len(rootTargets))
+
 	rootIDs := make([]int64, 0, len(rootTargets))
 	for _, target := range rootTargets {
 		err := validateInvalidateUnminedTxTarget(target)

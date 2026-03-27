@@ -55,7 +55,7 @@ func (o *pgCreateTxOps) loadExisting(ctx context.Context,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, errCreateTxExistingNotFound
 		}
 
 		return nil, fmt.Errorf("get transaction metadata: %w", err)
@@ -129,8 +129,41 @@ func (o *pgCreateTxOps) prepareBlock(ctx context.Context,
 func (o *pgCreateTxOps) listDirectConflictTargets(ctx context.Context,
 	req createTxRequest) ([]invalidateUnminedTxTarget, error) {
 
-	if blockchain.IsCoinBaseTx(req.params.Tx) {
+	rootIDs, err := collectPgCreateTxConflictRootIDs(ctx, o.qtx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rootIDs) == 0 {
 		return nil, nil
+	}
+
+	rows, err := o.qtx.ListUnminedTransactions(ctx, int64(req.params.WalletID))
+	if err != nil {
+		return nil, fmt.Errorf("list unmined transactions: %w", err)
+	}
+
+	return buildPgInvalidateTargets(rows, rootIDs)
+}
+
+// invalidateConflicts invalidates the provided direct conflicting roots and any
+// descendants before the new confirmed transaction claims their inputs.
+func (o *pgCreateTxOps) invalidateConflicts(ctx context.Context,
+	req createTxRequest, rootTargets []invalidateUnminedTxTarget) error {
+
+	return invalidateUnminedTxRootsWithOps(
+		ctx, req.params.WalletID, rootTargets,
+		pgInvalidateUnminedTxOps{qtx: o.qtx},
+	)
+}
+
+// collectPgCreateTxConflictRootIDs returns the active unmined spender row IDs
+// that currently own any wallet-controlled input spent by the incoming tx.
+func collectPgCreateTxConflictRootIDs(ctx context.Context, qtx *sqlcpg.Queries,
+	req createTxRequest) (map[int64]struct{}, error) {
+
+	if blockchain.IsCoinBaseTx(req.params.Tx) {
+		return map[int64]struct{}{}, nil
 	}
 
 	rootIDs := make(map[int64]struct{}, len(req.params.Tx.TxIn))
@@ -141,7 +174,7 @@ func (o *pgCreateTxOps) listDirectConflictTargets(ctx context.Context,
 				inputIndex, err)
 		}
 
-		spentByTxID, err := o.qtx.GetUtxoSpendByOutpoint(
+		spentByTxID, err := qtx.GetUtxoSpendByOutpoint(
 			ctx, sqlcpg.GetUtxoSpendByOutpointParams{
 				WalletID:    int64(req.params.WalletID),
 				TxHash:      txIn.PreviousOutPoint.Hash[:],
@@ -164,14 +197,13 @@ func (o *pgCreateTxOps) listDirectConflictTargets(ctx context.Context,
 		rootIDs[spentByTxID.Int64] = struct{}{}
 	}
 
-	if len(rootIDs) == 0 {
-		return nil, nil
-	}
+	return rootIDs, nil
+}
 
-	rows, err := o.qtx.ListUnminedTransactions(ctx, int64(req.params.WalletID))
-	if err != nil {
-		return nil, fmt.Errorf("list unmined transactions: %w", err)
-	}
+// buildPgInvalidateTargets maps the selected unmined rows into the shared
+// invalidation-target shape.
+func buildPgInvalidateTargets(rows []sqlcpg.ListUnminedTransactionsRow,
+	rootIDs map[int64]struct{}) ([]invalidateUnminedTxTarget, error) {
 
 	targets := make([]invalidateUnminedTxTarget, 0, len(rootIDs))
 	for _, row := range rows {
@@ -199,17 +231,6 @@ func (o *pgCreateTxOps) listDirectConflictTargets(ctx context.Context,
 	}
 
 	return targets, nil
-}
-
-// invalidateConflicts invalidates the provided direct conflicting roots and any
-// descendants before the new confirmed transaction claims their inputs.
-func (o *pgCreateTxOps) invalidateConflicts(ctx context.Context,
-	req createTxRequest, rootTargets []invalidateUnminedTxTarget) error {
-
-	return invalidateUnminedTxRootsWithOps(
-		ctx, req.params.WalletID, rootTargets,
-		pgInvalidateUnminedTxOps{qtx: o.qtx},
-	)
 }
 
 // insert stores one new postgres transaction row for CreateTx.

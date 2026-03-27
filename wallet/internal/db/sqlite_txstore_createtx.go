@@ -55,7 +55,7 @@ func (o *sqliteCreateTxOps) loadExisting(ctx context.Context,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, errCreateTxExistingNotFound
 		}
 
 		return nil, fmt.Errorf("get transaction metadata: %w", err)
@@ -129,13 +129,47 @@ func (o *sqliteCreateTxOps) prepareBlock(ctx context.Context,
 func (o *sqliteCreateTxOps) listDirectConflictTargets(ctx context.Context,
 	req createTxRequest) ([]invalidateUnminedTxTarget, error) {
 
-	if blockchain.IsCoinBaseTx(req.params.Tx) {
+	rootIDs, err := collectSqliteCreateTxConflictRootIDs(ctx, o.qtx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rootIDs) == 0 {
 		return nil, nil
+	}
+
+	rows, err := o.qtx.ListUnminedTransactions(ctx, int64(req.params.WalletID))
+	if err != nil {
+		return nil, fmt.Errorf("list unmined transactions: %w", err)
+	}
+
+	return buildSqliteInvalidateTargets(rows, rootIDs)
+}
+
+// invalidateConflicts invalidates the provided direct conflicting roots and any
+// descendants before the new confirmed transaction claims their inputs.
+func (o *sqliteCreateTxOps) invalidateConflicts(ctx context.Context,
+	req createTxRequest, rootTargets []invalidateUnminedTxTarget) error {
+
+	return invalidateUnminedTxRootsWithOps(
+		ctx, req.params.WalletID, rootTargets,
+		sqliteInvalidateUnminedTxOps{qtx: o.qtx},
+	)
+}
+
+// collectSqliteCreateTxConflictRootIDs returns the active unmined spender row
+// IDs that currently own any wallet-controlled input spent by the incoming tx.
+func collectSqliteCreateTxConflictRootIDs(ctx context.Context,
+	qtx *sqlcsqlite.Queries,
+	req createTxRequest) (map[int64]struct{}, error) {
+
+	if blockchain.IsCoinBaseTx(req.params.Tx) {
+		return map[int64]struct{}{}, nil
 	}
 
 	rootIDs := make(map[int64]struct{}, len(req.params.Tx.TxIn))
 	for inputIndex, txIn := range req.params.Tx.TxIn {
-		spentByTxID, err := o.qtx.GetUtxoSpendByOutpoint(
+		spentByTxID, err := qtx.GetUtxoSpendByOutpoint(
 			ctx, sqlcsqlite.GetUtxoSpendByOutpointParams{
 				WalletID:    int64(req.params.WalletID),
 				TxHash:      txIn.PreviousOutPoint.Hash[:],
@@ -158,14 +192,13 @@ func (o *sqliteCreateTxOps) listDirectConflictTargets(ctx context.Context,
 		rootIDs[spentByTxID.Int64] = struct{}{}
 	}
 
-	if len(rootIDs) == 0 {
-		return nil, nil
-	}
+	return rootIDs, nil
+}
 
-	rows, err := o.qtx.ListUnminedTransactions(ctx, int64(req.params.WalletID))
-	if err != nil {
-		return nil, fmt.Errorf("list unmined transactions: %w", err)
-	}
+// buildSqliteInvalidateTargets maps the selected unmined rows into the shared
+// invalidation-target shape.
+func buildSqliteInvalidateTargets(rows []sqlcsqlite.ListUnminedTransactionsRow,
+	rootIDs map[int64]struct{}) ([]invalidateUnminedTxTarget, error) {
 
 	targets := make([]invalidateUnminedTxTarget, 0, len(rootIDs))
 	for _, row := range rows {
@@ -193,17 +226,6 @@ func (o *sqliteCreateTxOps) listDirectConflictTargets(ctx context.Context,
 	}
 
 	return targets, nil
-}
-
-// invalidateConflicts invalidates the provided direct conflicting roots and any
-// descendants before the new confirmed transaction claims their inputs.
-func (o *sqliteCreateTxOps) invalidateConflicts(ctx context.Context,
-	req createTxRequest, rootTargets []invalidateUnminedTxTarget) error {
-
-	return invalidateUnminedTxRootsWithOps(
-		ctx, req.params.WalletID, rootTargets,
-		sqliteInvalidateUnminedTxOps{qtx: o.qtx},
-	)
 }
 
 // insert stores one new sqlite transaction row for CreateTx.

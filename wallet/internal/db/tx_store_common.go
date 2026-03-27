@@ -265,6 +265,10 @@ type createTxExistingTarget struct {
 	isCoinbase bool
 }
 
+var errCreateTxExistingNotFound = errors.New(
+	"create transaction existing target not found",
+)
+
 // createTxOps is the small semantic adapter CreateTx needs from one SQL
 // backend.
 //
@@ -277,13 +281,13 @@ type createTxExistingTarget struct {
 // Each backend implements those steps with its own sqlc-generated query types
 // while createTxWithOps keeps the high-level sequencing in one place.
 type createTxOps interface {
-	// loadExisting loads any existing wallet-scoped transaction row for the same
-	// hash.
+	// loadExisting loads any existing wallet-scoped transaction row for the
+	// same hash.
 	loadExisting(ctx context.Context,
 		req createTxRequest) (*createTxExistingTarget, error)
 
-	// confirmExisting reuses one existing row when CreateTx learns about the same
-	// transaction with confirming block context later.
+	// confirmExisting reuses one existing row when CreateTx learns about the
+	// same transaction with confirming block context later.
 	confirmExisting(ctx context.Context, req createTxRequest,
 		existing createTxExistingTarget) error
 
@@ -291,14 +295,14 @@ type createTxOps interface {
 	// the later insert step needs.
 	prepareBlock(ctx context.Context, req createTxRequest) error
 
-	// listDirectConflictTargets returns the direct wallet-owned spender rows that
-	// conflict with the incoming transaction on its inputs.
+	// listDirectConflictTargets returns the direct wallet-owned spender rows
+	// that conflict with the incoming transaction on its inputs.
 	listDirectConflictTargets(ctx context.Context,
 		req createTxRequest) ([]invalidateUnminedTxTarget, error)
 
 	// invalidateConflicts invalidates the provided direct conflicting root rows
-	// and any dependent descendants before the incoming transaction claims their
-	// wallet-owned inputs.
+	// and any dependent descendants before the incoming transaction claims
+	// their wallet-owned inputs.
 	invalidateConflicts(ctx context.Context, req createTxRequest,
 		rootTargets []invalidateUnminedTxTarget) error
 
@@ -356,6 +360,55 @@ func maybeConfirmCreateTxExisting(ctx context.Context, req createTxRequest,
 	return true, nil
 }
 
+// maybeInvalidateCreateTxConflicts invalidates any direct conflict roots that a
+// newly confirmed transaction supersedes before the new row claims their
+// wallet-owned inputs.
+func maybeInvalidateCreateTxConflicts(ctx context.Context,
+	req createTxRequest, ops createTxOps) error {
+
+	if req.params.Block == nil {
+		return nil
+	}
+
+	conflictTargets, err := ops.listDirectConflictTargets(ctx, req)
+	if err != nil {
+		return fmt.Errorf("list create transaction conflicts: %w", err)
+	}
+
+	if len(conflictTargets) == 0 {
+		return nil
+	}
+
+	err = ops.invalidateConflicts(ctx, req, conflictTargets)
+	if err != nil {
+		return fmt.Errorf("invalidate create transaction conflicts: %w", err)
+	}
+
+	return nil
+}
+
+// loadCreateTxExisting resolves any wallet-scoped row already stored for the
+// requested tx hash and reports whether one was found.
+func loadCreateTxExisting(ctx context.Context, req createTxRequest,
+	ops createTxOps) (*createTxExistingTarget, bool, error) {
+
+	existing, err := ops.loadExisting(ctx, req)
+	if err != nil && !errors.Is(err, errCreateTxExistingNotFound) {
+		return nil, false,
+			fmt.Errorf("load create transaction target: %w", err)
+	}
+
+	if errors.Is(err, errCreateTxExistingNotFound) {
+		return nil, false, nil
+	}
+
+	if existing == nil {
+		return nil, false, nil
+	}
+
+	return existing, true, nil
+}
+
 // createTxWithOps runs the backend-independent CreateTx orchestration once the
 // caller has opened a backend-specific SQL transaction.
 //
@@ -364,12 +417,13 @@ func maybeConfirmCreateTxExisting(ctx context.Context, req createTxRequest,
 // before the new row claims wallet-owned inputs.
 func createTxWithOps(ctx context.Context, req createTxRequest,
 	ops createTxOps) error {
-	existing, err := ops.loadExisting(ctx, req)
+
+	existing, foundExisting, err := loadCreateTxExisting(ctx, req, ops)
 	if err != nil {
-		return fmt.Errorf("load create transaction target: %w", err)
+		return err
 	}
 
-	if existing != nil {
+	if foundExisting {
 		handled, err := maybeConfirmCreateTxExisting(ctx, req, *existing, ops)
 		if err != nil {
 			return fmt.Errorf("confirm existing transaction: %w", err)
@@ -379,8 +433,7 @@ func createTxWithOps(ctx context.Context, req createTxRequest,
 			return nil
 		}
 
-		return fmt.Errorf("transaction %s: %w", req.txHash,
-			ErrTxAlreadyExists)
+		return fmt.Errorf("transaction %s: %w", req.txHash, ErrTxAlreadyExists)
 	}
 
 	err = ops.prepareBlock(ctx, req)
@@ -388,19 +441,9 @@ func createTxWithOps(ctx context.Context, req createTxRequest,
 		return fmt.Errorf("prepare create block assignment: %w", err)
 	}
 
-	if req.params.Block != nil {
-		conflictTargets, err := ops.listDirectConflictTargets(ctx, req)
-		if err != nil {
-			return fmt.Errorf("list create transaction conflicts: %w", err)
-		}
-
-		if len(conflictTargets) > 0 {
-			err = ops.invalidateConflicts(ctx, req, conflictTargets)
-			if err != nil {
-				return fmt.Errorf("invalidate create transaction conflicts: %w",
-					err)
-			}
-		}
+	err = maybeInvalidateCreateTxConflicts(ctx, req, ops)
+	if err != nil {
+		return err
 	}
 
 	txID, err := ops.insert(ctx, req)
@@ -895,8 +938,10 @@ func markRollbackRootsOrphaned(ctx context.Context,
 	for walletID, rootHashes := range rootHashesByWallet {
 		err := ops.markRollbackRootsOrphaned(ctx, walletID, rootHashes)
 		if err != nil {
-			return fmt.Errorf("mark rollback coinbase roots orphaned for wallet %d: %w",
-				walletID, err)
+			return fmt.Errorf(
+				"mark rollback coinbase roots orphaned for wallet %d: %w",
+				walletID, err,
+			)
 		}
 	}
 

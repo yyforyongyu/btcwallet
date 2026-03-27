@@ -75,8 +75,12 @@ func (o sqliteInvalidateUnminedTxOps) listUnminedTxRecords(
 		return nil, fmt.Errorf("list unmined transactions: %w", err)
 	}
 
-	return buildUnminedTxRecords(rows,
-		func(row sqlcsqlite.ListUnminedTransactionsRow) (int64, []byte, []byte) {
+	return buildUnminedTxRecords(
+		rows,
+		func(
+			row sqlcsqlite.ListUnminedTransactionsRow,
+		) (int64, []byte, []byte) {
+
 			return row.ID, row.TxHash, row.RawTx
 		},
 	)

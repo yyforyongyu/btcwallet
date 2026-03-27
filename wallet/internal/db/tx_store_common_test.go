@@ -328,7 +328,13 @@ func TestCreateTxWithOpsInsert(t *testing.T) {
 
 	// Assert: The shared flow executes the expected write sequence.
 	require.Equal(t,
-		[]string{"load-existing", "prepare-block", "insert", "credits", "inputs"},
+		[]string{
+			"load-existing",
+			"prepare-block",
+			"insert",
+			"credits",
+			"inputs",
+		},
 		ops.calls,
 	)
 	require.Equal(t, int64(11), ops.creditsTxID)

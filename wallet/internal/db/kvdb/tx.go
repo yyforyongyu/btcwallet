@@ -32,11 +32,14 @@ func (s *Store) InvalidateUnminedTx(_ context.Context,
 			return db.ErrTxNotFound
 		}
 
-		if details.Block.Height != -1 || blockchain.IsCoinBaseTx(&details.MsgTx) {
+		if details.Block.Height != -1 ||
+			blockchain.IsCoinBaseTx(&details.MsgTx) {
+
 			return db.ErrInvalidateRequiresUnmined
 		}
 
-		if err := s.txStore.RemoveUnminedTx(ns, &details.TxRecord); err != nil {
+		err = s.txStore.RemoveUnminedTx(ns, &details.TxRecord)
+		if err != nil {
 			return fmt.Errorf("remove unmined transaction: %w", err)
 		}
 
