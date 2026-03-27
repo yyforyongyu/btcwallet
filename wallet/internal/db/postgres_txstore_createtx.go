@@ -15,10 +15,11 @@ import (
 // wallet-owned credits, and any spend edges created by its inputs.
 //
 // The full write runs inside ExecuteTx so the transaction row, created UTXOs,
-// and spent-parent markers are either committed together or not at all.
-// Received timestamps are normalized to UTC before insert. CreateTx is
-// insert-only and returns ErrTxAlreadyExists if the wallet already stores the
-// tx hash.
+// spent-parent markers, and any required invalidation are either committed
+// together or not at all. Received timestamps are normalized to UTC before
+// insert. When the wallet already stores the same unmined transaction hash,
+// CreateTx may promote that existing row to confirmed state instead of
+// inserting a duplicate.
 func (s *PostgresStore) CreateTx(ctx context.Context,
 	params CreateTxParams) error {
 
@@ -41,11 +42,11 @@ type pgCreateTxOps struct {
 
 var _ createTxOps = (*pgCreateTxOps)(nil)
 
-// hasExisting reports whether the wallet already stores the requested tx hash.
-func (o *pgCreateTxOps) hasExisting(ctx context.Context,
-	req createTxRequest) (bool, error) {
+// loadExisting loads any existing wallet-scoped row for the requested tx hash.
+func (o *pgCreateTxOps) loadExisting(ctx context.Context,
+	req createTxRequest) (*createTxExistingTarget, error) {
 
-	_, err := o.qtx.GetTransactionMetaByHash(
+	meta, err := o.qtx.GetTransactionMetaByHash(
 		ctx,
 		sqlcpg.GetTransactionMetaByHashParams{
 			WalletID: int64(req.params.WalletID),
@@ -54,13 +55,52 @@ func (o *pgCreateTxOps) hasExisting(ctx context.Context,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
+			return nil, nil
 		}
 
-		return false, fmt.Errorf("get transaction metadata: %w", err)
+		return nil, fmt.Errorf("get transaction metadata: %w", err)
 	}
 
-	return true, nil
+	status, err := parseTxStatus(int64(meta.TxStatus))
+	if err != nil {
+		return nil, err
+	}
+
+	return &createTxExistingTarget{
+		id:         meta.ID,
+		status:     status,
+		hasBlock:   meta.BlockHeight.Valid,
+		isCoinbase: meta.IsCoinbase,
+	}, nil
+}
+
+// confirmExisting promotes one existing unmined row to its confirmed state.
+func (o *pgCreateTxOps) confirmExisting(ctx context.Context,
+	req createTxRequest,
+	_ createTxExistingTarget) error {
+
+	blockHeight, err := requireBlockMatchesPg(ctx, o.qtx, req.params.Block)
+	if err != nil {
+		return fmt.Errorf("require confirming block: %w", err)
+	}
+
+	rows, err := o.qtx.UpdateTransactionStateByHash(
+		ctx, sqlcpg.UpdateTransactionStateByHashParams{
+			BlockHeight: sql.NullInt32{Int32: blockHeight, Valid: true},
+			Status:      int16(TxStatusPublished),
+			WalletID:    int64(req.params.WalletID),
+			TxHash:      req.txHash[:],
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("update transaction state query: %w", err)
+	}
+
+	if rows == 0 {
+		return fmt.Errorf("transaction %s: %w", req.txHash, ErrTxNotFound)
+	}
+
+	return nil
 }
 
 // prepareBlock validates the optional confirming block and caches the postgres
@@ -82,6 +122,94 @@ func (o *pgCreateTxOps) prepareBlock(ctx context.Context,
 	o.blockHeight = sql.NullInt32{Int32: height, Valid: true}
 
 	return nil
+}
+
+// listDirectConflictTargets returns the live unmined transaction rows that
+// currently own any wallet-controlled input spent by the incoming transaction.
+func (o *pgCreateTxOps) listDirectConflictTargets(ctx context.Context,
+	req createTxRequest) ([]invalidateUnminedTxTarget, error) {
+
+	if blockchain.IsCoinBaseTx(req.params.Tx) {
+		return nil, nil
+	}
+
+	rootIDs := make(map[int64]struct{}, len(req.params.Tx.TxIn))
+	for inputIndex, txIn := range req.params.Tx.TxIn {
+		outputIndex, err := uint32ToInt32(txIn.PreviousOutPoint.Index)
+		if err != nil {
+			return nil, fmt.Errorf("convert input outpoint index %d: %w",
+				inputIndex, err)
+		}
+
+		spentByTxID, err := o.qtx.GetUtxoSpendByOutpoint(
+			ctx, sqlcpg.GetUtxoSpendByOutpointParams{
+				WalletID:    int64(req.params.WalletID),
+				TxHash:      txIn.PreviousOutPoint.Hash[:],
+				OutputIndex: outputIndex,
+			},
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+
+			return nil, fmt.Errorf("lookup input conflict %d: %w", inputIndex,
+				err)
+		}
+
+		if !spentByTxID.Valid {
+			continue
+		}
+
+		rootIDs[spentByTxID.Int64] = struct{}{}
+	}
+
+	if len(rootIDs) == 0 {
+		return nil, nil
+	}
+
+	rows, err := o.qtx.ListUnminedTransactions(ctx, int64(req.params.WalletID))
+	if err != nil {
+		return nil, fmt.Errorf("list unmined transactions: %w", err)
+	}
+
+	targets := make([]invalidateUnminedTxTarget, 0, len(rootIDs))
+	for _, row := range rows {
+		if _, ok := rootIDs[row.ID]; !ok {
+			continue
+		}
+
+		status, err := parseTxStatus(int64(row.TxStatus))
+		if err != nil {
+			return nil, err
+		}
+
+		txHash, err := chainhash.NewHash(row.TxHash)
+		if err != nil {
+			return nil, fmt.Errorf("transaction hash: %w", err)
+		}
+
+		targets = append(targets, invalidateUnminedTxTarget{
+			id:         row.ID,
+			txHash:     *txHash,
+			status:     status,
+			hasBlock:   row.BlockHeight.Valid,
+			isCoinbase: row.IsCoinbase,
+		})
+	}
+
+	return targets, nil
+}
+
+// invalidateConflicts invalidates the provided direct conflicting roots and any
+// descendants before the new confirmed transaction claims their inputs.
+func (o *pgCreateTxOps) invalidateConflicts(ctx context.Context,
+	req createTxRequest, rootTargets []invalidateUnminedTxTarget) error {
+
+	return invalidateUnminedTxRootsWithOps(
+		ctx, req.params.WalletID, rootTargets,
+		pgInvalidateUnminedTxOps{qtx: o.qtx},
+	)
 }
 
 // insert stores one new postgres transaction row for CreateTx.

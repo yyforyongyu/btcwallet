@@ -60,6 +60,57 @@ func validateInvalidateUnminedTxTarget(
 	return nil
 }
 
+// invalidateUnminedTxRootsWithOps invalidates the provided unmined roots
+// together with any descendant branch that depends on them.
+func invalidateUnminedTxRootsWithOps(ctx context.Context, walletID uint32,
+	rootTargets []invalidateUnminedTxTarget,
+	ops invalidateUnminedTxOps) error {
+
+	rootHashes := make(map[chainhash.Hash]struct{}, len(rootTargets))
+	rootIDs := make([]int64, 0, len(rootTargets))
+	for _, target := range rootTargets {
+		err := validateInvalidateUnminedTxTarget(target)
+		if err != nil {
+			return err
+		}
+
+		rootHashes[target.txHash] = struct{}{}
+		rootIDs = append(rootIDs, target.id)
+	}
+
+	candidates, err := ops.listUnminedTxRecords(ctx, int64(walletID))
+	if err != nil {
+		return fmt.Errorf("list unmined invalidation candidates: %w", err)
+	}
+
+	descendantIDs := collectDescendantTxIDs(rootHashes, candidates)
+
+	for _, rootID := range rootIDs {
+		err = ops.clearSpentUtxos(ctx, int64(walletID), rootID)
+		if err != nil {
+			return fmt.Errorf("clear root spent utxos: %w", err)
+		}
+	}
+
+	for _, descendantID := range descendantIDs {
+		err = ops.clearSpentUtxos(ctx, int64(walletID), descendantID)
+		if err != nil {
+			return fmt.Errorf("clear descendant spent utxos: %w", err)
+		}
+	}
+
+	failedIDs := make([]int64, 0, len(descendantIDs)+len(rootIDs))
+	failedIDs = append(failedIDs, rootIDs...)
+	failedIDs = append(failedIDs, descendantIDs...)
+
+	err = ops.markTransactionsFailed(ctx, int64(walletID), failedIDs)
+	if err != nil {
+		return fmt.Errorf("mark invalidated transactions failed: %w", err)
+	}
+
+	return nil
+}
+
 // invalidateUnminedTxWithOps invalidates one wallet-owned unmined transaction
 // root together with any descendant branch that depends on it.
 func invalidateUnminedTxWithOps(ctx context.Context,
@@ -70,40 +121,7 @@ func invalidateUnminedTxWithOps(ctx context.Context,
 		return fmt.Errorf("load invalidate transaction target: %w", err)
 	}
 
-	err = validateInvalidateUnminedTxTarget(target)
-	if err != nil {
-		return err
-	}
-
-	candidates, err := ops.listUnminedTxRecords(ctx, int64(params.WalletID))
-	if err != nil {
-		return fmt.Errorf("list unmined invalidation candidates: %w", err)
-	}
-
-	descendantIDs := collectDescendantTxIDs(
-		map[chainhash.Hash]struct{}{target.txHash: {}}, candidates,
+	return invalidateUnminedTxRootsWithOps(
+		ctx, params.WalletID, []invalidateUnminedTxTarget{target}, ops,
 	)
-
-	err = ops.clearSpentUtxos(ctx, int64(params.WalletID), target.id)
-	if err != nil {
-		return fmt.Errorf("clear root spent utxos: %w", err)
-	}
-
-	for _, descendantID := range descendantIDs {
-		err = ops.clearSpentUtxos(ctx, int64(params.WalletID), descendantID)
-		if err != nil {
-			return fmt.Errorf("clear descendant spent utxos: %w", err)
-		}
-	}
-
-	failedIDs := make([]int64, 0, len(descendantIDs)+1)
-	failedIDs = append(failedIDs, target.id)
-	failedIDs = append(failedIDs, descendantIDs...)
-
-	err = ops.markTransactionsFailed(ctx, int64(params.WalletID), failedIDs)
-	if err != nil {
-		return fmt.Errorf("mark invalidated transactions failed: %w", err)
-	}
-
-	return nil
 }
