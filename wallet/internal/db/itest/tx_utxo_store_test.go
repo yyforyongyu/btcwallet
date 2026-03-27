@@ -1088,6 +1088,61 @@ func TestRollbackToBlockFailsCoinbaseDescendants(t *testing.T) {
 	require.Empty(t, childSpendingTxIDs(t, store, walletID, childTx.TxHash()))
 }
 
+// TestGetUtxoReturnsCurrentWalletOutput verifies that GetUtxo returns a stored
+// wallet-owned output created by an unmined transaction.
+func TestGetUtxoReturnsCurrentWalletOutput(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-get-utxo")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
+
+	addr := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "default", false,
+	)
+
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 15000, PkScript: addr.ScriptPubKey}},
+	)
+
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       tx,
+		Received: time.Unix(1710001400, 0),
+		Status:   db.TxStatusPending,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	utxo, err := store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: wire.OutPoint{Hash: tx.TxHash(), Index: 0},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, tx.TxHash(), utxo.OutPoint.Hash)
+	require.Equal(t, uint32(0), utxo.OutPoint.Index)
+	require.Equal(t, btcutil.Amount(15000), utxo.Amount)
+	require.Equal(t, db.UnminedHeight, utxo.Height)
+}
+
+// TestGetUtxoNotFound verifies that GetUtxo returns ErrUtxoNotFound when the
+// requested outpoint is not part of the current wallet UTXO set.
+func TestGetUtxoNotFound(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-get-utxo-missing")
+
+	_, err := store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: randomOutPoint(),
+	})
+
+	require.ErrorIs(t, err, db.ErrUtxoNotFound)
+}
+
 // newCoinbaseTx builds a simple coinbase fixture transaction.
 func newCoinbaseTx(pkScript []byte) *wire.MsgTx {
 	tx := wire.NewMsgTx(2)
