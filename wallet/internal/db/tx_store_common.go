@@ -256,23 +256,18 @@ func newCreateTxRequest(params CreateTxParams) (createTxRequest, error) {
 	}, nil
 }
 
-// ensureCreateTxAbsent rejects CreateTx when the wallet already has a row for
-// the requested transaction hash.
-func ensureCreateTxAbsent(ctx context.Context, txHash chainhash.Hash,
-	hasExisting func(context.Context) (bool, error)) error {
-
-	exists, err := hasExisting(ctx)
-	if err != nil {
-		return fmt.Errorf("check existing transaction: %w", err)
-	}
-
-	if exists {
-		return fmt.Errorf("transaction %s: %w", txHash,
-			ErrTxAlreadyExists)
-	}
-
-	return nil
+// createTxExistingTarget is the normalized metadata the shared CreateTx flow
+// needs when the wallet already stores the requested tx hash.
+type createTxExistingTarget struct {
+	id         int64
+	status     TxStatus
+	hasBlock   bool
+	isCoinbase bool
 }
+
+var errCreateTxExistingNotFound = errors.New(
+	"create transaction existing target not found",
+)
 
 // createTxOps is the small semantic adapter CreateTx needs from one SQL
 // backend.
@@ -286,13 +281,30 @@ func ensureCreateTxAbsent(ctx context.Context, txHash chainhash.Hash,
 // Each backend implements those steps with its own sqlc-generated query types
 // while createTxWithOps keeps the high-level sequencing in one place.
 type createTxOps interface {
-	// hasExisting reports whether CreateTx would collide with an existing
-	// wallet-scoped transaction row for the same hash.
-	hasExisting(ctx context.Context, req createTxRequest) (bool, error)
+	// loadExisting loads any existing wallet-scoped transaction row for the
+	// same hash.
+	loadExisting(ctx context.Context,
+		req createTxRequest) (*createTxExistingTarget, error)
+
+	// confirmExisting reuses one existing row when CreateTx learns about the
+	// same transaction with confirming block context later.
+	confirmExisting(ctx context.Context, req createTxRequest,
+		existing createTxExistingTarget) error
 
 	// prepareBlock validates and caches any optional confirming block metadata
 	// the later insert step needs.
 	prepareBlock(ctx context.Context, req createTxRequest) error
+
+	// listDirectConflictTargets returns the direct wallet-owned spender rows
+	// that conflict with the incoming transaction on its inputs.
+	listDirectConflictTargets(ctx context.Context,
+		req createTxRequest) ([]invalidateUnminedTxTarget, error)
+
+	// invalidateConflicts invalidates the provided direct conflicting root rows
+	// and any dependent descendants before the incoming transaction claims
+	// their wallet-owned inputs.
+	invalidateConflicts(ctx context.Context, req createTxRequest,
+		rootTargets []invalidateUnminedTxTarget) error
 
 	// insert writes the base transaction row and returns its new primary key.
 	insert(ctx context.Context, req createTxRequest) (int64, error)
@@ -306,27 +318,132 @@ type createTxOps interface {
 	markInputsSpent(ctx context.Context, req createTxRequest, txID int64) error
 }
 
+// maybeConfirmCreateTxExisting decides whether CreateTx can reuse an existing
+// wallet-scoped row instead of inserting a new one.
+func maybeConfirmCreateTxExisting(ctx context.Context, req createTxRequest,
+	existing createTxExistingTarget, ops createTxOps) (bool, error) {
+
+	if req.params.Block == nil {
+		return false, nil
+	}
+
+	if req.params.Status != TxStatusPublished {
+		return false, nil
+	}
+
+	if existing.hasBlock {
+		return false, nil
+	}
+
+	if existing.isCoinbase {
+		if !req.isCoinbase || existing.status != TxStatusOrphaned {
+			return false, nil
+		}
+
+		err := ops.confirmExisting(ctx, req, existing)
+		if err != nil {
+			return false, err
+		}
+
+		return true, nil
+	}
+
+	if !isUnminedStatus(existing.status) {
+		return false, nil
+	}
+
+	err := ops.confirmExisting(ctx, req, existing)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// maybeInvalidateCreateTxConflicts invalidates any direct conflict roots that a
+// newly confirmed transaction supersedes before the new row claims their
+// wallet-owned inputs.
+func maybeInvalidateCreateTxConflicts(ctx context.Context,
+	req createTxRequest, ops createTxOps) error {
+
+	if req.params.Block == nil {
+		return nil
+	}
+
+	conflictTargets, err := ops.listDirectConflictTargets(ctx, req)
+	if err != nil {
+		return fmt.Errorf("list create transaction conflicts: %w", err)
+	}
+
+	if len(conflictTargets) == 0 {
+		return nil
+	}
+
+	err = ops.invalidateConflicts(ctx, req, conflictTargets)
+	if err != nil {
+		return fmt.Errorf("invalidate create transaction conflicts: %w", err)
+	}
+
+	return nil
+}
+
+// loadCreateTxExisting resolves any wallet-scoped row already stored for the
+// requested tx hash and reports whether one was found.
+func loadCreateTxExisting(ctx context.Context, req createTxRequest,
+	ops createTxOps) (*createTxExistingTarget, bool, error) {
+
+	existing, err := ops.loadExisting(ctx, req)
+	if err != nil && !errors.Is(err, errCreateTxExistingNotFound) {
+		return nil, false,
+			fmt.Errorf("load create transaction target: %w", err)
+	}
+
+	if errors.Is(err, errCreateTxExistingNotFound) {
+		return nil, false, nil
+	}
+
+	if existing == nil {
+		return nil, false, nil
+	}
+
+	return existing, true, nil
+}
+
 // createTxWithOps runs the backend-independent CreateTx orchestration once the
 // caller has opened a backend-specific SQL transaction.
 //
-// The helper inserts the base transaction row before it records credits or
-// spent inputs so every later step can point at one stable row ID. If any later
-// step fails, ExecuteTx rolls the whole write back.
+// The helper can either confirm an existing unmined row or insert a new row.
+// For confirmed inserts it also invalidates any current direct conflict branch
+// before the new row claims wallet-owned inputs.
 func createTxWithOps(ctx context.Context, req createTxRequest,
 	ops createTxOps) error {
 
-	err := ensureCreateTxAbsent(ctx, req.txHash,
-		func(ctx context.Context) (bool, error) {
-			return ops.hasExisting(ctx, req)
-		},
-	)
+	existing, foundExisting, err := loadCreateTxExisting(ctx, req, ops)
 	if err != nil {
-		return fmt.Errorf("prepare create transaction: %w", err)
+		return err
+	}
+
+	if foundExisting {
+		handled, err := maybeConfirmCreateTxExisting(ctx, req, *existing, ops)
+		if err != nil {
+			return fmt.Errorf("confirm existing transaction: %w", err)
+		}
+
+		if handled {
+			return nil
+		}
+
+		return fmt.Errorf("transaction %s: %w", req.txHash, ErrTxAlreadyExists)
 	}
 
 	err = ops.prepareBlock(ctx, req)
 	if err != nil {
 		return fmt.Errorf("prepare create block assignment: %w", err)
+	}
+
+	err = maybeInvalidateCreateTxConflicts(ctx, req, ops)
+	if err != nil {
+		return err
 	}
 
 	txID, err := ops.insert(ctx, req)
@@ -656,6 +773,11 @@ type rollbackToBlockOps interface {
 	// rollback boundary after sync-state references have been rewound.
 	deleteBlocksAtOrAboveHeight(ctx context.Context, height uint32) error
 
+	// markRollbackRootsOrphaned rewrites the disconnected coinbase roots to the
+	// orphaned state after their confirming blocks are deleted.
+	markRollbackRootsOrphaned(ctx context.Context, walletID uint32,
+		rootHashes map[chainhash.Hash]struct{}) error
+
 	// listUnminedTxRecords loads the wallet's current unmined transaction
 	// rows in the normalized shape the descendant walk expects.
 	listUnminedTxRecords(ctx context.Context,
@@ -807,6 +929,25 @@ func invalidateRollbackDescendants(ctx context.Context,
 	return nil
 }
 
+// markRollbackRootsOrphaned rewrites every disconnected coinbase root to the
+// orphaned state before descendant invalidation completes.
+func markRollbackRootsOrphaned(ctx context.Context,
+	rootHashesByWallet map[uint32]map[chainhash.Hash]struct{},
+	ops rollbackToBlockOps) error {
+
+	for walletID, rootHashes := range rootHashesByWallet {
+		err := ops.markRollbackRootsOrphaned(ctx, walletID, rootHashes)
+		if err != nil {
+			return fmt.Errorf(
+				"mark rollback coinbase roots orphaned for wallet %d: %w",
+				walletID, err,
+			)
+		}
+	}
+
+	return nil
+}
+
 // rollbackToBlockWithOps runs the shared RollbackToBlock sequence inside one
 // backend-specific SQL transaction.
 //
@@ -829,6 +970,11 @@ func rollbackToBlockWithOps(ctx context.Context, height uint32,
 	err = ops.deleteBlocksAtOrAboveHeight(ctx, height)
 	if err != nil {
 		return fmt.Errorf("delete blocks at or above height: %w", err)
+	}
+
+	err = markRollbackRootsOrphaned(ctx, rootHashesByWallet, ops)
+	if err != nil {
+		return err
 	}
 
 	err = invalidateRollbackDescendants(ctx, rootHashesByWallet, ops)

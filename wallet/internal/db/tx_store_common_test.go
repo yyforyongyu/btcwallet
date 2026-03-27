@@ -328,7 +328,13 @@ func TestCreateTxWithOpsInsert(t *testing.T) {
 
 	// Assert: The shared flow executes the expected write sequence.
 	require.Equal(t,
-		[]string{"exists", "prepare-block", "insert", "credits", "inputs"},
+		[]string{
+			"load-existing",
+			"prepare-block",
+			"insert",
+			"credits",
+			"inputs",
+		},
 		ops.calls,
 	)
 	require.Equal(t, int64(11), ops.creditsTxID)
@@ -342,11 +348,76 @@ func TestCreateTxWithOpsDuplicate(t *testing.T) {
 	t.Parallel()
 
 	req := testCreateTxRequest(t)
-	ops := &stubCreateTxOps{hasExistingResult: true}
+	ops := &stubCreateTxOps{existing: &createTxExistingTarget{id: 4}}
 
 	err := createTxWithOps(context.Background(), req, ops)
 	require.ErrorIs(t, err, ErrTxAlreadyExists)
-	require.Equal(t, []string{"exists"}, ops.calls)
+	require.Equal(t, []string{"load-existing"}, ops.calls)
+}
+
+// TestCreateTxWithOpsConfirmExisting verifies that the shared CreateTx flow can
+// promote one existing unmined row to confirmed state instead of inserting a
+// duplicate row.
+func TestCreateTxWithOpsConfirmExisting(t *testing.T) {
+	t.Parallel()
+
+	req, err := newCreateTxRequest(CreateTxParams{
+		WalletID: 5,
+		Tx:       testRegularMsgTx(),
+		Received: time.Unix(456, 0),
+		Block:    testBlock(77),
+		Status:   TxStatusPublished,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	ops := &stubCreateTxOps{existing: &createTxExistingTarget{
+		id:       7,
+		status:   TxStatusPending,
+		hasBlock: false,
+	}}
+
+	err = createTxWithOps(context.Background(), req, ops)
+	require.NoError(t, err)
+	require.Equal(t, []string{"load-existing", "confirm-existing"}, ops.calls)
+}
+
+// TestCreateTxWithOpsInvalidateConflicts verifies that the shared CreateTx flow
+// invalidates direct conflict roots before a confirmed insert claims their
+// spent-parent edges.
+func TestCreateTxWithOpsInvalidateConflicts(t *testing.T) {
+	t.Parallel()
+
+	req, err := newCreateTxRequest(CreateTxParams{
+		WalletID: 5,
+		Tx:       testRegularMsgTx(),
+		Received: time.Unix(456, 0),
+		Block:    testBlock(77),
+		Status:   TxStatusPublished,
+		Credits:  map[uint32]btcutil.Address{0: nil},
+	})
+	require.NoError(t, err)
+
+	ops := &stubCreateTxOps{
+		insertTxID: 11,
+		conflictIDs: []invalidateUnminedTxTarget{{
+			id:     5,
+			txHash: chainhash.Hash{9},
+			status: TxStatusPublished,
+		}},
+	}
+
+	err = createTxWithOps(context.Background(), req, ops)
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"load-existing",
+		"prepare-block",
+		"list-conflicts",
+		"invalidate-conflicts",
+		"insert",
+		"credits",
+		"inputs",
+	}, ops.calls)
 }
 
 // testBlock builds a simple block fixture for CreateTx validation tests.
@@ -382,8 +453,9 @@ func testCoinbaseMsgTx() *wire.MsgTx {
 // stubCreateTxOps records how the shared CreateTx helper drives one backend
 // adapter while letting each test control the returned transaction IDs.
 type stubCreateTxOps struct {
-	hasExistingResult bool
-	insertTxID        int64
+	existing    *createTxExistingTarget
+	insertTxID  int64
+	conflictIDs []invalidateUnminedTxTarget
 
 	calls       []string
 	insertReq   createTxRequest
@@ -393,14 +465,24 @@ type stubCreateTxOps struct {
 
 var _ createTxOps = (*stubCreateTxOps)(nil)
 
-// hasExisting records that the shared flow checked whether the tx hash already
+// loadExisting records that the shared flow checked whether the tx hash already
 // exists and returns the test-controlled result.
-func (s *stubCreateTxOps) hasExisting(_ context.Context,
-	_ createTxRequest) (bool, error) {
+func (s *stubCreateTxOps) loadExisting(_ context.Context,
+	_ createTxRequest) (*createTxExistingTarget, error) {
 
-	s.calls = append(s.calls, "exists")
+	s.calls = append(s.calls, "load-existing")
 
-	return s.hasExistingResult, nil
+	return s.existing, nil
+}
+
+// confirmExisting records that the shared flow promoted one existing row.
+func (s *stubCreateTxOps) confirmExisting(_ context.Context,
+	_ createTxRequest,
+	_ createTxExistingTarget) error {
+
+	s.calls = append(s.calls, "confirm-existing")
+
+	return nil
 }
 
 // prepareBlock records that the shared flow validated any optional block
@@ -409,6 +491,27 @@ func (s *stubCreateTxOps) prepareBlock(_ context.Context,
 	_ createTxRequest) error {
 
 	s.calls = append(s.calls, "prepare-block")
+
+	return nil
+}
+
+// listDirectConflictTargets records that the shared flow checked for direct
+// wallet-owned conflicts before insert.
+func (s *stubCreateTxOps) listDirectConflictTargets(_ context.Context,
+	_ createTxRequest) ([]invalidateUnminedTxTarget, error) {
+
+	s.calls = append(s.calls, "list-conflicts")
+
+	return s.conflictIDs, nil
+}
+
+// invalidateConflicts records that the shared flow invalidated one direct
+// conflict branch before insert.
+func (s *stubCreateTxOps) invalidateConflicts(_ context.Context,
+	_ createTxRequest,
+	_ []invalidateUnminedTxTarget) error {
+
+	s.calls = append(s.calls, "invalidate-conflicts")
 
 	return nil
 }
