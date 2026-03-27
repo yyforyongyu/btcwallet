@@ -332,7 +332,16 @@ func maybeConfirmCreateTxExisting(ctx context.Context, req createTxRequest,
 	}
 
 	if existing.isCoinbase {
-		return false, nil
+		if !req.isCoinbase || existing.status != TxStatusOrphaned {
+			return false, nil
+		}
+
+		err := ops.confirmExisting(ctx, req, existing)
+		if err != nil {
+			return false, err
+		}
+
+		return true, nil
 	}
 
 	if !isUnminedStatus(existing.status) {
@@ -721,6 +730,11 @@ type rollbackToBlockOps interface {
 	// rollback boundary after sync-state references have been rewound.
 	deleteBlocksAtOrAboveHeight(ctx context.Context, height uint32) error
 
+	// markRollbackRootsOrphaned rewrites the disconnected coinbase roots to the
+	// orphaned state after their confirming blocks are deleted.
+	markRollbackRootsOrphaned(ctx context.Context, walletID uint32,
+		rootHashes map[chainhash.Hash]struct{}) error
+
 	// listUnminedTxRecords loads the wallet's current unmined transaction
 	// rows in the normalized shape the descendant walk expects.
 	listUnminedTxRecords(ctx context.Context,
@@ -872,6 +886,23 @@ func invalidateRollbackDescendants(ctx context.Context,
 	return nil
 }
 
+// markRollbackRootsOrphaned rewrites every disconnected coinbase root to the
+// orphaned state before descendant invalidation completes.
+func markRollbackRootsOrphaned(ctx context.Context,
+	rootHashesByWallet map[uint32]map[chainhash.Hash]struct{},
+	ops rollbackToBlockOps) error {
+
+	for walletID, rootHashes := range rootHashesByWallet {
+		err := ops.markRollbackRootsOrphaned(ctx, walletID, rootHashes)
+		if err != nil {
+			return fmt.Errorf("mark rollback coinbase roots orphaned for wallet %d: %w",
+				walletID, err)
+		}
+	}
+
+	return nil
+}
+
 // rollbackToBlockWithOps runs the shared RollbackToBlock sequence inside one
 // backend-specific SQL transaction.
 //
@@ -894,6 +925,11 @@ func rollbackToBlockWithOps(ctx context.Context, height uint32,
 	err = ops.deleteBlocksAtOrAboveHeight(ctx, height)
 	if err != nil {
 		return fmt.Errorf("delete blocks at or above height: %w", err)
+	}
+
+	err = markRollbackRootsOrphaned(ctx, rootHashesByWallet, ops)
+	if err != nil {
+		return err
 	}
 
 	err = invalidateRollbackDescendants(ctx, rootHashesByWallet, ops)
