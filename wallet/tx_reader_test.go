@@ -81,17 +81,17 @@ func TestGetTxSuccess(t *testing.T) {
 
 	testCases := []struct {
 		name             string
-		mockDetails      *wtxmgr.TxDetails
+		mockDetails      *db.TxDetailInfo
 		expectedTxDetail *TxDetail
 	}{
 		{
 			name:             "mined tx",
-			mockDetails:      minedDetails,
+			mockDetails:      txDetailInfoFromLegacy(minedDetails),
 			expectedTxDetail: minedTxDetail,
 		},
 		{
 			name:             "unmined tx",
-			mockDetails:      unminedDetails,
+			mockDetails:      txDetailInfoFromLegacy(unminedDetails),
 			expectedTxDetail: unminedTxDetail,
 		},
 	}
@@ -103,8 +103,10 @@ func TestGetTxSuccess(t *testing.T) {
 			w, mocks := createStartedWalletWithMocks(t)
 			// SyncedTo is mocked in createStartedWalletWithMocks (height 1).
 
-			mocks.txStore.On("TxDetails", mock.Anything, TstTxHash).
-				Return(tc.mockDetails, nil).Once()
+			mocks.store.On("GetTxDetail", mock.Anything, db.GetTxDetailQuery{
+				WalletID: w.id,
+				Txid:     *TstTxHash,
+			}).Return(tc.mockDetails, nil).Once()
 
 			// Act: Get the transaction.
 			details, err := w.GetTx(t.Context(), TxQuery{
@@ -149,8 +151,10 @@ func TestGetTxNotFound(t *testing.T) {
 	// Arrange: Create a test wallet with mocks and mock the TxDetails call
 	// to return nil, simulating a non-existing tx.
 	w, mocks := createStartedWalletWithMocks(t)
-	mocks.txStore.On("TxDetails", mock.Anything, TstTxHash).
-		Return(nil, nil).Once()
+	mocks.store.On("GetTxDetail", mock.Anything, db.GetTxDetailQuery{
+		WalletID: w.id,
+		Txid:     *TstTxHash,
+	}).Return(nil, db.ErrTxNotFound).Once()
 
 	// Act: Attempt to get the transaction.
 	_, err := w.GetTx(t.Context(), TxQuery{
@@ -353,6 +357,45 @@ func txInfoFromLegacy(details *wtxmgr.TxDetails) *db.TxInfo {
 		Block:        block,
 		Status:       db.TxStatusPublished,
 		Label:        details.Label,
+	}
+}
+
+func txDetailInfoFromLegacy(details *wtxmgr.TxDetails) *db.TxDetailInfo {
+	var block *db.Block
+	if details.Block.Height >= 0 {
+		block = &db.Block{
+			Hash:      details.Block.Hash,
+			Height:    uint32(details.Block.Height),
+			Timestamp: details.Block.Time,
+		}
+	}
+
+	ownedInputs := make([]db.TxOwnedInput, 0, len(details.Debits))
+	for _, debit := range details.Debits {
+		ownedInputs = append(ownedInputs, db.TxOwnedInput{
+			Index:  debit.Index,
+			Amount: debit.Amount,
+		})
+	}
+
+	ownedOutputs := make([]db.TxOwnedOutput, 0, len(details.Credits))
+	for _, credit := range details.Credits {
+		ownedOutputs = append(ownedOutputs, db.TxOwnedOutput{
+			Index:  credit.Index,
+			Amount: credit.Amount,
+		})
+	}
+
+	return &db.TxDetailInfo{
+		Hash:         details.Hash,
+		MsgTx:        &details.MsgTx,
+		SerializedTx: details.SerializedTx,
+		Received:     details.Received,
+		Block:        block,
+		Status:       db.TxStatusPublished,
+		Label:        details.Label,
+		OwnedInputs:  ownedInputs,
+		OwnedOutputs: ownedOutputs,
 	}
 }
 

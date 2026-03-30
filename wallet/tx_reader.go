@@ -195,15 +195,22 @@ func (w *Wallet) GetTx(ctx context.Context, query TxQuery) (
 		return w.buildTxSummary(txInfo, currentHeight)
 	}
 
-	txDetails, err := w.fetchTxDetails(&query.TxHash)
+	txDetails, err := w.store.GetTxDetail(ctx, db.GetTxDetailQuery{
+		WalletID: w.id,
+		Txid:     query.TxHash,
+	})
 	if err != nil {
-		return nil, err
+		if errors.Is(err, db.ErrTxNotFound) {
+			return nil, ErrTxNotFound
+		}
+
+		return nil, fmt.Errorf("get tx detail: %w", err)
 	}
 
 	bestBlock := w.SyncedTo()
 	currentHeight := bestBlock.Height
 
-	return w.buildTxDetail(txDetails, currentHeight), nil
+	return w.buildTxDetailFromStore(txDetails, currentHeight)
 }
 
 // ListTxns returns transaction views over the provided block range query.
@@ -335,6 +342,31 @@ func (w *Wallet) buildTxSummary(txInfo *db.TxInfo,
 	return details, nil
 }
 
+// buildTxDetailFromStore builds a TxDetail from the given db-native detail
+// shape returned by db.Store.
+func (w *Wallet) buildTxDetailFromStore(txDetails *db.TxDetailInfo,
+	currentHeight int32) (*TxDetail, error) {
+
+	msgTx := txDetails.MsgTx
+	if msgTx == nil {
+		var err error
+
+		msgTx, err = deserializeTxDetail(txDetails.SerializedTx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	details := w.buildBasicTxDetailFromStore(txDetails, msgTx)
+
+	w.populateBlockDetailsFromStore(details, txDetails, currentHeight)
+	w.calculateValueAndFeeFromStore(details, txDetails, msgTx)
+	w.populateOutputsFromStore(details, txDetails, msgTx)
+	w.populatePrevOutsFromStore(details, txDetails, msgTx)
+
+	return details, nil
+}
+
 // buildBasicTxDetail builds the basic TxDetail from the given wtxmgr.TxDetails.
 func (w *Wallet) buildBasicTxDetail(txDetails *wtxmgr.TxDetails) *TxDetail {
 	return buildBasicTxDetail(
@@ -357,6 +389,25 @@ func buildBasicTxDetail(hash chainhash.Hash, rawTx []byte, label string,
 		RawTx:        rawTx,
 		Label:        label,
 		ReceivedTime: received,
+		Weight:       safeInt64ToWeightUnit(txWeight),
+		FeeRate:      btcunit.ZeroSatPerVByte,
+	}
+}
+
+// buildBasicTxDetailFromStore builds the basic TxDetail from the given
+// db-native detail shape.
+func (w *Wallet) buildBasicTxDetailFromStore(txDetails *db.TxDetailInfo,
+	msgTx *wire.MsgTx) *TxDetail {
+
+	txWeight := blockchain.GetTransactionWeight(
+		btcutil.NewTx(msgTx),
+	)
+
+	return &TxDetail{
+		Hash:         txDetails.Hash,
+		RawTx:        txDetails.SerializedTx,
+		Label:        txDetails.Label,
+		ReceivedTime: txDetails.Received,
 		Weight:       safeInt64ToWeightUnit(txWeight),
 		FeeRate:      btcunit.ZeroSatPerVByte,
 	}
@@ -406,6 +457,31 @@ func (w *Wallet) populateBlockDetailsFromBlock(details *TxDetail,
 	details.Confirmations = calcConf(height, currentHeight)
 }
 
+// populateBlockDetailsFromStore populates the block details for a store-backed
+// TxDetail.
+func (w *Wallet) populateBlockDetailsFromStore(details *TxDetail,
+	txDetails *db.TxDetailInfo, currentHeight int32) {
+
+	if txDetails.Block == nil {
+		return
+	}
+
+	height, ok := safeUint32ToInt32(txDetails.Block.Height)
+	if !ok {
+		log.Warnf("Block height %d out of int32 range", txDetails.Block.Height)
+
+		return
+	}
+
+	details.Block = &BlockDetails{
+		Hash:      txDetails.Block.Hash,
+		Height:    height,
+		Timestamp: txDetails.Block.Timestamp.Unix(),
+	}
+
+	details.Confirmations = calcConf(height, currentHeight)
+}
+
 // calculateValueAndFee calculates the value and fee for the given TxDetail.
 func (w *Wallet) calculateValueAndFee(details *TxDetail,
 	txDetails *wtxmgr.TxDetails) {
@@ -437,6 +513,42 @@ func (w *Wallet) calculateValueAndFee(details *TxDetail,
 
 	var totalOutput btcutil.Amount
 	for _, txOut := range txDetails.MsgTx.TxOut {
+		totalOutput += btcutil.Amount(txOut.Value)
+	}
+
+	details.Fee = totalInput - totalOutput
+	details.FeeRate = btcunit.CalcSatPerVByte(
+		details.Fee, details.Weight.ToVB(),
+	)
+}
+
+// calculateValueAndFeeFromStore calculates the value and fee for the given
+// store-backed TxDetail.
+func (w *Wallet) calculateValueAndFeeFromStore(details *TxDetail,
+	txDetails *db.TxDetailInfo, msgTx *wire.MsgTx) {
+
+	var balanceDelta btcutil.Amount
+	for _, debit := range txDetails.OwnedInputs {
+		balanceDelta -= debit.Amount
+	}
+
+	for _, credit := range txDetails.OwnedOutputs {
+		balanceDelta += credit.Amount
+	}
+
+	details.Value = balanceDelta
+
+	if len(txDetails.OwnedInputs) != len(msgTx.TxIn) {
+		return
+	}
+
+	var totalInput btcutil.Amount
+	for _, debit := range txDetails.OwnedInputs {
+		totalInput += debit.Amount
+	}
+
+	var totalOutput btcutil.Amount
+	for _, txOut := range msgTx.TxOut {
 		totalOutput += btcutil.Amount(txOut.Value)
 	}
 
@@ -487,6 +599,45 @@ func (w *Wallet) populateOutputs(details *TxDetail,
 	}
 }
 
+// populateOutputsFromStore populates outputs for a store-backed TxDetail.
+func (w *Wallet) populateOutputsFromStore(details *TxDetail,
+	txDetails *db.TxDetailInfo, msgTx *wire.MsgTx) {
+
+	isOurAddress := make(map[uint32]bool)
+	for _, credit := range txDetails.OwnedOutputs {
+		isOurAddress[credit.Index] = true
+	}
+
+	for i, txOut := range msgTx.TxOut {
+		sc, outAddresses, _, err := txscript.ExtractPkScriptAddrs(
+			txOut.PkScript, w.cfg.ChainParams,
+		)
+
+		var addresses []btcutil.Address
+		if err != nil {
+			log.Warnf("Cannot extract addresses from pkScript for "+
+				"tx %v, output %d: %v", details.Hash, i, err)
+		} else {
+			addresses = outAddresses
+		}
+
+		idx, ok := safeIntToUint32(i)
+		if !ok {
+			log.Warnf("Output index %d out of uint32 range", i)
+			continue
+		}
+
+		details.Outputs = append(details.Outputs, Output{
+			Type:      sc,
+			Addresses: addresses,
+			PkScript:  txOut.PkScript,
+			Index:     i,
+			Amount:    btcutil.Amount(txOut.Value),
+			IsOurs:    isOurAddress[idx],
+		})
+	}
+}
+
 // populatePrevOuts populates the previous outputs for the given TxDetail.
 func (w *Wallet) populatePrevOuts(details *TxDetail,
 	txDetails *wtxmgr.TxDetails) {
@@ -509,6 +660,29 @@ func (w *Wallet) populatePrevOuts(details *TxDetail,
 				IsOurs:   isOurOutput[idx],
 			},
 		)
+	}
+}
+
+// populatePrevOutsFromStore populates prevouts for a store-backed TxDetail.
+func (w *Wallet) populatePrevOutsFromStore(details *TxDetail,
+	txDetails *db.TxDetailInfo, msgTx *wire.MsgTx) {
+
+	isOurOutput := make(map[uint32]bool)
+	for _, debit := range txDetails.OwnedInputs {
+		isOurOutput[debit.Index] = true
+	}
+
+	for i, txIn := range msgTx.TxIn {
+		idx, ok := safeIntToUint32(i)
+		if !ok {
+			log.Warnf("Input index %d out of uint32 range", i)
+			continue
+		}
+
+		details.PrevOuts = append(details.PrevOuts, PrevOut{
+			OutPoint: txIn.PreviousOutPoint,
+			IsOurs:   isOurOutput[idx],
+		})
 	}
 }
 
@@ -543,7 +717,7 @@ func safeUint32ToInt32(u uint32) (int32, bool) {
 }
 
 // deserializeTxDetail decodes a serialized transaction detail payload into a
-// wire transaction.
+// wire transaction when the store did not already provide a decoded MsgTx.
 func deserializeTxDetail(rawTx []byte) (*wire.MsgTx, error) {
 	var tx wire.MsgTx
 
