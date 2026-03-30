@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcwallet/pkg/btcunit"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -116,6 +117,28 @@ func TestGetTxSuccess(t *testing.T) {
 			require.Equal(t, tc.expectedTxDetail, details)
 		})
 	}
+}
+
+// TestGetTxSummarySuccess tests the summary query path for GetTx.
+func TestGetTxSummarySuccess(t *testing.T) {
+	t.Parallel()
+
+	minedDetails, minedTxDetail := createMinedTxDetail(t)
+	expectedSummary := txSummaryFromDetailed(minedTxDetail)
+
+	w, mocks := createStartedWalletWithMocks(t)
+	mocks.store.On("GetTx", mock.Anything, db.GetTxQuery{
+		WalletID: w.id,
+		Txid:     *TstTxHash,
+	}).Return(txInfoFromLegacy(minedDetails), nil).Once()
+
+	details, err := w.GetTx(t.Context(), TxQuery{
+		TxHash:         *TstTxHash,
+		IncludeDetails: false,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, expectedSummary, details)
 }
 
 // TestGetTxNotFound tests that GetTx returns the correct error when a
@@ -311,4 +334,35 @@ func createMinedTxDetail(t *testing.T) (*wtxmgr.TxDetails, *TxDetail) {
 	}
 
 	return minedDetails, minedTxDetail
+}
+
+func txInfoFromLegacy(details *wtxmgr.TxDetails) *db.TxInfo {
+	var block *db.Block
+	if details.Block.Height >= 0 {
+		block = &db.Block{
+			Hash:      details.Block.Hash,
+			Height:    uint32(details.Block.Height),
+			Timestamp: details.Block.Time,
+		}
+	}
+
+	return &db.TxInfo{
+		Hash:         details.Hash,
+		SerializedTx: details.SerializedTx,
+		Received:     details.Received,
+		Block:        block,
+		Status:       db.TxStatusPublished,
+		Label:        details.Label,
+	}
+}
+
+func txSummaryFromDetailed(detail *TxDetail) *TxDetail {
+	summary := *detail
+	summary.Value = 0
+	summary.Fee = 0
+	summary.FeeRate = btcunit.ZeroSatPerVByte
+	summary.Outputs = nil
+	summary.PrevOuts = nil
+
+	return &summary
 }

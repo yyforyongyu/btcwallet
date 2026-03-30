@@ -5,6 +5,7 @@
 package wallet
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/pkg/btcunit"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -167,12 +169,30 @@ type TxDetail struct {
 // number of outputs. The lookup is dominated by a key-based B-tree lookup
 // in the database and the processing of the transaction's inputs and
 // outputs.
-func (w *Wallet) GetTx(_ context.Context, query TxQuery) (
+func (w *Wallet) GetTx(ctx context.Context, query TxQuery) (
 	*TxDetail, error) {
 
 	err := w.state.validateStarted()
 	if err != nil {
 		return nil, err
+	}
+
+	if !query.IncludeDetails {
+		txInfo, err := w.store.GetTx(ctx, db.GetTxQuery{
+			WalletID: w.id,
+			Txid:     query.TxHash,
+		})
+		if err != nil {
+			if errors.Is(err, db.ErrTxNotFound) {
+				return nil, ErrTxNotFound
+			}
+
+			return nil, fmt.Errorf("get tx summary: %w", err)
+		}
+
+		currentHeight := w.SyncedTo().Height
+
+		return w.buildTxSummary(txInfo, currentHeight)
 	}
 
 	txDetails, err := w.fetchTxDetails(&query.TxHash)
@@ -296,17 +316,47 @@ func (w *Wallet) buildTxDetail(txDetails *wtxmgr.TxDetails,
 	return details
 }
 
+// buildTxSummary builds a TxDetail from the given db-native transaction
+// summary shape.
+func (w *Wallet) buildTxSummary(txInfo *db.TxInfo,
+	currentHeight int32) (*TxDetail, error) {
+
+	msgTx, err := deserializeTxDetail(txInfo.SerializedTx)
+	if err != nil {
+		return nil, err
+	}
+
+	details := buildBasicTxDetail(
+		txInfo.Hash, txInfo.SerializedTx, txInfo.Label, txInfo.Received, msgTx,
+	)
+
+	w.populateBlockDetailsFromBlock(details, txInfo.Block, currentHeight)
+
+	return details, nil
+}
+
 // buildBasicTxDetail builds the basic TxDetail from the given wtxmgr.TxDetails.
 func (w *Wallet) buildBasicTxDetail(txDetails *wtxmgr.TxDetails) *TxDetail {
+	return buildBasicTxDetail(
+		txDetails.Hash, txDetails.SerializedTx, txDetails.Label,
+		txDetails.Received, &txDetails.MsgTx,
+	)
+}
+
+// buildBasicTxDetail builds the common non-wallet-relative fields for one tx
+// response.
+func buildBasicTxDetail(hash chainhash.Hash, rawTx []byte, label string,
+	received time.Time, msgTx *wire.MsgTx) *TxDetail {
+
 	txWeight := blockchain.GetTransactionWeight(
-		btcutil.NewTx(&txDetails.MsgTx),
+		btcutil.NewTx(msgTx),
 	)
 
 	return &TxDetail{
-		Hash:         txDetails.Hash,
-		RawTx:        txDetails.SerializedTx,
-		Label:        txDetails.Label,
-		ReceivedTime: txDetails.Received,
+		Hash:         hash,
+		RawTx:        rawTx,
+		Label:        label,
+		ReceivedTime: received,
 		Weight:       safeInt64ToWeightUnit(txWeight),
 		FeeRate:      btcunit.ZeroSatPerVByte,
 	}
@@ -315,16 +365,42 @@ func (w *Wallet) buildBasicTxDetail(txDetails *wtxmgr.TxDetails) *TxDetail {
 // populateBlockDetails populates the block details for the given TxDetail.
 func (w *Wallet) populateBlockDetails(details *TxDetail,
 	txDetails *wtxmgr.TxDetails, currentHeight int32) {
+	w.populateBlockDetailsFromBlock(
+		details,
+		&db.Block{
+			Hash:      txDetails.Block.Hash,
+			Height:    nonNegativeHeight(txDetails.Block.Height),
+			Timestamp: txDetails.Block.Time,
+		},
+		currentHeight,
+	)
 
-	height := txDetails.Block.Height
-	if height == -1 {
+	if txDetails.Block.Height == -1 {
+		details.Block = nil
+		details.Confirmations = 0
+	}
+}
+
+// populateBlockDetailsFromBlock populates the block details from a db-native
+// block shape.
+func (w *Wallet) populateBlockDetailsFromBlock(details *TxDetail,
+	block *db.Block, currentHeight int32) {
+
+	if block == nil {
+		return
+	}
+
+	height, ok := safeUint32ToInt32(block.Height)
+	if !ok {
+		log.Warnf("Block height %d out of int32 range", block.Height)
+
 		return
 	}
 
 	details.Block = &BlockDetails{
-		Hash:      txDetails.Block.Hash,
-		Height:    txDetails.Block.Height,
-		Timestamp: txDetails.Block.Time.Unix(),
+		Hash:      block.Hash,
+		Height:    height,
+		Timestamp: block.Timestamp.Unix(),
 	}
 
 	details.Confirmations = calcConf(height, currentHeight)
@@ -454,4 +530,37 @@ func safeIntToUint32(i int) (uint32, bool) {
 	}
 
 	return uint32(i), true
+}
+
+// safeUint32ToInt32 converts a uint32 to an int32, returning false if the
+// conversion would overflow.
+func safeUint32ToInt32(u uint32) (int32, bool) {
+	if u > math.MaxInt32 {
+		return 0, false
+	}
+
+	return int32(u), true
+}
+
+// deserializeTxDetail decodes a serialized transaction detail payload into a
+// wire transaction.
+func deserializeTxDetail(rawTx []byte) (*wire.MsgTx, error) {
+	var tx wire.MsgTx
+
+	err := tx.Deserialize(bytes.NewReader(rawTx))
+	if err != nil {
+		return nil, fmt.Errorf("deserialize tx detail: %w", err)
+	}
+
+	return &tx, nil
+}
+
+// nonNegativeHeight converts a legacy height into a uint32 for db-native block
+// metadata.
+func nonNegativeHeight(height int32) uint32 {
+	if height < 0 {
+		return 0
+	}
+
+	return uint32(height)
 }
