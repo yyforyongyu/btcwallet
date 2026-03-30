@@ -20,7 +20,6 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/pkg/btcunit"
 	db "github.com/btcsuite/btcwallet/wallet/internal/db"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
 var (
@@ -34,8 +33,11 @@ type TxQuery struct {
 	// TxHash is the transaction hash to query.
 	TxHash chainhash.Hash
 
-	// IncludeDetails controls whether wallet-relative value, fee, inputs, and
-	// outputs are populated.
+	// IncludeDetails controls whether wallet-relative inputs, outputs, value,
+	// and fee data are populated.
+	//
+	// When false, TxReader uses the summary store path and leaves those detail
+	// fields at their zero values.
 	IncludeDetails bool
 }
 
@@ -47,17 +49,18 @@ type TxListQuery struct {
 	// EndHeight is the ending height in wallet tx-reader semantics.
 	EndHeight int32
 
-	// IncludeDetails controls whether wallet-relative value, fee, inputs, and
-	// outputs are populated for each result.
+	// IncludeDetails controls whether wallet-relative inputs, outputs, value,
+	// and fee data are populated for each returned transaction.
 	IncludeDetails bool
 }
 
 // TxReader provides an interface for querying tx history.
 type TxReader interface {
-	// GetTx returns one wallet transaction view using the provided query.
+	// GetTx returns one transaction view using the requested query mode.
 	GetTx(ctx context.Context, query TxQuery) (*TxDetail, error)
 
-	// ListTxns returns wallet transaction views over the provided range.
+	// ListTxns returns transaction views over a block range using the requested
+	// query mode.
 	ListTxns(ctx context.Context, query TxListQuery) (
 		[]*TxDetail, error)
 }
@@ -65,17 +68,6 @@ type TxReader interface {
 // A compile-time assertion to ensure that Wallet implements the TxReader
 // interface.
 var _ TxReader = (*Wallet)(nil)
-
-type normalizedTxListQuery struct {
-	confirmedStart uint32
-	confirmedEnd   uint32
-	reverse        bool
-	includeUnmined bool
-	unminedFirst   bool
-	hasConfirmed   bool
-}
-
-const maxWalletTxHeight = uint32(math.MaxInt32)
 
 // Output contains details for a tx output.
 type Output struct {
@@ -173,13 +165,10 @@ type TxDetail struct {
 	Label string
 }
 
-// GetTx returns a transaction view using the provided query.
+// GetTx returns one transaction view using either the summary or the detailed
+// store path, depending on IncludeDetails.
 //
-// Time complexity: O(log n + I + O), where n is the number of
-// transactions in the database, I is the number of inputs, and O is the
-// number of outputs. The lookup is dominated by a key-based B-tree lookup
-// in the database and the processing of the transaction's inputs and
-// outputs.
+// NOTE: This method is part of the TxReader interface.
 func (w *Wallet) GetTx(ctx context.Context, query TxQuery) (
 	*TxDetail, error) {
 
@@ -188,23 +177,69 @@ func (w *Wallet) GetTx(ctx context.Context, query TxQuery) (
 		return nil, err
 	}
 
-	if !query.IncludeDetails {
-		txInfo, err := w.store.GetTx(ctx, db.GetTxQuery{
-			WalletID: w.id,
-			Txid:     query.TxHash,
-		})
-		if err != nil {
-			if errors.Is(err, db.ErrTxNotFound) {
-				return nil, ErrTxNotFound
-			}
+	currentHeight := w.SyncedTo().Height
+	if query.IncludeDetails {
+		return w.getTxDetail(ctx, query, currentHeight)
+	}
 
-			return nil, fmt.Errorf("get tx summary: %w", err)
+	return w.getTxSummary(ctx, query, currentHeight)
+}
+
+// ListTxns returns transaction views over a block range using either the
+// summary or the detailed store path, depending on IncludeDetails.
+//
+// NOTE: This method is part of the TxReader interface.
+func (w *Wallet) ListTxns(ctx context.Context, query TxListQuery) (
+	[]*TxDetail, error) {
+
+	err := w.state.validateStarted()
+	if err != nil {
+		return nil, err
+	}
+
+	currentHeight := w.SyncedTo().Height
+	if query.IncludeDetails {
+		return w.listTxDetails(ctx, query, currentHeight)
+	}
+
+	return w.listTxSummaries(ctx, query, currentHeight)
+}
+
+type normalizedTxListQuery struct {
+	confirmedStart uint32
+	confirmedEnd   uint32
+	reverse        bool
+	includeUnmined bool
+	unminedFirst   bool
+	hasConfirmed   bool
+}
+
+const maxWalletTxHeight = uint32(math.MaxInt32)
+
+// getTxSummary loads one transaction through the summary store path and builds
+// the lightweight wallet response.
+func (w *Wallet) getTxSummary(ctx context.Context, query TxQuery,
+	currentHeight int32) (*TxDetail, error) {
+
+	txInfo, err := w.store.GetTx(ctx, db.GetTxQuery{
+		WalletID: w.id,
+		Txid:     query.TxHash,
+	})
+	if err != nil {
+		if errors.Is(err, db.ErrTxNotFound) {
+			return nil, ErrTxNotFound
 		}
 
-		currentHeight := w.SyncedTo().Height
-
-		return w.buildTxSummary(txInfo, currentHeight)
+		return nil, fmt.Errorf("get tx summary: %w", err)
 	}
+
+	return w.buildTxSummary(txInfo, currentHeight)
+}
+
+// getTxDetail loads one transaction through the detailed store path and builds
+// the full wallet response.
+func (w *Wallet) getTxDetail(ctx context.Context, query TxQuery,
+	currentHeight int32) (*TxDetail, error) {
 
 	txDetails, err := w.store.GetTxDetail(ctx, db.GetTxDetailQuery{
 		WalletID: w.id,
@@ -218,63 +253,19 @@ func (w *Wallet) GetTx(ctx context.Context, query TxQuery) (
 		return nil, fmt.Errorf("get tx detail: %w", err)
 	}
 
-	bestBlock := w.SyncedTo()
-	currentHeight := bestBlock.Height
-
 	return w.buildTxDetailFromStore(txDetails, currentHeight)
 }
 
-// ListTxns returns transaction views over the provided block range query.
-//
-// The underlying transaction store allows for reverse iteration, so if
-// StartHeight > EndHeight, the transactions will be returned in reverse
-// order.
-//
-// The special height -1 may be used to include unmined transactions. For
-// example, to get all transactions from block 100 to the current tip including
-// unmined, use a StartHeight of 100 and an EndHeight of -1. To get all
-// transactions in the wallet, use a StartHeight of 0 and an EndHeight of -1.
-//
-// Time complexity: O(B + N), where B is the number of blocks in the
-// range and N is the total number of inputs and outputs across all
-// transactions in the range.
-func (w *Wallet) ListTxns(ctx context.Context,
-	query TxListQuery) ([]*TxDetail, error) {
-
-	err := w.state.validateStarted()
-	if err != nil {
-		return nil, err
-	}
-
-	currentHeight := w.SyncedTo().Height
-	if query.IncludeDetails {
-		records, err := w.store.ListTxDetails(ctx, db.ListTxDetailsQuery{
-			WalletID:    w.id,
-			StartHeight: query.StartHeight,
-			EndHeight:   query.EndHeight,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("list tx details: %w", err)
-		}
-
-		details := make([]*TxDetail, 0, len(records))
-		for _, detail := range records {
-			txDetail, err := w.buildTxDetailFromStore(&detail, currentHeight)
-			if err != nil {
-				return nil, err
-			}
-
-			details = append(details, txDetail)
-		}
-
-		return details, nil
-	}
+// listTxSummaries loads transaction summaries over the requested wallet range
+// and builds lightweight wallet responses.
+func (w *Wallet) listTxSummaries(ctx context.Context, query TxListQuery,
+	currentHeight int32) ([]*TxDetail, error) {
 
 	normalized := normalizeTxListQuery(query)
 
 	var infos []db.TxInfo
 
-	infos, err = w.appendUnminedTxSummariesIfNeeded(
+	infos, err := w.appendUnminedTxSummariesIfNeeded(
 		ctx,
 		normalized.includeUnmined && normalized.unminedFirst,
 		infos,
@@ -300,6 +291,33 @@ func (w *Wallet) ListTxns(ctx context.Context,
 	}
 
 	return w.buildTxSummaries(infos, currentHeight)
+}
+
+// listTxDetails loads detailed transactions over the requested wallet range and
+// builds full wallet responses.
+func (w *Wallet) listTxDetails(ctx context.Context, query TxListQuery,
+	currentHeight int32) ([]*TxDetail, error) {
+
+	records, err := w.store.ListTxDetails(ctx, db.ListTxDetailsQuery{
+		WalletID:    w.id,
+		StartHeight: query.StartHeight,
+		EndHeight:   query.EndHeight,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list tx details: %w", err)
+	}
+
+	details := make([]*TxDetail, 0, len(records))
+	for i := range records {
+		txDetail, err := w.buildTxDetailFromStore(&records[i], currentHeight)
+		if err != nil {
+			return nil, err
+		}
+
+		details = append(details, txDetail)
+	}
+
+	return details, nil
 }
 
 // appendUnminedTxSummariesIfNeeded appends the summary-store unmined view when
@@ -414,29 +432,15 @@ func normalizeTxListQuery(query TxListQuery) normalizedTxListQuery {
 // nonNegativeHeightToUint32 converts a non-negative wallet tx-reader height to
 // uint32.
 func nonNegativeHeightToUint32(height int32) uint32 {
-	if height < 0 {
+	value, ok := safeIntToUint32(int(height))
+	if !ok {
 		return 0
 	}
 
-	return uint32(height)
+	return value
 }
 
-// buildTxDetail builds a TxDetail from the given wtxmgr.TxDetails.
-func (w *Wallet) buildTxDetail(txDetails *wtxmgr.TxDetails,
-	currentHeight int32) *TxDetail {
-
-	details := w.buildBasicTxDetail(txDetails)
-
-	w.populateBlockDetails(details, txDetails, currentHeight)
-	w.calculateValueAndFee(details, txDetails)
-	w.populateOutputs(details, txDetails)
-	w.populatePrevOuts(details, txDetails)
-
-	return details
-}
-
-// buildTxSummary builds a TxDetail from the given db-native transaction
-// summary shape.
+// buildTxSummary builds a wallet tx response from the db-native summary shape.
 func (w *Wallet) buildTxSummary(txInfo *db.TxInfo,
 	currentHeight int32) (*TxDetail, error) {
 
@@ -449,12 +453,12 @@ func (w *Wallet) buildTxSummary(txInfo *db.TxInfo,
 		txInfo.Hash, txInfo.SerializedTx, txInfo.Label, txInfo.Received, msgTx,
 	)
 
-	w.populateBlockDetailsFromBlock(details, txInfo.Block, currentHeight)
+	w.populateBlockDetails(details, txInfo.Block, currentHeight)
 
 	return details, nil
 }
 
-// buildTxDetailFromStore builds a TxDetail from the given db-native detail
+// buildTxDetailFromStore builds a wallet tx response from the db-native detail
 // shape returned by db.Store.
 func (w *Wallet) buildTxDetailFromStore(txDetails *db.TxDetailInfo,
 	currentHeight int32) (*TxDetail, error) {
@@ -469,22 +473,17 @@ func (w *Wallet) buildTxDetailFromStore(txDetails *db.TxDetailInfo,
 		}
 	}
 
-	details := w.buildBasicTxDetailFromStore(txDetails, msgTx)
+	details := buildBasicTxDetail(
+		txDetails.Hash, txDetails.SerializedTx, txDetails.Label,
+		txDetails.Received, msgTx,
+	)
 
-	w.populateBlockDetailsFromStore(details, txDetails, currentHeight)
+	w.populateBlockDetails(details, txDetails.Block, currentHeight)
 	w.calculateValueAndFeeFromStore(details, txDetails, msgTx)
-	w.populateOutputsFromStore(details, txDetails, msgTx)
-	w.populatePrevOutsFromStore(details, txDetails, msgTx)
+	w.populateOutputs(details, msgTx, txDetails.OwnedOutputs)
+	w.populatePrevOuts(details, msgTx, txDetails.OwnedInputs)
 
 	return details, nil
-}
-
-// buildBasicTxDetail builds the basic TxDetail from the given wtxmgr.TxDetails.
-func (w *Wallet) buildBasicTxDetail(txDetails *wtxmgr.TxDetails) *TxDetail {
-	return buildBasicTxDetail(
-		txDetails.Hash, txDetails.SerializedTx, txDetails.Label,
-		txDetails.Received, &txDetails.MsgTx,
-	)
 }
 
 // buildBasicTxDetail builds the common non-wallet-relative fields for one tx
@@ -506,48 +505,9 @@ func buildBasicTxDetail(hash chainhash.Hash, rawTx []byte, label string,
 	}
 }
 
-// buildBasicTxDetailFromStore builds the basic TxDetail from the given
-// db-native detail shape.
-func (w *Wallet) buildBasicTxDetailFromStore(txDetails *db.TxDetailInfo,
-	msgTx *wire.MsgTx) *TxDetail {
-
-	txWeight := blockchain.GetTransactionWeight(
-		btcutil.NewTx(msgTx),
-	)
-
-	return &TxDetail{
-		Hash:         txDetails.Hash,
-		RawTx:        txDetails.SerializedTx,
-		Label:        txDetails.Label,
-		ReceivedTime: txDetails.Received,
-		Weight:       safeInt64ToWeightUnit(txWeight),
-		FeeRate:      btcunit.ZeroSatPerVByte,
-	}
-}
-
 // populateBlockDetails populates the block details for the given TxDetail.
-func (w *Wallet) populateBlockDetails(details *TxDetail,
-	txDetails *wtxmgr.TxDetails, currentHeight int32) {
-	w.populateBlockDetailsFromBlock(
-		details,
-		&db.Block{
-			Hash:      txDetails.Block.Hash,
-			Height:    nonNegativeHeight(txDetails.Block.Height),
-			Timestamp: txDetails.Block.Time,
-		},
-		currentHeight,
-	)
-
-	if txDetails.Block.Height == -1 {
-		details.Block = nil
-		details.Confirmations = 0
-	}
-}
-
-// populateBlockDetailsFromBlock populates the block details from a db-native
-// block shape.
-func (w *Wallet) populateBlockDetailsFromBlock(details *TxDetail,
-	block *db.Block, currentHeight int32) {
+func (w *Wallet) populateBlockDetails(details *TxDetail, block *db.Block,
+	currentHeight int32) {
 
 	if block == nil {
 		return
@@ -567,71 +527,6 @@ func (w *Wallet) populateBlockDetailsFromBlock(details *TxDetail,
 	}
 
 	details.Confirmations = calcConf(height, currentHeight)
-}
-
-// populateBlockDetailsFromStore populates the block details for a store-backed
-// TxDetail.
-func (w *Wallet) populateBlockDetailsFromStore(details *TxDetail,
-	txDetails *db.TxDetailInfo, currentHeight int32) {
-
-	if txDetails.Block == nil {
-		return
-	}
-
-	height, ok := safeUint32ToInt32(txDetails.Block.Height)
-	if !ok {
-		log.Warnf("Block height %d out of int32 range", txDetails.Block.Height)
-
-		return
-	}
-
-	details.Block = &BlockDetails{
-		Hash:      txDetails.Block.Hash,
-		Height:    height,
-		Timestamp: txDetails.Block.Timestamp.Unix(),
-	}
-
-	details.Confirmations = calcConf(height, currentHeight)
-}
-
-// calculateValueAndFee calculates the value and fee for the given TxDetail.
-func (w *Wallet) calculateValueAndFee(details *TxDetail,
-	txDetails *wtxmgr.TxDetails) {
-
-	var balanceDelta btcutil.Amount
-	for _, debit := range txDetails.Debits {
-		balanceDelta -= debit.Amount
-	}
-
-	for _, credit := range txDetails.Credits {
-		balanceDelta += credit.Amount
-	}
-
-	details.Value = balanceDelta
-
-	// If not all inputs are ours, we can't calculate the total fee.
-	// txDetails.Debits contains only our inputs, while
-	// txDetails.MsgTx.TxIn contains all inputs. If they differ, some
-	// inputs belong to external wallets and we don't know their input
-	// values.
-	if len(txDetails.Debits) != len(txDetails.MsgTx.TxIn) {
-		return
-	}
-
-	var totalInput btcutil.Amount
-	for _, debit := range txDetails.Debits {
-		totalInput += debit.Amount
-	}
-
-	var totalOutput btcutil.Amount
-	for _, txOut := range txDetails.MsgTx.TxOut {
-		totalOutput += btcutil.Amount(txOut.Value)
-	}
-
-	details.Fee = totalInput - totalOutput
-	details.FeeRate = btcunit.CalcSatPerVByte(
-		details.Fee, details.Weight.ToVB(),
-	)
 }
 
 // calculateValueAndFeeFromStore calculates the value and fee for the given
@@ -670,53 +565,12 @@ func (w *Wallet) calculateValueAndFeeFromStore(details *TxDetail,
 	)
 }
 
-// populateOutputs populates the outputs for the given TxDetail.
-func (w *Wallet) populateOutputs(details *TxDetail,
-	txDetails *wtxmgr.TxDetails) {
+// populateOutputs populates outputs for a store-backed TxDetail.
+func (w *Wallet) populateOutputs(details *TxDetail, msgTx *wire.MsgTx,
+	ownedOutputs []db.TxOwnedOutput) {
 
 	isOurAddress := make(map[uint32]bool)
-	for _, credit := range txDetails.Credits {
-		isOurAddress[credit.Index] = true
-	}
-
-	for i, txOut := range txDetails.MsgTx.TxOut {
-		sc, outAddresses, _, err := txscript.ExtractPkScriptAddrs(
-			txOut.PkScript, w.cfg.ChainParams,
-		)
-
-		var addresses []btcutil.Address
-		if err != nil {
-			log.Warnf("Cannot extract addresses from pkScript for "+
-				"tx %v, output %d: %v", details.Hash, i, err)
-		} else {
-			addresses = outAddresses
-		}
-
-		idx, ok := safeIntToUint32(i)
-		if !ok {
-			log.Warnf("Output index %d out of uint32 range", i)
-			continue
-		}
-
-		details.Outputs = append(
-			details.Outputs, Output{
-				Type:      sc,
-				Addresses: addresses,
-				PkScript:  txOut.PkScript,
-				Index:     i,
-				Amount:    btcutil.Amount(txOut.Value),
-				IsOurs:    isOurAddress[idx],
-			},
-		)
-	}
-}
-
-// populateOutputsFromStore populates outputs for a store-backed TxDetail.
-func (w *Wallet) populateOutputsFromStore(details *TxDetail,
-	txDetails *db.TxDetailInfo, msgTx *wire.MsgTx) {
-
-	isOurAddress := make(map[uint32]bool)
-	for _, credit := range txDetails.OwnedOutputs {
+	for _, credit := range ownedOutputs {
 		isOurAddress[credit.Index] = true
 	}
 
@@ -750,37 +604,12 @@ func (w *Wallet) populateOutputsFromStore(details *TxDetail,
 	}
 }
 
-// populatePrevOuts populates the previous outputs for the given TxDetail.
-func (w *Wallet) populatePrevOuts(details *TxDetail,
-	txDetails *wtxmgr.TxDetails) {
+// populatePrevOuts populates prevouts for a store-backed TxDetail.
+func (w *Wallet) populatePrevOuts(details *TxDetail, msgTx *wire.MsgTx,
+	ownedInputs []db.TxOwnedInput) {
 
 	isOurOutput := make(map[uint32]bool)
-	for _, debit := range txDetails.Debits {
-		isOurOutput[debit.Index] = true
-	}
-
-	for i, txIn := range txDetails.MsgTx.TxIn {
-		idx, ok := safeIntToUint32(i)
-		if !ok {
-			log.Warnf("Input index %d out of uint32 range", i)
-			continue
-		}
-
-		details.PrevOuts = append(
-			details.PrevOuts, PrevOut{
-				OutPoint: txIn.PreviousOutPoint,
-				IsOurs:   isOurOutput[idx],
-			},
-		)
-	}
-}
-
-// populatePrevOutsFromStore populates prevouts for a store-backed TxDetail.
-func (w *Wallet) populatePrevOutsFromStore(details *TxDetail,
-	txDetails *db.TxDetailInfo, msgTx *wire.MsgTx) {
-
-	isOurOutput := make(map[uint32]bool)
-	for _, debit := range txDetails.OwnedInputs {
+	for _, debit := range ownedInputs {
 		isOurOutput[debit.Index] = true
 	}
 
@@ -839,14 +668,4 @@ func deserializeTxDetail(rawTx []byte) (*wire.MsgTx, error) {
 	}
 
 	return &tx, nil
-}
-
-// nonNegativeHeight converts a legacy height into a uint32 for db-native block
-// metadata.
-func nonNegativeHeight(height int32) uint32 {
-	if height < 0 {
-		return 0
-	}
-
-	return uint32(height)
 }

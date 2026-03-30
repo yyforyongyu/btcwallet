@@ -20,8 +20,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestBuildTxDetail tests the buildTxDetail function.
-func TestBuildTxDetail(t *testing.T) {
+// TestBuildTxDetailFromStore tests the detailed store-backed tx builder.
+func TestBuildTxDetailFromStore(t *testing.T) {
 	t.Parallel()
 
 	// Create the various test cases.
@@ -65,9 +65,12 @@ func TestBuildTxDetail(t *testing.T) {
 			currentHeight := int32(1)
 
 			// Act: Build the TxDetail.
-			result := w.buildTxDetail(tc.details, currentHeight)
+			result, err := w.buildTxDetailFromStore(
+				txDetailInfoFromLegacy(tc.details), currentHeight,
+			)
 
 			// Assert: Check that the correct details are returned.
+			require.NoError(t, err)
 			require.Equal(t, tc.expectedTxDetail, result)
 		})
 	}
@@ -392,26 +395,6 @@ func createMinedTxDetail(t *testing.T) (*wtxmgr.TxDetails, *TxDetail) {
 	return minedDetails, minedTxDetail
 }
 
-func txInfoFromLegacy(details *wtxmgr.TxDetails) *db.TxInfo {
-	var block *db.Block
-	if details.Block.Height >= 0 {
-		block = &db.Block{
-			Hash:      details.Block.Hash,
-			Height:    uint32(details.Block.Height),
-			Timestamp: details.Block.Time,
-		}
-	}
-
-	return &db.TxInfo{
-		Hash:         details.Hash,
-		SerializedTx: details.SerializedTx,
-		Received:     details.Received,
-		Block:        block,
-		Status:       db.TxStatusPublished,
-		Label:        details.Label,
-	}
-}
-
 func txDetailInfoFromLegacy(details *wtxmgr.TxDetails) *db.TxDetailInfo {
 	var block *db.Block
 	if details.Block.Height >= 0 {
@@ -448,6 +431,26 @@ func txDetailInfoFromLegacy(details *wtxmgr.TxDetails) *db.TxDetailInfo {
 		Label:        details.Label,
 		OwnedInputs:  ownedInputs,
 		OwnedOutputs: ownedOutputs,
+	}
+}
+
+func txInfoFromLegacy(details *wtxmgr.TxDetails) *db.TxInfo {
+	var block *db.Block
+	if details.Block.Height >= 0 {
+		block = &db.Block{
+			Hash:      details.Block.Hash,
+			Height:    uint32(details.Block.Height),
+			Timestamp: details.Block.Time,
+		}
+	}
+
+	return &db.TxInfo{
+		Hash:         details.Hash,
+		SerializedTx: details.SerializedTx,
+		Received:     details.Received,
+		Block:        block,
+		Status:       db.TxStatusPublished,
+		Label:        details.Label,
 	}
 }
 
