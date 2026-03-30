@@ -316,6 +316,11 @@ type TxStore interface {
 	GetTxDetail(ctx context.Context, query GetTxDetailQuery) (*TxDetailInfo,
 		error)
 
+	// ListTxDetails lists detailed wallet-scoped transaction views using
+	// wallet tx-reader range semantics.
+	ListTxDetails(ctx context.Context,
+		query ListTxDetailsQuery) ([]TxDetailInfo, error)
+
 	// ListTxns returns a slice of transaction information based on the
 	// provided query parameters. It takes a context and ListTxnsQuery,
 	// returning a slice of TxInfo or an error if the retrieval fails.

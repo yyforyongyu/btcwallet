@@ -996,6 +996,19 @@ type GetTxDetailQuery struct {
 	Txid chainhash.Hash
 }
 
+// ListTxDetailsQuery contains the parameters for listing detailed transaction
+// data using wallet tx-reader range semantics.
+type ListTxDetailsQuery struct {
+	// WalletID is the ID of the wallet to query.
+	WalletID uint32
+
+	// StartHeight is the starting height in wallet tx-reader semantics.
+	StartHeight int32
+
+	// EndHeight is the ending height in wallet tx-reader semantics.
+	EndHeight int32
+}
+
 // ListTxnsQuery contains the parameters for listing transactions.
 type ListTxnsQuery struct {
 	// WalletID is the ID of the wallet to query.

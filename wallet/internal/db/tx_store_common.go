@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
@@ -160,6 +161,200 @@ func buildTxDetailInfo(hash []byte, msgTx *wire.MsgTx, rawTx []byte,
 		OwnedInputs:  ownedInputs,
 		OwnedOutputs: ownedOutputs,
 	}, nil
+}
+
+type normalizedListTxDetailsQuery struct {
+	confirmedStart int32
+	confirmedEnd   int32
+	reverse        bool
+	includeUnmined bool
+	unminedFirst   bool
+	hasConfirmed   bool
+}
+
+// normalizeListTxDetailsQuery converts wallet tx-reader range semantics into
+// a simpler internal representation for backend-specific query execution.
+func normalizeListTxDetailsQuery(
+	query ListTxDetailsQuery,
+) normalizedListTxDetailsQuery {
+
+	switch {
+	case query.StartHeight < 0 && query.EndHeight < 0:
+		return normalizedListTxDetailsQuery{
+			includeUnmined: true,
+			unminedFirst:   true,
+		}
+
+	case query.StartHeight < 0:
+		return normalizedListTxDetailsQuery{
+			confirmedStart: query.EndHeight,
+			confirmedEnd:   math.MaxInt32,
+			reverse:        true,
+			includeUnmined: true,
+			unminedFirst:   true,
+			hasConfirmed:   true,
+		}
+
+	case query.EndHeight < 0:
+		return normalizedListTxDetailsQuery{
+			confirmedStart: query.StartHeight,
+			confirmedEnd:   math.MaxInt32,
+			includeUnmined: true,
+			hasConfirmed:   true,
+		}
+
+	default:
+		start := query.StartHeight
+		end := query.EndHeight
+
+		reverse := start > end
+		if reverse {
+			start, end = end, start
+		}
+
+		return normalizedListTxDetailsQuery{
+			confirmedStart: start,
+			confirmedEnd:   end,
+			reverse:        reverse,
+			hasConfirmed:   true,
+		}
+	}
+}
+
+type listTxDetailBasesFn[baseT any] func(context.Context,
+	uint32) ([]baseT, error)
+
+type listConfirmedTxDetailBasesFn[baseT any] func(context.Context, uint32,
+	int32, int32, bool) ([]baseT, error)
+
+type loadOwnedInputsFn func(context.Context, uint32,
+	[]int64) (map[int64][]TxOwnedInput, error)
+
+type loadOwnedOutputsFn func(context.Context, uint32,
+	[]int64) (map[int64][]TxOwnedOutput, error)
+
+type txDetailFromBaseFn[baseT any] func(baseT, []TxOwnedInput,
+	[]TxOwnedOutput) (*TxDetailInfo, error)
+
+type txDetailIDFn[baseT any] func(baseT) int64
+
+// listTxDetailsWithOps runs the shared batched transaction-detail read
+// workflow for both SQL backends.
+func listTxDetailsWithOps[baseT any](ctx context.Context,
+	query ListTxDetailsQuery, listUnmined listTxDetailBasesFn[baseT],
+	listConfirmed listConfirmedTxDetailBasesFn[baseT],
+	loadOwnedInputs loadOwnedInputsFn,
+	loadOwnedOutputs loadOwnedOutputsFn,
+	buildDetail txDetailFromBaseFn[baseT],
+	baseID txDetailIDFn[baseT]) ([]TxDetailInfo, error) {
+
+	normalized := normalizeListTxDetailsQuery(query)
+
+	var bases []baseT
+
+	bases, err := appendUnminedTxDetailsIfNeeded(
+		ctx, query.WalletID,
+		normalized.includeUnmined && normalized.unminedFirst,
+		bases, listUnmined,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	bases, err = appendConfirmedTxDetailsIfNeeded(
+		ctx, query.WalletID, normalized, bases, listConfirmed,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	bases, err = appendUnminedTxDetailsIfNeeded(
+		ctx, query.WalletID,
+		normalized.includeUnmined && !normalized.unminedFirst,
+		bases, listUnmined,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(bases) == 0 {
+		return nil, nil
+	}
+
+	txIDs := make([]int64, 0, len(bases))
+	for _, base := range bases {
+		txIDs = append(txIDs, baseID(base))
+	}
+
+	ownedOutputs, err := loadOwnedOutputs(ctx, query.WalletID, txIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	ownedInputs, err := loadOwnedInputs(ctx, query.WalletID, txIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	return buildTxDetailsFromBases(
+		bases, ownedInputs, ownedOutputs, buildDetail, baseID,
+	)
+}
+
+func appendUnminedTxDetailsIfNeeded[baseT any](ctx context.Context,
+	walletID uint32, enabled bool, bases []baseT,
+	listUnmined listTxDetailBasesFn[baseT]) ([]baseT, error) {
+
+	if !enabled {
+		return bases, nil
+	}
+
+	unmined, err := listUnmined(ctx, walletID)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(bases, unmined...), nil
+}
+
+func appendConfirmedTxDetailsIfNeeded[baseT any](ctx context.Context,
+	walletID uint32, normalized normalizedListTxDetailsQuery, bases []baseT,
+	listConfirmed listConfirmedTxDetailBasesFn[baseT]) ([]baseT, error) {
+
+	if !normalized.hasConfirmed {
+		return bases, nil
+	}
+
+	confirmed, err := listConfirmed(
+		ctx, walletID, normalized.confirmedStart, normalized.confirmedEnd,
+		normalized.reverse,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(bases, confirmed...), nil
+}
+
+func buildTxDetailsFromBases[baseT any](bases []baseT,
+	ownedInputs map[int64][]TxOwnedInput,
+	ownedOutputs map[int64][]TxOwnedOutput,
+	buildDetail txDetailFromBaseFn[baseT],
+	baseID txDetailIDFn[baseT]) ([]TxDetailInfo, error) {
+
+	details := make([]TxDetailInfo, 0, len(bases))
+	for _, base := range bases {
+		id := baseID(base)
+
+		detail, err := buildDetail(base, ownedInputs[id], ownedOutputs[id])
+		if err != nil {
+			return nil, err
+		}
+
+		details = append(details, *detail)
+	}
+
+	return details, nil
 }
 
 // validateCreateTxParams enforces the CreateTx invariants shared by both SQL
