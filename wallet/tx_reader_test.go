@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcwallet/pkg/btcunit"
 	db "github.com/btcsuite/btcwallet/wallet/internal/db"
@@ -205,6 +206,67 @@ func TestListTxnsSuccess(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, details, 1)
 	require.Equal(t, expectedTxDetail, details[0])
+}
+
+// TestListTxnsSummarySuccess tests the summary query path for ListTxns,
+// including wallet reverse-range semantics.
+func TestListTxnsSummarySuccess(t *testing.T) {
+	t.Parallel()
+
+	w, mocks := createStartedWalletWithMocks(t)
+
+	unminedInfo := &db.TxInfo{
+		Hash:         chainhash.Hash{1},
+		SerializedTx: TstSerializedTx,
+		Received:     time.Unix(1710000000, 0),
+		Status:       db.TxStatusPublished,
+		Label:        "unmined",
+	}
+	confirmedLow := db.TxInfo{
+		Hash:         chainhash.Hash{2},
+		SerializedTx: TstSerializedTx,
+		Received:     time.Unix(1710000010, 0),
+		Block: &db.Block{
+			Height:    0,
+			Timestamp: time.Unix(1710000011, 0),
+		},
+		Status: db.TxStatusPublished,
+		Label:  "confirmed-low",
+	}
+	confirmedHigh := db.TxInfo{
+		Hash:         chainhash.Hash{3},
+		SerializedTx: TstSerializedTx,
+		Received:     time.Unix(1710000020, 0),
+		Block: &db.Block{
+			Height:    1,
+			Timestamp: time.Unix(1710000021, 0),
+		},
+		Status: db.TxStatusPublished,
+		Label:  "confirmed-high",
+	}
+
+	mocks.store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID:    w.id,
+		UnminedOnly: true,
+	}).Return([]db.TxInfo{*unminedInfo}, nil).Once()
+	mocks.store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID:    w.id,
+		StartHeight: 0,
+		EndHeight:   maxWalletTxHeight,
+	}).Return([]db.TxInfo{confirmedLow, confirmedHigh}, nil).Once()
+
+	details, err := w.ListTxns(t.Context(), TxListQuery{
+		StartHeight:    -1,
+		EndHeight:      0,
+		IncludeDetails: false,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []*TxDetail{
+		txSummaryFromInfo(unminedInfo),
+		txSummaryFromInfo(&confirmedHigh),
+		txSummaryFromInfo(&confirmedLow),
+	}, details)
 }
 
 // createUnminedTxDetail creates a test transaction that sends funds from the
@@ -408,4 +470,36 @@ func txSummaryFromDetailed(detail *TxDetail) *TxDetail {
 	summary.PrevOuts = nil
 
 	return &summary
+}
+
+func txSummaryFromInfo(info *db.TxInfo) *TxDetail {
+	tx, err := btcutil.NewTxFromBytes(TstSerializedTx)
+	if err != nil {
+		panic(err)
+	}
+
+	weight := btcunit.NewWeightUnit(uint64(blockchain.GetTransactionWeight(
+		btcutil.NewTx(tx.MsgTx()),
+	)))
+
+	detail := &TxDetail{
+		Hash:          info.Hash,
+		RawTx:         info.SerializedTx,
+		Label:         info.Label,
+		Confirmations: 0,
+		Weight:        weight,
+		FeeRate:       btcunit.ZeroSatPerVByte,
+		ReceivedTime:  info.Received,
+	}
+
+	if info.Block != nil {
+		detail.Block = &BlockDetails{
+			Hash:      info.Block.Hash,
+			Height:    int32(info.Block.Height),
+			Timestamp: info.Block.Timestamp.Unix(),
+		}
+		detail.Confirmations = calcConf(int32(info.Block.Height), 1)
+	}
+
+	return detail
 }

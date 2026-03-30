@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
@@ -65,6 +66,17 @@ type TxReader interface {
 // A compile-time assertion to ensure that Wallet implements the TxReader
 // interface.
 var _ TxReader = (*Wallet)(nil)
+
+type normalizedTxListQuery struct {
+	confirmedStart uint32
+	confirmedEnd   uint32
+	reverse        bool
+	includeUnmined bool
+	unminedFirst   bool
+	hasConfirmed   bool
+}
+
+const maxWalletTxHeight = uint32(math.MaxInt32)
 
 // Output contains details for a tx output.
 type Output struct {
@@ -227,7 +239,7 @@ func (w *Wallet) GetTx(ctx context.Context, query TxQuery) (
 // Time complexity: O(B + N), where B is the number of blocks in the
 // range and N is the total number of inputs and outputs across all
 // transactions in the range.
-func (w *Wallet) ListTxns(_ context.Context,
+func (w *Wallet) ListTxns(ctx context.Context,
 	query TxListQuery) ([]*TxDetail, error) {
 
 	err := w.state.validateStarted()
@@ -235,44 +247,189 @@ func (w *Wallet) ListTxns(_ context.Context,
 		return nil, err
 	}
 
-	bestBlock := w.SyncedTo()
-	currentHeight := bestBlock.Height
+	currentHeight := w.SyncedTo().Height
+	if query.IncludeDetails {
+		var records []wtxmgr.TxDetails
 
-	// We'll first fetch all the transaction records from the database
-	// within a single database transaction. This is done to minimize the
-	// time we hold the database lock.
-	var records []wtxmgr.TxDetails
+		err = walletdb.View(w.cfg.DB, func(dbtx walletdb.ReadTx) error {
+			txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
 
-	err = walletdb.View(w.cfg.DB, func(dbtx walletdb.ReadTx) error {
-		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+			err := w.txStore.RangeTransactions(
+				txmgrNs, query.StartHeight, query.EndHeight,
+				func(d []wtxmgr.TxDetails) (bool, error) {
+					records = append(records, d...)
 
-		err := w.txStore.RangeTransactions(
-			txmgrNs, query.StartHeight, query.EndHeight,
-			func(d []wtxmgr.TxDetails) (bool, error) {
-				records = append(records, d...)
+					return false, nil
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("tx range failed: %w", err)
+			}
 
-				return false, nil
-			},
-		)
+			return nil
+		})
 		if err != nil {
-			return fmt.Errorf("tx range failed: %w", err)
+			return nil, fmt.Errorf("failed to view wallet db: %w", err)
 		}
 
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to view wallet db: %w", err)
+		details := make([]*TxDetail, 0, len(records))
+		for _, detail := range records {
+			txDetail := w.buildTxDetail(&detail, currentHeight)
+			details = append(details, txDetail)
+		}
+
+		return details, nil
 	}
 
-	// Now that we have all the records, we can build the detailed
-	// response without holding the database lock.
-	details := make([]*TxDetail, 0, len(records))
-	for _, detail := range records {
-		txDetail := w.buildTxDetail(&detail, currentHeight)
+	normalized := normalizeTxListQuery(query)
+
+	var infos []db.TxInfo
+
+	infos, err = w.appendUnminedTxSummariesIfNeeded(
+		ctx,
+		normalized.includeUnmined && normalized.unminedFirst,
+		infos,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	infos, err = w.appendConfirmedTxSummariesIfNeeded(
+		ctx, normalized, infos,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	infos, err = w.appendUnminedTxSummariesIfNeeded(
+		ctx,
+		normalized.includeUnmined && !normalized.unminedFirst,
+		infos,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return w.buildTxSummaries(infos, currentHeight)
+}
+
+// appendUnminedTxSummariesIfNeeded appends the summary-store unmined view when
+// the normalized wallet range requires it.
+func (w *Wallet) appendUnminedTxSummariesIfNeeded(ctx context.Context,
+	enabled bool, infos []db.TxInfo) ([]db.TxInfo, error) {
+
+	if !enabled {
+		return infos, nil
+	}
+
+	unmined, err := w.store.ListTxns(ctx, db.ListTxnsQuery{
+		WalletID:    w.id,
+		UnminedOnly: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list unmined tx summaries: %w", err)
+	}
+
+	return append(infos, unmined...), nil
+}
+
+// appendConfirmedTxSummariesIfNeeded appends the summary-store confirmed range
+// view when the normalized wallet range requires it.
+func (w *Wallet) appendConfirmedTxSummariesIfNeeded(ctx context.Context,
+	normalized normalizedTxListQuery,
+	infos []db.TxInfo) ([]db.TxInfo, error) {
+
+	if !normalized.hasConfirmed {
+		return infos, nil
+	}
+
+	confirmed, err := w.store.ListTxns(ctx, db.ListTxnsQuery{
+		WalletID:    w.id,
+		StartHeight: normalized.confirmedStart,
+		EndHeight:   normalized.confirmedEnd,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list confirmed tx summaries: %w", err)
+	}
+
+	if normalized.reverse {
+		slices.Reverse(confirmed)
+	}
+
+	return append(infos, confirmed...), nil
+}
+
+// buildTxSummaries converts summary-store rows into wallet tx responses.
+func (w *Wallet) buildTxSummaries(infos []db.TxInfo,
+	currentHeight int32) ([]*TxDetail, error) {
+
+	details := make([]*TxDetail, 0, len(infos))
+	for i := range infos {
+		txDetail, err := w.buildTxSummary(&infos[i], currentHeight)
+		if err != nil {
+			return nil, err
+		}
+
 		details = append(details, txDetail)
 	}
 
 	return details, nil
+}
+
+// normalizeTxListQuery converts wallet tx-reader range semantics into a simpler
+// internal representation for summary-path query routing.
+func normalizeTxListQuery(query TxListQuery) normalizedTxListQuery {
+	switch {
+	case query.StartHeight < 0 && query.EndHeight < 0:
+		return normalizedTxListQuery{
+			includeUnmined: true,
+			unminedFirst:   true,
+		}
+
+	case query.StartHeight < 0:
+		return normalizedTxListQuery{
+			confirmedStart: nonNegativeHeightToUint32(query.EndHeight),
+			confirmedEnd:   maxWalletTxHeight,
+			reverse:        true,
+			includeUnmined: true,
+			unminedFirst:   true,
+			hasConfirmed:   true,
+		}
+
+	case query.EndHeight < 0:
+		return normalizedTxListQuery{
+			confirmedStart: nonNegativeHeightToUint32(query.StartHeight),
+			confirmedEnd:   maxWalletTxHeight,
+			includeUnmined: true,
+			hasConfirmed:   true,
+		}
+
+	default:
+		start := query.StartHeight
+		end := query.EndHeight
+
+		reverse := start > end
+		if reverse {
+			start, end = end, start
+		}
+
+		return normalizedTxListQuery{
+			confirmedStart: nonNegativeHeightToUint32(start),
+			confirmedEnd:   nonNegativeHeightToUint32(end),
+			reverse:        reverse,
+			hasConfirmed:   true,
+		}
+	}
+}
+
+// nonNegativeHeightToUint32 converts a non-negative wallet tx-reader height to
+// uint32.
+func nonNegativeHeightToUint32(height int32) uint32 {
+	if height < 0 {
+		return 0
+	}
+
+	return uint32(height)
 }
 
 // fetchTxDetails fetches the tx details for the given tx hash
