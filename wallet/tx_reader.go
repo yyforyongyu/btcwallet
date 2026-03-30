@@ -27,14 +27,36 @@ var (
 	ErrTxNotFound = errors.New("tx not found")
 )
 
+// TxQuery contains the parameters for querying one wallet transaction.
+type TxQuery struct {
+	// TxHash is the transaction hash to query.
+	TxHash chainhash.Hash
+
+	// IncludeDetails controls whether wallet-relative value, fee, inputs, and
+	// outputs are populated.
+	IncludeDetails bool
+}
+
+// TxListQuery contains the parameters for listing wallet transactions.
+type TxListQuery struct {
+	// StartHeight is the starting height in wallet tx-reader semantics.
+	StartHeight int32
+
+	// EndHeight is the ending height in wallet tx-reader semantics.
+	EndHeight int32
+
+	// IncludeDetails controls whether wallet-relative value, fee, inputs, and
+	// outputs are populated for each result.
+	IncludeDetails bool
+}
+
 // TxReader provides an interface for querying tx history.
 type TxReader interface {
-	// GetTx returns a detailed description of a tx given its tx hash.
-	GetTx(ctx context.Context, txHash chainhash.Hash) (*TxDetail, error)
+	// GetTx returns one wallet transaction view using the provided query.
+	GetTx(ctx context.Context, query TxQuery) (*TxDetail, error)
 
-	// ListTxns returns a list of all txns which are relevant to the wallet
-	// over a given block range.
-	ListTxns(ctx context.Context, startHeight, endHeight int32) (
+	// ListTxns returns wallet transaction views over the provided range.
+	ListTxns(ctx context.Context, query TxListQuery) (
 		[]*TxDetail, error)
 }
 
@@ -138,16 +160,14 @@ type TxDetail struct {
 	Label string
 }
 
-// GetTx returns a detailed description of a tx given its tx hash.
-//
-// NOTE: This method is part of the TxReader interface.
+// GetTx returns a transaction view using the provided query.
 //
 // Time complexity: O(log n + I + O), where n is the number of
 // transactions in the database, I is the number of inputs, and O is the
 // number of outputs. The lookup is dominated by a key-based B-tree lookup
 // in the database and the processing of the transaction's inputs and
 // outputs.
-func (w *Wallet) GetTx(_ context.Context, txHash chainhash.Hash) (
+func (w *Wallet) GetTx(_ context.Context, query TxQuery) (
 	*TxDetail, error) {
 
 	err := w.state.validateStarted()
@@ -155,7 +175,7 @@ func (w *Wallet) GetTx(_ context.Context, txHash chainhash.Hash) (
 		return nil, err
 	}
 
-	txDetails, err := w.fetchTxDetails(&txHash)
+	txDetails, err := w.fetchTxDetails(&query.TxHash)
 	if err != nil {
 		return nil, err
 	}
@@ -166,26 +186,22 @@ func (w *Wallet) GetTx(_ context.Context, txHash chainhash.Hash) (
 	return w.buildTxDetail(txDetails, currentHeight), nil
 }
 
-// ListTxns returns a list of all txns which are relevant to the
-// wallet over a given block range. The block range is inclusive of the
-// start and end heights.
+// ListTxns returns transaction views over the provided block range query.
 //
 // The underlying transaction store allows for reverse iteration, so if
-// startHeight > endHeight, the transactions will be returned in reverse
+// StartHeight > EndHeight, the transactions will be returned in reverse
 // order.
 //
 // The special height -1 may be used to include unmined transactions. For
 // example, to get all transactions from block 100 to the current tip including
-// unmined, use a startHeight of 100 and an endHeight of -1. To get all
-// transactions in the wallet, use a startHeight of 0 and an endHeight of -1.
-//
-// NOTE: This method is part of the TxReader interface.
+// unmined, use a StartHeight of 100 and an EndHeight of -1. To get all
+// transactions in the wallet, use a StartHeight of 0 and an EndHeight of -1.
 //
 // Time complexity: O(B + N), where B is the number of blocks in the
 // range and N is the total number of inputs and outputs across all
 // transactions in the range.
-func (w *Wallet) ListTxns(_ context.Context, startHeight,
-	endHeight int32) ([]*TxDetail, error) {
+func (w *Wallet) ListTxns(_ context.Context,
+	query TxListQuery) ([]*TxDetail, error) {
 
 	err := w.state.validateStarted()
 	if err != nil {
@@ -204,7 +220,7 @@ func (w *Wallet) ListTxns(_ context.Context, startHeight,
 		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
 
 		err := w.txStore.RangeTransactions(
-			txmgrNs, startHeight, endHeight,
+			txmgrNs, query.StartHeight, query.EndHeight,
 			func(d []wtxmgr.TxDetails) (bool, error) {
 				records = append(records, d...)
 

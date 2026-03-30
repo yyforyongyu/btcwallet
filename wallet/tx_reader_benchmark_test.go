@@ -142,7 +142,10 @@ func BenchmarkGetTxAPI(b *testing.B) {
 
 				for i := 0; b.Loop(); i++ {
 					result, err = bw.GetTx(
-						b.Context(), testTxHash,
+						b.Context(), TxQuery{
+							TxHash:         testTxHash,
+							IncludeDetails: true,
+						},
 					)
 					require.NoError(b, err)
 
@@ -292,7 +295,10 @@ func BenchmarkGetTxAPIConcurrently(b *testing.B) {
 				b.RunParallel(func(pb *testing.PB) {
 					for pb.Next() {
 						res, err := bw.GetTx(
-							b.Context(), testTxHash,
+							b.Context(), TxQuery{
+								TxHash:         testTxHash,
+								IncludeDetails: true,
+							},
 						)
 						after = res
 
@@ -449,8 +455,11 @@ func BenchmarkListTxnsAPI(b *testing.B) {
 
 				for i := 0; b.Loop(); i++ {
 					result, err = bw.ListTxns(
-						b.Context(), startHeight,
-						endHeight,
+						b.Context(), TxListQuery{
+							StartHeight:    startHeight,
+							EndHeight:      endHeight,
+							IncludeDetails: true,
+						},
 					)
 					require.NoError(b, err)
 
@@ -601,8 +610,11 @@ func BenchmarkListTxnsAPIConcurrently(b *testing.B) {
 				b.RunParallel(func(pb *testing.PB) {
 					for pb.Next() {
 						res, err := bw.ListTxns(
-							b.Context(),
-							startHeight, endHeight,
+							b.Context(), TxListQuery{
+								StartHeight:    startHeight,
+								EndHeight:      endHeight,
+								IncludeDetails: true,
+							},
 						)
 						afterResult = res
 

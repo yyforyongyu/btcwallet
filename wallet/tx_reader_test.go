@@ -106,7 +106,10 @@ func TestGetTxSuccess(t *testing.T) {
 				Return(tc.mockDetails, nil).Once()
 
 			// Act: Get the transaction.
-			details, err := w.GetTx(t.Context(), *TstTxHash)
+			details, err := w.GetTx(t.Context(), TxQuery{
+				TxHash:         *TstTxHash,
+				IncludeDetails: true,
+			})
 
 			// Assert: Check that the correct details are returned.
 			require.NoError(t, err)
@@ -127,7 +130,10 @@ func TestGetTxNotFound(t *testing.T) {
 		Return(nil, nil).Once()
 
 	// Act: Attempt to get the transaction.
-	_, err := w.GetTx(t.Context(), *TstTxHash)
+	_, err := w.GetTx(t.Context(), TxQuery{
+		TxHash:         *TstTxHash,
+		IncludeDetails: true,
+	})
 
 	// Assert that the correct error is returned.
 	require.ErrorIs(t, err, ErrTxNotFound)
@@ -162,7 +168,11 @@ func TestListTxnsSuccess(t *testing.T) {
 	}).Return(nil).Once()
 
 	// Act: List txns.
-	details, err := w.ListTxns(t.Context(), 0, 1000)
+	details, err := w.ListTxns(t.Context(), TxListQuery{
+		StartHeight:    0,
+		EndHeight:      1000,
+		IncludeDetails: true,
+	})
 
 	// Assert: Check that the correct details are returned.
 	require.NoError(t, err)
