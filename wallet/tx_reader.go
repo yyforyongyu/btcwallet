@@ -249,32 +249,22 @@ func (w *Wallet) ListTxns(ctx context.Context,
 
 	currentHeight := w.SyncedTo().Height
 	if query.IncludeDetails {
-		var records []wtxmgr.TxDetails
-
-		err = walletdb.View(w.cfg.DB, func(dbtx walletdb.ReadTx) error {
-			txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-
-			err := w.txStore.RangeTransactions(
-				txmgrNs, query.StartHeight, query.EndHeight,
-				func(d []wtxmgr.TxDetails) (bool, error) {
-					records = append(records, d...)
-
-					return false, nil
-				},
-			)
-			if err != nil {
-				return fmt.Errorf("tx range failed: %w", err)
-			}
-
-			return nil
+		records, err := w.store.ListTxDetails(ctx, db.ListTxDetailsQuery{
+			WalletID:    w.id,
+			StartHeight: query.StartHeight,
+			EndHeight:   query.EndHeight,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to view wallet db: %w", err)
+			return nil, fmt.Errorf("list tx details: %w", err)
 		}
 
 		details := make([]*TxDetail, 0, len(records))
 		for _, detail := range records {
-			txDetail := w.buildTxDetail(&detail, currentHeight)
+			txDetail, err := w.buildTxDetailFromStore(&detail, currentHeight)
+			if err != nil {
+				return nil, err
+			}
+
 			details = append(details, txDetail)
 		}
 

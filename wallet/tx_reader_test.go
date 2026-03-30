@@ -177,23 +177,13 @@ func TestListTxnsSuccess(t *testing.T) {
 
 	// SyncedTo is mocked in createStartedWalletWithMocks (height 1).
 
-	// Set up the mock for the tx store. We use .Run to execute the
-	// callback function that's passed in as an argument to the mock.
-	mocks.txStore.On("RangeTransactions",
-		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
-	).Run(func(args mock.Arguments) {
-		// Get the callback function from the arguments.
-		f, ok := args.Get(3).(func([]wtxmgr.TxDetails) (bool, error))
-		require.True(t, ok)
-
-		// Create the mock details to pass to the callback.
-		minedDetails, _ := createMinedTxDetail(t)
-		details := []wtxmgr.TxDetails{*minedDetails}
-
-		// Call the callback.
-		_, err := f(details)
-		require.NoError(t, err)
-	}).Return(nil).Once()
+	minedDetails, _ := createMinedTxDetail(t)
+	mocks.store.On("ListTxDetails", mock.Anything, db.ListTxDetailsQuery{
+		WalletID:    w.id,
+		StartHeight: 0,
+		EndHeight:   1000,
+	}).Return([]db.TxDetailInfo{*txDetailInfoFromLegacy(minedDetails)}, nil).
+		Once()
 
 	// Act: List txns.
 	details, err := w.ListTxns(t.Context(), TxListQuery{
