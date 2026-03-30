@@ -230,3 +230,101 @@ func TestGetTxSummaryNotFound(t *testing.T) {
 	})
 	require.ErrorIs(t, err, db.ErrTxNotFound)
 }
+
+// TestListTxnsSummaryUnminedOnlySuccess verifies that kvdb.Store can list the
+// legacy unmined set through the db-native summary API.
+func TestListTxnsSummaryUnminedOnlySuccess(t *testing.T) {
+	t.Parallel()
+
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+
+	txStore := newTxStore(t, dbConn)
+	store := NewStore(dbConn, txStore)
+
+	txMsg := &wire.MsgTx{Version: 1}
+	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash: chainhash.Hash{21},
+	}})
+	txMsg.AddTxOut(&wire.TxOut{Value: 2_500, PkScript: []byte{0x51}})
+	rec, err := wtxmgr.NewTxRecordFromMsgTx(txMsg, time.Now())
+	require.NoError(t, err)
+
+	err = walletdb.Update(dbConn, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+		require.NotNil(t, ns)
+
+		return txStore.InsertTx(ns, rec, nil)
+	})
+	require.NoError(t, err)
+
+	infos, err := store.ListTxns(t.Context(), db.ListTxnsQuery{
+		WalletID:    0,
+		UnminedOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, infos, 1)
+	require.Equal(t, rec.Hash, infos[0].Hash)
+	require.Nil(t, infos[0].Block)
+	require.Equal(t, db.TxStatusPublished, infos[0].Status)
+}
+
+// TestListTxnsSummaryConfirmedRangeSuccess verifies that kvdb.Store can adapt
+// the legacy confirmed range iterator to the db-native summary API.
+func TestListTxnsSummaryConfirmedRangeSuccess(t *testing.T) {
+	t.Parallel()
+
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+
+	txStore := newTxStore(t, dbConn)
+	store := NewStore(dbConn, txStore)
+
+	rec := insertConfirmedTx(t, dbConn, txStore, 144)
+
+	infos, err := store.ListTxns(t.Context(), db.ListTxnsQuery{
+		WalletID:    0,
+		StartHeight: 144,
+		EndHeight:   144,
+	})
+	require.NoError(t, err)
+	require.Len(t, infos, 1)
+	require.Equal(t, rec.Hash, infos[0].Hash)
+	require.NotNil(t, infos[0].Block)
+	require.Equal(t, uint32(144), infos[0].Block.Height)
+	require.Equal(t, db.TxStatusPublished, infos[0].Status)
+}
+
+// insertConfirmedTx inserts one mined transaction into the legacy tx store so
+// kvdb summary reads can exercise confirmed block metadata.
+func insertConfirmedTx(t *testing.T, dbConn walletdb.DB,
+	txStore *wtxmgr.Store, height int32) *wtxmgr.TxRecord {
+
+	t.Helper()
+
+	txMsg := &wire.MsgTx{Version: 1}
+	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash: chainhash.Hash{30},
+	}})
+	txMsg.AddTxOut(&wire.TxOut{Value: 3_000, PkScript: []byte{0x51}})
+	rec, err := wtxmgr.NewTxRecordFromMsgTx(txMsg, time.Now())
+	require.NoError(t, err)
+
+	block := &wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{
+			Height: height,
+			Hash:   chainhash.Hash{31},
+		},
+		Time: time.Unix(1710002000, 0),
+	}
+
+	err = walletdb.Update(dbConn, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+		require.NotNil(t, ns)
+
+		return txStore.InsertTx(ns, rec, block)
+	})
+	require.NoError(t, err)
+
+	return rec
+}
