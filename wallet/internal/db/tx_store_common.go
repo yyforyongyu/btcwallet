@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/blockchain"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 )
@@ -115,6 +116,49 @@ func BuildTxInfo(hash []byte, rawTx []byte, received time.Time, block *Block,
 		Block:        block,
 		Status:       txStatus,
 		Label:        label,
+	}, nil
+}
+
+// buildTxOwnedInput converts normalized input-edge data into the public
+// TxOwnedInput shape.
+func buildTxOwnedInput(index uint32, amount int64) TxOwnedInput {
+	return TxOwnedInput{
+		Index:  index,
+		Amount: btcutil.Amount(amount),
+	}
+}
+
+// buildTxOwnedOutput converts normalized output-edge data into the public
+// TxOwnedOutput shape.
+func buildTxOwnedOutput(index uint32, amount int64) TxOwnedOutput {
+	return TxOwnedOutput{
+		Index:  index,
+		Amount: btcutil.Amount(amount),
+	}
+}
+
+// buildTxDetailInfo converts normalized transaction fields plus owned-edge data
+// into the public TxDetailInfo shape returned by the detail API.
+func buildTxDetailInfo(hash []byte, msgTx *wire.MsgTx, rawTx []byte,
+	received time.Time, block *Block, status int64, label string,
+	ownedInputs []TxOwnedInput,
+	ownedOutputs []TxOwnedOutput) (*TxDetailInfo, error) {
+
+	txInfo, err := BuildTxInfo(hash, rawTx, received, block, status, label)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TxDetailInfo{
+		Hash:         txInfo.Hash,
+		MsgTx:        msgTx,
+		SerializedTx: txInfo.SerializedTx,
+		Received:     txInfo.Received,
+		Block:        txInfo.Block,
+		Status:       txInfo.Status,
+		Label:        txInfo.Label,
+		OwnedInputs:  ownedInputs,
+		OwnedOutputs: ownedOutputs,
 	}, nil
 }
 

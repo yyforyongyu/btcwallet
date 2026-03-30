@@ -140,6 +140,39 @@ func (s *Store) ListTxns(_ context.Context,
 	return infos, nil
 }
 
+// GetTxDetail retrieves one detailed wallet-scoped transaction view through the
+// legacy wtxmgr query path.
+func (s *Store) GetTxDetail(_ context.Context,
+	query db.GetTxDetailQuery) (*db.TxDetailInfo, error) {
+
+	var detail *db.TxDetailInfo
+
+	err := walletdb.View(s.db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(wtxmgrNamespaceKey)
+		if ns == nil {
+			return errMissingTxmgrNamespace
+		}
+
+		txDetails, err := s.txStore.TxDetails(ns, &query.Txid)
+		if err != nil {
+			return fmt.Errorf("lookup transaction details: %w", err)
+		}
+
+		if txDetails == nil {
+			return db.ErrTxNotFound
+		}
+
+		detail = kvdbTxDetailInfo(txDetails)
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kvdb.Store.GetTxDetail: %w", err)
+	}
+
+	return detail, nil
+}
+
 // DeleteTx is not yet implemented for kvdb.
 func (s *Store) DeleteTx(ctx context.Context, _ db.DeleteTxParams) error {
 	return notImplemented(ctx, "DeleteTx")
@@ -239,6 +272,47 @@ func kvdbTxInfo(details *wtxmgr.TxDetails) *db.TxInfo {
 		Block:        block,
 		Status:       db.TxStatusPublished,
 		Label:        details.Label,
+	}
+}
+
+// kvdbTxDetailInfo maps legacy wtxmgr detail data into the db-native
+// transaction detail model used by wallet tx-reader code.
+func kvdbTxDetailInfo(details *wtxmgr.TxDetails) *db.TxDetailInfo {
+	var block *db.Block
+	if details.Block.Height >= 0 {
+		block = &db.Block{
+			Hash:      details.Block.Hash,
+			Height:    nonNegativeInt32ToUint32(details.Block.Height),
+			Timestamp: details.Block.Time,
+		}
+	}
+
+	ownedInputs := make([]db.TxOwnedInput, 0, len(details.Debits))
+	for _, debit := range details.Debits {
+		ownedInputs = append(ownedInputs, db.TxOwnedInput{
+			Index:  debit.Index,
+			Amount: debit.Amount,
+		})
+	}
+
+	ownedOutputs := make([]db.TxOwnedOutput, 0, len(details.Credits))
+	for _, credit := range details.Credits {
+		ownedOutputs = append(ownedOutputs, db.TxOwnedOutput{
+			Index:  credit.Index,
+			Amount: credit.Amount,
+		})
+	}
+
+	return &db.TxDetailInfo{
+		Hash:         details.Hash,
+		MsgTx:        &details.MsgTx,
+		SerializedTx: details.SerializedTx,
+		Received:     details.Received.UTC(),
+		Block:        block,
+		Status:       db.TxStatusPublished,
+		Label:        details.Label,
+		OwnedInputs:  ownedInputs,
+		OwnedOutputs: ownedOutputs,
 	}
 }
 
