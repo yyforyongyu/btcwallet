@@ -230,6 +230,144 @@ func (q *Queries) InsertTransaction(ctx context.Context, arg InsertTransactionPa
 	return id, err
 }
 
+const ListOwnedInputsBySpendingTxIDs = `-- name: ListOwnedInputsBySpendingTxIDs :many
+SELECT
+    u.spent_by_tx_id,
+    u.spent_input_index,
+    u.amount
+FROM utxos AS u
+INNER JOIN transactions AS t ON u.spent_by_tx_id = t.id
+WHERE
+    t.wallet_id = ?1
+    AND u.spent_by_tx_id IN (/*SLICE:tx_ids*/?)
+    AND u.spent_input_index IS NOT NULL
+ORDER BY u.spent_by_tx_id, u.spent_input_index
+`
+
+type ListOwnedInputsBySpendingTxIDsParams struct {
+	WalletID int64
+	TxIds    []sql.NullInt64
+}
+
+type ListOwnedInputsBySpendingTxIDsRow struct {
+	SpentByTxID     sql.NullInt64
+	SpentInputIndex sql.NullInt64
+	Amount          int64
+}
+
+// Lists wallet-owned inputs spent by the selected transaction rows.
+//
+// How:
+//   - Reads from utxos using the `spent_by_tx_id` spend edge.
+//   - Returns only wallet-owned inputs because only those are tracked in utxos.
+//   - Filters out NULL spent_input_index values so callers receive only concrete
+//     input positions.
+//
+// Performance:
+//   - Uses the provided spender tx-id slice to bound the scan to the selected
+//     rows.
+func (q *Queries) ListOwnedInputsBySpendingTxIDs(ctx context.Context, arg ListOwnedInputsBySpendingTxIDsParams) ([]ListOwnedInputsBySpendingTxIDsRow, error) {
+	query := ListOwnedInputsBySpendingTxIDs
+	var queryParams []interface{}
+	queryParams = append(queryParams, arg.WalletID)
+	if len(arg.TxIds) > 0 {
+		for _, v := range arg.TxIds {
+			queryParams = append(queryParams, v)
+		}
+		query = strings.Replace(query, "/*SLICE:tx_ids*/?", strings.Repeat(",?", len(arg.TxIds))[1:], 1)
+	} else {
+		query = strings.Replace(query, "/*SLICE:tx_ids*/?", "NULL", 1)
+	}
+	rows, err := q.query(ctx, nil, query, queryParams...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListOwnedInputsBySpendingTxIDsRow
+	for rows.Next() {
+		var i ListOwnedInputsBySpendingTxIDsRow
+		if err := rows.Scan(&i.SpentByTxID, &i.SpentInputIndex, &i.Amount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const ListOwnedOutputsByTxIDs = `-- name: ListOwnedOutputsByTxIDs :many
+SELECT
+    u.tx_id,
+    u.output_index,
+    u.amount
+FROM utxos AS u
+INNER JOIN transactions AS t ON u.tx_id = t.id
+WHERE
+    t.wallet_id = ?1
+    AND u.tx_id IN (/*SLICE:tx_ids*/?)
+ORDER BY u.tx_id, u.output_index
+`
+
+type ListOwnedOutputsByTxIDsParams struct {
+	WalletID int64
+	TxIds    []int64
+}
+
+type ListOwnedOutputsByTxIDsRow struct {
+	TxID        int64
+	OutputIndex int64
+	Amount      int64
+}
+
+// Lists wallet-owned outputs created by the selected transaction rows.
+//
+// How:
+//   - Reads directly from utxos by `tx_id` after the caller has already selected
+//     the wallet-scoped transaction rows.
+//   - Returns only the output indexes and amounts needed by the tx detail read
+//     model.
+//
+// Performance:
+// - Uses the provided tx-id slice to bound the scan to the selected rows.
+func (q *Queries) ListOwnedOutputsByTxIDs(ctx context.Context, arg ListOwnedOutputsByTxIDsParams) ([]ListOwnedOutputsByTxIDsRow, error) {
+	query := ListOwnedOutputsByTxIDs
+	var queryParams []interface{}
+	queryParams = append(queryParams, arg.WalletID)
+	if len(arg.TxIds) > 0 {
+		for _, v := range arg.TxIds {
+			queryParams = append(queryParams, v)
+		}
+		query = strings.Replace(query, "/*SLICE:tx_ids*/?", strings.Repeat(",?", len(arg.TxIds))[1:], 1)
+	} else {
+		query = strings.Replace(query, "/*SLICE:tx_ids*/?", "NULL", 1)
+	}
+	rows, err := q.query(ctx, nil, query, queryParams...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListOwnedOutputsByTxIDsRow
+	for rows.Next() {
+		var i ListOwnedOutputsByTxIDsRow
+		if err := rows.Scan(&i.TxID, &i.OutputIndex, &i.Amount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const ListRollbackCoinbaseRoots = `-- name: ListRollbackCoinbaseRoots :many
 SELECT
     wallet_id,

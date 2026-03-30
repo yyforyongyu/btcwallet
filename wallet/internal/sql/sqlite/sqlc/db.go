@@ -201,6 +201,12 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listKeyScopesByWalletStmt, err = db.PrepareContext(ctx, ListKeyScopesByWallet); err != nil {
 		return nil, fmt.Errorf("error preparing query ListKeyScopesByWallet: %w", err)
 	}
+	if q.listOwnedInputsBySpendingTxIDsStmt, err = db.PrepareContext(ctx, ListOwnedInputsBySpendingTxIDs); err != nil {
+		return nil, fmt.Errorf("error preparing query ListOwnedInputsBySpendingTxIDs: %w", err)
+	}
+	if q.listOwnedOutputsByTxIDsStmt, err = db.PrepareContext(ctx, ListOwnedOutputsByTxIDs); err != nil {
+		return nil, fmt.Errorf("error preparing query ListOwnedOutputsByTxIDs: %w", err)
+	}
 	if q.listReplacedTxHashesByReplacementTxHashStmt, err = db.PrepareContext(ctx, ListReplacedTxHashesByReplacementTxHash); err != nil {
 		return nil, fmt.Errorf("error preparing query ListReplacedTxHashesByReplacementTxHash: %w", err)
 	}
@@ -564,6 +570,16 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listKeyScopesByWalletStmt: %w", cerr)
 		}
 	}
+	if q.listOwnedInputsBySpendingTxIDsStmt != nil {
+		if cerr := q.listOwnedInputsBySpendingTxIDsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listOwnedInputsBySpendingTxIDsStmt: %w", cerr)
+		}
+	}
+	if q.listOwnedOutputsByTxIDsStmt != nil {
+		if cerr := q.listOwnedOutputsByTxIDsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listOwnedOutputsByTxIDsStmt: %w", cerr)
+		}
+	}
 	if q.listReplacedTxHashesByReplacementTxHashStmt != nil {
 		if cerr := q.listReplacedTxHashesByReplacementTxHashStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listReplacedTxHashesByReplacementTxHashStmt: %w", cerr)
@@ -767,6 +783,8 @@ type Queries struct {
 	listAddressTypesStmt                        *sql.Stmt
 	listAddressesByAccountStmt                  *sql.Stmt
 	listKeyScopesByWalletStmt                   *sql.Stmt
+	listOwnedInputsBySpendingTxIDsStmt          *sql.Stmt
+	listOwnedOutputsByTxIDsStmt                 *sql.Stmt
 	listReplacedTxHashesByReplacementTxHashStmt *sql.Stmt
 	listReplacedTxIDsByReplacementTxIDStmt      *sql.Stmt
 	listReplacementTxHashesByReplacedTxHashStmt *sql.Stmt
@@ -853,6 +871,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listAddressTypesStmt:                        q.listAddressTypesStmt,
 		listAddressesByAccountStmt:                  q.listAddressesByAccountStmt,
 		listKeyScopesByWalletStmt:                   q.listKeyScopesByWalletStmt,
+		listOwnedInputsBySpendingTxIDsStmt:          q.listOwnedInputsBySpendingTxIDsStmt,
+		listOwnedOutputsByTxIDsStmt:                 q.listOwnedOutputsByTxIDsStmt,
 		listReplacedTxHashesByReplacementTxHashStmt: q.listReplacedTxHashesByReplacementTxHashStmt,
 		listReplacedTxIDsByReplacementTxIDStmt:      q.listReplacedTxIDsByReplacementTxIDStmt,
 		listReplacementTxHashesByReplacedTxHashStmt: q.listReplacementTxHashesByReplacedTxHashStmt,

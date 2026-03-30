@@ -331,6 +331,27 @@ type Querier interface {
 	ListAddressesByAccount(ctx context.Context, arg ListAddressesByAccountParams) ([]ListAddressesByAccountRow, error)
 	// Lists all key scopes for a wallet, ordered by ID.
 	ListKeyScopesByWallet(ctx context.Context, walletID int64) ([]KeyScope, error)
+	// Lists wallet-owned inputs spent by the selected transaction rows.
+	//
+	// How:
+	// - Reads from utxos using the `spent_by_tx_id` spend edge.
+	// - Returns only wallet-owned inputs because only those are tracked in utxos.
+	// - Filters out NULL spent_input_index values so callers receive only concrete
+	//   input positions.
+	// Performance:
+	// - Uses the provided spender tx-id slice to bound the scan to the selected
+	//   rows.
+	ListOwnedInputsBySpendingTxIDs(ctx context.Context, arg ListOwnedInputsBySpendingTxIDsParams) ([]ListOwnedInputsBySpendingTxIDsRow, error)
+	// Lists wallet-owned outputs created by the selected transaction rows.
+	//
+	// How:
+	// - Reads directly from utxos by `tx_id` after the caller has already selected
+	//   the wallet-scoped transaction rows.
+	// - Returns only the output indexes and amounts needed by the tx detail read
+	//   model.
+	// Performance:
+	// - Uses the provided tx-id slice to bound the scan to the selected rows.
+	ListOwnedOutputsByTxIDs(ctx context.Context, arg ListOwnedOutputsByTxIDsParams) ([]ListOwnedOutputsByTxIDsRow, error)
 	// Lists victim txids for a given replacement txid.
 	//
 	// How:

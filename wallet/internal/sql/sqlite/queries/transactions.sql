@@ -159,6 +159,50 @@ WHERE
     AND t.block_height <= cast(sqlc.arg('end_height') AS INTEGER)
 ORDER BY t.block_height, t.id;
 
+-- name: ListOwnedOutputsByTxIDs :many
+-- Lists wallet-owned outputs created by the selected transaction rows.
+--
+-- How:
+-- - Reads directly from utxos by `tx_id` after the caller has already selected
+--   the wallet-scoped transaction rows.
+-- - Returns only the output indexes and amounts needed by the tx detail read
+--   model.
+-- Performance:
+-- - Uses the provided tx-id slice to bound the scan to the selected rows.
+SELECT
+    u.tx_id,
+    u.output_index,
+    u.amount
+FROM utxos AS u
+INNER JOIN transactions AS t ON u.tx_id = t.id
+WHERE
+    t.wallet_id = sqlc.arg('wallet_id')
+    AND u.tx_id IN (sqlc.slice('tx_ids'))
+ORDER BY u.tx_id, u.output_index;
+
+-- name: ListOwnedInputsBySpendingTxIDs :many
+-- Lists wallet-owned inputs spent by the selected transaction rows.
+--
+-- How:
+-- - Reads from utxos using the `spent_by_tx_id` spend edge.
+-- - Returns only wallet-owned inputs because only those are tracked in utxos.
+-- - Filters out NULL spent_input_index values so callers receive only concrete
+--   input positions.
+-- Performance:
+-- - Uses the provided spender tx-id slice to bound the scan to the selected
+--   rows.
+SELECT
+    u.spent_by_tx_id,
+    u.spent_input_index,
+    u.amount
+FROM utxos AS u
+INNER JOIN transactions AS t ON u.spent_by_tx_id = t.id
+WHERE
+    t.wallet_id = sqlc.arg('wallet_id')
+    AND u.spent_by_tx_id IN (sqlc.slice('tx_ids'))
+    AND u.spent_input_index IS NOT NULL
+ORDER BY u.spent_by_tx_id, u.spent_input_index;
+
 -- name: UpdateTransactionLabelByHash :execrows
 -- Updates only the user-visible transaction label.
 --
