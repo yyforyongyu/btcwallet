@@ -6,8 +6,6 @@
 // around the concept of a UtxoManager, which is responsible for managing the
 // wallet's UTXO set.
 //
-// TODO(yy): bring wrapcheck back when implementing the `Store` interface.
-//
 //nolint:wrapcheck
 package wallet
 
