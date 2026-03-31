@@ -12,42 +12,6 @@ import (
 	"time"
 )
 
-const ConfirmUnminedTransactionByHash = `-- name: ConfirmUnminedTransactionByHash :execrows
-UPDATE transactions
-SET
-    block_height = cast(?1 AS INTEGER),
-    tx_status = 1
-WHERE
-    wallet_id = ?2
-    AND tx_hash = ?3
-    AND block_height IS NULL
-    AND tx_status IN (0, 1)
-`
-
-type ConfirmUnminedTransactionByHashParams struct {
-	BlockHeight int64
-	WalletID    int64
-	TxHash      []byte
-}
-
-// Attaches a confirming block to one existing live unmined transaction row.
-//
-// How:
-//   - Updates only rows that are still blockless and live (`pending` or
-//     `published`).
-//   - Leaves user-visible metadata such as labels untouched so confirmation can
-//     reuse the original transaction row instead of reinserting it.
-//
-// Performance:
-// - Updates at most one row through the wallet-scoped unique tx-hash lookup.
-func (q *Queries) ConfirmUnminedTransactionByHash(ctx context.Context, arg ConfirmUnminedTransactionByHashParams) (int64, error) {
-	result, err := q.exec(ctx, q.confirmUnminedTransactionByHashStmt, ConfirmUnminedTransactionByHash, arg.BlockHeight, arg.WalletID, arg.TxHash)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
-}
-
 const DeleteBlocksAtOrAboveHeight = `-- name: DeleteBlocksAtOrAboveHeight :execrows
 DELETE FROM blocks
 WHERE block_height >= ?
@@ -88,7 +52,7 @@ type DeleteUnminedTransactionByHashParams struct {
 //
 // How:
 //   - Deletes only rows whose `block_height` is still NULL and whose status is
-//     still in a live unconfirmed state (`pending` or `published`).
+//     still unmined `pending` or `published`.
 //   - Preserves orphaned/replaced/failed history; those rows must remain visible
 //     for audit/reorg handling instead of being treated as ordinary mempool data.
 //   - The caller must delete or restore dependent UTXO rows first.
@@ -288,7 +252,7 @@ type ListRollbackCoinbaseRootsRow struct {
 // How:
 //   - Reads only confirmed coinbase rows at or above the rollback boundary.
 //   - Returns wallet scope alongside each tx hash so callers can treat these
-//     coinbase transactions as rollback roots when invalidating now-dead
+//     coinbase transactions as rollback roots when invalidating now-invalid
 //     descendants inside the same rollback transaction.
 //   - This is a rollback-specific helper, not a generic "coinbase txs from one
 //     block" listing query.
@@ -402,6 +366,86 @@ func (q *Queries) ListTransactionsByHeightRange(ctx context.Context, arg ListTra
 	return items, nil
 }
 
+const ListTransactionsWithoutBlock = `-- name: ListTransactionsWithoutBlock :many
+SELECT
+    t.id,
+    t.tx_hash,
+    t.raw_tx,
+    t.received_time,
+    t.block_height,
+    b.header_hash AS block_hash,
+    b.block_timestamp,
+    t.is_coinbase,
+    t.tx_status,
+    t.tx_label
+FROM transactions AS t
+LEFT JOIN blocks AS b ON 1 = 0
+WHERE
+    t.wallet_id = ?
+    AND t.block_height IS NULL
+ORDER BY t.received_time DESC, t.id DESC
+`
+
+type ListTransactionsWithoutBlockRow struct {
+	ID             int64
+	TxHash         []byte
+	RawTx          []byte
+	ReceivedTime   time.Time
+	BlockHeight    sql.NullInt64
+	BlockHash      []byte
+	BlockTimestamp sql.NullInt64
+	IsCoinbase     bool
+	TxStatus       int64
+	TxLabel        string
+}
+
+// Lists every wallet transaction row that currently has no confirming block.
+//
+// How:
+//   - Reads from transactions only and filters on rows with no confirming block.
+//   - Includes the active unmined set (`pending` and `published`) together with
+//     retained invalid history such as `failed`, `replaced`, or `orphaned`
+//     rows.
+//   - Projects typed NULL block metadata through `LEFT JOIN blocks AS b ON 1 = 0`
+//     so sqlc preserves the nullable block columns while the row shape stays
+//     aligned with the confirmed query below.
+//
+// Performance:
+// - Matches the dedicated no-confirming-block history index.
+func (q *Queries) ListTransactionsWithoutBlock(ctx context.Context, walletID int64) ([]ListTransactionsWithoutBlockRow, error) {
+	rows, err := q.query(ctx, q.listTransactionsWithoutBlockStmt, ListTransactionsWithoutBlock, walletID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTransactionsWithoutBlockRow
+	for rows.Next() {
+		var i ListTransactionsWithoutBlockRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TxHash,
+			&i.RawTx,
+			&i.ReceivedTime,
+			&i.BlockHeight,
+			&i.BlockHash,
+			&i.BlockTimestamp,
+			&i.IsCoinbase,
+			&i.TxStatus,
+			&i.TxLabel,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const ListUnminedTransactions = `-- name: ListUnminedTransactions :many
 SELECT
     t.id,
@@ -436,18 +480,19 @@ type ListUnminedTransactionsRow struct {
 	TxLabel        string
 }
 
-// Lists all unconfirmed transactions for a wallet.
+// Lists the wallet transactions that still belong to the active unmined set.
 //
 // How:
-//   - Reads from transactions only and filters on blockless rows that are still
-//     in a live unconfirmed state (`pending` or `published`).
-//   - Excludes orphaned/replaced/failed history so rollback-produced coinbase
-//     rows do not reappear as mempool transactions.
+//   - Reads from transactions only and filters on unmined rows that are still
+//     in unmined `pending` or `published` status.
+//   - Excludes orphaned/replaced/failed history so delete and rollback logic do
+//     not treat retained invalid rows as active mempool spends.
 //   - Projects typed NULL block metadata through `LEFT JOIN blocks AS b ON 1 = 0`
-//     so the unmined row shape stays aligned with the confirmed query below.
+//     so sqlc preserves the nullable block columns while the row shape stays
+//     aligned with other transaction queries.
 //
 // Performance:
-//   - Matches the dedicated blockless-history index while the more selective
+//   - Matches the dedicated unmined-history index while the more selective
 //     live-only partial index stays available for conflict paths.
 func (q *Queries) ListUnminedTransactions(ctx context.Context, walletID int64) ([]ListUnminedTransactionsRow, error) {
 	rows, err := q.query(ctx, q.listUnminedTransactionsStmt, ListUnminedTransactions, walletID)
@@ -565,6 +610,49 @@ type UpdateTransactionLabelByHashParams struct {
 // - Updates at most one row through the wallet-scoped unique tx-hash lookup.
 func (q *Queries) UpdateTransactionLabelByHash(ctx context.Context, arg UpdateTransactionLabelByHashParams) (int64, error) {
 	result, err := q.exec(ctx, q.updateTransactionLabelByHashStmt, UpdateTransactionLabelByHash, arg.Label, arg.WalletID, arg.TxHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const UpdateTransactionStateByHash = `-- name: UpdateTransactionStateByHash :execrows
+UPDATE transactions
+SET
+    block_height = cast(?1 AS INTEGER),
+    tx_status = ?2
+WHERE
+    wallet_id = ?3
+    AND tx_hash = ?4
+`
+
+type UpdateTransactionStateByHashParams struct {
+	BlockHeight sql.NullInt64
+	Status      int64
+	WalletID    int64
+	TxHash      []byte
+}
+
+// Updates the stored block assignment and wallet-relative status for one
+// transaction row.
+//
+// How:
+//   - Leaves immutable transaction facts such as `raw_tx`, credits, and spent
+//     inputs untouched.
+//   - Leaves the user-visible label untouched so callers can patch label and
+//     state independently or together inside one SQL transaction.
+//   - Expects callers to validate any required block reference and state
+//     invariants before issuing the update.
+//
+// Performance:
+// - Updates at most one row through the wallet-scoped unique tx-hash lookup.
+func (q *Queries) UpdateTransactionStateByHash(ctx context.Context, arg UpdateTransactionStateByHashParams) (int64, error) {
+	result, err := q.exec(ctx, q.updateTransactionStateByHashStmt, UpdateTransactionStateByHash,
+		arg.BlockHeight,
+		arg.Status,
+		arg.WalletID,
+		arg.TxHash,
+	)
 	if err != nil {
 		return 0, err
 	}

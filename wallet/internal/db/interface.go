@@ -75,13 +75,32 @@ var (
 	// database.
 	ErrTxNotFound = errors.New("transaction not found")
 
+	// ErrTxAlreadyExists is returned when CreateTx is asked to insert a
+	// wallet-scoped transaction hash that already exists.
+	ErrTxAlreadyExists = errors.New("transaction already exists")
+
+	// ErrBlockNotFound is returned when a transaction operation references a
+	// block height that does not exist in the shared blocks table.
+	ErrBlockNotFound = errors.New("block not found")
+
+	// ErrBlockMismatch is returned when a transaction operation references a
+	// block height whose stored hash or timestamp does not match the supplied
+	// block metadata.
+	ErrBlockMismatch = errors.New("block metadata mismatch")
+
 	// ErrUtxoNotFound is returned when a UTXO is not found in the database.
 	ErrUtxoNotFound = errors.New("utxo not found")
 
 	// ErrTxInputConflict is returned when CreateTx references a wallet-owned
-	// input that is already spent by another live wallet transaction.
+	// input that is already claimed by another recorded wallet spend.
 	ErrTxInputConflict = errors.New(
-		"transaction input conflicts with live wallet spend",
+		"transaction input conflicts with another wallet spend",
+	)
+
+	// ErrTxInputInvalidParent is returned when CreateTx references a wallet-
+	// owned input whose parent transaction is already invalid.
+	ErrTxInputInvalidParent = errors.New(
+		"transaction input spends wallet output with invalid parent",
 	)
 )
 
@@ -259,15 +278,17 @@ type TxStore interface {
 	// choice explicitly in CreateTxParams.
 	CreateTx(ctx context.Context, params CreateTxParams) error
 
-	// UpdateTxLabel updates an existing transaction record in the database. It
-	// takes a context and UpdateTxLabelParams, returning an error if the
-	// transaction cannot be found or updated.
+	// UpdateTx patches the mutable metadata for one existing wallet-scoped
+	// transaction record.
 	//
-	// UpdateTxLabel is intentionally narrow: it only updates the user-visible
-	// label. Block assignment, rollback, and status transitions belong to
-	// dedicated internal queries used by wallet synchronization and
-	// replacement handling.
-	UpdateTxLabel(ctx context.Context, params UpdateTxLabelParams) error
+	// UpdateTx can update the user-visible label, the chain-state view
+	// (block/status), or both in one atomic write. It never rewrites
+	// immutable transaction facts such as the serialized transaction bytes,
+	// created credits, or spent-input edges.
+	//
+	// UpdateTx is the only public tx-store API that may attach, replace, or
+	// clear confirming block metadata.
+	UpdateTx(ctx context.Context, params UpdateTxParams) error
 
 	// GetTx retrieves a transaction record by its hash. It takes a context
 	// and GetTxQuery, returning a TxInfo struct or an error if the
@@ -283,8 +304,8 @@ type TxStore interface {
 	// returning a slice of TxInfo or an error if the retrieval fails.
 	ListTxns(ctx context.Context, query ListTxnsQuery) ([]TxInfo, error)
 
-	// DeleteTx removes a live unconfirmed transaction from the store. It
-	// takes a context and DeleteTxParams, returning an error if the
+	// DeleteTx removes an unmined pending or published transaction from the
+	// store. It takes a context and DeleteTxParams, returning an error if the
 	// transaction is not found or the deletion fails.
 	//
 	// DeleteTx is intentionally narrower than a generic
@@ -319,16 +340,16 @@ type UTXOStore interface {
 	// outpoint. It returns a UtxoInfo struct containing the UTXO's details
 	// or an error if the UTXO is not found or has been spent.
 	//
-	// GetUtxo treats outputs created by both live unconfirmed states
-	// (TxStatusPending and TxStatusPublished) as present in the wallet's
-	// UTXO set.
+	// GetUtxo treats outputs created by unmined `pending` and `published`
+	// transactions as present in the wallet's UTXO set.
 	GetUtxo(ctx context.Context, query GetUtxoQuery) (*UtxoInfo, error)
 
 	// ListUTXOs returns a slice of all unspent transaction outputs (UTXOs)
 	// that match the provided query parameters. This can be used to list
 	// all UTXOs or filter them by account or confirmation status.
 	//
-	// ListUTXOs includes outputs from live unconfirmed parent transactions.
+	// ListUTXOs includes outputs from unmined `pending` and `published`
+	// parent transactions.
 	// Spendability policy such as coinbase maturity, lease state, or whether
 	// a caller wants to exclude TxStatusPending parents belongs in higher-level
 	// selection logic.
@@ -350,7 +371,8 @@ type UTXOStore interface {
 	// ErrOutputUnlockNotAllowed.
 	ReleaseOutput(ctx context.Context, params ReleaseOutputParams) error
 
-	// ListLeasedOutputs returns a slice of all currently leased live UTXOs.
+	// ListLeasedOutputs returns a slice of all currently leased UTXOs whose
+	// parent transaction is still `pending` or `published`.
 	// This can be used to inspect which still-unspent outputs are currently
 	// locked and when their leases expire.
 	ListLeasedOutputs(ctx context.Context, walletID uint32) (
@@ -359,7 +381,8 @@ type UTXOStore interface {
 	// Balance returns a wallet-scoped balance view for the current unspent UTXO
 	// set after applying any optional caller-supplied filters.
 	//
-	// The zero-value BalanceParams request the wallet's live factual balance.
+	// The zero-value BalanceParams request the wallet's current factual
+	// balance.
 	// Callers may narrow that view by account, confirmation range, lease
 	// or coinbase maturity when they need a workflow-specific balance policy
 	// from the public store interface. The returned BalanceResult always uses
