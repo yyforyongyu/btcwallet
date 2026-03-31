@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 )
 
@@ -704,6 +705,38 @@ type GetAddressQuery struct {
 	ScriptPubKey []byte
 }
 
+// FindUnusedAddressQuery contains the parameters for scanning one account for
+// its first unused address.
+type FindUnusedAddressQuery struct {
+	// WalletID is the ID of the wallet to query.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	WalletID uint32
+
+	// AccountName is the name of the account to scan.
+	AccountName string
+
+	// Scope is the key scope of the account.
+	Scope KeyScope
+
+	// Change selects the internal/change branch when true.
+	Change bool
+}
+
+// GetManagedAddressQuery contains the parameters for looking up the legacy
+// managed-address view of one wallet address.
+type GetManagedAddressQuery struct {
+	// WalletID is the ID of the wallet to query.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	WalletID uint32
+
+	// Address is the encoded address string to look up.
+	Address string
+}
+
 // GetAddressDetailsQuery contains the parameters for querying the wallet-
 // facing details of one address by script pubkey.
 type GetAddressDetailsQuery struct {
@@ -733,6 +766,45 @@ type ListAddressesQuery struct {
 
 	// Page holds the pagination parameters for this query.
 	Page page.Request[uint32]
+}
+
+// ImportPublicKeyParams contains the inputs needed to import one public key
+// through the backend's native address-manager path.
+type ImportPublicKeyParams struct {
+	// WalletID is the ID of the wallet to import the public key into.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	WalletID uint32
+
+	// Scope is the key scope that determines the address family.
+	Scope KeyScope
+
+	// SerializedPubKey is the serialized compressed public key to import.
+	SerializedPubKey []byte
+}
+
+// ImportTaprootScriptParams contains the inputs needed to import one taproot
+// script through the backend's native address-manager path.
+type ImportTaprootScriptParams struct {
+	// WalletID is the ID of the wallet to import the script into.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	WalletID uint32
+
+	// Tapscript is the taproot script descriptor to import.
+	Tapscript waddrmgr.Tapscript
+
+	// SyncedTo is the wallet sync state used as the import birthday.
+	SyncedTo waddrmgr.BlockStamp
+
+	// WitnessVersion is the witness version used by the imported script.
+	WitnessVersion byte
+
+	// IsSecretScript indicates whether the imported script should be encrypted
+	// with the secret script key.
+	IsSecretScript bool
 }
 
 // --------------------

@@ -38,6 +38,9 @@ import (
 // exercising a real database backend.
 type mockStore struct {
 	mock.Mock
+
+	addrStore   *mockAddrStore
+	chainParams *chaincfg.Params
 }
 
 // A compile-time assertion to ensure that mockStore implements the db.Store
@@ -139,6 +142,30 @@ func (m *mockStore) NewImportedAddress(ctx context.Context,
 	return args.Get(0).(*db.AddressInfo), args.Error(1)
 }
 
+// ImportPublicKey implements the db.AddressStore interface.
+func (m *mockStore) ImportPublicKey(ctx context.Context,
+	params db.ImportPublicKeyParams) (btcutil.Address, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(btcutil.Address), args.Error(1)
+}
+
+// ImportTaprootScript implements the db.AddressStore interface.
+func (m *mockStore) ImportTaprootScript(ctx context.Context,
+	params db.ImportTaprootScriptParams) (btcutil.Address, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(btcutil.Address), args.Error(1)
+}
+
 // GetAddress implements the db.AddressStore interface.
 func (m *mockStore) GetAddress(ctx context.Context,
 	query db.GetAddressQuery) (*db.AddressInfo, error) {
@@ -149,6 +176,39 @@ func (m *mockStore) GetAddress(ctx context.Context,
 	}
 
 	return args.Get(0).(*db.AddressInfo), args.Error(1)
+}
+
+// FindUnusedAddress implements the db.AddressStore interface.
+func (m *mockStore) FindUnusedAddress(ctx context.Context,
+	query db.FindUnusedAddressQuery) (btcutil.Address, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(btcutil.Address), args.Error(1)
+}
+
+// GetManagedAddress implements the db.AddressStore interface.
+func (m *mockStore) GetManagedAddress(ctx context.Context,
+	query db.GetManagedAddressQuery) (waddrmgr.ManagedAddress, error) {
+
+	if !m.hasExpectation("GetManagedAddress") && m.addrStore != nil {
+		addr, err := btcutil.DecodeAddress(query.Address, m.chainParams)
+		if err != nil {
+			return nil, err
+		}
+
+		return m.addrStore.Address(nil, addr)
+	}
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(waddrmgr.ManagedAddress), args.Error(1)
 }
 
 // GetAddressDetails implements the db.AddressStore interface.
@@ -317,6 +377,16 @@ func (m *mockStore) RollbackToBlock(ctx context.Context, height uint32) error {
 	args := m.Called(ctx, height)
 
 	return args.Error(0)
+}
+
+func (m *mockStore) hasExpectation(method string) bool {
+	for i := range m.ExpectedCalls {
+		if m.ExpectedCalls[i].Method == method {
+			return true
+		}
+	}
+
+	return false
 }
 
 // mockTxStore is a mock implementation of the wtxmgr.TxStore interface.

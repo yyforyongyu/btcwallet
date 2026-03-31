@@ -106,6 +106,34 @@ func (s *Store) GetAddressDetails(_ context.Context,
 	return spendable, account, addrType, nil
 }
 
+// FindUnusedAddress is not yet implemented for kvdb.
+func (s *Store) FindUnusedAddress(ctx context.Context,
+	_ db.FindUnusedAddressQuery) (btcutil.Address, error) {
+
+	return nil, notImplemented(ctx, "FindUnusedAddress")
+}
+
+// GetManagedAddress is not yet implemented for kvdb.
+func (s *Store) GetManagedAddress(ctx context.Context,
+	_ db.GetManagedAddressQuery) (waddrmgr.ManagedAddress, error) {
+
+	return nil, notImplemented(ctx, "GetManagedAddress")
+}
+
+// ImportPublicKey is not yet implemented for kvdb.
+func (s *Store) ImportPublicKey(ctx context.Context,
+	_ db.ImportPublicKeyParams) (btcutil.Address, error) {
+
+	return nil, notImplemented(ctx, "ImportPublicKey")
+}
+
+// ImportTaprootScript is not yet implemented for kvdb.
+func (s *Store) ImportTaprootScript(ctx context.Context,
+	_ db.ImportTaprootScriptParams) (btcutil.Address, error) {
+
+	return nil, notImplemented(ctx, "ImportTaprootScript")
+}
+
 // ListAddresses is not yet implemented for kvdb.
 func (s *Store) ListAddresses(ctx context.Context,
 	_ db.ListAddressesQuery) (page.Result[db.AddressInfo, uint32], error) {

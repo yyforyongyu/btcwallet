@@ -5,6 +5,8 @@ import (
 	"errors"
 	"iter"
 
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 )
 
@@ -223,6 +225,8 @@ type DerivedAddressData struct {
 }
 
 // AddressStore defines the database actions for managing addresses.
+//
+//nolint:interfacebloat
 type AddressStore interface {
 	// NewDerivedAddress creates a new HD-derived address for the specified
 	// account and key scope. The database layer allocates the address index
@@ -240,10 +244,33 @@ type AddressStore interface {
 	NewImportedAddress(ctx context.Context,
 		params NewImportedAddressParams) (*AddressInfo, error)
 
+	// ImportPublicKey imports a single public key through the backend's native
+	// address-manager path and returns the imported address.
+	ImportPublicKey(ctx context.Context,
+		params ImportPublicKeyParams) (btcutil.Address, error)
+
+	// ImportTaprootScript imports a taproot script through the backend's native
+	// address-manager path and returns the imported address.
+	ImportTaprootScript(ctx context.Context,
+		params ImportTaprootScriptParams) (btcutil.Address, error)
+
 	// GetAddress retrieves information about a specific address. It
 	// returns an AddressInfo struct containing the address's properties or
 	// an error if the address is not found.
 	GetAddress(ctx context.Context, query GetAddressQuery) (*AddressInfo, error)
+
+	// FindUnusedAddress scans one account and returns the first address whose
+	// used flag is still clear.
+	FindUnusedAddress(ctx context.Context,
+		query FindUnusedAddressQuery) (btcutil.Address, error)
+
+	// GetManagedAddress returns the legacy managed-address view for one wallet
+	// address.
+	//
+	// NOTE: This is a transitional compatibility seam while wallet APIs still
+	// expose waddrmgr.ManagedAddress directly.
+	GetManagedAddress(ctx context.Context,
+		query GetManagedAddressQuery) (waddrmgr.ManagedAddress, error)
 
 	// GetAddressDetails looks up one wallet-managed address by script pubkey.
 	//
