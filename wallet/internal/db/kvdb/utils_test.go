@@ -63,3 +63,15 @@ func newTxStore(t *testing.T, dbConn walletdb.DB) *wtxmgr.Store {
 
 	return txStore
 }
+
+// newAddrmgrNamespace creates the top-level waddrmgr bucket expected by kvdb
+// address-related tests.
+func newAddrmgrNamespace(t *testing.T, dbConn walletdb.DB) {
+	t.Helper()
+
+	err := walletdb.Update(dbConn, func(tx walletdb.ReadWriteTx) error {
+		_, err := tx.CreateTopLevelBucket(waddrmgrNamespaceKey)
+		return err
+	})
+	require.NoError(t, err)
+}
