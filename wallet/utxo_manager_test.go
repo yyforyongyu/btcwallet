@@ -334,3 +334,111 @@ func TestListLeasedOutputs(t *testing.T) {
 		Expiration: leasedOutput.Expiration,
 	}}, leasedOutputs)
 }
+
+// TestListUnspentDeprecated verifies that the deprecated ListUnspent wrapper
+// reuses the store-backed UTXO path while preserving the legacy locked-output
+// filtering.
+func TestListUnspentDeprecated(t *testing.T) {
+	t.Parallel()
+
+	w, mocks := createStartedWalletWithMocks(t)
+
+	privKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	addr, err := btcutil.NewAddressPubKey(
+		privKey.PubKey().SerializeCompressed(), &chainParams,
+	)
+	require.NoError(t, err)
+
+	pkScript, err := txscript.PayToAddrScript(addr)
+	require.NoError(t, err)
+
+	unlocked := db.UtxoInfo{
+		OutPoint: wire.OutPoint{Hash: [32]byte{1}, Index: 0},
+		Amount:   100000,
+		PkScript: pkScript,
+		Height:   1,
+	}
+	locked := db.UtxoInfo{
+		OutPoint: wire.OutPoint{Hash: [32]byte{2}, Index: 0},
+		Amount:   200000,
+		PkScript: pkScript,
+		Height:   1,
+	}
+
+	minConfs := int32(0)
+	maxConfs := int32(999999)
+
+	mocks.store.On("ListUTXOs", mock.Anything, db.ListUtxosQuery{
+		WalletID: w.id,
+		MinConfs: &minConfs,
+		MaxConfs: &maxConfs,
+		Account:  nil,
+	}).Return([]db.UtxoInfo{unlocked, locked}, nil).Once()
+	mocks.store.On("ListLeasedOutputs", mock.Anything, w.id).Return(
+		[]db.LeasedOutput{{
+			OutPoint:   locked.OutPoint,
+			LockID:     db.LockID{9},
+			Expiration: time.Now().UTC().Add(time.Hour),
+		}}, nil,
+	).Once()
+	mocks.store.On(
+		"GetAddressDetails", mock.Anything,
+		db.GetAddressDetailsQuery{
+			WalletID:     w.id,
+			ScriptPubKey: pkScript,
+		},
+	).Return(false, defaultAccountName, db.WitnessPubKey, nil).Twice()
+
+	results, err := w.ListUnspentDeprecated(0, 999999, "")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, unlocked.OutPoint.Hash.String(), results[0].TxID)
+	require.Equal(t, unlocked.OutPoint.Index, results[0].Vout)
+	require.Equal(t, defaultAccountName, results[0].Account)
+	require.InDelta(t, unlocked.Amount.ToBTC(), results[0].Amount, 0)
+	require.Equal(t, addr.EncodeAddress(), results[0].Address)
+}
+
+// TestListLeasedOutputsDeprecated verifies that the deprecated leased-output
+// wrapper reuses the store-backed lease scan and enriches each result with the
+// leased UTXO value and script.
+func TestListLeasedOutputsDeprecated(t *testing.T) {
+	t.Parallel()
+
+	w, mocks := createStartedWalletWithMocks(t)
+
+	expiration := time.Now().UTC().Add(time.Hour)
+	outPoint := wire.OutPoint{Hash: [32]byte{3}, Index: 1}
+	pkScript := []byte{0x51}
+
+	mocks.store.On("ListLeasedOutputs", mock.Anything, w.id).Return(
+		[]db.LeasedOutput{{
+			OutPoint:   outPoint,
+			LockID:     db.LockID{4},
+			Expiration: expiration,
+		}}, nil,
+	).Once()
+	mocks.store.On("GetUtxo", mock.Anything, db.GetUtxoQuery{
+		WalletID: w.id,
+		OutPoint: outPoint,
+	}).Return(&db.UtxoInfo{
+		OutPoint: outPoint,
+		Amount:   12345,
+		PkScript: pkScript,
+		Height:   1,
+	}, nil).Once()
+
+	results, err := w.ListLeasedOutputsDeprecated()
+	require.NoError(t, err)
+	require.Equal(t, []*ListLeasedOutputResult{{
+		LockedOutput: &wtxmgr.LockedOutput{
+			Outpoint:   outPoint,
+			LockID:     wtxmgr.LockID{4},
+			Expiration: expiration,
+		},
+		Value:    12345,
+		PkScript: pkScript,
+	}}, results)
+}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	db "github.com/btcsuite/btcwallet/wallet/internal/db"
@@ -56,6 +57,21 @@ type Utxo struct {
 
 	// Locked indicates whether the output is locked.
 	Locked bool
+}
+
+// utxoChainParams returns the active chain params for UTXO-manager helpers
+// across both the modern config-backed wallet path and the legacy embedded
+// wallet path used by deprecated compatibility code.
+func (w *Wallet) utxoChainParams() *chaincfg.Params {
+	if w.cfg.ChainParams != nil {
+		return w.cfg.ChainParams
+	}
+
+	if w.walletDeprecated != nil {
+		return w.chainParams
+	}
+
+	return nil
 }
 
 // LeasedOutput describes one currently leased wallet output.
@@ -124,6 +140,14 @@ func (w *Wallet) ListUnspent(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+
+	return w.listUnspent(ctx, query)
+}
+
+// listUnspent returns the wallet-owned UTXOs that match the provided query
+// without checking the wallet runtime state first.
+func (w *Wallet) listUnspent(ctx context.Context,
+	query UtxoQuery) ([]*Utxo, error) {
 
 	log.Debugf("ListUnspent using query: %v", query)
 
@@ -232,7 +256,7 @@ func (w *Wallet) buildWalletUtxoFromStore(ctx context.Context,
 	info *db.UtxoInfo, currentHeight int32,
 	accountFilter string, locked bool) (*Utxo, bool, error) {
 
-	addr := extractAddrFromPKScript(info.PkScript, w.cfg.ChainParams)
+	addr := extractAddrFromPKScript(info.PkScript, w.utxoChainParams())
 	if addr == nil {
 		return nil, false, nil
 	}
@@ -254,7 +278,7 @@ func (w *Wallet) buildWalletUtxoFromStore(ctx context.Context,
 	}
 
 	if info.FromCoinBase {
-		maturity := w.cfg.ChainParams.CoinbaseMaturity
+		maturity := w.utxoChainParams().CoinbaseMaturity
 		if confirmations < int32(maturity) {
 			spendable = false
 		}
@@ -357,6 +381,14 @@ func (w *Wallet) LeaseOutput(ctx context.Context, id wtxmgr.LockID,
 		return time.Time{}, err
 	}
 
+	return w.leaseOutput(ctx, id, op, duration)
+}
+
+// leaseOutput locks one wallet output for the given duration without checking
+// the wallet runtime state first.
+func (w *Wallet) leaseOutput(ctx context.Context, id wtxmgr.LockID,
+	op wire.OutPoint, duration time.Duration) (time.Time, error) {
+
 	lease, err := w.store.LeaseOutput(ctx, db.LeaseOutputParams{
 		WalletID: w.id,
 		ID:       db.LockID(id),
@@ -390,6 +422,14 @@ func (w *Wallet) ReleaseOutput(ctx context.Context, id wtxmgr.LockID,
 		return err
 	}
 
+	return w.releaseOutput(ctx, id, op)
+}
+
+// releaseOutput unlocks one wallet output without checking the wallet runtime
+// state first.
+func (w *Wallet) releaseOutput(ctx context.Context, id wtxmgr.LockID,
+	op wire.OutPoint) error {
+
 	params := db.ReleaseOutputParams{
 		WalletID: w.id,
 		ID:       [32]byte(id),
@@ -410,6 +450,14 @@ func (w *Wallet) ListLeasedOutputs(
 	if err != nil {
 		return nil, err
 	}
+
+	return w.listLeasedOutputs(ctx)
+}
+
+// listLeasedOutputs returns the wallet-owned outputs that currently have
+// active leases without checking the wallet runtime state first.
+func (w *Wallet) listLeasedOutputs(
+	ctx context.Context) ([]*LeasedOutput, error) {
 
 	leases, err := w.store.ListLeasedOutputs(ctx, w.id)
 	if err != nil {

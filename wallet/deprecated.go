@@ -3,6 +3,7 @@ package wallet
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/internal/prompt"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
@@ -3298,15 +3300,7 @@ func (w *Wallet) LockedOutpoints() []btcjson.TransactionInput {
 func (w *Wallet) LeaseOutputDeprecated(id wtxmgr.LockID, op wire.OutPoint,
 	duration time.Duration) (time.Time, error) {
 
-	var expiry time.Time
-	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		var err error
-
-		expiry, err = w.txStore.LockOutput(ns, id, op, duration)
-		return err
-	})
-	return expiry, err
+	return w.leaseOutput(context.Background(), id, op, duration)
 }
 
 // ReleaseOutputDeprecated unlocks an output, allowing it to be available for
@@ -3317,10 +3311,7 @@ func (w *Wallet) LeaseOutputDeprecated(id wtxmgr.LockID, op wire.OutPoint,
 func (w *Wallet) ReleaseOutputDeprecated(
 	id wtxmgr.LockID, op wire.OutPoint) error {
 
-	return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		return w.txStore.UnlockOutput(ns, id, op)
-	})
+	return w.releaseOutput(context.Background(), id, op)
 }
 
 // resendUnminedTxs iterates through all transactions that spend from wallet
@@ -4829,145 +4820,42 @@ func (w *Wallet) AccountBalances(scope waddrmgr.KeyScope,
 // transaction an empty array will be returned.
 //
 // Deprecated: Use UtxoManager.ListUnspent instead.
-//
-//nolint:funlen
 func (w *Wallet) ListUnspentDeprecated(minconf, maxconf int32,
 	accountName string) ([]*btcjson.ListUnspentResult, error) {
 
-	var results []*btcjson.ListUnspentResult
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		syncBlock := w.addrStore.SyncedTo()
-
-		filter := accountName != ""
-
-		unspent, err := w.txStore.UnspentOutputs(txmgrNs)
-		if err != nil {
-			return err
-		}
-		sort.Sort(sort.Reverse(creditSlice(unspent)))
-
-		defaultAccountName := "default"
-
-		results = make([]*btcjson.ListUnspentResult, 0, len(unspent))
-		for i := range unspent {
-			output := unspent[i]
-
-			// Outputs with fewer confirmations than the minimum or
-			// more confs than the maximum are excluded.
-			confs := calcConf(output.Height, syncBlock.Height)
-			if confs < minconf || confs > maxconf {
-				continue
-			}
-
-			// Only mature coinbase outputs are included.
-			if output.FromCoinBase {
-				target := uint32(
-					w.ChainParams().CoinbaseMaturity,
-				)
-				if !hasMinConfs(
-					target, output.Height, syncBlock.Height,
-				) {
-
-					continue
-				}
-			}
-
-			// Exclude locked outputs from the result set.
-			if w.LockedOutpoint(output.OutPoint) {
-				continue
-			}
-
-			// Lookup the associated account for the output.  Use the
-			// default account name in case there is no associated account
-			// for some reason, although this should never happen.
-			//
-			// This will be unnecessary once transactions and outputs are
-			// grouped under the associated account in the db.
-			outputAcctName := defaultAccountName
-			sc, addrs, _, err := txscript.ExtractPkScriptAddrs(
-				output.PkScript, w.chainParams)
-			if err != nil {
-				continue
-			}
-			if len(addrs) > 0 {
-				smgr, acct, err := w.addrStore.AddrAccount(
-					addrmgrNs, addrs[0],
-				)
-				if err == nil {
-					s, err := smgr.AccountName(addrmgrNs, acct)
-					if err == nil {
-						outputAcctName = s
-					}
-				}
-			}
-
-			if filter && outputAcctName != accountName {
-				continue
-			}
-
-			// At the moment watch-only addresses are not supported, so all
-			// recorded outputs that are not multisig are "spendable".
-			// Multisig outputs are only "spendable" if all keys are
-			// controlled by this wallet.
-			//
-			// TODO: Each case will need updates when watch-only addrs
-			// is added.  For P2PK, P2PKH, and P2SH, the address must be
-			// looked up and not be watching-only.  For multisig, all
-			// pubkeys must belong to the manager with the associated
-			// private key (currently it only checks whether the pubkey
-			// exists, since the private key is required at the moment).
-			var spendable bool
-		scSwitch:
-			switch sc {
-			case txscript.PubKeyHashTy:
-				spendable = true
-			case txscript.PubKeyTy:
-				spendable = true
-			case txscript.WitnessV0ScriptHashTy:
-				spendable = true
-			case txscript.WitnessV0PubKeyHashTy:
-				spendable = true
-			case txscript.MultiSigTy:
-				for _, a := range addrs {
-					_, err := w.addrStore.Address(
-						addrmgrNs, a,
-					)
-					if err == nil {
-						continue
-					}
-					if waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound) {
-						break scSwitch
-					}
-					return err
-				}
-				spendable = true
-			}
-
-			result := &btcjson.ListUnspentResult{
-				TxID:          output.OutPoint.Hash.String(),
-				Vout:          output.OutPoint.Index,
-				Account:       outputAcctName,
-				ScriptPubKey:  hex.EncodeToString(output.PkScript),
-				Amount:        output.Amount.ToBTC(),
-				Confirmations: int64(confs),
-				Spendable:     spendable,
-			}
-
-			// BUG: this should be a JSON array so that all
-			// addresses can be included, or removed (and the
-			// caller extracts addresses from the pkScript).
-			if len(addrs) > 0 {
-				result.Address = addrs[0].EncodeAddress()
-			}
-
-			results = append(results, result)
-		}
-		return nil
+	utxos, err := w.listUnspent(context.Background(), UtxoQuery{
+		Account:  accountName,
+		MinConfs: minconf,
+		MaxConfs: maxconf,
 	})
-	return results, err
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]*btcjson.ListUnspentResult, 0, len(utxos))
+	for i := range utxos {
+		if utxos[i].Locked {
+			continue
+		}
+
+		result := &btcjson.ListUnspentResult{
+			TxID:          utxos[i].OutPoint.Hash.String(),
+			Vout:          utxos[i].OutPoint.Index,
+			Account:       utxos[i].Account,
+			ScriptPubKey:  hex.EncodeToString(utxos[i].PkScript),
+			Amount:        utxos[i].Amount.ToBTC(),
+			Confirmations: int64(utxos[i].Confirmations),
+			Spendable:     utxos[i].Spendable,
+		}
+
+		if utxos[i].Address != nil {
+			result.Address = utxos[i].Address.EncodeAddress()
+		}
+
+		results = append(results, result)
+	}
+
+	return results, nil
 }
 
 // ListLeasedOutputsDeprecated returns a list of objects representing the
@@ -4977,44 +4865,41 @@ func (w *Wallet) ListUnspentDeprecated(minconf, maxconf int32,
 func (w *Wallet) ListLeasedOutputsDeprecated() (
 	[]*ListLeasedOutputResult, error) {
 
-	var results []*ListLeasedOutputResult
-	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
-		ns := tx.ReadBucket(wtxmgrNamespaceKey)
+	ctx := context.Background()
 
-		outputs, err := w.txStore.ListLockedOutputs(ns)
+	leases, err := w.listLeasedOutputs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]*ListLeasedOutputResult, 0, len(leases))
+	for i := range leases {
+		utxo, err := w.store.GetUtxo(ctx, db.GetUtxoQuery{
+			WalletID: w.id,
+			OutPoint: leases[i].OutPoint,
+		})
 		if err != nil {
-			return err
-		}
-
-		for _, output := range outputs {
-			details, err := w.txStore.TxDetails(
-				ns, &output.Outpoint.Hash,
-			)
-			if err != nil {
-				return err
-			}
-
-			if details == nil {
-				log.Infof("unable to find tx details for "+
-					"%v:%v", output.Outpoint.Hash,
-					output.Outpoint.Index)
+			if errors.Is(err, db.ErrUtxoNotFound) {
+				log.Infof("unable to find utxo details for %v:%v",
+					leases[i].OutPoint.Hash, leases[i].OutPoint.Index)
 				continue
 			}
 
-			txOut := details.MsgTx.TxOut[output.Outpoint.Index]
-
-			result := &ListLeasedOutputResult{
-				LockedOutput: output,
-				Value:        txOut.Value,
-				PkScript:     txOut.PkScript,
-			}
-
-			results = append(results, result)
+			return nil, err
 		}
 
-		return nil
-	})
-	return results, err
+		results = append(results, &ListLeasedOutputResult{
+			LockedOutput: &wtxmgr.LockedOutput{
+				Outpoint:   leases[i].OutPoint,
+				LockID:     leases[i].LockID,
+				Expiration: leases[i].Expiration,
+			},
+			Value:    int64(utxo.Amount),
+			PkScript: utxo.PkScript,
+		})
+	}
+
+	return results, nil
 }
 
 // BlockIdentifier identifies a block by either a height or a hash.
@@ -5055,43 +4940,6 @@ type AccountBalanceResult struct {
 	AccountNumber  uint32
 	AccountName    string
 	AccountBalance btcutil.Amount
-}
-
-// creditSlice satisifies the sort.Interface interface to provide sorting
-// transaction credits from oldest to newest.  Credits with the same receive
-// time and mined in the same block are not guaranteed to be sorted by the order
-// they appear in the block.  Credits from the same transaction are sorted by
-// output index.
-type creditSlice []wtxmgr.Credit
-
-func (s creditSlice) Len() int {
-	return len(s)
-}
-
-func (s creditSlice) Less(i, j int) bool {
-	switch {
-	// If both credits are from the same tx, sort by output index.
-	case s[i].OutPoint.Hash == s[j].OutPoint.Hash:
-		return s[i].OutPoint.Index < s[j].OutPoint.Index
-
-	// If both transactions are unmined, sort by their received date.
-	case s[i].Height == -1 && s[j].Height == -1:
-		return s[i].Received.Before(s[j].Received)
-
-	// Unmined (newer) txs always come last.
-	case s[i].Height == -1:
-		return false
-	case s[j].Height == -1:
-		return true
-
-	// If both txs are mined in different blocks, sort by block height.
-	default:
-		return s[i].Height < s[j].Height
-	}
-}
-
-func (s creditSlice) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
 }
 
 // ListLeasedOutputResult is a single result for the Wallet.ListLeasedOutputs method.
