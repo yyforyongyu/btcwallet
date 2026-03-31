@@ -21,7 +21,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
-	"github.com/btcsuite/btcwallet/walletdb"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 )
 
 var (
@@ -50,9 +50,9 @@ var (
 	// extracted from a pkscript.
 	ErrUnableToExtractAddress = errors.New("unable to extract address")
 
-	// errStopIteration is a special error used to stop the iteration in
-	// ForEachAccountAddress.
-	errStopIteration = errors.New("stop iteration")
+	// errUnexpectedRedeemScript is returned when family-level redeem-script
+	// construction does not match the expected single-push shape.
+	errUnexpectedRedeemScript = errors.New("unexpected redeem script")
 )
 
 // AddressProperty represents an address and its balance.
@@ -127,9 +127,14 @@ type OutputScriptInfo struct {
 	// RedeemScript is the redeem script committed to by the outer P2SH output.
 	// For nested P2WPKH-in-P2SH spends, this is the inner witness program, for
 	// example `OP_0 <20-byte-key-hash>`. Native witness spends, such as P2WPKH
-	// and P2TR, leave this nil. The final scriptSig wrapper for nested witness
-	// spends can be rebuilt from this script when assembling the input.
+	// and P2TR, leave this nil.
 	RedeemScript []byte
+
+	// SigScript is the final scriptSig wrapper needed to spend outputs that are
+	// wrapped in P2SH.
+	// For nested P2WPKH-in-P2SH spends, this is a single push of RedeemScript.
+	// Native witness spends leave this nil.
+	SigScript []byte
 }
 
 // AddressManager provides an interface for generating and inspecting wallet
@@ -216,7 +221,7 @@ func addressInfoFromManagedAddress(
 // outputScriptInfoFromManagedAddress converts one legacy managed address plus
 // script data into the wallet-owned output metadata shape.
 func outputScriptInfoFromManagedAddress(managedAddr waddrmgr.ManagedAddress,
-	witnessProgram, redeemScript []byte) (OutputScriptInfo, error) {
+	witnessProgram, redeemScript, sigScript []byte) (OutputScriptInfo, error) {
 
 	addressInfo, err := addressInfoFromManagedAddress(managedAddr)
 	if err != nil {
@@ -227,6 +232,7 @@ func outputScriptInfoFromManagedAddress(managedAddr waddrmgr.ManagedAddress,
 		AddressInfo:    addressInfo,
 		WitnessProgram: witnessProgram,
 		RedeemScript:   redeemScript,
+		SigScript:      sigScript,
 	}, nil
 }
 
@@ -305,7 +311,7 @@ func addressDerivationFromManagedPubKeyAddress(
 //     transaction to persist the new address.
 //     This ensures that we only save an address after we are confident that
 //     it is being watched by the backend, preventing fund loss.
-func (w *Wallet) NewAddress(_ context.Context, accountName string,
+func (w *Wallet) NewAddress(ctx context.Context, accountName string,
 	addrType waddrmgr.AddressType, change bool) (btcutil.Address, error) {
 
 	err := w.state.validateStarted()
@@ -323,14 +329,29 @@ func (w *Wallet) NewAddress(_ context.Context, accountName string,
 		return nil, fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
+	addrInfo, err := w.store.NewDerivedAddress(
+		ctx, db.NewDerivedAddressParams{
+			WalletID:    w.id,
+			AccountName: accountName,
+			Scope:       db.KeyScope(keyScope),
+			Change:      change,
+		},
+		func(ctx context.Context, _ uint32, branch, index uint32) (
+			*db.DerivedAddressData, error) {
+
+			return w.DBDeriveAddressData(
+				ctx, keyScope, accountName, branch, index,
+			)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	addr, err := w.newAddress(manager, accountName, change)
-	if err != nil {
-		return nil, err
+	addr := extractAddrFromPKScript(addrInfo.ScriptPubKey, w.cfg.ChainParams)
+	if addr == nil {
+		return nil, fmt.Errorf("%w: from pkscript %x",
+			ErrUnableToExtractAddress, addrInfo.ScriptPubKey)
 	}
 
 	// Notify the rpc server about the newly created address.
@@ -342,35 +363,7 @@ func (w *Wallet) NewAddress(_ context.Context, accountName string,
 	return addr, nil
 }
 
-// newAddress returns the next external chained address for a wallet. It
-// wraps the database transaction and the call to the scoped key manager's
-// NewAddress method. The underlying address manager handles its own
-// synchronization to ensure that in-memory state remains consistent with the
-// database, preventing race conditions during address creation.
-func (w *Wallet) newAddress(manager waddrmgr.AccountStore,
-	accountName string, change bool) (btcutil.Address, error) {
-
-	var (
-		addr btcutil.Address
-		err  error
-	)
-
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		addr, err = manager.NewAddress(addrmgrNs, accountName, change)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return addr, nil
-}
+// GetUnusedAddress returns the first, oldest, unused address by scanning
 
 // GetUnusedAddress returns the first, oldest, unused address by scanning
 // forward from the start of the derivation path. The address is considered
@@ -424,14 +417,15 @@ func (w *Wallet) GetUnusedAddress(ctx context.Context, accountName string,
 		return nil, fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
+	unusedAddr, err := w.store.FindUnusedAddress(
+		ctx, db.FindUnusedAddressQuery{
+			WalletID:    w.id,
+			AccountName: accountName,
+			Scope:       db.KeyScope(keyScope),
+			Change:      change,
+		},
+	)
 	if err != nil {
-		return nil, err
-	}
-
-	unusedAddr, err := w.findUnusedAddress(manager, accountName, change)
-	// We'll ignore the special error that we use to stop the iteration.
-	if err != nil && !errors.Is(err, errStopIteration) {
 		return nil, err
 	}
 
@@ -444,77 +438,8 @@ func (w *Wallet) GetUnusedAddress(ctx context.Context, accountName string,
 	return w.NewAddress(ctx, accountName, addrType, change)
 }
 
-// findUnusedAddress scans for an unused address for the given account.
-func (w *Wallet) findUnusedAddress(manager waddrmgr.AccountStore,
-	accountName string, change bool) (btcutil.Address, error) {
-
-	var unusedAddr btcutil.Address
-
-	err := walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		// First, look up the account number for the passed account
-		// name.
-		acctNum, err := manager.LookupAccount(addrmgrNs, accountName)
-		if err != nil {
-			return err
-		}
-
-		// Now, iterate through all addresses for the account and
-		// return the first one that is unused.
-		return manager.ForEachAccountAddress(
-			addrmgrNs, acctNum,
-			func(maddr waddrmgr.ManagedAddress) error {
-				// We only want to consider addresses that match
-				// the change parameter.
-				if maddr.Internal() != change {
-					return nil
-				}
-
-				if !maddr.Used(addrmgrNs) {
-					unusedAddr = maddr.Address()
-
-					// Return a special error to signal
-					// that the iteration should be
-					// stopped. This is the idiomatic way
-					// to halt a ForEach* loop in this
-					// codebase.
-					return errStopIteration
-				}
-
-				return nil
-			},
-		)
-	})
-
-	return unusedAddr, err
-}
-
 // GetAddressInfo returns detailed information regarding a wallet address.
-//
-// This method provides metadata about a managed address, such as its type,
-// derivation path, and whether it's internal or compressed.
-//
-// How it works:
-// The method performs a direct lookup in the address manager to find the
-// requested address.
-//
-// Logical Steps:
-//  1. Initiate a read-only database transaction.
-//  2. Call the underlying address manager's `Address` method to look up the
-//     address.
-//  3. Return the managed address information.
-//
-// Database Actions:
-//   - This method performs a single read-only database transaction
-//     (`walletdb.View`).
-//   - It reads from the `waddrmgr` namespace to find the address.
-//
-// Time Complexity:
-//   - The operation is a direct database lookup, making its complexity roughly
-//     O(1) or O(log N) depending on the database backend's indexing strategy
-//     for addresses. It is a very fast operation.
-func (w *Wallet) GetAddressInfo(_ context.Context, a btcutil.Address) (
+func (w *Wallet) GetAddressInfo(ctx context.Context, a btcutil.Address) (
 	AddressInfo, error) {
 
 	err := w.state.validateStarted()
@@ -522,15 +447,12 @@ func (w *Wallet) GetAddressInfo(_ context.Context, a btcutil.Address) (
 		return AddressInfo{}, err
 	}
 
-	var managedAddress waddrmgr.ManagedAddress
-
-	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		managedAddress, err = w.addrStore.Address(addrmgrNs, a)
-
-		return err
-	})
+	managedAddress, err := w.store.GetManagedAddress(
+		ctx, db.GetManagedAddressQuery{
+			WalletID: w.id,
+			Address:  a.EncodeAddress(),
+		},
+	)
 	if err != nil {
 		return AddressInfo{}, err
 	}
@@ -540,40 +462,7 @@ func (w *Wallet) GetAddressInfo(_ context.Context, a btcutil.Address) (
 
 // ListAddresses lists all addresses for a given account, including their
 // balances.
-//
-// This method provides a comprehensive view of all addresses within a
-// specific account, along with their current confirmed balances.
-//
-// How it works:
-// The method first calculates the balances of all UTXOs in the wallet and
-// stores them in a map. It then iterates through all addresses of the
-// specified account and looks up their balance in the map.
-//
-// Logical Steps:
-//  1. Initiate a read-only database transaction.
-//  2. Create a map to store address balances.
-//  3. Iterate through all unspent transaction outputs (UTXOs) in the
-//     wallet's `wtxmgr` namespace.
-//  4. For each UTXO, extract the address and add the output's value to the
-//     address's balance in the map.
-//  5. Fetch the scoped key manager for the given address type.
-//  6. Look up the account number for the given account name.
-//  7. Iterate through all addresses in that account.
-//  8. For each address, create an `AddressProperty` with the address and its
-//     balance from the map.
-//  9. Return the list of `AddressProperty` objects.
-//
-// Database Actions:
-//   - This method performs a single read-only database transaction
-//     (`walletdb.View`).
-//   - It reads from both the `wtxmgr` and `waddrmgr` namespaces.
-//
-// Time Complexity:
-//   - The complexity is O(U + A), where U is the number of unspent
-//     transaction outputs in the wallet and A is the number of addresses in
-//     the specified account. This is because it iterates through all UTXOs to
-//     build the balance map and then iterates through all account addresses.
-func (w *Wallet) ListAddresses(_ context.Context, accountName string,
+func (w *Wallet) ListAddresses(ctx context.Context, accountName string,
 	addrType waddrmgr.AddressType) ([]AddressProperty, error) {
 
 	err := w.state.validateStarted()
@@ -581,95 +470,55 @@ func (w *Wallet) ListAddresses(_ context.Context, accountName string,
 		return nil, err
 	}
 
-	var properties []AddressProperty
+	keyScope, err := addrType.KeyScope()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
+	}
 
-	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// First, we'll create a map of address to balance by iterating
-		// through all the unspent outputs.
-		addrToBalance := make(map[string]btcutil.Amount)
-
-		utxos, err := w.txStore.UnspentOutputs(txmgrNs)
-		if err != nil {
-			return err
-		}
-
-		for _, utxo := range utxos {
-			addr := extractAddrFromPKScript(
-				utxo.PkScript, w.cfg.ChainParams,
-			)
-			if addr == nil {
-				continue
-			}
-
-			addrToBalance[addr.String()] += utxo.Amount
-		}
-
-		keyScope, err := addrType.KeyScope()
-		if err != nil {
-			return fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
-		}
-
-		manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
-		if err != nil {
-			return err
-		}
-
-		acctNum, err := manager.LookupAccount(addrmgrNs, accountName)
-		if err != nil {
-			return err
-		}
-
-		return manager.ForEachAccountAddress(addrmgrNs, acctNum,
-			func(maddr waddrmgr.ManagedAddress) error {
-				addr := maddr.Address()
-				properties = append(properties, AddressProperty{
-					Address: addr,
-					Balance: addrToBalance[addr.String()],
-				})
-
-				return nil
-			})
+	addresses, err := w.store.ListAddresses(ctx, db.ListAddressesQuery{
+		WalletID:    w.id,
+		AccountName: accountName,
+		Scope:       db.KeyScope(keyScope),
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	utxos, err := w.store.ListUTXOs(ctx, db.ListUtxosQuery{WalletID: w.id})
+	if err != nil {
+		return nil, err
+	}
+
+	addrToBalance := make(map[string]btcutil.Amount)
+	for i := range utxos {
+		addr := extractAddrFromPKScript(utxos[i].PkScript, w.cfg.ChainParams)
+		if addr == nil {
+			continue
+		}
+
+		addrToBalance[addr.String()] += utxos[i].Amount
+	}
+
+	properties := make([]AddressProperty, 0, len(addresses.Items))
+	for i := range addresses.Items {
+		addr := extractAddrFromPKScript(
+			addresses.Items[i].ScriptPubKey, w.cfg.ChainParams,
+		)
+		if addr == nil {
+			continue
+		}
+
+		properties = append(properties, AddressProperty{
+			Address: addr,
+			Balance: addrToBalance[addr.String()],
+		})
 	}
 
 	return properties, nil
 }
 
 // ImportPublicKey imports a single public key as a watch-only address.
-//
-// This method allows the wallet to track transactions related to a specific
-// public key without having access to the corresponding private key. This is
-// useful for monitoring addresses without compromising their security.
-//
-// How it works:
-// The method determines the appropriate key scope based on the provided
-// address type and then uses the corresponding scoped key manager to import
-// the public key.
-//
-// Logical Steps:
-//  1. Determine the key scope from the address type (e.g., P2WKH, NP2WKH).
-//  2. Fetch the scoped key manager for that scope.
-//  3. Initiate a database transaction.
-//  4. Within the transaction, call the underlying address manager's
-//     ImportPublicKey method to store the key.
-//  5. Commit the transaction.
-//
-// Database Actions:
-//   - This method performs a single database write transaction
-//     (`walletdb.Update`).
-//   - It stores the public key and its associated address information within
-//     the `waddrmgr` namespace.
-//
-// Time Complexity:
-//   - The operation is dominated by the database write, making its complexity
-//     roughly O(1) or O(log N) depending on the database backend's indexing
-//     strategy for keys. It is generally a fast operation.
-func (w *Wallet) ImportPublicKey(_ context.Context, pubKey *btcec.PublicKey,
+func (w *Wallet) ImportPublicKey(ctx context.Context, pubKey *btcec.PublicKey,
 	addrType waddrmgr.AddressType) error {
 
 	err := w.state.validateStarted()
@@ -682,24 +531,10 @@ func (w *Wallet) ImportPublicKey(_ context.Context, pubKey *btcec.PublicKey,
 		return fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
-	if err != nil {
-		return err
-	}
-
-	var addr btcutil.Address
-
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		ma, err := manager.ImportPublicKey(addrmgrNs, pubKey, nil)
-		if err != nil {
-			return err
-		}
-
-		addr = ma.Address()
-
-		return nil
+	addr, err := w.store.ImportPublicKey(ctx, db.ImportPublicKeyParams{
+		WalletID:         w.id,
+		Scope:            db.KeyScope(keyScope),
+		SerializedPubKey: pubKey.SerializeCompressed(),
 	})
 	if err != nil {
 		return err
@@ -709,33 +544,7 @@ func (w *Wallet) ImportPublicKey(_ context.Context, pubKey *btcec.PublicKey,
 }
 
 // ImportTaprootScript imports a taproot script for tracking and spending.
-//
-// This method allows the wallet to import a taproot script, which is
-// necessary for spending from or tracking a taproot address.
-//
-// How it works:
-// The method uses the BIP-0086 key scope to fetch the taproot-specific
-// scoped key manager. It then calls the underlying manager's
-// ImportTaprootScript method to store the script information.
-//
-// Logical Steps:
-//  1. Fetch the scoped key manager for the taproot key scope (BIP-0086).
-//  2. Initiate a database transaction.
-//  3. Within the transaction, get the wallet's current sync state to use as
-//     the "birthday" for the new script.
-//  4. Call the underlying address manager's ImportTaprootScript method.
-//  5. Commit the transaction.
-//
-// Database Actions:
-//   - This method performs a single database write transaction
-//     (`walletdb.Update`).
-//   - It stores the taproot script and its derived address information within
-//     the `waddrmgr` namespace.
-//
-// Time Complexity:
-//   - Similar to ImportPublicKey, this operation is dominated by a database
-//     write, making it a fast operation with a complexity of roughly O(1).
-func (w *Wallet) ImportTaprootScript(_ context.Context,
+func (w *Wallet) ImportTaprootScript(ctx context.Context,
 	tapscript waddrmgr.Tapscript) (AddressInfo, error) {
 
 	err := w.state.validateStarted()
@@ -743,34 +552,27 @@ func (w *Wallet) ImportTaprootScript(_ context.Context,
 		return AddressInfo{}, err
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(
-		waddrmgr.KeyScopeBIP0086,
+	syncedTo := w.addrStore.SyncedTo()
+
+	addr, err := w.store.ImportTaprootScript(ctx,
+		db.ImportTaprootScriptParams{
+			WalletID:       w.id,
+			Tapscript:      tapscript,
+			SyncedTo:       syncedTo,
+			WitnessVersion: 1,
+			IsSecretScript: false,
+		},
 	)
 	if err != nil {
 		return AddressInfo{}, err
 	}
 
-	var addr waddrmgr.ManagedAddress
-
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		syncedTo := w.addrStore.SyncedTo()
-		addr, err = manager.ImportTaprootScript(
-			ns, &tapscript, &syncedTo, 1, false,
-		)
-
-		return err
-	})
+	err = w.cfg.Chain.NotifyReceived([]btcutil.Address{addr})
 	if err != nil {
 		return AddressInfo{}, err
 	}
 
-	err = w.cfg.Chain.NotifyReceived([]btcutil.Address{addr.Address()})
-	if err != nil {
-		return AddressInfo{}, err
-	}
-
-	return addressInfoFromManagedAddress(addr)
+	return w.GetAddressInfo(ctx, addr)
 }
 
 // ScriptForOutput returns the address metadata and spending scripts for a given
@@ -792,9 +594,10 @@ func (w *Wallet) ImportTaprootScript(_ context.Context,
 //     sign for (e.g., P2WKH, NP2WKH, P2TR).
 //  3. Based on the address type, construct the appropriate scripts:
 //     - For nested P2WKH (NP2WKH), it returns the inner witness program as the
-//     redeem script.
+//     redeem script and also builds the single-push sigScript wrapper used in
+//     the final input.
 //     - For native SegWit outputs (P2WKH, P2TR), the `witnessProgram` is the
-//     output's `pkScript`, while the redeem script is nil.
+//     output's `pkScript`, while the redeem script and sigScript are nil.
 //
 // Database Actions:
 //   - This method performs a read-only database access to fetch address
@@ -825,58 +628,73 @@ func (w *Wallet) ScriptForOutput(ctx context.Context, output wire.TxOut) (
 			"for %s: %w", addr.String(), err)
 	}
 
-	if addressInfo.PubKey == nil {
-		return OutputScriptInfo{}, fmt.Errorf("%w: addr %s",
-			ErrNotPubKeyAddress, addressInfo.Addr)
-	}
-
-	witnessProgram := output.PkScript
-
-	var redeemScript []byte
-	if addressInfo.AddrType == waddrmgr.NestedWitnessPubKey {
-		redeemScript, err = nestedWitnessProgramFromPubKey(
-			addressInfo.PubKey, w.cfg.ChainParams,
-		)
-		if err != nil {
-			return OutputScriptInfo{}, err
-		}
-
-		// For nested P2WPKH-in-P2SH, the redeem script committed by the outer
-		// P2SH output is the same inner witness program used for signing.
-		witnessProgram = redeemScript
-	} else if addressInfo.AddrType != waddrmgr.PubKeyHash &&
-		addressInfo.AddrType != waddrmgr.WitnessPubKey &&
-		addressInfo.AddrType != waddrmgr.TaprootPubKey {
-
-		return OutputScriptInfo{}, fmt.Errorf("%w: %v",
-			ErrUnsupportedAddressType, addressInfo.AddrType)
+	witnessProgram, redeemScript, sigScript, err := buildScriptsForAddressInfo(
+		addressInfo, output.PkScript, w.cfg.ChainParams,
+	)
+	if err != nil {
+		return OutputScriptInfo{}, err
 	}
 
 	return OutputScriptInfo{
 		AddressInfo:    addressInfo,
 		WitnessProgram: witnessProgram,
 		RedeemScript:   redeemScript,
+		SigScript:      sigScript,
 	}, nil
 }
 
-// nestedWitnessProgramFromPubKey builds the inner witness program used by a
-// nested P2WPKH-in-P2SH output from one compressed public key.
-func nestedWitnessProgramFromPubKey(pubKey *btcec.PublicKey,
-	chainParams *chaincfg.Params) ([]byte, error) {
+// buildScriptsForAddressInfo constructs the witness program, redeem script,
+// and final sigScript for a wallet-owned address metadata record.
+func buildScriptsForAddressInfo(addressInfo AddressInfo, pkScript []byte,
+	chainParams *chaincfg.Params) ([]byte, []byte, []byte, error) {
 
-	witnessAddr, err := btcutil.NewAddressWitnessPubKeyHash(
-		btcutil.Hash160(pubKey.SerializeCompressed()), chainParams,
+	if addressInfo.PubKey == nil {
+		return nil, nil, nil, fmt.Errorf("%w: addr %s", ErrNotPubKeyAddress,
+			addressInfo.Addr)
+	}
+
+	// For nested witness spends, the redeem script committed to by the outer
+	// P2SH output is the inner witness program, while the sigScript is a single
+	// push of that redeem script. For all other supported single-key families,
+	// the previous output pkScript remains the correct subscript for signing.
+	witnessProgram := pkScript
+
+	var (
+		redeemScript []byte
+		sigScript    []byte
+		err          error
 	)
-	if err != nil {
-		return nil, fmt.Errorf("new witness pubkey hash: %w", err)
+
+	spendType := addressInfo.AddrType.SpendType()
+	if spendType == waddrmgr.SpendTypeNestedWitnessKey {
+		sigScript, err = addressInfo.AddrType.RedeemScriptFromPubKey(
+			addressInfo.PubKey, chainParams,
+		)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("%w: %v",
+				ErrUnsupportedAddressType, addressInfo.AddrType)
+		}
+
+		pushes, err := txscript.PushedData(sigScript)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("decode redeem script: %w", err)
+		}
+
+		if len(pushes) != 1 {
+			return nil, nil, nil, fmt.Errorf("%w for %v",
+				errUnexpectedRedeemScript, addressInfo.AddrType)
+		}
+
+		redeemScript = pushes[0]
+		witnessProgram = redeemScript
+	} else if spendType != waddrmgr.SpendTypeWitnessKey &&
+		spendType != waddrmgr.SpendTypeTaprootKeyPath {
+
+		return nil, nil, nil, fmt.Errorf("%w: %v", ErrUnsupportedAddressType,
+			addressInfo.AddrType)
 	}
 
-	witnessProgram, err := txscript.PayToAddrScript(witnessAddr)
-	if err != nil {
-		return nil, fmt.Errorf("pay to witness address: %w", err)
-	}
-
-	return witnessProgram, nil
+	return witnessProgram, redeemScript, sigScript, nil
 }
 
 // GetDerivationInfo returns the BIP-32 derivation path for a given address.
@@ -922,15 +740,17 @@ func derivationForAddressInfo(addressInfo AddressInfo) (
 
 	keyScope := addressInfo.Derivation.KeyScope
 
-	return &psbt.Bip32Derivation{
+	derivationInfo := &psbt.Bip32Derivation{
 		PubKey:               addressInfo.PubKey.SerializeCompressed(),
 		MasterKeyFingerprint: addressInfo.Derivation.MasterKeyFingerprint,
 		Bip32Path: []uint32{
 			keyScope.Purpose + hdkeychain.HardenedKeyStart,
 			keyScope.Coin + hdkeychain.HardenedKeyStart,
-			addressInfo.Derivation.Account + hdkeychain.HardenedKeyStart,
+			addressInfo.Derivation.Account,
 			addressInfo.Derivation.Branch,
 			addressInfo.Derivation.Index,
 		},
-	}, nil
+	}
+
+	return derivationInfo, nil
 }

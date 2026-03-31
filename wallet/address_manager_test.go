@@ -6,7 +6,6 @@ package wallet
 
 import (
 	"testing"
-	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -15,11 +14,49 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
-	"github.com/btcsuite/btcwallet/walletdb"
-	"github.com/btcsuite/btcwallet/wtxmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+func addressInfoFromAddr(t *testing.T, addr btcutil.Address) *db.AddressInfo {
+	t.Helper()
+
+	pkScript, err := txscript.PayToAddrScript(addr)
+	require.NoError(t, err)
+
+	return &db.AddressInfo{ScriptPubKey: pkScript}
+}
+
+func expectStoreNewAddress(t *testing.T, w *Wallet, deps *mockWalletDeps,
+	accountName string, scope waddrmgr.KeyScope, change bool,
+	addr btcutil.Address) {
+
+	t.Helper()
+
+	deps.store.On(
+		"NewDerivedAddress", mock.Anything,
+		db.NewDerivedAddressParams{
+			WalletID:    w.id,
+			AccountName: accountName,
+			Scope:       db.KeyScope(scope),
+			Change:      change,
+		}, mock.Anything,
+	).Return(addressInfoFromAddr(t, addr), nil).Once()
+	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).Return(nil).Once()
+}
+
+func expectStoreManagedAddress(t *testing.T, w *Wallet, deps *mockWalletDeps,
+	addr btcutil.Address, managedAddr waddrmgr.ManagedAddress) {
+
+	t.Helper()
+
+	deps.store.On("GetManagedAddress", mock.Anything, db.GetManagedAddressQuery{
+		WalletID: w.id,
+		Address:  addr.EncodeAddress(),
+	}).Return(managedAddr, nil).Once()
+}
 
 // TestNewAddress tests the NewAddress method, ensuring it can generate
 // various address types for different accounts and correctly handles both
@@ -83,13 +120,9 @@ func TestNewAddress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Create a new test wallet for each test case.
 			w, deps := createStartedWalletWithMocks(t)
 
-			// Setup mock expectations.
 			if tc.expectErr {
-				// Attempt to generate a new address with the specified
-				// parameters.
 				_, err := w.NewAddress(
 					t.Context(), tc.accountName,
 					tc.addrType, tc.change,
@@ -123,29 +156,19 @@ func TestNewAddress(t *testing.T) {
 				require.FailNow(t, "unknown address type", tc.addrType)
 			}
 
-			deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-				Return(deps.accountManager, nil).
-				Once()
-			deps.addrStore.On("Address", mock.Anything, addr).
-				Return(deps.addr, nil).
-				Once()
+			scope, ok := tc.addrType.KeyScope()
+			require.True(t, ok)
 
-			deps.accountManager.On(
-				"NewAddress", mock.Anything, tc.accountName, tc.change,
-			).Return(addr, nil).Once()
-
-			deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
-				Return(nil).
-				Once()
-
+			expectStoreNewAddress(
+				t, w, deps, tc.accountName, scope, tc.change, addr,
+			)
+			expectStoreManagedAddress(t, w, deps, addr, deps.addr)
 			deps.addr.On("Address").Return(addr).Once()
 			deps.addr.On("AddrType").Return(tc.addrType).Once()
 			deps.addr.On("Imported").Return(false).Once()
 			deps.addr.On("Internal").Return(tc.change).Once()
 			deps.addr.On("Compressed").Return(true).Once()
 
-			// Attempt to generate a new address with the specified
-			// parameters.
 			addr, err := w.NewAddress(
 				t.Context(), tc.accountName,
 				tc.addrType, tc.change,
@@ -153,11 +176,8 @@ func TestNewAddress(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, addr)
 
-			// Verify that the address is of the correct type.
 			require.IsType(t, tc.expectedAddrType, addr)
 
-			// Verify that the address is correctly marked as
-			// internal or external.
 			addrInfo, err := w.GetAddressInfo(t.Context(), addr)
 			require.NoError(t, err)
 			require.Equal(t, tc.change, addrInfo.Internal)
@@ -170,121 +190,32 @@ func TestNewAddress(t *testing.T) {
 func TestGetUnusedAddress(t *testing.T) {
 	t.Parallel()
 
-	// Create a new test wallet.
 	w, deps := createStartedWalletWithMocks(t)
 
-	// Get a new address to start with.
-	mockAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
+	firstAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
 		make([]byte, 20), w.cfg.ChainParams,
 	)
+	scope := waddrmgr.KeyScopeBIP0084
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(mockAddr, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
-		Return(nil).Once()
-
-	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
-	)
-	require.NoError(t, err)
-
-	// The first unused address should be the one we just created.
-	// GetUnusedAddress calls:
-	// - addrType.KeyScope
-	// - w.addrStore.FetchScopedKeyManager
-	// - w.findUnusedAddress (calls manager.LookupAccount and
-	//   ForEachAccountAddress)
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("LookupAccount", mock.Anything, "default").
-		Return(uint32(0), nil).Once()
-
-	deps.accountManager.On("ForEachAccountAddress", mock.Anything, uint32(0),
-		mock.Anything).Run(func(args mock.Arguments) {
-		f, ok := args.Get(2).(func(waddrmgr.ManagedAddress) error)
-		require.True(t, ok)
-		mockAddr1 := &mockManagedAddress{}
-		mockAddr1.On("Internal").Return(false).Once()
-		mockAddr1.On("Used", mock.Anything).Return(false).Once()
-		mockAddr1.On("Address").Return(addr).Once()
-		_ = f(mockAddr1)
-	}).Return(errStopIteration).Once()
+	deps.store.On("FindUnusedAddress", mock.Anything, db.FindUnusedAddressQuery{
+		WalletID:    w.id,
+		AccountName: "default",
+		Scope:       db.KeyScope(scope),
+		Change:      false,
+	}).Return(firstAddr, nil).Once()
 
 	unusedAddr, err := w.GetUnusedAddress(
 		t.Context(), "default", waddrmgr.WitnessPubKey, false,
 	)
 	require.NoError(t, err)
-	require.Equal(t, addr.String(), unusedAddr.String())
+	require.Equal(t, firstAddr.String(), unusedAddr.String())
 
-	// "Use" the address by creating a fake UTXO for it.
-	pkScript, err := txscript.PayToAddrScript(addr)
-	require.NoError(t, err)
-
-	// Setup expectations for using the address.
-	deps.txStore.On("InsertTx", mock.Anything, mock.Anything,
-		mock.Anything).Return(nil).Once()
-	deps.txStore.On("AddCredit", mock.Anything, mock.Anything,
-		mock.Anything, uint32(0), false).Return(nil).Once()
-	deps.addrStore.On("MarkUsed", mock.Anything, addr).Return(nil).Once()
-
-	// We need to create a realistic transaction that has at least one
-	// input.
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-		// Create a new transaction and set the output to the address
-		// we want to mark as used.
-		msgTx := TstTx.MsgTx()
-		msgTx.TxOut = []*wire.TxOut{{
-			PkScript: pkScript,
-			Value:    1000,
-		}}
-
-		rec, err := wtxmgr.NewTxRecordFromMsgTx(msgTx, time.Now())
-		if err != nil {
-			return err
-		}
-
-		err = w.txStore.InsertTx(txmgrNs, rec, nil)
-		if err != nil {
-			return err
-		}
-
-		err = w.txStore.AddCredit(txmgrNs, rec, nil, 0, false)
-		if err != nil {
-			return err
-		}
-
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		return w.addrStore.MarkUsed(addrmgrNs, addr)
-	})
-	require.NoError(t, err)
-
-	// Get the next unused address.
-	// This time findUnusedAddress will find the first address as used, and
-	// then we mock it returning nil for any more existing addresses,
-	// triggering a NewAddress call.
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Twice()
-
-	deps.accountManager.On("LookupAccount", mock.Anything, "default").
-		Return(uint32(0), nil).Once()
-
-	deps.accountManager.On("ForEachAccountAddress", mock.Anything, uint32(0),
-		mock.Anything).Run(func(args mock.Arguments) {
-		f, ok := args.Get(2).(func(waddrmgr.ManagedAddress) error)
-		require.True(t, ok)
-
-		// First addr is used.
-		mockAddr1 := &mockManagedAddress{}
-		mockAddr1.On("Internal").Return(false).Once()
-		mockAddr1.On("Used", mock.Anything).Return(true).Once()
-		_ = f(mockAddr1)
-	}).Return(nil).Once()
+	deps.store.On("FindUnusedAddress", mock.Anything, db.FindUnusedAddressQuery{
+		WalletID:    w.id,
+		AccountName: "default",
+		Scope:       db.KeyScope(scope),
+		Change:      false,
+	}).Return(nil, nil).Once()
 
 	nextAddrVal, _ := btcutil.NewAddressWitnessPubKeyHash(
 		[]byte{
@@ -292,10 +223,7 @@ func TestGetUnusedAddress(t *testing.T) {
 			11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
 		}, w.cfg.ChainParams,
 	)
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(nextAddrVal, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{nextAddrVal}).
-		Return(nil).Once()
+	expectStoreNewAddress(t, w, deps, "default", scope, false, nextAddrVal)
 
 	nextAddr, err := w.GetUnusedAddress(
 		t.Context(), "default", waddrmgr.WitnessPubKey, false,
@@ -303,9 +231,8 @@ func TestGetUnusedAddress(t *testing.T) {
 	require.NoError(t, err)
 
 	// The next unused address should not be the same as the first one.
-	require.NotEqual(t, addr.String(), nextAddr.String())
+	require.NotEqual(t, firstAddr.String(), nextAddr.String())
 
-	// Now, let's test the change address.
 	changeAddrVal, _ := btcutil.NewAddressWitnessPubKeyHash(
 		[]byte{
 			21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
@@ -313,47 +240,18 @@ func TestGetUnusedAddress(t *testing.T) {
 		}, w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", true).
-		Return(changeAddrVal, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{changeAddrVal}).
-		Return(nil).Once()
-
-	changeAddr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, true,
-	)
-	require.NoError(t, err)
-
-	// The first unused change address should be the one we just created.
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("LookupAccount", mock.Anything, "default").
-		Return(uint32(0), nil).Once()
-
-	deps.accountManager.On("ForEachAccountAddress", mock.Anything, uint32(0),
-		mock.Anything).Run(func(args mock.Arguments) {
-		f, ok := args.Get(2).(func(waddrmgr.ManagedAddress) error)
-		require.True(t, ok)
-
-		// First external addr (used).
-		deps.addr.On("Internal").Return(false).Once()
-		_ = f(deps.addr)
-
-		// First internal addr (unused).
-		mockAddr2 := &mockManagedAddress{}
-		mockAddr2.On("Internal").Return(true).Once()
-		mockAddr2.On("Used", mock.Anything).Return(false).Once()
-		mockAddr2.On("Address").Return(changeAddrVal).Once()
-		_ = f(mockAddr2)
-	}).Return(errStopIteration).Once()
+	deps.store.On("FindUnusedAddress", mock.Anything, db.FindUnusedAddressQuery{
+		WalletID:    w.id,
+		AccountName: "default",
+		Scope:       db.KeyScope(scope),
+		Change:      true,
+	}).Return(changeAddrVal, nil).Once()
 
 	unusedChangeAddr, err := w.GetUnusedAddress(
 		t.Context(), "default", waddrmgr.WitnessPubKey, true,
 	)
 	require.NoError(t, err)
-	require.Equal(t, changeAddr.String(), unusedChangeAddr.String())
+	require.Equal(t, changeAddrVal.String(), unusedChangeAddr.String())
 }
 
 // TestGetAddressInfo tests the GetAddressInfo method to ensure it returns
@@ -361,31 +259,12 @@ func TestGetUnusedAddress(t *testing.T) {
 func TestGetAddressInfo(t *testing.T) {
 	t.Parallel()
 
-	// Create a new test wallet.
 	w, deps := createStartedWalletWithMocks(t)
 
-	// Get a new external address to test with.
-	var addr btcutil.Address
-
-	addr, _ = btcutil.NewAddressWitnessPubKeyHash(
+	extAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
 		make([]byte, 20), w.cfg.ChainParams,
 	)
-
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(addr, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
-		Return(nil).Once()
-
-	extAddr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
-	)
-	require.NoError(t, err)
-
-	// Get the address info for the external address.
-	deps.addrStore.On("Address", mock.Anything, extAddr).
-		Return(deps.addr, nil).Once()
+	expectStoreManagedAddress(t, w, deps, extAddr, deps.addr)
 	deps.addr.On("Address").Return(extAddr).Once()
 	deps.addr.On("Internal").Return(false).Once()
 	deps.addr.On("Compressed").Return(true).Once()
@@ -395,33 +274,16 @@ func TestGetAddressInfo(t *testing.T) {
 	extInfo, err := w.GetAddressInfo(t.Context(), extAddr)
 	require.NoError(t, err)
 
-	// Check the external address info.
 	require.Equal(t, extAddr.String(), extInfo.Addr.String())
 	require.False(t, extInfo.Internal)
 	require.True(t, extInfo.Compressed)
 	require.False(t, extInfo.Imported)
 	require.Equal(t, waddrmgr.WitnessPubKey, extInfo.AddrType)
 
-	// Get a new internal address to test with.
-	addr, _ = btcutil.NewAddressWitnessPubKeyHash(
+	intAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
 		make([]byte, 20), w.cfg.ChainParams,
 	)
-
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", true).
-		Return(addr, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
-		Return(nil).Once()
-
-	intAddr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, true,
-	)
-	require.NoError(t, err)
-
-	// Get the address info for the internal address.
-	deps.addrStore.On("Address", mock.Anything, intAddr).
-		Return(deps.addr, nil).Once()
+	expectStoreManagedAddress(t, w, deps, intAddr, deps.addr)
 	deps.addr.On("Address").Return(intAddr).Once()
 	deps.addr.On("Internal").Return(true).Once()
 	deps.addr.On("Compressed").Return(true).Once()
@@ -431,7 +293,6 @@ func TestGetAddressInfo(t *testing.T) {
 	intInfo, err := w.GetAddressInfo(t.Context(), intAddr)
 	require.NoError(t, err)
 
-	// Check the internal address info.
 	require.Equal(t, intAddr.String(), intInfo.Addr.String())
 	require.True(t, intInfo.Internal)
 	require.True(t, intInfo.Compressed)
@@ -444,28 +305,11 @@ func TestGetAddressInfo(t *testing.T) {
 func TestGetDerivationInfoExternalAddressSuccess(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Create a new test wallet and a new p2wkh address to test
-	// with.
 	w, deps := createStartedWalletWithMocks(t)
-	mockAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
+	addr, _ := btcutil.NewAddressWitnessPubKeyHash(
 		make([]byte, 20), w.cfg.ChainParams,
 	)
-
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(mockAddr, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
-		Return(nil).Once()
-
-	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
-	)
-	require.NoError(t, err)
-
-	// Act: Get the derivation info for the address.
-	deps.addrStore.On("Address", mock.Anything, addr).
-		Return(deps.pubKeyAddr, nil).Once()
+	expectStoreManagedAddress(t, w, deps, addr, deps.pubKeyAddr)
 	deps.pubKeyAddr.On("Address").Return(addr).Once()
 	deps.pubKeyAddr.On("AddrType").Return(waddrmgr.WitnessPubKey).Once()
 	deps.pubKeyAddr.On("Imported").Return(false).Once()
@@ -487,7 +331,6 @@ func TestGetDerivationInfoExternalAddressSuccess(t *testing.T) {
 
 	derivationInfo, err := w.GetDerivationInfo(t.Context(), addr)
 
-	// Assert: Check that the correct derivation info is returned.
 	require.NoError(t, err)
 	require.NotNil(t, derivationInfo)
 
@@ -510,28 +353,11 @@ func TestGetDerivationInfoExternalAddressSuccess(t *testing.T) {
 func TestGetDerivationInfoInternalAddressSuccess(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Create a new test wallet and a new p2wkh change address to
-	// test with.
 	w, deps := createStartedWalletWithMocks(t)
-	mockAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
+	addr, _ := btcutil.NewAddressWitnessPubKeyHash(
 		make([]byte, 20), w.cfg.ChainParams,
 	)
-
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", true).
-		Return(mockAddr, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
-		Return(nil).Once()
-
-	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, true,
-	)
-	require.NoError(t, err)
-
-	// Act: Get the derivation info for the address.
-	deps.addrStore.On("Address", mock.Anything, addr).
-		Return(deps.pubKeyAddr, nil).Once()
+	expectStoreManagedAddress(t, w, deps, addr, deps.pubKeyAddr)
 	deps.pubKeyAddr.On("Address").Return(addr).Once()
 	deps.pubKeyAddr.On("AddrType").Return(waddrmgr.WitnessPubKey).Once()
 	deps.pubKeyAddr.On("Imported").Return(false).Once()
@@ -553,7 +379,6 @@ func TestGetDerivationInfoInternalAddressSuccess(t *testing.T) {
 
 	derivationInfo, err := w.GetDerivationInfo(t.Context(), addr)
 
-	// Assert: Check that the correct derivation info is returned.
 	require.NoError(t, err)
 	require.NotNil(t, derivationInfo)
 
@@ -589,18 +414,21 @@ func TestGetDerivationInfoNoDerivationInfo(t *testing.T) {
 
 	// Act & Assert: Check that we get an error for an address not in the
 	// wallet.
-	deps.addrStore.On("Address", mock.Anything, addr).Return(
+	deps.store.On("GetManagedAddress", mock.Anything, db.GetManagedAddressQuery{
+		WalletID: w.id,
+		Address:  addr.EncodeAddress(),
+	}).Return(
 		nil, errDBMock).Once()
 
 	_, err = w.GetDerivationInfo(t.Context(), addr)
 	require.Error(t, err)
 
 	// Arrange: Import the key as a watch-only address.
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("ImportPublicKey", mock.Anything, pubKey,
-		mock.Anything).Return(deps.pubKeyAddr, nil).Once()
-	deps.pubKeyAddr.On("Address").Return(addr).Twice()
+	deps.store.On("ImportPublicKey", mock.Anything, db.ImportPublicKeyParams{
+		WalletID:         w.id,
+		Scope:            db.KeyScope(waddrmgr.KeyScopeBIP0084),
+		SerializedPubKey: pubKey.SerializeCompressed(),
+	}).Return(addr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
 		Return(nil).Once()
 
@@ -609,10 +437,10 @@ func TestGetDerivationInfoNoDerivationInfo(t *testing.T) {
 
 	// Act & Assert: Check that we still get an error because it's an
 	// imported key.
-	deps.addrStore.On("Address", mock.Anything, addr).
-		Return(deps.pubKeyAddr, nil).Once()
-	deps.pubKeyAddr.On("AddrType").Return(waddrmgr.WitnessPubKey).Once()
+	expectStoreManagedAddress(t, w, deps, addr, deps.pubKeyAddr)
 	deps.pubKeyAddr.On("Imported").Return(true).Once()
+	deps.pubKeyAddr.On("Address").Return(addr).Once()
+	deps.pubKeyAddr.On("AddrType").Return(waddrmgr.WitnessPubKey).Once()
 	deps.pubKeyAddr.On("Internal").Return(false).Once()
 	deps.pubKeyAddr.On("Compressed").Return(true).Once()
 	deps.pubKeyAddr.On("PubKey").Return(pubKey).Once()
@@ -629,90 +457,24 @@ func TestGetDerivationInfoNoDerivationInfo(t *testing.T) {
 func TestListAddresses(t *testing.T) {
 	t.Parallel()
 
-	// Create a new test wallet.
 	w, deps := createStartedWalletWithMocks(t)
 
-	// Get a new address and give it a balance.
-	mockAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
+	addr, _ := btcutil.NewAddressWitnessPubKeyHash(
 		make([]byte, 20), w.cfg.ChainParams,
 	)
-
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(mockAddr, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
-		Return(nil).Once()
-
-	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
-	)
-	require.NoError(t, err)
-
 	pkScript, err := txscript.PayToAddrScript(addr)
 	require.NoError(t, err)
 
-	// We need to create a realistic transaction that has at least one
-	// input.
-	deps.txStore.On("InsertTx", mock.Anything, mock.Anything,
-		mock.Anything).Return(nil).Once()
-	deps.txStore.On("AddCredit", mock.Anything, mock.Anything,
-		mock.Anything, uint32(0), false).Return(nil).Once()
-	deps.addrStore.On("MarkUsed", mock.Anything, addr).Return(nil).Once()
-
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-		// Create a new transaction and set the output to the address
-		// we want to mark as used.
-		msgTx := TstTx.MsgTx()
-		msgTx.TxOut = []*wire.TxOut{{
-			PkScript: pkScript,
-			Value:    1000,
-		}}
-
-		rec, err := wtxmgr.NewTxRecordFromMsgTx(msgTx, time.Now())
-		if err != nil {
-			return err
-		}
-
-		err = w.txStore.InsertTx(txmgrNs, rec, nil)
-		if err != nil {
-			return err
-		}
-
-		err = w.txStore.AddCredit(txmgrNs, rec, nil, 0, false)
-		if err != nil {
-			return err
-		}
-
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		return w.addrStore.MarkUsed(addrmgrNs, addr)
-	})
-	require.NoError(t, err)
-
-	// List the addresses for the default account.
-	deps.txStore.On("UnspentOutputs", mock.Anything).Return([]wtxmgr.Credit{
-		{
-			Amount:   1000,
-			PkScript: pkScript,
-		},
+	deps.store.On("ListAddresses", mock.Anything, db.ListAddressesQuery{
+		WalletID:    w.id,
+		AccountName: "default",
+		Scope:       db.KeyScope(waddrmgr.KeyScopeBIP0084),
+	}).Return(page.Result[db.AddressInfo, uint32]{
+		Items: []db.AddressInfo{{ScriptPubKey: pkScript}},
 	}, nil).Once()
-
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("LookupAccount", mock.Anything, "default").
-		Return(uint32(0), nil).Once()
-
-	deps.accountManager.On("ForEachAccountAddress", mock.Anything, uint32(0),
-		mock.Anything).Run(func(args mock.Arguments) {
-		f, ok := args.Get(2).(func(waddrmgr.ManagedAddress) error)
-		require.True(t, ok)
-		deps.addr.On("Address").Return(addr).Once()
-		_ = f(deps.addr)
-	}).Return(nil).Once()
+	deps.store.On("ListUTXOs", mock.Anything, db.ListUtxosQuery{
+		WalletID: w.id,
+	}).Return([]db.UtxoInfo{{Amount: 1000, PkScript: pkScript}}, nil).Once()
 
 	addrs, err := w.ListAddresses(
 		t.Context(), "default", waddrmgr.WitnessPubKey,
@@ -730,35 +492,30 @@ func TestListAddresses(t *testing.T) {
 func TestImportPublicKey(t *testing.T) {
 	t.Parallel()
 
-	// Create a new test wallet.
 	w, deps := createStartedWalletWithMocks(t)
 
-	// Create a new public key to import.
 	privKey, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
 
 	pubKey := privKey.PubKey()
 
-	// Import the public key.
 	addr, _ := btcutil.NewAddressWitnessPubKeyHash(
 		btcutil.Hash160(pubKey.SerializeCompressed()),
 		w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("ImportPublicKey", mock.Anything, pubKey,
-		mock.Anything).Return(deps.pubKeyAddr, nil).Once()
-	deps.pubKeyAddr.On("Address").Return(addr).Once()
+	deps.store.On("ImportPublicKey", mock.Anything, db.ImportPublicKeyParams{
+		WalletID:         w.id,
+		Scope:            db.KeyScope(waddrmgr.KeyScopeBIP0084),
+		SerializedPubKey: pubKey.SerializeCompressed(),
+	}).Return(addr, nil).Once()
 	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
 		Return(nil).Once()
 
 	err = w.ImportPublicKey(t.Context(), pubKey, waddrmgr.WitnessPubKey)
 	require.NoError(t, err)
 
-	// Check that the address is now managed by the wallet.
-	deps.addrStore.On("Address", mock.Anything, addr).
-		Return(deps.pubKeyAddr, nil).Once()
+	expectStoreManagedAddress(t, w, deps, addr, deps.pubKeyAddr)
 	deps.pubKeyAddr.On("Address").Return(addr).Once()
 	deps.pubKeyAddr.On("AddrType").Return(waddrmgr.WitnessPubKey).Once()
 	deps.pubKeyAddr.On("Imported").Return(true).Once()
@@ -779,7 +536,6 @@ func TestImportPublicKey(t *testing.T) {
 func TestImportTaprootScript(t *testing.T) {
 	t.Parallel()
 
-	// Create a new test wallet.
 	w, deps := createStartedWalletWithMocks(t)
 
 	// Create a new tapscript to import.
@@ -804,27 +560,29 @@ func TestImportTaprootScript(t *testing.T) {
 		Leaves: []txscript.TapLeaf{leaf},
 	}
 
-	// Import the tapscript.
 	addr, _ := btcutil.NewAddressTaproot(
 		schnorr.SerializePubKey(txscript.ComputeTaprootOutputKey(
 			pubKey, rootHash[:],
 		)), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", waddrmgr.KeyScopeBIP0086).
-		Return(deps.accountManager, nil).Once()
-
-	// SyncedTo is mocked in createStartedWalletWithMocks (height 1).
-	deps.accountManager.On("ImportTaprootScript", mock.Anything,
-		mock.Anything, mock.Anything, uint8(1), false).
-		Return(deps.taprootAddr, nil).Once()
-	deps.taprootAddr.On("Address").Return(addr).Twice()
+	deps.store.On("ImportTaprootScript", mock.Anything,
+		db.ImportTaprootScriptParams{
+			WalletID:       w.id,
+			Tapscript:      tapscript,
+			SyncedTo:       waddrmgr.BlockStamp{Height: 1},
+			WitnessVersion: 1,
+			IsSecretScript: false,
+		},
+	).Return(addr, nil).Once()
+	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
+		Return(nil).Once()
+	expectStoreManagedAddress(t, w, deps, addr, deps.taprootAddr)
+	deps.taprootAddr.On("Address").Return(addr).Once()
 	deps.taprootAddr.On("AddrType").Return(waddrmgr.TaprootScript).Once()
 	deps.taprootAddr.On("Imported").Return(true).Once()
 	deps.taprootAddr.On("Internal").Return(false).Once()
 	deps.taprootAddr.On("Compressed").Return(false).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{addr}).
-		Return(nil).Once()
 
 	info, err := w.ImportTaprootScript(t.Context(), tapscript)
 	require.NoError(t, err)
@@ -838,26 +596,12 @@ func TestImportTaprootScript(t *testing.T) {
 func TestScriptForOutput(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Create a started wallet, one witness output, and matching
-	// managed address metadata.
 	w, deps := createStartedWalletWithMocks(t)
 
-	// Create a new p2wkh address and output.
-	mockAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
+	addr, _ := btcutil.NewAddressWitnessPubKeyHash(
 		make([]byte, 20), w.cfg.ChainParams,
 	)
 
-	deps.addrStore.On("FetchScopedKeyManager", mock.Anything).
-		Return(deps.accountManager, nil).Once()
-	deps.accountManager.On("NewAddress", mock.Anything, "default", false).
-		Return(mockAddr, nil).Once()
-	deps.chain.On("NotifyReceived", []btcutil.Address{mockAddr}).
-		Return(nil).Once()
-
-	addr, err := w.NewAddress(
-		t.Context(), "default", waddrmgr.WitnessPubKey, false,
-	)
-	require.NoError(t, err)
 	pkScript, err := txscript.PayToAddrScript(addr)
 	require.NoError(t, err)
 
@@ -867,9 +611,7 @@ func TestScriptForOutput(t *testing.T) {
 	}
 
 	_, pubKey := deterministicPrivKey(t)
-
-	deps.addrStore.On("Address", mock.Anything, addr).
-		Return(deps.pubKeyAddr, nil).Once()
+	expectStoreManagedAddress(t, w, deps, addr, deps.pubKeyAddr)
 	deps.pubKeyAddr.On("Address").Return(addr).Once()
 	deps.pubKeyAddr.On("AddrType").Return(waddrmgr.WitnessPubKey).Once()
 	deps.pubKeyAddr.On("Imported").Return(false).Once()
@@ -880,11 +622,10 @@ func TestScriptForOutput(t *testing.T) {
 		waddrmgr.KeyScopeBIP0084, waddrmgr.DerivationPath{}, false,
 	).Once()
 
-	// Act: Build the spending metadata for the witness output.
 	script, err := w.ScriptForOutput(t.Context(), output)
 	require.NoError(t, err)
 
-	// Assert: The output metadata matches the native witness spend shape.
+	// Check that the script is correct.
 	require.Equal(t, addr, script.Addr)
 	require.Equal(t, waddrmgr.WitnessPubKey, script.AddrType)
 	require.Equal(t, pkScript, script.WitnessProgram)
@@ -896,8 +637,6 @@ func TestScriptForOutput(t *testing.T) {
 func TestScriptForOutputNestedWitness(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Create a started wallet, a nested witness output, and matching
-	// managed address metadata.
 	w, deps := createStartedWalletWithMocks(t)
 	_, pubKey := deterministicPrivKey(t)
 	witnessProgram, err := txscript.NewScriptBuilder().
@@ -910,9 +649,11 @@ func TestScriptForOutputNestedWitness(t *testing.T) {
 	require.NoError(t, err)
 	pkScript, err := txscript.PayToAddrScript(addr)
 	require.NoError(t, err)
+	expectedSigScript, err := waddrmgr.NestedWitnessPubKey.
+		RedeemScriptFromPubKey(pubKey, w.cfg.ChainParams)
+	require.NoError(t, err)
 
-	deps.addrStore.On("Address", mock.Anything, addr).
-		Return(deps.pubKeyAddr, nil).Once()
+	expectStoreManagedAddress(t, w, deps, addr, deps.pubKeyAddr)
 	deps.pubKeyAddr.On("Address").Return(addr).Once()
 	deps.pubKeyAddr.On("AddrType").Return(waddrmgr.NestedWitnessPubKey).Once()
 	deps.pubKeyAddr.On("Imported").Return(false).Once()
@@ -923,18 +664,15 @@ func TestScriptForOutputNestedWitness(t *testing.T) {
 		waddrmgr.KeyScopeBIP0049Plus, waddrmgr.DerivationPath{}, false,
 	).Once()
 
-	// Act: Build the spending metadata for the nested witness output.
 	scriptInfo, err := w.ScriptForOutput(t.Context(), wire.TxOut{
 		Value:    1000,
 		PkScript: pkScript,
 	})
 	require.NoError(t, err)
-
-	// Assert: The output metadata carries the inner witness program and redeem
-	// script required for nested witness spends.
 	require.Equal(t, addr, scriptInfo.Addr)
 	require.Equal(t, waddrmgr.NestedWitnessPubKey,
 		scriptInfo.AddrType)
 	require.Equal(t, witnessProgram, scriptInfo.WitnessProgram)
 	require.Equal(t, witnessProgram, scriptInfo.RedeemScript)
+	require.Equal(t, expectedSigScript, scriptInfo.SigScript)
 }
