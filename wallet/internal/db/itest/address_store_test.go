@@ -1635,7 +1635,13 @@ func TestNewDerivedAddressConcurrent(t *testing.T) {
 	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, accountName)
 
 	const workers = 20
-	results := make([]db.AddressInfo, workers)
+
+	type deriveResult struct {
+		info db.AddressInfo
+		err  error
+	}
+
+	resultCh := make(chan deriveResult, workers)
 	var wg sync.WaitGroup
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -1646,6 +1652,7 @@ func TestNewDerivedAddressConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+
 			info, err := store.NewDerivedAddress(
 				ctx, db.NewDerivedAddressParams{
 					WalletID:    walletID,
@@ -1654,12 +1661,25 @@ func TestNewDerivedAddressConcurrent(t *testing.T) {
 					Change:      false,
 				}, deriveFn,
 			)
-			require.NoError(t, err)
-			results[i] = *info
+			if err != nil {
+				resultCh <- deriveResult{err: err}
+				return
+			}
+
+			resultCh <- deriveResult{info: *info}
 		}(i)
 	}
 
 	wg.Wait()
+	close(resultCh)
+
+	results := make([]db.AddressInfo, 0, workers)
+	for result := range resultCh {
+		require.NoError(t, result.err)
+		results = append(results, result.info)
+	}
+
+	require.Len(t, results, workers)
 
 	// Verify all indexes are unique and sequential.
 	indexes := make([]uint32, workers)
