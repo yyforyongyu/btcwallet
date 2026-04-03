@@ -166,7 +166,7 @@ func (s *SqliteStore) ListWallets(ctx context.Context,
 	}
 
 	result := page.BuildResult(
-		query.Page, items,
+		items, query.Page.EffectiveLimit(),
 		func(item WalletInfo) uint32 {
 			return item.ID
 		},
@@ -180,7 +180,7 @@ func (s *SqliteStore) IterWallets(ctx context.Context,
 	query ListWalletsQuery) iter.Seq2[WalletInfo, error] {
 
 	return page.Iter(
-		ctx, query, "wallets", s.ListWallets, nextListWalletsQuery,
+		ctx, query, s.ListWallets, nextListWalletsQuery,
 	)
 }
 
@@ -324,11 +324,11 @@ func sqliteListWalletsParams(
 	req page.Request[uint32]) sqlcsqlite.ListWalletsParams {
 
 	params := sqlcsqlite.ListWalletsParams{
-		PageLimit: int64(req.QueryLimit()),
+		PageLimit: int64(req.EffectiveLimit()) + 1,
 	}
 
-	if cursor := req.Cursor(); cursor != nil {
-		params.CursorID = int64(*cursor)
+	if req.HasAfter {
+		params.CursorID = int64(req.After)
 	}
 
 	return params

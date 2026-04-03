@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 )
 
 var (
@@ -203,18 +205,27 @@ func accountInfosFromRows[T any](rows []T,
 	return accounts, nil
 }
 
-// listAccounts is a generic helper that retrieves accounts using the provided
-// list function and converts the results to AccountInfo structs.
+// listAccountsPage is a generic helper that retrieves accounts using the
+// provided list function and converts the results to a paginated AccountInfo
+// page.
 func listAccounts[T any, Args any](ctx context.Context,
 	lister func(context.Context, Args) ([]T, error), args Args,
-	toInfo func(T) (*AccountInfo, error)) ([]AccountInfo, error) {
+	limit uint32,
+	toInfo func(T) (*AccountInfo, error)) (page.Result[AccountInfo,
+	AccountCursor], error) {
 
 	rows, err := lister(ctx, args)
 	if err != nil {
-		return nil, fmt.Errorf("list accounts: %w", err)
+		return page.Result[AccountInfo, AccountCursor]{},
+			fmt.Errorf("list accounts: %w", err)
 	}
 
-	return accountInfosFromRows(rows, toInfo)
+	items, err := accountInfosFromRows(rows, toInfo)
+	if err != nil {
+		return page.Result[AccountInfo, AccountCursor]{}, err
+	}
+
+	return page.BuildResult(items, limit, accountCursorFromInfo), nil
 }
 
 // getAddrSchemaForScope returns the address schema for a given key scope or
@@ -234,12 +245,13 @@ func getAddrSchemaForScope(scope KeyScope) (ScopeAddrSchema, error) {
 //
 // TODO(stingelin): Add balance tracking support after transaction management is
 // implemented.
-func buildAccountInfo(accountNum uint32, accountName string,
+func buildAccountInfo(accountID, accountNum uint32, accountName string,
 	origin AccountOrigin, externalKeyCount, internalKeyCount,
 	importedKeyCount uint32, isWatchOnly bool, createdAt time.Time,
 	scope KeyScope) *AccountInfo {
 
 	return &AccountInfo{
+		ID:                 accountID,
 		AccountNumber:      accountNum,
 		AccountName:        accountName,
 		Origin:             origin,
@@ -251,6 +263,15 @@ func buildAccountInfo(accountNum uint32, accountName string,
 		IsWatchOnly:        isWatchOnly,
 		CreatedAt:          createdAt,
 		KeyScope:           scope,
+	}
+}
+
+// accountCursorFromInfo derives the pagination cursor for an account item.
+func accountCursorFromInfo(info AccountInfo) AccountCursor {
+	return AccountCursor{
+		Imported:      info.Origin == ImportedAccount,
+		AccountNumber: info.AccountNumber,
+		RowID:         info.ID,
 	}
 }
 
@@ -267,6 +288,7 @@ func idToAccountOrigin[T ~int16 | ~int64](v T) (AccountOrigin, error) {
 // accountInfoRow represents the raw database fields needed to construct
 // AccountInfo.
 type accountInfoRow[AccOriginId any] struct {
+	ID               int64
 	AccountNumber    sql.NullInt64
 	AccountName      string
 	OriginID         AccOriginId
@@ -285,10 +307,13 @@ type accountInfoRow[AccOriginId any] struct {
 func accountRowToInfo[AccOriginId any](
 	row accountInfoRow[AccOriginId]) (*AccountInfo, error) {
 
+	accountID, err := int64ToUint32(row.ID)
+	if err != nil {
+		return nil, fmt.Errorf("account id: %w", err)
+	}
+
 	var accountNum uint32
 	if row.AccountNumber.Valid {
-		var err error
-
 		accountNum, err = int64ToUint32(row.AccountNumber.Int64)
 		if err != nil {
 			return nil, fmt.Errorf("account number: %w", err)
@@ -318,7 +343,8 @@ func accountRowToInfo[AccOriginId any](
 	}
 
 	return buildAccountInfo(
-		accountNum, row.AccountName, origin, externalKeyCount, internalKeyCount,
+		accountID, accountNum, row.AccountName, origin,
+		externalKeyCount, internalKeyCount,
 		importedKeyCount, row.IsWatchOnly, row.CreatedAt,
 		KeyScope{Purpose: purposeNum, Coin: coinTypeNum},
 	), nil
@@ -394,20 +420,20 @@ func getAccountByQuery(ctx context.Context, query GetAccountQuery,
 	}
 }
 
-// listAccountsFunc defines a function signature for listing accounts.
-type listAccountsFunc func(context.Context, ListAccountsQuery) ([]AccountInfo,
-	error)
+// listAccountsFunc defines a function signature for listing account pages.
+type listAccountsFunc func(context.Context, ListAccountsQuery) (
+	page.Result[AccountInfo, AccountCursor], error)
 
 // listAccountsByQuery dispatches to the appropriate list query based on the
 // provided filters. It returns an error if both scope and name filters are
 // provided, as they are mutually exclusive.
 func listAccountsByQuery(ctx context.Context, query ListAccountsQuery,
 	listByScope listAccountsFunc, listByName listAccountsFunc,
-	listAll listAccountsFunc) ([]AccountInfo, error) {
+	listAll listAccountsFunc) (page.Result[AccountInfo, AccountCursor], error) {
 
 	switch {
 	case query.Scope != nil && query.Name != nil:
-		return nil, ErrInvalidAccountQuery
+		return page.Result[AccountInfo, AccountCursor]{}, ErrInvalidAccountQuery
 
 	case query.Scope != nil:
 		return listByScope(ctx, query)
@@ -418,6 +444,15 @@ func listAccountsByQuery(ctx context.Context, query ListAccountsQuery,
 	default:
 		return listAll(ctx, query)
 	}
+}
+
+// nextListAccountsQuery returns the query for the next page.
+func nextListAccountsQuery(q ListAccountsQuery,
+	cursor AccountCursor) ListAccountsQuery {
+
+	q.Page = q.Page.WithAfter(cursor)
+
+	return q
 }
 
 // renameAccountFunc defines a function signature for renaming an account.

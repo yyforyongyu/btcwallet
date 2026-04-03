@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	"github.com/stretchr/testify/require"
 )
 
@@ -405,8 +406,11 @@ func TestListAccounts(t *testing.T) {
 		createAllAccounts(t, store, walletID)
 
 		query := db.ListAccountsQuery{WalletID: walletID}
-		accounts, err := store.ListAccounts(t.Context(), query)
+		result, err := store.ListAccounts(t.Context(), query)
 		require.NoError(t, err)
+		require.False(t, result.HasNext)
+
+		accounts := result.Items
 		require.Len(t, accounts, len(AllAccountCases))
 		for _, tc := range AllAccountCases {
 			acc := findAccountInList(t, accounts, tc)
@@ -426,10 +430,11 @@ func TestListAccounts(t *testing.T) {
 			WalletID: walletID,
 			Scope:    &scope,
 		}
-		accounts, err := store.ListAccounts(t.Context(), query)
+		result, err := store.ListAccounts(t.Context(), query)
 		require.NoError(t, err)
 
 		cases := FilterAccountsByScope(scope)
+		accounts := result.Items
 
 		require.Len(t, accounts, len(cases))
 		for _, tc := range cases {
@@ -454,8 +459,9 @@ func TestListAccounts(t *testing.T) {
 			WalletID: walletID,
 			Name:     &tc.Name,
 		}
-		accounts, err := store.ListAccounts(t.Context(), query)
+		result, err := store.ListAccounts(t.Context(), query)
 		require.NoError(t, err)
+		accounts := result.Items
 		require.Len(t, accounts, 1)
 		requireAccountMatches(t, &accounts[0], tc)
 	})
@@ -468,9 +474,10 @@ func TestListAccounts(t *testing.T) {
 		// Create a new wallet with no accounts.
 		emptyWalletID := newWallet(t, store, "wallet-list-empty")
 		query := db.ListAccountsQuery{WalletID: emptyWalletID}
-		accounts, err := store.ListAccounts(t.Context(), query)
+		result, err := store.ListAccounts(t.Context(), query)
 		require.NoError(t, err)
-		require.Empty(t, accounts)
+		require.Empty(t, result.Items)
+		require.False(t, result.HasNext)
 	})
 }
 
@@ -495,8 +502,9 @@ func TestListAccountsOrdering(t *testing.T) {
 		WalletID: walletID,
 		Scope:    &scope,
 	}
-	accounts, err := store.ListAccounts(t.Context(), query)
+	result, err := store.ListAccounts(t.Context(), query)
 	require.NoError(t, err)
+	accounts := result.Items
 	require.Len(t, accounts, 4)
 
 	// Derived accounts should come first (ordered by account number).
@@ -511,6 +519,80 @@ func TestListAccountsOrdering(t *testing.T) {
 	// Imported accounts should come last.
 	require.Equal(t, db.ImportedAccount, accounts[2].Origin)
 	require.Equal(t, db.ImportedAccount, accounts[3].Origin)
+}
+
+// TestListAccountsPagination verifies account pagination across the derived and
+// imported ordering boundary.
+func TestListAccountsPagination(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-list-accounts-pagination")
+	createAllAccounts(t, store, walletID)
+
+	query := db.ListAccountsQuery{
+		WalletID: walletID,
+		Page:     page.Request[db.AccountCursor]{Limit: 2},
+	}
+
+	pages := collectAccountPages(t, store, query)
+	require.GreaterOrEqual(t, len(pages), 2)
+
+	accounts := flattenAccountPages(pages)
+	require.Len(t, accounts, len(AllAccountCases))
+
+	seen := make(map[uint32]struct{}, len(accounts))
+	seenImported := false
+	for i, account := range accounts {
+		_, duplicate := seen[account.ID]
+		require.False(t, duplicate)
+		seen[account.ID] = struct{}{}
+
+		if i > 0 {
+			if accounts[i-1].Origin == db.DerivedAccount &&
+				account.Origin == db.DerivedAccount {
+
+				require.LessOrEqual(t,
+					accounts[i-1].AccountNumber, account.AccountNumber,
+				)
+			}
+		}
+
+		if account.Origin == db.ImportedAccount {
+			seenImported = true
+		}
+		if seenImported {
+			require.Equal(t, db.ImportedAccount, account.Origin)
+		}
+	}
+	for i := range pages[:len(pages)-1] {
+		require.True(t, pages[i].HasNext)
+	}
+	require.False(t, pages[len(pages)-1].HasNext)
+}
+
+// TestIterAccounts verifies that IterAccounts yields the same items as manual
+// page traversal.
+func TestIterAccounts(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-iter-accounts")
+	createAllAccounts(t, store, walletID)
+
+	query := db.ListAccountsQuery{
+		WalletID: walletID,
+		Page:     page.Request[db.AccountCursor]{Limit: 2},
+	}
+	expected := flattenAccountPages(collectAccountPages(t, store, query))
+
+	var got []db.AccountInfo
+	for account, err := range store.IterAccounts(t.Context(), query) {
+		require.NoError(t, err)
+		got = append(got, account)
+	}
+
+	require.Equal(t, expected, got)
 }
 
 // TestAccountCreatedAtTimestamp verifies that accounts have their CreatedAt
@@ -869,4 +951,41 @@ func findAccountInList(t *testing.T, accounts []db.AccountInfo,
 	require.GreaterOrEqual(t, i, 0, "expected account %s in list", tc.Name)
 
 	return accounts[i]
+}
+
+// collectAccountPages collects paginated account results until HasNext is
+// false.
+func collectAccountPages(t *testing.T, store db.AccountStore,
+	query db.ListAccountsQuery) []page.Result[db.AccountInfo, db.AccountCursor] {
+	t.Helper()
+
+	pages := make([]page.Result[db.AccountInfo, db.AccountCursor], 0)
+	for {
+		pageResult, err := store.ListAccounts(t.Context(), query)
+		require.NoError(t, err)
+		pages = append(pages, pageResult)
+
+		if !pageResult.HasNext {
+			return pages
+		}
+
+		query.Page = query.Page.WithAfter(pageResult.Next)
+	}
+}
+
+// flattenAccountPages flattens paginated account results into a single slice.
+func flattenAccountPages(
+	pages []page.Result[db.AccountInfo, db.AccountCursor]) []db.AccountInfo {
+
+	count := 0
+	for i := range pages {
+		count += len(pages[i].Items)
+	}
+
+	accounts := make([]db.AccountInfo, 0, count)
+	for i := range pages {
+		accounts = append(accounts, pages[i].Items...)
+	}
+
+	return accounts
 }

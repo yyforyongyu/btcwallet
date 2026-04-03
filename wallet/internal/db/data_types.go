@@ -348,6 +348,12 @@ type UpdateWalletSecretsParams struct {
 // AccountInfo contains all information about a single account, including its
 // properties and balances.
 type AccountInfo struct {
+	// ID is the database unique identifier for the account.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	ID uint32
+
 	// AccountNumber is the BIP44 account index used for derived accounts.
 	// Imported accounts do not follow BIP44 derivation and therefore do not
 	// have a meaningful account index. For those accounts, this field is
@@ -389,6 +395,19 @@ type AccountInfo struct {
 	// KeyScope is the key scope the account belongs to. This determines the
 	// derivation path and the default address schema.
 	KeyScope KeyScope
+}
+
+// AccountCursor identifies a stable resume point for paginating accounts.
+type AccountCursor struct {
+	// Imported reports whether the cursor points into the imported-account
+	// segment of the ordering.
+	Imported bool
+
+	// AccountNumber is the derived account number when Imported is false.
+	AccountNumber uint32
+
+	// RowID is the unique database row identifier used as the final tie-breaker.
+	RowID uint32
 }
 
 // ScopeAddrSchema is the address schema of a particular KeyScope. This will be
@@ -544,6 +563,9 @@ type ListAccountsQuery struct {
 	// Name is an optional filter to list accounts only with a specific
 	// name.
 	Name *string
+
+	// Page holds the pagination parameters for this query.
+	Page page.Request[AccountCursor]
 }
 
 // RenameAccountParams contains the parameters for renaming an account. The

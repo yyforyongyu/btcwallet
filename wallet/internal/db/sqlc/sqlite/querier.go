@@ -301,14 +301,11 @@ type Querier interface {
 	// Lists all accounts in a scope, ordered by account number. Imported accounts
 	// (with NULL account_number) appear last.
 	ListAccountsByScope(ctx context.Context, scopeID int64) ([]ListAccountsByScopeRow, error)
-	// Lists all accounts for a wallet, ordered by account number. Imported
-	// accounts (with NULL account_number) appear last.
-	ListAccountsByWallet(ctx context.Context, walletID int64) ([]ListAccountsByWalletRow, error)
-	// Lists all accounts for a wallet filtered by account name, ordered by account
-	// number. Imported accounts (with NULL account_number) appear last.
+	// Lists one page of accounts for a wallet.
+	ListAccountsByWallet(ctx context.Context, arg ListAccountsByWalletParams) ([]ListAccountsByWalletRow, error)
+	// Lists one page of accounts for a wallet filtered by account name.
 	ListAccountsByWalletAndName(ctx context.Context, arg ListAccountsByWalletAndNameParams) ([]ListAccountsByWalletAndNameRow, error)
-	// Lists all accounts for a wallet and scope tuple, ordered by account number.
-	// Imported accounts (with NULL account_number) appear last.
+	// Lists one page of accounts for a wallet and scope tuple.
 	ListAccountsByWalletScope(ctx context.Context, arg ListAccountsByWalletScopeParams) ([]ListAccountsByWalletScopeRow, error)
 	// Lists all currently active leases for a wallet.
 	//

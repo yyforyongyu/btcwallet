@@ -164,7 +164,7 @@ func (s *PostgresStore) ListWallets(ctx context.Context,
 	}
 
 	result := page.BuildResult(
-		query.Page, items,
+		items, query.Page.EffectiveLimit(),
 		func(item WalletInfo) uint32 {
 			return item.ID
 		},
@@ -178,7 +178,7 @@ func (s *PostgresStore) IterWallets(ctx context.Context,
 	query ListWalletsQuery) iter.Seq2[WalletInfo, error] {
 
 	return page.Iter(
-		ctx, query, "wallets", s.ListWallets, nextListWalletsQuery,
+		ctx, query, s.ListWallets, nextListWalletsQuery,
 	)
 }
 
@@ -321,12 +321,12 @@ func pgListWalletsParams(
 	req page.Request[uint32]) sqlcpg.ListWalletsParams {
 
 	params := sqlcpg.ListWalletsParams{
-		PageLimit: int64(req.QueryLimit()),
+		PageLimit: int64(req.EffectiveLimit()) + 1,
 	}
 
-	if cursor := req.Cursor(); cursor != nil {
+	if req.HasAfter {
 		params.CursorID = sql.NullInt64{
-			Int64: int64(*cursor),
+			Int64: int64(req.After),
 			Valid: true,
 		}
 	}

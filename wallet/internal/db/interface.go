@@ -194,11 +194,15 @@ type AccountStore interface {
 	GetAccount(ctx context.Context, query GetAccountQuery) (
 		*AccountInfo, error)
 
-	// ListAccounts returns a slice of AccountInfo for all accounts,
-	// optionally filtered by name or key scope. It returns an empty slice
-	// if no accounts are found.
+	// ListAccounts returns one page of accounts for the given query,
+	// including the next cursor when another page may be fetched.
 	ListAccounts(ctx context.Context, query ListAccountsQuery) (
-		[]AccountInfo, error)
+		page.Result[AccountInfo, AccountCursor], error)
+
+	// IterAccounts returns an iterator that fetches pages transparently and
+	// yields accounts one by one until exhaustion or error.
+	IterAccounts(ctx context.Context,
+		query ListAccountsQuery) iter.Seq2[AccountInfo, error]
 
 	// RenameAccount changes the name of an account. The account can be
 	// identified by its old name or its account number. It returns an

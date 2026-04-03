@@ -37,15 +37,13 @@ func (s *PostgresStore) GetAddress(ctx context.Context,
 func (s *PostgresStore) ListAddresses(ctx context.Context,
 	query ListAddressesQuery) (page.Result[AddressInfo, uint32], error) {
 
-	listQueries := pgAddressListPagedQueries{q: s.queries}
-
-	items, err := listQueries.byAccount(ctx, query)
+	items, err := pgListAddressesByAccount(ctx, s.queries, query)
 	if err != nil {
 		return page.Result[AddressInfo, uint32]{}, err
 	}
 
 	result := page.BuildResult(
-		query.Page, items,
+		items, query.Page.EffectiveLimit(),
 		func(item AddressInfo) uint32 {
 			return item.ID
 		},
@@ -59,7 +57,7 @@ func (s *PostgresStore) IterAddresses(ctx context.Context,
 	query ListAddressesQuery) iter.Seq2[AddressInfo, error] {
 
 	return page.Iter(
-		ctx, query, "addresses", s.ListAddresses, nextListAddressesQuery,
+		ctx, query, s.ListAddresses, nextListAddressesQuery,
 	)
 }
 
@@ -317,18 +315,12 @@ func pgAddressRowToInfo[T pgAddressInfoRow](row T) (*AddressInfo, error) {
 	return info, nil
 }
 
-// pgAddressListPagedQueries holds the queries for paginated address listing
-// in PostgreSQL.
-type pgAddressListPagedQueries struct {
-	q *sqlcpg.Queries
-}
-
-// byAccount lists addresses filtered by wallet ID, key scope, and account
-// name, with pagination support.
-func (p pgAddressListPagedQueries) byAccount(ctx context.Context,
+// pgListAddressesByAccount lists addresses filtered by wallet ID, key scope,
+// and account name.
+func pgListAddressesByAccount(ctx context.Context, q *sqlcpg.Queries,
 	query ListAddressesQuery) ([]AddressInfo, error) {
 
-	rows, err := p.q.ListAddressesByAccount(
+	rows, err := q.ListAddressesByAccount(
 		ctx, pgBuildAddressPageParams(query),
 	)
 	if err != nil {
@@ -358,12 +350,12 @@ func pgBuildAddressPageParams(
 		Purpose:     int64(q.Scope.Purpose),
 		CoinType:    int64(q.Scope.Coin),
 		AccountName: q.AccountName,
-		PageLimit:   int64(q.Page.QueryLimit()),
+		PageLimit:   int64(q.Page.EffectiveLimit()) + 1,
 	}
 
-	if cursor := q.Page.Cursor(); cursor != nil {
+	if q.Page.HasAfter {
 		params.CursorID = sql.NullInt64{
-			Int64: int64(*cursor),
+			Int64: int64(q.Page.After),
 			Valid: true,
 		}
 	}

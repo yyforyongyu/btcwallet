@@ -599,8 +599,42 @@ SELECT
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE ks.wallet_id = ?
-ORDER BY a.account_number IS NULL, a.account_number
+    AND (
+        ?2 = FALSE
+        OR (
+            ?3 = FALSE
+            AND (
+                (
+                    a.account_number IS NOT NULL
+                    AND (
+                        a.account_number > ?4
+                        OR (
+                            a.account_number = ?4
+                            AND a.id > ?5
+                        )
+                    )
+                )
+                OR a.account_number IS NULL
+            )
+        )
+        OR (
+            ?3 = TRUE
+            AND a.account_number IS NULL
+            AND a.id > ?5
+        )
+    )
+ORDER BY a.account_number IS NULL, a.account_number, a.id
+LIMIT ?6
 `
+
+type ListAccountsByWalletParams struct {
+	WalletID           int64
+	HasAfter           interface{}
+	AfterImported      interface{}
+	AfterAccountNumber sql.NullInt64
+	AfterRowID         int64
+	PageLimit          int64
+}
 
 type ListAccountsByWalletRow struct {
 	ID               int64
@@ -616,10 +650,16 @@ type ListAccountsByWalletRow struct {
 	ImportedKeyCount int64
 }
 
-// Lists all accounts for a wallet, ordered by account number. Imported
-// accounts (with NULL account_number) appear last.
-func (q *Queries) ListAccountsByWallet(ctx context.Context, walletID int64) ([]ListAccountsByWalletRow, error) {
-	rows, err := q.query(ctx, q.listAccountsByWalletStmt, ListAccountsByWallet, walletID)
+// Lists one page of accounts for a wallet.
+func (q *Queries) ListAccountsByWallet(ctx context.Context, arg ListAccountsByWalletParams) ([]ListAccountsByWalletRow, error) {
+	rows, err := q.query(ctx, q.listAccountsByWalletStmt, ListAccountsByWallet,
+		arg.WalletID,
+		arg.HasAfter,
+		arg.AfterImported,
+		arg.AfterAccountNumber,
+		arg.AfterRowID,
+		arg.PageLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -668,13 +708,45 @@ SELECT
     a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
-WHERE ks.wallet_id = ? AND a.account_name = ?
-ORDER BY a.account_number IS NULL, a.account_number
+WHERE
+    ks.wallet_id = ?
+    AND a.account_name = ?
+    AND (
+        ?3 = FALSE
+        OR (
+            ?4 = FALSE
+            AND (
+                (
+                    a.account_number IS NOT NULL
+                    AND (
+                        a.account_number > ?5
+                        OR (
+                            a.account_number = ?5
+                            AND a.id > ?6
+                        )
+                    )
+                )
+                OR a.account_number IS NULL
+            )
+        )
+        OR (
+            ?4 = TRUE
+            AND a.account_number IS NULL
+            AND a.id > ?6
+        )
+    )
+ORDER BY a.account_number IS NULL, a.account_number, a.id
+LIMIT ?7
 `
 
 type ListAccountsByWalletAndNameParams struct {
-	WalletID    int64
-	AccountName string
+	WalletID           int64
+	AccountName        string
+	HasAfter           interface{}
+	AfterImported      interface{}
+	AfterAccountNumber sql.NullInt64
+	AfterRowID         int64
+	PageLimit          int64
 }
 
 type ListAccountsByWalletAndNameRow struct {
@@ -691,10 +763,17 @@ type ListAccountsByWalletAndNameRow struct {
 	ImportedKeyCount int64
 }
 
-// Lists all accounts for a wallet filtered by account name, ordered by account
-// number. Imported accounts (with NULL account_number) appear last.
+// Lists one page of accounts for a wallet filtered by account name.
 func (q *Queries) ListAccountsByWalletAndName(ctx context.Context, arg ListAccountsByWalletAndNameParams) ([]ListAccountsByWalletAndNameRow, error) {
-	rows, err := q.query(ctx, q.listAccountsByWalletAndNameStmt, ListAccountsByWalletAndName, arg.WalletID, arg.AccountName)
+	rows, err := q.query(ctx, q.listAccountsByWalletAndNameStmt, ListAccountsByWalletAndName,
+		arg.WalletID,
+		arg.AccountName,
+		arg.HasAfter,
+		arg.AfterImported,
+		arg.AfterAccountNumber,
+		arg.AfterRowID,
+		arg.PageLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -747,13 +826,43 @@ WHERE
     ks.wallet_id = ?
     AND ks.purpose = ?
     AND ks.coin_type = ?
-ORDER BY a.account_number IS NULL, a.account_number
+    AND (
+        ?4 = FALSE
+        OR (
+            ?5 = FALSE
+            AND (
+                (
+                    a.account_number IS NOT NULL
+                    AND (
+                        a.account_number > ?6
+                        OR (
+                            a.account_number = ?6
+                            AND a.id > ?7
+                        )
+                    )
+                )
+                OR a.account_number IS NULL
+            )
+        )
+        OR (
+            ?5 = TRUE
+            AND a.account_number IS NULL
+            AND a.id > ?7
+        )
+    )
+ORDER BY a.account_number IS NULL, a.account_number, a.id
+LIMIT ?8
 `
 
 type ListAccountsByWalletScopeParams struct {
-	WalletID int64
-	Purpose  int64
-	CoinType int64
+	WalletID           int64
+	Purpose            int64
+	CoinType           int64
+	HasAfter           interface{}
+	AfterImported      interface{}
+	AfterAccountNumber sql.NullInt64
+	AfterRowID         int64
+	PageLimit          int64
 }
 
 type ListAccountsByWalletScopeRow struct {
@@ -770,10 +879,18 @@ type ListAccountsByWalletScopeRow struct {
 	ImportedKeyCount int64
 }
 
-// Lists all accounts for a wallet and scope tuple, ordered by account number.
-// Imported accounts (with NULL account_number) appear last.
+// Lists one page of accounts for a wallet and scope tuple.
 func (q *Queries) ListAccountsByWalletScope(ctx context.Context, arg ListAccountsByWalletScopeParams) ([]ListAccountsByWalletScopeRow, error) {
-	rows, err := q.query(ctx, q.listAccountsByWalletScopeStmt, ListAccountsByWalletScope, arg.WalletID, arg.Purpose, arg.CoinType)
+	rows, err := q.query(ctx, q.listAccountsByWalletScopeStmt, ListAccountsByWalletScope,
+		arg.WalletID,
+		arg.Purpose,
+		arg.CoinType,
+		arg.HasAfter,
+		arg.AfterImported,
+		arg.AfterAccountNumber,
+		arg.AfterRowID,
+		arg.PageLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

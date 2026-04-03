@@ -168,8 +168,7 @@ WHERE a.scope_id = ?
 ORDER BY a.account_number IS NULL, a.account_number;
 
 -- name: ListAccountsByWalletScope :many
--- Lists all accounts for a wallet and scope tuple, ordered by account number.
--- Imported accounts (with NULL account_number) appear last.
+-- Lists one page of accounts for a wallet and scope tuple.
 SELECT
     a.id,
     a.account_number,
@@ -188,11 +187,35 @@ WHERE
     ks.wallet_id = ?
     AND ks.purpose = ?
     AND ks.coin_type = ?
-ORDER BY a.account_number IS NULL, a.account_number;
+    AND (
+        sqlc.arg('has_after') = FALSE
+        OR (
+            sqlc.arg('after_imported') = FALSE
+            AND (
+                (
+                    a.account_number IS NOT NULL
+                    AND (
+                        a.account_number > sqlc.arg('after_account_number')
+                        OR (
+                            a.account_number = sqlc.arg('after_account_number')
+                            AND a.id > sqlc.arg('after_row_id')
+                        )
+                    )
+                )
+                OR a.account_number IS NULL
+            )
+        )
+        OR (
+            sqlc.arg('after_imported') = TRUE
+            AND a.account_number IS NULL
+            AND a.id > sqlc.arg('after_row_id')
+        )
+    )
+ORDER BY a.account_number IS NULL, a.account_number, a.id
+LIMIT sqlc.arg('page_limit');
 
 -- name: ListAccountsByWalletAndName :many
--- Lists all accounts for a wallet filtered by account name, ordered by account
--- number. Imported accounts (with NULL account_number) appear last.
+-- Lists one page of accounts for a wallet filtered by account name.
 SELECT
     a.id,
     a.account_number,
@@ -207,12 +230,38 @@ SELECT
     a.imported_key_count
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
-WHERE ks.wallet_id = ? AND a.account_name = ?
-ORDER BY a.account_number IS NULL, a.account_number;
+WHERE
+    ks.wallet_id = ?
+    AND a.account_name = ?
+    AND (
+        sqlc.arg('has_after') = FALSE
+        OR (
+            sqlc.arg('after_imported') = FALSE
+            AND (
+                (
+                    a.account_number IS NOT NULL
+                    AND (
+                        a.account_number > sqlc.arg('after_account_number')
+                        OR (
+                            a.account_number = sqlc.arg('after_account_number')
+                            AND a.id > sqlc.arg('after_row_id')
+                        )
+                    )
+                )
+                OR a.account_number IS NULL
+            )
+        )
+        OR (
+            sqlc.arg('after_imported') = TRUE
+            AND a.account_number IS NULL
+            AND a.id > sqlc.arg('after_row_id')
+        )
+    )
+ORDER BY a.account_number IS NULL, a.account_number, a.id
+LIMIT sqlc.arg('page_limit');
 
 -- name: ListAccountsByWallet :many
--- Lists all accounts for a wallet, ordered by account number. Imported
--- accounts (with NULL account_number) appear last.
+-- Lists one page of accounts for a wallet.
 SELECT
     a.id,
     a.account_number,
@@ -228,7 +277,32 @@ SELECT
 FROM accounts AS a
 INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
 WHERE ks.wallet_id = ?
-ORDER BY a.account_number IS NULL, a.account_number;
+    AND (
+        sqlc.arg('has_after') = FALSE
+        OR (
+            sqlc.arg('after_imported') = FALSE
+            AND (
+                (
+                    a.account_number IS NOT NULL
+                    AND (
+                        a.account_number > sqlc.arg('after_account_number')
+                        OR (
+                            a.account_number = sqlc.arg('after_account_number')
+                            AND a.id > sqlc.arg('after_row_id')
+                        )
+                    )
+                )
+                OR a.account_number IS NULL
+            )
+        )
+        OR (
+            sqlc.arg('after_imported') = TRUE
+            AND a.account_number IS NULL
+            AND a.id > sqlc.arg('after_row_id')
+        )
+    )
+ORDER BY a.account_number IS NULL, a.account_number, a.id
+LIMIT sqlc.arg('page_limit');
 
 -- name: UpdateAccountNameByWalletScopeAndNumber :execrows
 -- Renames an account identified by wallet id, scope tuple, and account number.

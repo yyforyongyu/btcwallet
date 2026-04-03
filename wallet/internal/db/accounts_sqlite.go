@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"iter"
 
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	sqlcsqlite "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/sqlite"
 )
 
@@ -21,16 +23,22 @@ func (s *SqliteStore) GetAccount(ctx context.Context,
 	return getAccountByQuery(ctx, query, getQueries.byNumber, getQueries.byName)
 }
 
-// ListAccounts returns a slice of AccountInfo for all accounts, optionally
-// filtered by name or key scope.
+// ListAccounts returns one page of accounts for the given query.
 func (s *SqliteStore) ListAccounts(ctx context.Context,
-	query ListAccountsQuery) ([]AccountInfo, error) {
+	query ListAccountsQuery) (page.Result[AccountInfo, AccountCursor], error) {
 
 	listQueries := sqliteAccountListQueries{q: s.queries}
 
 	return listAccountsByQuery(
 		ctx, query, listQueries.byScope, listQueries.byName, listQueries.all,
 	)
+}
+
+// IterAccounts returns an iterator over paginated account results.
+func (s *SqliteStore) IterAccounts(ctx context.Context,
+	query ListAccountsQuery) iter.Seq2[AccountInfo, error] {
+
+	return page.Iter(ctx, query, s.ListAccounts, nextListAccountsQuery)
 }
 
 // RenameAccount changes the name of an account. The account can be identified
@@ -89,8 +97,14 @@ func (s *SqliteStore) CreateDerivedAccount(ctx context.Context,
 			return fmt.Errorf("%w: %w", ErrMaxAccountNumberReached, err)
 		}
 
+		accountID, err := int64ToUint32(row.ID)
+		if err != nil {
+			return fmt.Errorf("account id: %w", err)
+		}
+
 		info = buildAccountInfo(
-			accNumber, params.Name, DerivedAccount, 0, 0, 0, false,
+			accountID, accNumber, params.Name, DerivedAccount, 0, 0, 0,
+			false,
 			row.CreatedAt, params.Scope,
 		)
 
@@ -263,6 +277,7 @@ func sqliteAccountRowToInfo[T sqliteAccountInfoRow](row T) (*AccountInfo,
 	base := sqlcsqlite.GetAccountByScopeAndNameRow(row)
 
 	return accountRowToInfo(accountInfoRow[int64]{
+		ID:               base.ID,
 		AccountNumber:    base.AccountNumber,
 		AccountName:      base.AccountName,
 		OriginID:         base.OriginID,
@@ -284,39 +299,86 @@ type sqliteAccountListQueries struct {
 
 // byScope lists accounts filtered by wallet ID and key scope.
 func (s sqliteAccountListQueries) byScope(ctx context.Context,
-	query ListAccountsQuery) ([]AccountInfo, error) {
+	query ListAccountsQuery) (page.Result[AccountInfo, AccountCursor], error) {
+
+	hasAfter, afterImported, afterAccountNumber, afterRowID, pageLimit :=
+		sqliteAccountPageParams(query.Page)
 
 	return listAccounts(
 		ctx, s.q.ListAccountsByWalletScope,
 		sqlcsqlite.ListAccountsByWalletScopeParams{
-			WalletID: int64(query.WalletID),
-			Purpose:  int64(query.Scope.Purpose),
-			CoinType: int64(query.Scope.Coin),
-		}, sqliteAccountRowToInfo,
+			WalletID:           int64(query.WalletID),
+			Purpose:            int64(query.Scope.Purpose),
+			CoinType:           int64(query.Scope.Coin),
+			HasAfter:           hasAfter,
+			AfterImported:      afterImported,
+			AfterAccountNumber: afterAccountNumber,
+			AfterRowID:         afterRowID,
+			PageLimit:          pageLimit,
+		},
+		query.Page.EffectiveLimit(),
+		sqliteAccountRowToInfo,
 	)
 }
 
 // byName lists accounts filtered by wallet ID and account name.
 func (s sqliteAccountListQueries) byName(ctx context.Context,
-	query ListAccountsQuery) ([]AccountInfo, error) {
+	query ListAccountsQuery) (page.Result[AccountInfo, AccountCursor], error) {
+
+	hasAfter, afterImported, afterAccountNumber, afterRowID, pageLimit :=
+		sqliteAccountPageParams(query.Page)
 
 	return listAccounts(
 		ctx, s.q.ListAccountsByWalletAndName,
 		sqlcsqlite.ListAccountsByWalletAndNameParams{
-			WalletID:    int64(query.WalletID),
-			AccountName: *query.Name,
-		}, sqliteAccountRowToInfo,
+			WalletID:           int64(query.WalletID),
+			AccountName:        *query.Name,
+			HasAfter:           hasAfter,
+			AfterImported:      afterImported,
+			AfterAccountNumber: afterAccountNumber,
+			AfterRowID:         afterRowID,
+			PageLimit:          pageLimit,
+		},
+		query.Page.EffectiveLimit(),
+		sqliteAccountRowToInfo,
 	)
 }
 
 // all lists all accounts for a wallet.
 func (s sqliteAccountListQueries) all(ctx context.Context,
-	query ListAccountsQuery) ([]AccountInfo, error) {
+	query ListAccountsQuery) (page.Result[AccountInfo, AccountCursor], error) {
+
+	hasAfter, afterImported, afterAccountNumber, afterRowID, pageLimit :=
+		sqliteAccountPageParams(query.Page)
 
 	return listAccounts(
-		ctx, s.q.ListAccountsByWallet, int64(query.WalletID),
+		ctx, s.q.ListAccountsByWallet, sqlcsqlite.ListAccountsByWalletParams{
+			WalletID:           int64(query.WalletID),
+			HasAfter:           hasAfter,
+			AfterImported:      afterImported,
+			AfterAccountNumber: afterAccountNumber,
+			AfterRowID:         afterRowID,
+			PageLimit:          pageLimit,
+		},
+		query.Page.EffectiveLimit(),
 		sqliteAccountRowToInfo,
 	)
+}
+
+// sqliteAccountPageParams translates a page request to SQLite account page
+// parameters.
+func sqliteAccountPageParams(req page.Request[AccountCursor]) (bool, bool,
+	sql.NullInt64, int64, int64) {
+
+	pageLimit := int64(req.EffectiveLimit()) + 1
+	if !req.HasAfter {
+		return false, false, sql.NullInt64{}, 0, pageLimit
+	}
+
+	return true, req.After.Imported, sql.NullInt64{
+		Int64: int64(req.After.AccountNumber),
+		Valid: true,
+	}, int64(req.After.RowID), pageLimit
 }
 
 // sqliteAccountGetQueries groups SQLite account retrieval query methods.

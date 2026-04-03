@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"iter"
 
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
 )
 
@@ -21,16 +23,22 @@ func (s *PostgresStore) GetAccount(ctx context.Context,
 	return getAccountByQuery(ctx, query, getQueries.byNumber, getQueries.byName)
 }
 
-// ListAccounts returns a slice of AccountInfo for all accounts, optionally
-// filtered by name or key scope.
+// ListAccounts returns one page of accounts for the given query.
 func (s *PostgresStore) ListAccounts(ctx context.Context,
-	query ListAccountsQuery) ([]AccountInfo, error) {
+	query ListAccountsQuery) (page.Result[AccountInfo, AccountCursor], error) {
 
 	listQueries := pgAccountListQueries{q: s.queries}
 
 	return listAccountsByQuery(
 		ctx, query, listQueries.byScope, listQueries.byName, listQueries.all,
 	)
+}
+
+// IterAccounts returns an iterator over paginated account results.
+func (s *PostgresStore) IterAccounts(ctx context.Context,
+	query ListAccountsQuery) iter.Seq2[AccountInfo, error] {
+
+	return page.Iter(ctx, query, s.ListAccounts, nextListAccountsQuery)
 }
 
 // RenameAccount changes the name of an account. The account can be identified
@@ -99,8 +107,14 @@ func (s *PostgresStore) CreateDerivedAccount(ctx context.Context,
 			return fmt.Errorf("%w: %w", ErrMaxAccountNumberReached, err)
 		}
 
+		accountID, err := int64ToUint32(row.ID)
+		if err != nil {
+			return fmt.Errorf("account id: %w", err)
+		}
+
 		info = buildAccountInfo(
-			accNumber, params.Name, DerivedAccount, 0, 0, 0, false,
+			accountID, accNumber, params.Name, DerivedAccount, 0, 0, 0,
+			false,
 			row.CreatedAt, params.Scope,
 		)
 
@@ -267,6 +281,7 @@ func pgAccountRowToInfo[T pgAccountInfoRow](row T) (*AccountInfo, error) {
 	base := sqlcpg.GetAccountByScopeAndNameRow(row)
 
 	return accountRowToInfo(accountInfoRow[int16]{
+		ID:               base.ID,
 		AccountNumber:    base.AccountNumber,
 		AccountName:      base.AccountName,
 		OriginID:         base.OriginID,
@@ -288,39 +303,84 @@ type pgAccountListQueries struct {
 
 // byScope lists accounts filtered by wallet ID and key scope.
 func (p pgAccountListQueries) byScope(ctx context.Context,
-	query ListAccountsQuery) ([]AccountInfo, error) {
+	query ListAccountsQuery) (page.Result[AccountInfo, AccountCursor], error) {
+
+	hasAfter, afterImported, afterAccountNumber, afterRowID, pageLimit :=
+		pgAccountPageParams(query.Page)
 
 	return listAccounts(
 		ctx, p.q.ListAccountsByWalletScope,
 		sqlcpg.ListAccountsByWalletScopeParams{
-			WalletID: int64(query.WalletID),
-			Purpose:  int64(query.Scope.Purpose),
-			CoinType: int64(query.Scope.Coin),
-		}, pgAccountRowToInfo,
+			WalletID:           int64(query.WalletID),
+			Purpose:            int64(query.Scope.Purpose),
+			CoinType:           int64(query.Scope.Coin),
+			HasAfter:           hasAfter,
+			AfterImported:      afterImported,
+			AfterAccountNumber: afterAccountNumber,
+			AfterRowID:         afterRowID,
+			PageLimit:          pageLimit,
+		},
+		query.Page.EffectiveLimit(),
+		pgAccountRowToInfo,
 	)
 }
 
 // byName lists accounts filtered by wallet ID and account name.
 func (p pgAccountListQueries) byName(ctx context.Context,
-	query ListAccountsQuery) ([]AccountInfo, error) {
+	query ListAccountsQuery) (page.Result[AccountInfo, AccountCursor], error) {
+
+	hasAfter, afterImported, afterAccountNumber, afterRowID, pageLimit :=
+		pgAccountPageParams(query.Page)
 
 	return listAccounts(
 		ctx, p.q.ListAccountsByWalletAndName,
 		sqlcpg.ListAccountsByWalletAndNameParams{
-			WalletID:    int64(query.WalletID),
-			AccountName: *query.Name,
-		}, pgAccountRowToInfo,
+			WalletID:           int64(query.WalletID),
+			AccountName:        *query.Name,
+			HasAfter:           hasAfter,
+			AfterImported:      afterImported,
+			AfterAccountNumber: afterAccountNumber,
+			AfterRowID:         afterRowID,
+			PageLimit:          pageLimit,
+		},
+		query.Page.EffectiveLimit(),
+		pgAccountRowToInfo,
 	)
 }
 
 // all lists all accounts for a wallet.
 func (p pgAccountListQueries) all(ctx context.Context,
-	query ListAccountsQuery) ([]AccountInfo, error) {
+	query ListAccountsQuery) (page.Result[AccountInfo, AccountCursor], error) {
+
+	hasAfter, afterImported, afterAccountNumber, afterRowID, pageLimit :=
+		pgAccountPageParams(query.Page)
 
 	return listAccounts(
-		ctx, p.q.ListAccountsByWallet, int64(query.WalletID),
+		ctx, p.q.ListAccountsByWallet, sqlcpg.ListAccountsByWalletParams{
+			WalletID:           int64(query.WalletID),
+			HasAfter:           hasAfter,
+			AfterImported:      afterImported,
+			AfterAccountNumber: afterAccountNumber,
+			AfterRowID:         afterRowID,
+			PageLimit:          pageLimit,
+		},
+		query.Page.EffectiveLimit(),
 		pgAccountRowToInfo,
 	)
+}
+
+// pgAccountPageParams translates a page request to PostgreSQL account page
+// parameters.
+func pgAccountPageParams(
+	req page.Request[AccountCursor]) (bool, bool, int64, int64, int64) {
+
+	pageLimit := int64(req.EffectiveLimit()) + 1
+	if !req.HasAfter {
+		return false, false, 0, 0, pageLimit
+	}
+
+	return true, req.After.Imported, int64(req.After.AccountNumber),
+		int64(req.After.RowID), pageLimit
 }
 
 // pgAccountGetQueries groups PostgreSQL account retrieval query methods.

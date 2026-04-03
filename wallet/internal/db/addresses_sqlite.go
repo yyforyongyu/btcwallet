@@ -37,15 +37,13 @@ func (s *SqliteStore) GetAddress(ctx context.Context,
 func (s *SqliteStore) ListAddresses(ctx context.Context,
 	query ListAddressesQuery) (page.Result[AddressInfo, uint32], error) {
 
-	listQueries := sqliteAddressListPagedQueries{q: s.queries}
-
-	items, err := listQueries.byAccount(ctx, query)
+	items, err := sqliteListAddressesByAccount(ctx, s.queries, query)
 	if err != nil {
 		return page.Result[AddressInfo, uint32]{}, err
 	}
 
 	result := page.BuildResult(
-		query.Page, items,
+		items, query.Page.EffectiveLimit(),
 		func(item AddressInfo) uint32 {
 			return item.ID
 		},
@@ -59,7 +57,7 @@ func (s *SqliteStore) IterAddresses(ctx context.Context,
 	query ListAddressesQuery) iter.Seq2[AddressInfo, error] {
 
 	return page.Iter(
-		ctx, query, "addresses", s.ListAddresses, nextListAddressesQuery,
+		ctx, query, s.ListAddresses, nextListAddressesQuery,
 	)
 }
 
@@ -311,18 +309,12 @@ func sqliteAddressRowToInfo[T sqliteAddressInfoRow](row T) (*AddressInfo,
 	return info, nil
 }
 
-// sqliteAddressListPagedQueries holds the queries for paginated address
-// listing in SQLite.
-type sqliteAddressListPagedQueries struct {
-	q *sqlcsqlite.Queries
-}
-
-// byAccount lists addresses filtered by wallet ID, key scope, and account
-// name, with pagination support.
-func (s sqliteAddressListPagedQueries) byAccount(ctx context.Context,
+// sqliteListAddressesByAccount lists addresses filtered by wallet ID, key
+// scope, and account name.
+func sqliteListAddressesByAccount(ctx context.Context, q *sqlcsqlite.Queries,
 	query ListAddressesQuery) ([]AddressInfo, error) {
 
-	rows, err := s.q.ListAddressesByAccount(
+	rows, err := q.ListAddressesByAccount(
 		ctx, sqliteBuildAddressPageParams(query),
 	)
 	if err != nil {
@@ -352,11 +344,11 @@ func sqliteBuildAddressPageParams(
 		Purpose:     int64(q.Scope.Purpose),
 		CoinType:    int64(q.Scope.Coin),
 		AccountName: q.AccountName,
-		PageLimit:   int64(q.Page.QueryLimit()),
+		PageLimit:   int64(q.Page.EffectiveLimit()) + 1,
 	}
 
-	if cursor := q.Page.Cursor(); cursor != nil {
-		params.CursorID = int64(*cursor)
+	if q.Page.HasAfter {
+		params.CursorID = int64(q.Page.After)
 	}
 
 	return params
