@@ -5,15 +5,22 @@ package itest
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
 	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -22,9 +29,6 @@ import (
 )
 
 var (
-	// Limit concurrent database creation to avoid exhausting connections.
-	pgDBSemaphore = make(chan struct{}, 4)
-
 	// Shared container instance, reused across tests for performance.
 	// This is safe to use concurrently because we only share the container
 	// and not the database inside it. Each test gets its own database.
@@ -45,6 +49,23 @@ var (
 	pgTerminateTimeout = 1 * time.Minute
 )
 
+// testParallelism returns the effective test parallelism level. It reads the
+// -test.parallel flag when set, falling back to GOMAXPROCS (the default used by
+// the Go test runner).
+func testParallelism() int {
+	f := flag.Lookup("test.parallel")
+	if f == nil {
+		return runtime.GOMAXPROCS(0)
+	}
+
+	n, err := strconv.Atoi(f.Value.String())
+	if err != nil || n <= 0 {
+		return runtime.GOMAXPROCS(0)
+	}
+
+	return n
+}
+
 // TestMain ensures the shared postgres container is terminated after the
 // integration test suite completes to avoid leaking docker resources.
 func TestMain(m *testing.M) {
@@ -52,10 +73,16 @@ func TestMain(m *testing.M) {
 
 	// Terminate the container after the test suite completes.
 	if pgContainer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), pgTerminateTimeout)
+		ctx, cancel := context.WithTimeout(
+			context.Background(), pgTerminateTimeout,
+		)
 		defer cancel()
 
-		err := pgContainer.Terminate(ctx)
+		// As the tests already completed, we can stop the container
+		// immediately.
+		err := pgContainer.Terminate(
+			ctx, testcontainers.StopTimeout(0),
+		)
 		if err != nil {
 			fmt.Printf("failed to terminate postgres container: %v\n", err)
 		}
@@ -91,9 +118,8 @@ func DefaultPostgresConfig() PostgresConfig {
 
 // GetPostgresContainer returns the shared PostgreSQL container instance.
 // The container is created once and reused across all tests for performance.
-//
-// Note: postgres:18-alpine defaults max_connections to 100.
-func GetPostgresContainer(ctx context.Context) (*postgres.PostgresContainer, error) {
+func GetPostgresContainer(ctx context.Context) (*postgres.PostgresContainer,
+	error) {
 	pgContainerOnce.Do(func() {
 		cfg := DefaultPostgresConfig()
 
@@ -110,11 +136,24 @@ func GetPostgresContainer(ctx context.Context) (*postgres.PostgresContainer, err
 			},
 		).WithStartupTimeout(pgInitTimeout)
 
+		p := testParallelism()
+		m := db.DefaultMaxConnections
+
+		// pgMaxConns is the Postgres max_connections budget for the
+		// test container. We budget 2x the steady-state pool size to
+		// absorb connection lifecycle overlap during parallel test
+		// teardown and startup without trying to model each transient
+		// connection source separately.
+		pgMaxConns := 2 * p * m
+
 		pgContainer, pgContainerErr = postgres.Run(ctx,
 			cfg.Image,
 			postgres.WithDatabase(cfg.Database),
 			postgres.WithUsername(cfg.Username),
 			postgres.WithPassword(cfg.Password),
+			testcontainers.WithCmd(
+				"-c", fmt.Sprintf("max_connections=%d", pgMaxConns),
+			),
 			testcontainers.WithWaitStrategyAndDeadline(
 				pgInitTimeout, waitForSQL,
 			),
@@ -144,17 +183,18 @@ func sanitizedPgDBName(t *testing.T) string {
 }
 
 // NewTestStore creates a new PostgreSQL database connection with migrations
-// applied. Each test gets its own database for isolation.
+// applied. Each parallel subtest must call NewTestStore itself rather than
+// sharing a store created by the parent test. When a parent test creates the
+// store and its subtests call t.Parallel(), the parent finishes and releases
+// its parallel slot while the subtests are still running. A new parent test
+// fills that slot and opens another store, but the original subtests still
+// hold their connections. This leads to more open connections than the parallel
+// limit allows, exhausting the PostgreSQL connection pool. Avoid this by
+// creating NewTestStore inside each parallel subtest so its lifecycle is tied
+// to the subtest's parallel slot.
 func NewTestStore(t *testing.T) *db.PostgresStore {
 	t.Helper()
 	ctx := t.Context()
-
-	// Acquire a semaphore slot to limit concurrent database creation and
-	// parallel test execution that depends on it.
-	pgDBSemaphore <- struct{}{}
-	defer func() {
-		<-pgDBSemaphore
-	}()
 
 	container, err := GetPostgresContainer(ctx)
 	require.NoError(t, err, "failed to get postgres container")
@@ -195,4 +235,124 @@ func NewTestStore(t *testing.T) *db.PostgresStore {
 	})
 
 	return store
+}
+
+// childSpendingTxIDs returns the direct child transaction IDs recorded for the
+// provided parent transaction hash.
+func childSpendingTxIDs(t *testing.T, store *db.PostgresStore, walletID uint32,
+	txHash chainhash.Hash) []int64 {
+
+	t.Helper()
+
+	meta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcpg.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   txHash[:],
+		},
+	)
+	require.NoError(t, err)
+
+	childIDs, err := store.Queries().ListSpendingTxIDsByParentTxID(
+		t.Context(), sqlcpg.ListSpendingTxIDsByParentTxIDParams{
+			WalletID: int64(walletID),
+			TxID:     meta.ID,
+		},
+	)
+	require.NoError(t, err)
+
+	ids := make([]int64, 0, len(childIDs))
+	for _, childID := range childIDs {
+		require.True(t, childID.Valid)
+		ids = append(ids, childID.Int64)
+	}
+
+	return ids
+}
+
+// txIDByHash returns the database row ID for the given wallet-scoped
+// transaction hash and reports whether the row exists.
+func txIDByHash(t *testing.T, store *db.PostgresStore, walletID uint32,
+	txHash chainhash.Hash) (int64, bool) {
+
+	t.Helper()
+
+	meta, err := store.Queries().GetTransactionMetaByHash(
+		t.Context(), sqlcpg.GetTransactionMetaByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   txHash[:],
+		},
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false
+		}
+
+		require.NoError(t, err)
+	}
+
+	return meta.ID, true
+}
+
+// rawTxByHash returns the serialized transaction bytes for the given
+// wallet-scoped transaction hash.
+func rawTxByHash(t *testing.T, store *db.PostgresStore, walletID uint32,
+	txHash chainhash.Hash) []byte {
+
+	t.Helper()
+
+	row, err := store.Queries().GetTransactionByHash(
+		t.Context(), sqlcpg.GetTransactionByHashParams{
+			WalletID: int64(walletID),
+			TxHash:   txHash[:],
+		},
+	)
+	require.NoError(t, err)
+
+	return row.RawTx
+}
+
+// setTxStatus rewrites one wallet-scoped transaction row to the provided
+// status using the internal status-update query.
+func setTxStatus(t *testing.T, store *db.PostgresStore, walletID uint32,
+	txHash chainhash.Hash, status db.TxStatus) {
+
+	t.Helper()
+
+	txID, ok := txIDByHash(t, store, walletID, txHash)
+	require.True(t, ok)
+
+	rows, err := store.Queries().UpdateTransactionStatusByIDs(
+		t.Context(), sqlcpg.UpdateTransactionStatusByIDsParams{
+			WalletID: int64(walletID),
+			Status:   int16(status),
+			TxIds:    []int64{txID},
+		},
+	)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, rows)
+}
+
+// walletUtxoExists reports whether one wallet-scoped outpoint is currently
+// present in the UTXO set.
+func walletUtxoExists(t *testing.T, store *db.PostgresStore, walletID uint32,
+	outPoint wire.OutPoint) bool {
+
+	t.Helper()
+
+	_, err := store.Queries().GetUtxoIDByOutpoint(
+		t.Context(), sqlcpg.GetUtxoIDByOutpointParams{
+			WalletID:    int64(walletID),
+			TxHash:      outPoint.Hash[:],
+			OutputIndex: int32(outPoint.Index),
+		},
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false
+		}
+
+		require.NoError(t, err)
+	}
+
+	return true
 }

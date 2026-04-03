@@ -33,9 +33,6 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.clearUtxosSpentByTxIDStmt, err = db.PrepareContext(ctx, ClearUtxosSpentByTxID); err != nil {
 		return nil, fmt.Errorf("error preparing query ClearUtxosSpentByTxID: %w", err)
 	}
-	if q.confirmUnminedTransactionByHashStmt, err = db.PrepareContext(ctx, ConfirmUnminedTransactionByHash); err != nil {
-		return nil, fmt.Errorf("error preparing query ConfirmUnminedTransactionByHash: %w", err)
-	}
 	if q.createAccountSecretStmt, err = db.PrepareContext(ctx, CreateAccountSecret); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateAccountSecret: %w", err)
 	}
@@ -150,6 +147,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getWalletSecretsStmt, err = db.PrepareContext(ctx, GetWalletSecrets); err != nil {
 		return nil, fmt.Errorf("error preparing query GetWalletSecrets: %w", err)
 	}
+	if q.hasInvalidWalletUtxoByOutpointStmt, err = db.PrepareContext(ctx, HasInvalidWalletUtxoByOutpoint); err != nil {
+		return nil, fmt.Errorf("error preparing query HasInvalidWalletUtxoByOutpoint: %w", err)
+	}
 	if q.insertAddressSecretStmt, err = db.PrepareContext(ctx, InsertAddressSecret); err != nil {
 		return nil, fmt.Errorf("error preparing query InsertAddressSecret: %w", err)
 	}
@@ -222,6 +222,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listTransactionsByHeightRangeStmt, err = db.PrepareContext(ctx, ListTransactionsByHeightRange); err != nil {
 		return nil, fmt.Errorf("error preparing query ListTransactionsByHeightRange: %w", err)
 	}
+	if q.listTransactionsWithoutBlockStmt, err = db.PrepareContext(ctx, ListTransactionsWithoutBlock); err != nil {
+		return nil, fmt.Errorf("error preparing query ListTransactionsWithoutBlock: %w", err)
+	}
 	if q.listUnminedTransactionsStmt, err = db.PrepareContext(ctx, ListUnminedTransactions); err != nil {
 		return nil, fmt.Errorf("error preparing query ListUnminedTransactions: %w", err)
 	}
@@ -248,6 +251,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.updateTransactionLabelByHashStmt, err = db.PrepareContext(ctx, UpdateTransactionLabelByHash); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateTransactionLabelByHash: %w", err)
+	}
+	if q.updateTransactionStateByHashStmt, err = db.PrepareContext(ctx, UpdateTransactionStateByHash); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateTransactionStateByHash: %w", err)
 	}
 	if q.updateTransactionStatusByIDsStmt, err = db.PrepareContext(ctx, UpdateTransactionStatusByIDs); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateTransactionStatusByIDs: %w", err)
@@ -276,11 +282,6 @@ func (q *Queries) Close() error {
 	if q.clearUtxosSpentByTxIDStmt != nil {
 		if cerr := q.clearUtxosSpentByTxIDStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing clearUtxosSpentByTxIDStmt: %w", cerr)
-		}
-	}
-	if q.confirmUnminedTransactionByHashStmt != nil {
-		if cerr := q.confirmUnminedTransactionByHashStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing confirmUnminedTransactionByHashStmt: %w", cerr)
 		}
 	}
 	if q.createAccountSecretStmt != nil {
@@ -473,6 +474,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getWalletSecretsStmt: %w", cerr)
 		}
 	}
+	if q.hasInvalidWalletUtxoByOutpointStmt != nil {
+		if cerr := q.hasInvalidWalletUtxoByOutpointStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing hasInvalidWalletUtxoByOutpointStmt: %w", cerr)
+		}
+	}
 	if q.insertAddressSecretStmt != nil {
 		if cerr := q.insertAddressSecretStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing insertAddressSecretStmt: %w", cerr)
@@ -593,6 +599,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listTransactionsByHeightRangeStmt: %w", cerr)
 		}
 	}
+	if q.listTransactionsWithoutBlockStmt != nil {
+		if cerr := q.listTransactionsWithoutBlockStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listTransactionsWithoutBlockStmt: %w", cerr)
+		}
+	}
 	if q.listUnminedTransactionsStmt != nil {
 		if cerr := q.listUnminedTransactionsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing listUnminedTransactionsStmt: %w", cerr)
@@ -636,6 +647,11 @@ func (q *Queries) Close() error {
 	if q.updateTransactionLabelByHashStmt != nil {
 		if cerr := q.updateTransactionLabelByHashStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateTransactionLabelByHashStmt: %w", cerr)
+		}
+	}
+	if q.updateTransactionStateByHashStmt != nil {
+		if cerr := q.updateTransactionStateByHashStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateTransactionStateByHashStmt: %w", cerr)
 		}
 	}
 	if q.updateTransactionStatusByIDsStmt != nil {
@@ -695,7 +711,6 @@ type Queries struct {
 	acquireUtxoLeaseStmt                        *sql.Stmt
 	balanceStmt                                 *sql.Stmt
 	clearUtxosSpentByTxIDStmt                   *sql.Stmt
-	confirmUnminedTransactionByHashStmt         *sql.Stmt
 	createAccountSecretStmt                     *sql.Stmt
 	createDerivedAccountStmt                    *sql.Stmt
 	createDerivedAccountWithNumberStmt          *sql.Stmt
@@ -734,6 +749,7 @@ type Queries struct {
 	getWalletByIDStmt                           *sql.Stmt
 	getWalletByNameStmt                         *sql.Stmt
 	getWalletSecretsStmt                        *sql.Stmt
+	hasInvalidWalletUtxoByOutpointStmt          *sql.Stmt
 	insertAddressSecretStmt                     *sql.Stmt
 	insertBlockStmt                             *sql.Stmt
 	insertKeyScopeSecretsStmt                   *sql.Stmt
@@ -758,6 +774,7 @@ type Queries struct {
 	listRollbackCoinbaseRootsStmt               *sql.Stmt
 	listSpendingTxIDsByParentTxIDStmt           *sql.Stmt
 	listTransactionsByHeightRangeStmt           *sql.Stmt
+	listTransactionsWithoutBlockStmt            *sql.Stmt
 	listUnminedTransactionsStmt                 *sql.Stmt
 	listUtxosStmt                               *sql.Stmt
 	listWalletsStmt                             *sql.Stmt
@@ -767,6 +784,7 @@ type Queries struct {
 	updateAccountNameByWalletScopeAndNameStmt   *sql.Stmt
 	updateAccountNameByWalletScopeAndNumberStmt *sql.Stmt
 	updateTransactionLabelByHashStmt            *sql.Stmt
+	updateTransactionStateByHashStmt            *sql.Stmt
 	updateTransactionStatusByIDsStmt            *sql.Stmt
 	updateWalletSecretsStmt                     *sql.Stmt
 	updateWalletSyncStateStmt                   *sql.Stmt
@@ -779,7 +797,6 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		acquireUtxoLeaseStmt:                        q.acquireUtxoLeaseStmt,
 		balanceStmt:                                 q.balanceStmt,
 		clearUtxosSpentByTxIDStmt:                   q.clearUtxosSpentByTxIDStmt,
-		confirmUnminedTransactionByHashStmt:         q.confirmUnminedTransactionByHashStmt,
 		createAccountSecretStmt:                     q.createAccountSecretStmt,
 		createDerivedAccountStmt:                    q.createDerivedAccountStmt,
 		createDerivedAccountWithNumberStmt:          q.createDerivedAccountWithNumberStmt,
@@ -818,6 +835,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getWalletByIDStmt:                           q.getWalletByIDStmt,
 		getWalletByNameStmt:                         q.getWalletByNameStmt,
 		getWalletSecretsStmt:                        q.getWalletSecretsStmt,
+		hasInvalidWalletUtxoByOutpointStmt:          q.hasInvalidWalletUtxoByOutpointStmt,
 		insertAddressSecretStmt:                     q.insertAddressSecretStmt,
 		insertBlockStmt:                             q.insertBlockStmt,
 		insertKeyScopeSecretsStmt:                   q.insertKeyScopeSecretsStmt,
@@ -842,6 +860,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listRollbackCoinbaseRootsStmt:               q.listRollbackCoinbaseRootsStmt,
 		listSpendingTxIDsByParentTxIDStmt:           q.listSpendingTxIDsByParentTxIDStmt,
 		listTransactionsByHeightRangeStmt:           q.listTransactionsByHeightRangeStmt,
+		listTransactionsWithoutBlockStmt:            q.listTransactionsWithoutBlockStmt,
 		listUnminedTransactionsStmt:                 q.listUnminedTransactionsStmt,
 		listUtxosStmt:                               q.listUtxosStmt,
 		listWalletsStmt:                             q.listWalletsStmt,
@@ -851,6 +870,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		updateAccountNameByWalletScopeAndNameStmt:   q.updateAccountNameByWalletScopeAndNameStmt,
 		updateAccountNameByWalletScopeAndNumberStmt: q.updateAccountNameByWalletScopeAndNumberStmt,
 		updateTransactionLabelByHashStmt:            q.updateTransactionLabelByHashStmt,
+		updateTransactionStateByHashStmt:            q.updateTransactionStateByHashStmt,
 		updateTransactionStatusByIDsStmt:            q.updateTransactionStatusByIDsStmt,
 		updateWalletSecretsStmt:                     q.updateWalletSecretsStmt,
 		updateWalletSyncStateStmt:                   q.updateWalletSyncStateStmt,
