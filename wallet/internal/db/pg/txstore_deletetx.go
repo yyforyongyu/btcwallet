@@ -8,7 +8,7 @@ import (
 	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
+	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/sql/pg/sqlc"
 )
 
 // DeleteTx atomically removes one unmined transaction and restores any wallet

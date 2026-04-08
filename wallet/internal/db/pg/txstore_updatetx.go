@@ -8,7 +8,7 @@ import (
 	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
+	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/sql/pg/sqlc"
 )
 
 // UpdateTx patches the mutable metadata for one wallet-scoped transaction.
