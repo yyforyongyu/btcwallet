@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 )
 
 const (
@@ -237,6 +238,12 @@ type Block struct {
 	// Timestamp is the timestamp of the block, which is used for wallet
 	// synchronization and rescan operations.
 	Timestamp time.Time
+}
+
+// ListWalletsQuery contains the parameters for listing wallets.
+type ListWalletsQuery struct {
+	// Page holds the pagination parameters for this query.
+	Page page.Request[uint32]
 }
 
 // CreateWalletParams contains the parameters required to create a new wallet.
@@ -710,6 +717,9 @@ type ListAddressesQuery struct {
 
 	// Scope is the key scope of the account.
 	Scope KeyScope
+
+	// Page holds the pagination parameters for this query.
+	Page page.Request[uint32]
 }
 
 // --------------------
@@ -962,6 +972,19 @@ type DeleteTxParams struct {
 	WalletID uint32
 
 	// Txid is the hash of the transaction to delete.
+	Txid chainhash.Hash
+}
+
+// InvalidateUnminedTxParams contains the parameters for invalidating one
+// wallet-owned unmined transaction branch.
+type InvalidateUnminedTxParams struct {
+	// WalletID is the ID of the wallet containing the transaction.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	WalletID uint32
+
+	// Txid is the hash of the unmined transaction to invalidate.
 	Txid chainhash.Hash
 }
 

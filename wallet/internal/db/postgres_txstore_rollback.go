@@ -32,7 +32,7 @@ var _ rollbackToBlockOps = (*pgRollbackToBlockOps)(nil)
 // listRollbackRootHashes loads the coinbase roots that a rollback disconnects
 // and groups them by wallet.
 func (o pgRollbackToBlockOps) listRollbackRootHashes(ctx context.Context,
-	height uint32) (map[uint32]map[chainhash.Hash]struct{}, error) {
+	height uint32) (map[uint32][]chainhash.Hash, error) {
 
 	rollbackHeight, err := uint32ToInt32(height)
 	if err != nil {
@@ -104,6 +104,36 @@ func (o pgRollbackToBlockOps) deleteBlocksAtOrAboveHeight(
 	return nil
 }
 
+// markTxRootsOrphaned rewrites each disconnected coinbase root to the
+// orphaned state once its confirming block has been deleted.
+func (o pgRollbackToBlockOps) markTxRootsOrphaned(ctx context.Context,
+	walletID uint32, rootHashes []chainhash.Hash) error {
+
+	for _, txHash := range rootHashes {
+		// Rollback already removed the confirming block rows.
+		// The remaining coinbase row must therefore clear its
+		// block reference and become orphaned in the same
+		// row-local state patch.
+		rows, err := o.qtx.UpdateTransactionStateByHash(
+			ctx, sqlcpg.UpdateTransactionStateByHashParams{
+				BlockHeight: sql.NullInt32{},
+				Status:      int16(TxStatusOrphaned),
+				WalletID:    int64(walletID),
+				TxHash:      txHash[:],
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("update rollback coinbase state query: %w", err)
+		}
+
+		if rows == 0 {
+			return fmt.Errorf("tx %s: %w", txHash, ErrTxNotFound)
+		}
+	}
+
+	return nil
+}
+
 // listUnminedTxRecords loads and decodes every unmined transaction row for the
 // wallet so the shared helper can inspect raw inputs for descendant edges.
 func (o pgRollbackToBlockOps) listUnminedTxRecords(
@@ -162,12 +192,12 @@ func (o pgRollbackToBlockOps) markDescendantsFailed(
 }
 
 // groupRollbackCoinbaseRootsPg groups rollback-affected coinbase hashes by
-// wallet so descendant invalidation can reuse wallet-scoped unmined queries.
+// wallet while preserving the query order inside each wallet bucket.
 func groupRollbackCoinbaseRootsPg(rows []sqlcpg.ListRollbackCoinbaseRootsRow) (
-	map[uint32]map[chainhash.Hash]struct{}, error) {
+	map[uint32][]chainhash.Hash, error) {
 
 	rootHashesByWallet := make(
-		map[uint32]map[chainhash.Hash]struct{}, len(rows),
+		map[uint32][]chainhash.Hash, len(rows),
 	)
 	for _, row := range rows {
 		walletID, err := int64ToUint32(row.WalletID)
@@ -180,11 +210,9 @@ func groupRollbackCoinbaseRootsPg(rows []sqlcpg.ListRollbackCoinbaseRootsRow) (
 			return nil, fmt.Errorf("rollback coinbase hash: %w", err)
 		}
 
-		if _, ok := rootHashesByWallet[walletID]; !ok {
-			rootHashesByWallet[walletID] = make(map[chainhash.Hash]struct{})
-		}
-
-		rootHashesByWallet[walletID][*txHash] = struct{}{}
+		rootHashesByWallet[walletID] = append(
+			rootHashesByWallet[walletID], *txHash,
+		)
 	}
 
 	return rootHashesByWallet, nil

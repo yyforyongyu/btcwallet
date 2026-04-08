@@ -324,9 +324,10 @@ type Querier interface {
 	ListActiveUtxoLeases(ctx context.Context, arg ListActiveUtxoLeasesParams) ([]ListActiveUtxoLeasesRow, error)
 	// Returns all address types ordered by ID.
 	ListAddressTypes(ctx context.Context) ([]AddressType, error)
-	// Lists all addresses for a given account identified by wallet_id, key scope
-	// (purpose/coin_type), and account name. Returns all address columns for
-	// filtering and processing by the application.
+	// Lists addresses for an account identified by wallet_id, key scope
+	// (purpose/coin_type), and account name, ordered by address ID.
+	// When cursor_id is provided, only rows strictly after that address ID are
+	// returned. Returns up to page_limit rows.
 	ListAddressesByAccount(ctx context.Context, arg ListAddressesByAccountParams) ([]ListAddressesByAccountRow, error)
 	// Lists all key scopes for a wallet, ordered by ID.
 	ListKeyScopesByWallet(ctx context.Context, walletID int64) ([]KeyScope, error)
@@ -452,7 +453,10 @@ type Querier interface {
 	// - Treats min/max confirmations as optional filters so callers can
 	//   distinguish "not set" from an explicit zero-conf request.
 	ListUtxos(ctx context.Context, arg ListUtxosParams) ([]ListUtxosRow, error)
-	ListWallets(ctx context.Context) ([]ListWalletsRow, error)
+	// Lists wallets using cursor-based pagination. If cursor_id is NULL, starts
+	// from the beginning; otherwise returns wallets with id > cursor_id. Returns up
+	// to page_limit rows.
+	ListWallets(ctx context.Context, arg ListWalletsParams) ([]ListWalletsRow, error)
 	// Marks a wallet-owned UTXO as spent by a transaction.
 	//
 	// How:

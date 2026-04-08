@@ -3,6 +3,9 @@ package db
 import (
 	"context"
 	"errors"
+	"iter"
+
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 )
 
 var (
@@ -73,11 +76,11 @@ var (
 
 	// ErrTxNotFound is returned when a transaction is not found in the
 	// database.
-	ErrTxNotFound = errors.New("transaction not found")
+	ErrTxNotFound = errors.New("tx not found")
 
 	// ErrTxAlreadyExists is returned when CreateTx is asked to insert a
 	// wallet-scoped transaction hash that already exists.
-	ErrTxAlreadyExists = errors.New("transaction already exists")
+	ErrTxAlreadyExists = errors.New("tx already exists")
 
 	// ErrBlockNotFound is returned when a transaction operation references a
 	// block height that does not exist in the shared blocks table.
@@ -139,10 +142,15 @@ type WalletStore interface {
 	// error if the wallet is not found.
 	GetWallet(ctx context.Context, name string) (*WalletInfo, error)
 
-	// ListWallets returns a slice of WalletInfo for all wallets stored in
-	// the database. It returns an empty slice if no wallets are found, or
-	// an error if the retrieval fails.
-	ListWallets(ctx context.Context) ([]WalletInfo, error)
+	// ListWallets returns one page of wallets for the given query, including a
+	// next-cursor for the following page.
+	ListWallets(ctx context.Context, query ListWalletsQuery) (
+		page.Result[WalletInfo, uint32], error)
+
+	// IterWallets returns an iterator that fetches pages transparently and
+	// yields wallets one by one until exhaustion or error.
+	IterWallets(ctx context.Context,
+		query ListWalletsQuery) iter.Seq2[WalletInfo, error]
 
 	// UpdateWallet updates various properties of a wallet, such as its
 	// birthday, birthday block, or sync state. The specific fields to
@@ -235,10 +243,15 @@ type AddressStore interface {
 	// an error if the address is not found.
 	GetAddress(ctx context.Context, query GetAddressQuery) (*AddressInfo, error)
 
-	// ListAddresses returns a slice of AddressInfo for all addresses in a
-	// given account. It returns an empty slice if no addresses are found.
-	ListAddresses(ctx context.Context, query ListAddressesQuery) ([]AddressInfo,
-		error)
+	// ListAddresses returns one page of addresses for the given query,
+	// including a next-cursor for the following page.
+	ListAddresses(ctx context.Context, query ListAddressesQuery) (
+		page.Result[AddressInfo, uint32], error)
+
+	// IterAddresses returns an iterator that fetches pages transparently and
+	// yields addresses one by one until exhaustion or error.
+	IterAddresses(ctx context.Context,
+		query ListAddressesQuery) iter.Seq2[AddressInfo, error]
 
 	// GetAddressSecret retrieves the encrypted secret material for a given
 	// address. Returns the AddressSecret containing encrypted private key
@@ -286,8 +299,10 @@ type TxStore interface {
 	// immutable transaction facts such as the serialized transaction bytes,
 	// created credits, or spent-input edges.
 	//
-	// UpdateTx is the only public tx-store API that may attach, replace, or
-	// clear confirming block metadata.
+	// UpdateTx is row-local only. It may attach, replace, or clear confirming
+	// block metadata for one tx, but it must not perform branch invalidation.
+	// Callers must use CreateTx, InvalidateUnminedTx, or RollbackToBlock for
+	// graph-affecting lifecycle changes.
 	UpdateTx(ctx context.Context, params UpdateTxParams) error
 
 	// GetTx retrieves a transaction record by its hash. It takes a context
@@ -314,6 +329,17 @@ type TxStore interface {
 	// handling and therefore must not be erased through the ordinary
 	// unconfirmed-deletion path.
 	DeleteTx(ctx context.Context, params DeleteTxParams) error
+
+	// InvalidateUnminedTx invalidates one unmined transaction branch as a
+	// single atomic wallet event.
+	//
+	// This method is intended for system-driven cleanup when a wallet-owned
+	// unmined transaction is no longer valid, for example after publisher-side
+	// rejection or conflict handling. Implementations must invalidate the root
+	// transaction and reconcile any dependent descendant state inside one
+	// database transaction.
+	InvalidateUnminedTx(ctx context.Context,
+		params InvalidateUnminedTxParams) error
 
 	// RollbackToBlock removes all blocks at and after a given height,
 	// moving any transactions within those blocks back to the unconfirmed

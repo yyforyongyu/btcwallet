@@ -15,10 +15,11 @@ import (
 // credits, and any spend edges created by its inputs.
 //
 // The full write runs inside ExecuteTx so the transaction row, created UTXOs,
-// and spent-parent markers are either committed together or not at all.
-// Received timestamps are normalized to UTC before insert. CreateTx is
-// insert-only and returns ErrTxAlreadyExists if the wallet already stores the
-// tx hash.
+// spent-parent markers, and any required invalidation are either committed
+// together or not at all. Received timestamps are normalized to UTC before
+// insert. When the wallet already stores the same unmined transaction hash,
+// CreateTx may promote that existing row to confirmed state instead of
+// inserting a duplicate.
 func (s *SqliteStore) CreateTx(ctx context.Context,
 	params CreateTxParams) error {
 
@@ -28,41 +29,82 @@ func (s *SqliteStore) CreateTx(ctx context.Context,
 	}
 
 	return s.ExecuteTx(ctx, func(qtx *sqlcsqlite.Queries) error {
-		return createTxWithOps(ctx, req, &sqliteCreateTxOps{qtx: qtx})
+		return createTxWithOps(ctx, req, &sqliteCreateTxOps{
+			sqliteInvalidateUnminedTxOps: sqliteInvalidateUnminedTxOps{
+				qtx: qtx,
+			},
+		})
 	})
 }
 
 // sqliteCreateTxOps adapts sqlite sqlc queries to the shared CreateTx flow.
 type sqliteCreateTxOps struct {
-	qtx *sqlcsqlite.Queries
+	sqliteInvalidateUnminedTxOps
 
 	blockHeight sql.NullInt64
 }
 
 var _ createTxOps = (*sqliteCreateTxOps)(nil)
 
-// hasExisting reports whether the wallet already stores the requested tx hash.
-func (o *sqliteCreateTxOps) hasExisting(ctx context.Context,
-	req createTxRequest) (bool, error) {
+// loadExisting loads any existing wallet-scoped row for the requested tx hash.
+func (o *sqliteCreateTxOps) loadExisting(ctx context.Context,
+	req createTxRequest) (*createTxExistingTarget, error) {
 
-	_, err := o.qtx.GetTransactionMetaByHash(
+	meta, err := o.qtx.GetTransactionMetaByHash(
 		ctx,
 		sqlcsqlite.GetTransactionMetaByHashParams{
 			WalletID: int64(req.params.WalletID),
 			TxHash:   req.txHash[:],
 		},
 	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errCreateTxExistingNotFound
+		}
 
-	// Exit early if there is no error.
-	if err == nil {
-		return true, nil
+		return nil, fmt.Errorf("get tx metadata: %w", err)
 	}
 
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+	status, err := parseTxStatus(meta.TxStatus)
+	if err != nil {
+		return nil, err
 	}
 
-	return false, fmt.Errorf("get tx metadata: %w", err)
+	return &createTxExistingTarget{
+		id:         meta.ID,
+		status:     status,
+		hasBlock:   meta.BlockHeight.Valid,
+		isCoinbase: meta.IsCoinbase,
+	}, nil
+}
+
+// confirmExisting promotes one existing unmined row to its confirmed state.
+func (o *sqliteCreateTxOps) confirmExisting(ctx context.Context,
+	req createTxRequest,
+	_ createTxExistingTarget) error {
+
+	blockHeight, err := requireBlockMatchesSqlite(ctx, o.qtx, req.params.Block)
+	if err != nil {
+		return fmt.Errorf("require confirming block: %w", err)
+	}
+
+	rows, err := o.qtx.UpdateTransactionStateByHash(
+		ctx, sqlcsqlite.UpdateTransactionStateByHashParams{
+			BlockHeight: sql.NullInt64{Int64: blockHeight, Valid: true},
+			Status:      int64(TxStatusPublished),
+			WalletID:    int64(req.params.WalletID),
+			TxHash:      req.txHash[:],
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("update tx state query: %w", err)
+	}
+
+	if rows == 0 {
+		return fmt.Errorf("tx %s: %w", req.txHash, ErrTxNotFound)
+	}
+
+	return nil
 }
 
 // prepareBlock validates the optional confirming block and caches the sqlite
@@ -84,6 +126,92 @@ func (o *sqliteCreateTxOps) prepareBlock(ctx context.Context,
 	o.blockHeight = sql.NullInt64{Int64: height, Valid: true}
 
 	return nil
+}
+
+// listConflictTxns returns the direct conflict root IDs plus the matching tx
+// hashes used for descendant discovery.
+func (o *sqliteCreateTxOps) listConflictTxns(ctx context.Context,
+	req createTxRequest) ([]int64, []chainhash.Hash, error) {
+
+	rootIDs, err := collectSqliteConflictRootIDs(ctx, o.qtx, req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(rootIDs) == 0 {
+		return nil, nil, nil
+	}
+
+	rows, err := o.qtx.ListUnminedTransactions(ctx, int64(req.params.WalletID))
+	if err != nil {
+		return nil, nil, fmt.Errorf("list unmined txns: %w", err)
+	}
+
+	return buildSqliteConflictRoots(rows, rootIDs)
+}
+
+// collectSqliteConflictRootIDs returns the active unmined spender row
+// IDs that currently own any wallet-controlled input spent by the incoming tx.
+func collectSqliteConflictRootIDs(ctx context.Context,
+	qtx *sqlcsqlite.Queries,
+	req createTxRequest) (map[int64]struct{}, error) {
+
+	if blockchain.IsCoinBaseTx(req.params.Tx) {
+		return map[int64]struct{}{}, nil
+	}
+
+	rootIDs := make(map[int64]struct{}, len(req.params.Tx.TxIn))
+	for inputIndex, txIn := range req.params.Tx.TxIn {
+		spentByTxID, err := qtx.GetUtxoSpendByOutpoint(
+			ctx, sqlcsqlite.GetUtxoSpendByOutpointParams{
+				WalletID:    int64(req.params.WalletID),
+				TxHash:      txIn.PreviousOutPoint.Hash[:],
+				OutputIndex: int64(txIn.PreviousOutPoint.Index),
+			},
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+
+			return nil, fmt.Errorf("lookup input conflict %d: %w", inputIndex,
+				err)
+		}
+
+		if !spentByTxID.Valid {
+			continue
+		}
+
+		rootIDs[spentByTxID.Int64] = struct{}{}
+	}
+
+	return rootIDs, nil
+}
+
+// buildSqliteConflictRoots maps the selected unmined rows into ordered root IDs
+// and the matching root hashes used for descendant discovery.
+func buildSqliteConflictRoots(rows []sqlcsqlite.ListUnminedTransactionsRow,
+	rootIDSet map[int64]struct{}) (
+	[]int64, []chainhash.Hash, error) {
+
+	rootIDs := make([]int64, 0, len(rootIDSet))
+
+	rootHashes := make([]chainhash.Hash, 0, len(rootIDSet))
+	for _, row := range rows {
+		if _, ok := rootIDSet[row.ID]; !ok {
+			continue
+		}
+
+		txHash, err := chainhash.NewHash(row.TxHash)
+		if err != nil {
+			return nil, nil, fmt.Errorf("tx hash: %w", err)
+		}
+
+		rootIDs = append(rootIDs, row.ID)
+		rootHashes = append(rootHashes, *txHash)
+	}
+
+	return rootIDs, rootHashes, nil
 }
 
 // insert stores one new sqlite transaction row for CreateTx.
@@ -122,6 +250,48 @@ func (o *sqliteCreateTxOps) markInputsSpent(ctx context.Context,
 	req createTxRequest, txID int64) error {
 
 	return markInputsSpentSqlite(ctx, o.qtx, req.params, txID)
+}
+
+// markTxnsReplaced marks the provided direct conflict roots replaced in one
+// batch update.
+func (o *sqliteCreateTxOps) markTxnsReplaced(
+	ctx context.Context, walletID int64, txIDs []int64) error {
+
+	_, err := o.qtx.UpdateTransactionStatusByIDs(
+		ctx, sqlcsqlite.UpdateTransactionStatusByIDsParams{
+			WalletID: walletID,
+			Status:   int64(TxStatusReplaced),
+			TxIds:    txIDs,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("mark txns replaced: %w", err)
+	}
+
+	return nil
+}
+
+// insertReplacementEdges records replacement-history edges from each direct
+// conflict root to the newly inserted confirmed transaction row.
+func (o *sqliteCreateTxOps) insertReplacementEdges(
+	ctx context.Context, walletID int64, replacedTxIDs []int64,
+	replacementTxID int64) error {
+
+	for _, replacedTxID := range replacedTxIDs {
+		_, err := o.qtx.InsertTxReplacementEdge(
+			ctx, sqlcsqlite.InsertTxReplacementEdgeParams{
+				WalletID:        walletID,
+				ReplacedTxID:    replacedTxID,
+				ReplacementTxID: replacementTxID,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("insert replacement edge for %d: %w",
+				replacedTxID, err)
+		}
+	}
+
+	return nil
 }
 
 // insertCreditsSqlite inserts one wallet-owned UTXO row for each credited
