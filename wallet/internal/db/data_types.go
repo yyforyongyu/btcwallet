@@ -704,6 +704,19 @@ type GetAddressQuery struct {
 	ScriptPubKey []byte
 }
 
+// GetAddressDetailsQuery contains the parameters for querying the wallet-
+// facing details of one address by script pubkey.
+type GetAddressDetailsQuery struct {
+	// WalletID is the ID of the wallet to query.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	WalletID uint32
+
+	// ScriptPubKey is the script pubkey to be fetched.
+	ScriptPubKey []byte
+}
+
 // ListAddressesQuery contains the parameters for listing addresses.
 type ListAddressesQuery struct {
 	// WalletID is the ID of the wallet to query.

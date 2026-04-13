@@ -245,6 +245,13 @@ type AddressStore interface {
 	// an error if the address is not found.
 	GetAddress(ctx context.Context, query GetAddressQuery) (*AddressInfo, error)
 
+	// GetAddressDetails looks up one wallet-managed address by script pubkey.
+	//
+	// It returns the spendability and account metadata the wallet uses when
+	// building public UTXO views.
+	GetAddressDetails(ctx context.Context, query GetAddressDetailsQuery) (bool,
+		string, AddressType, error)
+
 	// ListAddresses returns one page of addresses for the given query,
 	// including a next-cursor for the following page.
 	ListAddresses(ctx context.Context, query ListAddressesQuery) (

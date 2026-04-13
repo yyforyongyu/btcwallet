@@ -30,6 +30,13 @@ func (s *Store) GetAddress(ctx context.Context,
 	return nil, notImplemented(ctx, "GetAddress")
 }
 
+// GetAddressDetails is not yet implemented for kvdb.
+func (s *Store) GetAddressDetails(ctx context.Context,
+	_ db.GetAddressDetailsQuery) (bool, string, db.AddressType, error) {
+
+	return false, "", 0, notImplemented(ctx, "GetAddressDetails")
+}
+
 // ListAddresses is not yet implemented for kvdb.
 func (s *Store) ListAddresses(ctx context.Context,
 	_ db.ListAddressesQuery) (page.Result[db.AddressInfo, uint32], error) {

@@ -151,6 +151,17 @@ func (m *mockStore) GetAddress(ctx context.Context,
 	return args.Get(0).(*db.AddressInfo), args.Error(1)
 }
 
+// GetAddressDetails implements the db.AddressStore interface.
+func (m *mockStore) GetAddressDetails(ctx context.Context,
+	query db.GetAddressDetailsQuery) (bool, string, db.AddressType, error) {
+
+	args := m.Called(ctx, query)
+
+	addrType, _ := args.Get(2).(db.AddressType)
+
+	return args.Bool(0), args.String(1), addrType, args.Error(3)
+}
+
 // ListAddresses implements the db.AddressStore interface.
 func (m *mockStore) ListAddresses(ctx context.Context,
 	query db.ListAddressesQuery) (page.Result[db.AddressInfo, uint32], error) {

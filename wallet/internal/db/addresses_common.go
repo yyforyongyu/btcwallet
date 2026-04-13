@@ -13,6 +13,10 @@ import (
 // addresses.
 const DefaultImportedAccountName = "imported"
 
+// defaultUnknownAccountName is the fallback account name returned by the
+// address-details lookup when the owning account cannot be resolved.
+const defaultUnknownAccountName = "unknown"
+
 var (
 	// errInvalidOriginID is returned when an origin ID from the database is
 	// outside the valid range [DerivedAccount, ImportedAccount]. In practice,
@@ -56,6 +60,70 @@ func AccountKeyFromImportedParams(
 		CoinType:    int64(params.Scope.Coin),
 		AccountName: DefaultImportedAccountName,
 	}
+}
+
+// addressDetailsFromInfo derives wallet-facing address metadata from resolved
+// store rows while preserving the legacy AddressDetails policy.
+func addressDetailsFromInfo(walletWatchOnly bool, address *AddressInfo,
+	accountName string, accountWatchOnly bool) (bool, string, AddressType) {
+
+	if walletWatchOnly {
+		return false, defaultUnknownAccountName, address.AddrType
+	}
+
+	if address.Origin == ImportedAccount {
+		return false, DefaultImportedAccountName, address.AddrType
+	}
+
+	if accountWatchOnly {
+		return false, accountName, address.AddrType
+	}
+
+	return true, accountName, address.AddrType
+}
+
+// GetAddressDetails resolves one script-pubkey lookup into the wallet-facing
+// address metadata used by the UTXO manager.
+func GetAddressDetails(ctx context.Context, query GetAddressDetailsQuery,
+	getAddressFn func(context.Context, GetAddressQuery) (*AddressInfo, error),
+	getWalletWatchOnly func(context.Context, uint32) (bool, error),
+	getAccountDetails func(context.Context, uint32) (string, bool, error),
+) (bool, string, AddressType, error) {
+
+	address, err := getAddressFn(ctx, GetAddressQuery(query))
+	if err != nil {
+		if errors.Is(err, ErrAddressNotFound) {
+			return false, defaultUnknownAccountName, 0, nil
+		}
+
+		return false, "", 0, fmt.Errorf("get address details: %w", err)
+	}
+
+	walletWatchOnly, err := getWalletWatchOnly(ctx, query.WalletID)
+	if err != nil {
+		return false, "", 0, fmt.Errorf(
+			"get wallet for address details: %w", err,
+		)
+	}
+
+	accountName, accountWatchOnly, err := getAccountDetails(
+		ctx, address.AccountID,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, defaultUnknownAccountName, address.AddrType, nil
+		}
+
+		return false, "", 0, fmt.Errorf(
+			"get account for address details: %w", err,
+		)
+	}
+
+	spendable, resolvedAccountName, addrType := addressDetailsFromInfo(
+		walletWatchOnly, address, accountName, accountWatchOnly,
+	)
+
+	return spendable, resolvedAccountName, addrType, nil
 }
 
 // GetAddressSecret is a generic helper that retrieves address secret

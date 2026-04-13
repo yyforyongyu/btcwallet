@@ -34,6 +34,34 @@ func (s *Store) GetAddress(ctx context.Context,
 	return db.GetAddressByQuery(ctx, query, getByScript)
 }
 
+// GetAddressDetails retrieves the wallet-facing address metadata for one script
+// pubkey.
+func (s *Store) GetAddressDetails(ctx context.Context,
+	query db.GetAddressDetailsQuery) (bool, string, db.AddressType, error) {
+
+	return db.GetAddressDetails(
+		ctx, query, s.GetAddress,
+		func(ctx context.Context, walletID uint32) (bool, error) {
+			walletInfo, err := s.queries.GetWalletByID(ctx, int64(walletID))
+			if err != nil {
+				return false, fmt.Errorf("get wallet: %w", err)
+			}
+
+			return walletInfo.IsWatchOnly, nil
+		},
+		func(ctx context.Context, accountID uint32) (string, bool, error) {
+			account, err := s.queries.GetAccountPropsById(
+				ctx, int64(accountID),
+			)
+			if err != nil {
+				return "", false, fmt.Errorf("get account props: %w", err)
+			}
+
+			return account.AccountName, account.IsWatchOnly, nil
+		},
+	)
+}
+
 // ListAddresses returns a page of addresses matching the given query.
 func (s *Store) ListAddresses(ctx context.Context,
 	query db.ListAddressesQuery) (page.Result[db.AddressInfo, uint32], error) {
