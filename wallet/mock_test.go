@@ -117,6 +117,62 @@ func (m *mockStore) Balance(ctx context.Context,
 	return result, args.Error(1)
 }
 
+// CreateDerivedAccount implements the db.AccountStore interface.
+func (m *mockStore) CreateDerivedAccount(ctx context.Context,
+	params db.CreateDerivedAccountParams) (*db.AccountInfo, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountInfo), args.Error(1)
+}
+
+// CreateImportedAccount implements the db.AccountStore interface.
+func (m *mockStore) CreateImportedAccount(ctx context.Context,
+	params db.CreateImportedAccountParams) (*db.AccountProperties, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountProperties), args.Error(1)
+}
+
+// GetAccount implements the db.AccountStore interface.
+func (m *mockStore) GetAccount(ctx context.Context,
+	query db.GetAccountQuery) (*db.AccountInfo, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountInfo), args.Error(1)
+}
+
+// ListAccounts implements the db.AccountStore interface.
+func (m *mockStore) ListAccounts(ctx context.Context,
+	query db.ListAccountsQuery) ([]db.AccountInfo, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).([]db.AccountInfo), args.Error(1)
+}
+
+// RenameAccount implements the db.AccountStore interface.
+func (m *mockStore) RenameAccount(ctx context.Context,
+	params db.RenameAccountParams) error {
+
+	args := m.Called(ctx, params)
+	return args.Error(0)
+}
+
 // NewDerivedAddress implements the db.AddressStore interface.
 func (m *mockStore) NewDerivedAddress(ctx context.Context,
 	params db.NewDerivedAddressParams,

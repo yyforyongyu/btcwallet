@@ -14,6 +14,10 @@ import (
 type legacyAddrStore interface {
 	ChainParams() *chaincfg.Params
 	SyncedTo() waddrmgr.BlockStamp
+	ActiveScopedKeyManagers() []waddrmgr.AccountStore
+	NewScopedKeyManager(ns walletdb.ReadWriteBucket,
+		scope waddrmgr.KeyScope,
+		addrSchema waddrmgr.ScopeAddrSchema) (waddrmgr.AccountStore, error)
 	FetchScopedKeyManager(scope waddrmgr.KeyScope) (waddrmgr.AccountStore,
 		error)
 	Address(ns walletdb.ReadBucket,

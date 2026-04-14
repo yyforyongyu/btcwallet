@@ -128,6 +128,7 @@ var (
 //
 // TODO(yy): Break down wallet managers into independent components.
 type Store interface {
+	AccountStore
 	UTXOStore
 	TxStore
 	AddressStore

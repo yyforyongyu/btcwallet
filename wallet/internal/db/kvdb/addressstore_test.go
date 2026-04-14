@@ -313,6 +313,18 @@ type testLegacyAddrStore struct {
 	accountByAddr map[string]uint32
 }
 
+//nolint:lll
+func (s *testLegacyAddrStore) ActiveScopedKeyManagers() []waddrmgr.AccountStore {
+	return nil
+}
+
+func (s *testLegacyAddrStore) NewScopedKeyManager(
+	_ walletdb.ReadWriteBucket, _ waddrmgr.KeyScope,
+	_ waddrmgr.ScopeAddrSchema) (waddrmgr.AccountStore, error) {
+
+	return nil, errTestAccountNotFound
+}
+
 func (s *testLegacyAddrStore) ChainParams() *chaincfg.Params {
 	return s.chainParams
 }
