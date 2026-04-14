@@ -106,9 +106,6 @@ func TestNewAccount(t *testing.T) {
 	require.Equal(t, uint32(1), account.AccountNumber, "expected account 1")
 
 	// We should be able to retrieve the account by its name.
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Once()
-
 	deps.addrStore.On("FetchScopedKeyManager", scope).
 		Return(deps.accountManager, nil).Once()
 
@@ -190,7 +187,6 @@ func TestListAccounts(t *testing.T) {
 	deps.addrStore.On("ActiveScopedKeyManagers").
 		Return([]waddrmgr.AccountStore{deps.accountManager}).Once()
 
-	deps.accountManager.On("Scope").Return(scope).Once()
 	deps.accountManager.On("LastAccount", mock.Anything).
 		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(0)).
@@ -203,9 +199,6 @@ func TestListAccounts(t *testing.T) {
 			AccountNumber: 1,
 			AccountName:   testAccountName,
 		}, nil).Once()
-
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Once()
 
 	// Now, we'll list all accounts and check that we have the default
 	// account and the new account.
@@ -301,9 +294,6 @@ func TestListAccountsByScope(t *testing.T) {
 			AccountName:   accBIP84Name,
 		}, nil).Once()
 
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Once()
-
 	// Now, we'll list the accounts for the BIP0084 scope and check that
 	// we only get the default account for that scope and the new account we
 	// created.
@@ -337,9 +327,6 @@ func TestListAccountsByScope(t *testing.T) {
 			AccountNumber: 1,
 			AccountName:   accBIP49Name,
 		}, nil).Once()
-
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Once()
 
 	// Now, we'll do the same for the BIP0049 scope.
 	accountsBIP49, err := w.ListAccountsByScope(t.Context(), scopeBIP49)
@@ -402,7 +389,6 @@ func TestListAccountsByName(t *testing.T) {
 	// Mock expectations for ListAccountsByName (BIP84 name).
 	deps.addrStore.On("ActiveScopedKeyManagers").
 		Return([]waddrmgr.AccountStore{deps.accountManager}).Once()
-	deps.accountManager.On("Scope").Return(scopeBIP84).Maybe()
 	deps.accountManager.On("LookupAccount", mock.Anything, accBIP84Name).
 		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
@@ -410,9 +396,6 @@ func TestListAccountsByName(t *testing.T) {
 			AccountNumber: 1,
 			AccountName:   accBIP84Name,
 		}, nil).Once()
-
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Times(3)
 
 	// Now, we'll list the accounts for the BIP0084 scope and check that
 	// we only get the default account for that scope and the new account we
@@ -430,7 +413,6 @@ func TestListAccountsByName(t *testing.T) {
 	// Mock expectations for ListAccountsByName (BIP49 name).
 	deps.addrStore.On("ActiveScopedKeyManagers").
 		Return([]waddrmgr.AccountStore{deps.accountManager}).Once()
-	deps.accountManager.On("Scope").Return(scopeBIP49).Maybe()
 	deps.accountManager.On("LookupAccount", mock.Anything, accBIP49Name).
 		Return(uint32(1), nil).Once()
 	deps.accountManager.On("AccountProperties", mock.Anything, uint32(1)).
@@ -453,7 +435,6 @@ func TestListAccountsByName(t *testing.T) {
 	// Mock expectations for non-existent account.
 	deps.addrStore.On("ActiveScopedKeyManagers").
 		Return([]waddrmgr.AccountStore{deps.accountManager}).Once()
-	deps.accountManager.On("Scope").Return(scopeBIP84).Maybe()
 	deps.accountManager.On("LookupAccount", mock.Anything, "non-existent").
 		Return(uint32(0), waddrmgr.ManagerError{
 			ErrorCode: waddrmgr.ErrAccountNotFound,
@@ -498,9 +479,6 @@ func TestGetAccount(t *testing.T) {
 			AccountNumber: 1,
 			AccountName:   testAccountName,
 		}, nil).Once()
-
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Twice()
 
 	// We should be able to get the new account.
 	account, err := w.GetAccount(t.Context(), scope, testAccountName)
@@ -591,9 +569,6 @@ func TestRenameAccount(t *testing.T) {
 			AccountNumber: 1,
 			AccountName:   newName,
 		}, nil).Once()
-
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Once()
 
 	// We should be able to get the account by its new name.
 	account, err := w.GetAccount(t.Context(), scope, newName)
@@ -795,9 +770,6 @@ func TestImportAccount(t *testing.T) {
 			AccountNumber: 1,
 			AccountName:   testAccountName,
 		}, nil).Once()
-
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Once()
 
 	// We should be able to get the account by its name.
 	_, err = w.GetAccount(t.Context(), scope, testAccountName)
