@@ -172,6 +172,18 @@ func (m *mockStore) CreateImportedAccount(ctx context.Context,
 	return args.Get(0).(*db.AccountProperties), args.Error(1)
 }
 
+// ImportAccount implements the db.AccountStore interface.
+func (m *mockStore) ImportAccount(ctx context.Context,
+	params db.ImportAccountParams) (*db.AccountProperties, error) {
+
+	args := m.Called(ctx, params)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*db.AccountProperties), args.Error(1)
+}
+
 // GetAccount implements the db.AccountStore interface.
 func (m *mockStore) GetAccount(ctx context.Context,
 	query db.GetAccountQuery) (*db.AccountInfo, error) {

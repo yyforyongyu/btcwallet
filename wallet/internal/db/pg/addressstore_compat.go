@@ -35,3 +35,10 @@ func (s *Store) ImportTaprootScript(_ context.Context,
 
 	return nil, db.AddressManagerCompatNotImplemented("ImportTaprootScript")
 }
+
+// ImportAccount is not yet implemented for the PostgreSQL store.
+func (s *Store) ImportAccount(_ context.Context,
+	_ db.ImportAccountParams) (*db.AccountProperties, error) {
+
+	return nil, db.AccountManagerCompatNotImplemented("ImportAccount")
+}

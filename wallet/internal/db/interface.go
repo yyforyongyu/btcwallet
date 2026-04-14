@@ -192,6 +192,14 @@ type AccountStore interface {
 	CreateImportedAccount(ctx context.Context,
 		params CreateImportedAccountParams) (*AccountProperties, error)
 
+	// ImportAccount imports one account through the backend's native account-
+	// manager path.
+	//
+	// NOTE: This is a transitional compatibility seam while wallet account APIs
+	// still rely on address-manager-specific behaviors such as dry-run import.
+	ImportAccount(ctx context.Context,
+		params ImportAccountParams) (*AccountProperties, error)
+
 	// GetAccount retrieves information about a specific account,
 	// identified by its name or account number within a given key scope.
 	// It returns an AccountInfo struct containing the account's properties

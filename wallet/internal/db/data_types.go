@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
@@ -448,6 +449,34 @@ type CreateImportedAccountParams struct {
 	// account. This should be encrypted by the caller before being passed
 	// to the database layer. A nil or empty slice indicates watch-only.
 	EncryptedPrivateKey []byte
+}
+
+// ImportAccountParams contains the data required by the transitional store
+// interface to import an account through a backend's native account-manager
+// path.
+type ImportAccountParams struct {
+	// WalletID is the ID of the wallet to import the account into.
+	WalletID uint32
+
+	// Name is the name of the account to import.
+	Name string
+
+	// Scope is the key scope for the account.
+	Scope KeyScope
+
+	// AccountKey is the imported account extended public key.
+	AccountKey *hdkeychain.ExtendedKey
+
+	// MasterFingerprint is the fingerprint of the master key.
+	MasterFingerprint uint32
+
+	// AddrSchema is the address schema override inferred for the imported
+	// account.
+	AddrSchema *ScopeAddrSchema
+
+	// DryRun indicates whether the import should be validated without
+	// persisting the result.
+	DryRun bool
 }
 
 // AccountProperties contains properties associated with each account, such as
