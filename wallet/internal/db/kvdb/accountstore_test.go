@@ -45,6 +45,36 @@ func TestGetAccountSuccess(t *testing.T) {
 	require.Equal(t, infoByName.AccountName, infoByNumber.AccountName)
 }
 
+// TestCreateDerivedAccountSuccess verifies that kvdb.Store creates one derived
+// account through the legacy account-manager path.
+func TestCreateDerivedAccountSuccess(t *testing.T) {
+	t.Parallel()
+
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+
+	addrStore := newAddrStore(t, dbConn)
+	store := NewStore(dbConn, nil, addrStore)
+
+	err := walletdb.View(dbConn, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		return addrStore.Unlock(ns, testPrivPass)
+	})
+	require.NoError(t, err)
+
+	info, err := store.CreateDerivedAccount(t.Context(),
+		db.CreateDerivedAccountParams{
+			WalletID: 0,
+			Scope:    db.KeyScope(waddrmgr.KeyScopeBIP0084),
+			Name:     "created",
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), info.AccountNumber)
+	require.Equal(t, "created", info.AccountName)
+	require.Equal(t, db.DerivedAccount, info.Origin)
+}
+
 // TestListAccountsFilters verifies that kvdb.Store lists and filters accounts
 // through the legacy account manager path.
 func TestListAccountsFilters(t *testing.T) {

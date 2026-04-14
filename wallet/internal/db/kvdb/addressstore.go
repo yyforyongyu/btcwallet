@@ -452,13 +452,6 @@ func (s *Store) GetAddressType(ctx context.Context,
 	return db.AddressTypeInfo{}, notImplemented(ctx, "GetAddressType")
 }
 
-// CreateDerivedAccount is not yet implemented for kvdb.
-func (s *Store) CreateDerivedAccount(ctx context.Context,
-	_ db.CreateDerivedAccountParams) (*db.AccountInfo, error) {
-
-	return nil, notImplemented(ctx, "CreateDerivedAccount")
-}
-
 // CreateImportedAccount is not yet implemented for kvdb.
 func (s *Store) CreateImportedAccount(ctx context.Context,
 	_ db.CreateImportedAccountParams) (*db.AccountProperties, error) {

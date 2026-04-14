@@ -57,12 +57,65 @@ func (s *Store) GetAccount(_ context.Context,
 			return fmt.Errorf("account properties: %w", err)
 		}
 
-		info = kvdbAccountInfo(props)
+		info = kvdbAccountInfoFromProps(props)
 
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kvdb.Store.GetAccount: %w", err)
+	}
+
+	return info, nil
+}
+
+// CreateDerivedAccount creates one derived account through the legacy address-
+// manager path.
+func (s *Store) CreateDerivedAccount(_ context.Context,
+	params db.CreateDerivedAccountParams) (*db.AccountInfo, error) {
+
+	if s.addrStore == nil {
+		return nil, fmt.Errorf(
+			"kvdb.Store.CreateDerivedAccount: %w",
+			errMissingLegacyAddrStore,
+		)
+	}
+
+	err := params.Validate()
+	if err != nil {
+		return nil, fmt.Errorf("validate params: %w", err)
+	}
+
+	var info *db.AccountInfo
+
+	err = walletdb.Update(s.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errMissingAddrmgrNamespace
+		}
+
+		manager, err := kvdbScopedManager(
+			ns, s.addrStore, params.Scope,
+		)
+		if err != nil {
+			return err
+		}
+
+		accountNum, err := manager.NewAccount(ns, params.Name)
+		if err != nil {
+			return fmt.Errorf("new account: %w", err)
+		}
+
+		props, err := manager.AccountProperties(ns, accountNum)
+		if err != nil {
+			return fmt.Errorf("account properties: %w", err)
+		}
+
+		info = kvdbAccountInfoFromProps(props)
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kvdb.Store.CreateDerivedAccount: %w", err)
 	}
 
 	return info, nil
@@ -278,7 +331,7 @@ func kvdbListScopeAccounts(ns walletdb.ReadBucket,
 			return nil, fmt.Errorf("account properties: %w", err)
 		}
 
-		return []db.AccountInfo{*kvdbAccountInfo(props)}, nil
+		return []db.AccountInfo{*kvdbAccountInfoFromProps(props)}, nil
 	}
 
 	var infos []db.AccountInfo
@@ -289,7 +342,7 @@ func kvdbListScopeAccounts(ns walletdb.ReadBucket,
 			return fmt.Errorf("account properties: %w", err)
 		}
 
-		infos = append(infos, *kvdbAccountInfo(props))
+		infos = append(infos, *kvdbAccountInfoFromProps(props))
 
 		return nil
 	})
@@ -300,9 +353,12 @@ func kvdbListScopeAccounts(ns walletdb.ReadBucket,
 	return infos, nil
 }
 
-// kvdbAccountInfo adapts one legacy account properties record into the db
-// account view used by store callers.
-func kvdbAccountInfo(props *waddrmgr.AccountProperties) *db.AccountInfo {
+// kvdbAccountInfoFromProps adapts one legacy account properties record into the
+// db account view used by store callers.
+func kvdbAccountInfoFromProps(
+	props *waddrmgr.AccountProperties,
+) *db.AccountInfo {
+
 	origin := db.DerivedAccount
 	accountNum := props.AccountNumber
 
@@ -324,6 +380,38 @@ func kvdbAccountInfo(props *waddrmgr.AccountProperties) *db.AccountInfo {
 		time.Time{},
 		db.KeyScope(props.KeyScope),
 	)
+}
+
+// kvdbScopedManager returns one scoped manager, creating the default scope on
+// demand when the legacy root manager does not have it yet.
+func kvdbScopedManager(ns walletdb.ReadWriteBucket, addrStore legacyAddrStore,
+	scope db.KeyScope) (waddrmgr.AccountStore, error) {
+
+	manager, err := addrStore.FetchScopedKeyManager(waddrmgr.KeyScope(scope))
+	if err == nil {
+		return manager, nil
+	}
+
+	if !waddrmgr.IsError(err, waddrmgr.ErrScopeNotFound) {
+		return nil, fmt.Errorf("fetch scoped manager: %w", err)
+	}
+
+	schema, ok := db.ScopeAddrMap[scope]
+	if !ok {
+		return nil, fmt.Errorf("scope %d/%d: %w", scope.Purpose, scope.Coin,
+			db.ErrUnknownKeyScope)
+	}
+
+	manager, err = addrStore.NewScopedKeyManager(ns, waddrmgr.KeyScope(scope),
+		waddrmgr.ScopeAddrSchema{
+			InternalAddrType: waddrmgr.AddressType(schema.InternalAddrType),
+			ExternalAddrType: waddrmgr.AddressType(schema.ExternalAddrType),
+		})
+	if err != nil {
+		return nil, fmt.Errorf("create scoped manager: %w", err)
+	}
+
+	return manager, nil
 }
 
 // kvdbSortAccountInfos keeps account listings stable and mirrors SQL ordering:
