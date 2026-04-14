@@ -14,8 +14,9 @@ import (
 // Store is the PostgreSQL implementation of the
 // WalletStore interface.
 type Store struct {
-	db      *sql.DB
-	queries *sqlc.Queries
+	db           *sql.DB
+	queries      *sqlc.Queries
+	runtimeState storeRuntimeState
 }
 
 // NewStore creates a new PostgreSQL-based WalletStore. It handles
