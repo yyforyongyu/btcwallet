@@ -459,13 +459,6 @@ func (s *Store) CreateImportedAccount(ctx context.Context,
 	return nil, notImplemented(ctx, "CreateImportedAccount")
 }
 
-// ImportAccount is not yet implemented for kvdb.
-func (s *Store) ImportAccount(ctx context.Context,
-	_ db.ImportAccountParams) (*db.AccountProperties, error) {
-
-	return nil, notImplemented(ctx, "ImportAccount")
-}
-
 // kvdbAddressFromPkScript extracts the first standard address from one script.
 //
 // This lets the legacy address manager resolve wallet metadata from a

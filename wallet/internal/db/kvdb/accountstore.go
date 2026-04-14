@@ -2,6 +2,7 @@ package kvdb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -119,6 +120,111 @@ func (s *Store) CreateDerivedAccount(_ context.Context,
 	}
 
 	return info, nil
+}
+
+// ImportAccount imports one account through the legacy account-manager path.
+func (s *Store) ImportAccount(_ context.Context,
+	params db.ImportAccountParams) (*db.AccountProperties, error) {
+
+	err := kvdbValidateImportAccountParams(s.addrStore, params)
+	if err != nil {
+		return nil, err
+	}
+
+	var props *db.AccountProperties
+
+	err = walletdb.Update(s.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errMissingAddrmgrNamespace
+		}
+
+		var txErr error
+
+		props, txErr = kvdbImportAccountProperties(
+			ns, s.addrStore, params,
+		)
+		if txErr != nil {
+			return txErr
+		}
+
+		if params.DryRun {
+			return walletdb.ErrDryRunRollBack
+		}
+
+		return nil
+	})
+	if err != nil &&
+		(!params.DryRun || !errors.Is(err, walletdb.ErrDryRunRollBack)) {
+
+		return nil, fmt.Errorf("kvdb.Store.ImportAccount: %w", err)
+	}
+
+	return props, nil
+}
+
+func kvdbValidateImportAccountParams(addrStore legacyAddrStore,
+	params db.ImportAccountParams) error {
+
+	if addrStore == nil {
+		return fmt.Errorf(
+			"kvdb.Store.ImportAccount: %w", errMissingLegacyAddrStore,
+		)
+	}
+
+	if params.AccountKey == nil {
+		return db.ErrMissingAccountPublicKey
+	}
+
+	return nil
+}
+
+func kvdbImportAccountProperties(ns walletdb.ReadWriteBucket,
+	addrStore legacyAddrStore,
+	params db.ImportAccountParams) (*db.AccountProperties, error) {
+
+	scopedMgr, err := kvdbImportAccountManager(
+		ns, addrStore, params.Scope, params.AddrSchema,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	accountNum, err := scopedMgr.NewAccountWatchingOnly(
+		ns,
+		params.Name,
+		params.AccountKey,
+		params.MasterFingerprint,
+		kvdbImportedAddrSchema(params.AddrSchema),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("new account watching-only: %w", err)
+	}
+
+	legacyProps, err := scopedMgr.AccountProperties(ns, accountNum)
+	if err != nil {
+		return nil, fmt.Errorf("account properties: %w", err)
+	}
+
+	if params.DryRun {
+		legacyProps, err = kvdbImportAccountDryRun(ns, legacyProps, scopedMgr)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return kvdbAccountPropertiesFromProps(legacyProps), nil
+}
+
+func kvdbImportedAddrSchema(
+	addrSchema *db.ScopeAddrSchema,
+) *waddrmgr.ScopeAddrSchema {
+
+	if addrSchema == nil {
+		return nil
+	}
+
+	return kvdbWaddrmgrScopeAddrSchema(*addrSchema)
 }
 
 // ListAccounts lists accounts through the legacy address-manager path.
@@ -382,6 +488,48 @@ func kvdbAccountInfoFromProps(
 	)
 }
 
+// kvdbAccountPropertiesFromProps adapts one legacy account properties record
+// into the db account-properties view used by store callers.
+func kvdbAccountPropertiesFromProps(
+	props *waddrmgr.AccountProperties,
+) *db.AccountProperties {
+
+	origin := db.DerivedAccount
+
+	accountNum := props.AccountNumber
+	if props.AccountPubKey == nil ||
+		accountNum == waddrmgr.ImportedAddrAccount {
+
+		accountNum = 0
+		origin = db.ImportedAccount
+	}
+
+	var addrSchema *db.ScopeAddrSchema
+	if props.AddrSchema != nil {
+		addrSchema = &db.ScopeAddrSchema{
+			InternalAddrType: db.AddressType(
+				props.AddrSchema.InternalAddrType,
+			),
+			ExternalAddrType: db.AddressType(
+				props.AddrSchema.ExternalAddrType,
+			),
+		}
+	}
+
+	return &db.AccountProperties{
+		AccountNumber:        accountNum,
+		AccountName:          props.AccountName,
+		Origin:               origin,
+		ExternalKeyCount:     props.ExternalKeyCount,
+		InternalKeyCount:     props.InternalKeyCount,
+		ImportedKeyCount:     props.ImportedKeyCount,
+		MasterKeyFingerprint: props.MasterKeyFingerprint,
+		KeyScope:             db.KeyScope(props.KeyScope),
+		IsWatchOnly:          props.IsWatchOnly,
+		AddrSchema:           addrSchema,
+	}
+}
+
 // kvdbScopedManager returns one scoped manager, creating the default scope on
 // demand when the legacy root manager does not have it yet.
 func kvdbScopedManager(ns walletdb.ReadWriteBucket, addrStore legacyAddrStore,
@@ -412,6 +560,83 @@ func kvdbScopedManager(ns walletdb.ReadWriteBucket, addrStore legacyAddrStore,
 	}
 
 	return manager, nil
+}
+
+// kvdbImportAccountManager returns one scoped manager for account import,
+// creating the scope with the requested address schema when necessary.
+func kvdbImportAccountManager(ns walletdb.ReadWriteBucket,
+	addrStore legacyAddrStore, scope db.KeyScope,
+	addrSchema *db.ScopeAddrSchema) (waddrmgr.AccountStore, error) {
+
+	manager, err := addrStore.FetchScopedKeyManager(waddrmgr.KeyScope(scope))
+	if err == nil {
+		return manager, nil
+	}
+
+	if !waddrmgr.IsError(err, waddrmgr.ErrScopeNotFound) {
+		return nil, fmt.Errorf("fetch scoped manager: %w", err)
+	}
+
+	var schema db.ScopeAddrSchema
+	if addrSchema != nil {
+		schema = *addrSchema
+	} else {
+		var ok bool
+
+		schema, ok = db.ScopeAddrMap[scope]
+		if !ok {
+			return nil, fmt.Errorf("scope %d/%d: %w", scope.Purpose,
+				scope.Coin, db.ErrUnknownKeyScope)
+		}
+	}
+
+	manager, err = addrStore.NewScopedKeyManager(
+		ns, waddrmgr.KeyScope(scope),
+		*kvdbWaddrmgrScopeAddrSchema(schema),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create scoped manager: %w", err)
+	}
+
+	return manager, nil
+}
+
+// kvdbWaddrmgrScopeAddrSchema converts one db scope schema to the legacy
+// waddrmgr schema type.
+func kvdbWaddrmgrScopeAddrSchema(
+	schema db.ScopeAddrSchema,
+) *waddrmgr.ScopeAddrSchema {
+
+	return &waddrmgr.ScopeAddrSchema{
+		InternalAddrType: waddrmgr.AddressType(schema.InternalAddrType),
+		ExternalAddrType: waddrmgr.AddressType(schema.ExternalAddrType),
+	}
+}
+
+// kvdbImportAccountDryRun validates one imported account by deriving one
+// external and one internal address before rolling back the transaction.
+func kvdbImportAccountDryRun(ns walletdb.ReadWriteBucket,
+	props *waddrmgr.AccountProperties,
+	scopedMgr waddrmgr.AccountStore) (*waddrmgr.AccountProperties, error) {
+
+	defer scopedMgr.InvalidateAccountCache(props.AccountNumber)
+
+	_, err := scopedMgr.NextExternalAddresses(ns, props.AccountNumber, 1)
+	if err != nil {
+		return nil, fmt.Errorf("next external addresses: %w", err)
+	}
+
+	_, err = scopedMgr.NextInternalAddresses(ns, props.AccountNumber, 1)
+	if err != nil {
+		return nil, fmt.Errorf("next internal addresses: %w", err)
+	}
+
+	props, err = scopedMgr.AccountProperties(ns, props.AccountNumber)
+	if err != nil {
+		return nil, fmt.Errorf("account properties: %w", err)
+	}
+
+	return props, nil
 }
 
 // kvdbSortAccountInfos keeps account listings stable and mirrors SQL ordering:

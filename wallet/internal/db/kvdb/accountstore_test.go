@@ -3,6 +3,8 @@ package kvdb
 import (
 	"testing"
 
+	"github.com/btcsuite/btcd/btcutil/hdkeychain"
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
@@ -150,6 +152,77 @@ func TestRenameAccountSuccess(t *testing.T) {
 	require.Equal(t, "after", info.AccountName)
 }
 
+// TestImportAccountSuccess verifies that kvdb.Store imports one watch-only
+// account through the legacy account-manager path.
+func TestImportAccountSuccess(t *testing.T) {
+	t.Parallel()
+
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+
+	addrStore := newAddrStore(t, dbConn)
+	store := NewStore(dbConn, nil, addrStore)
+	accountKey := testAccountPubKey(t, waddrmgr.KeyScopeBIP0084)
+	name := "watch-only"
+	schema := db.ScopeAddrMap[db.KeyScopeBIP0084]
+
+	props, err := store.ImportAccount(t.Context(), db.ImportAccountParams{
+		WalletID:          0,
+		Name:              name,
+		Scope:             db.KeyScope(waddrmgr.KeyScopeBIP0084),
+		AccountKey:        accountKey,
+		MasterFingerprint: 101,
+		AddrSchema:        &schema,
+		DryRun:            false,
+	})
+	require.NoError(t, err)
+	require.Equal(t, name, props.AccountName)
+	require.Equal(t, db.DerivedAccount, props.Origin)
+
+	info, err := store.GetAccount(t.Context(), db.GetAccountQuery{
+		WalletID: 0,
+		Scope:    db.KeyScope(waddrmgr.KeyScopeBIP0084),
+		Name:     &name,
+	})
+	require.NoError(t, err)
+	require.Equal(t, name, info.AccountName)
+	require.Equal(t, db.DerivedAccount, info.Origin)
+}
+
+// TestImportAccountDryRun verifies that kvdb.Store validates a watch-only
+// import without persisting it.
+func TestImportAccountDryRun(t *testing.T) {
+	t.Parallel()
+
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+
+	addrStore := newAddrStore(t, dbConn)
+	store := NewStore(dbConn, nil, addrStore)
+	accountKey := testAccountPubKey(t, waddrmgr.KeyScopeBIP0084)
+	name := "dry-run"
+	schema := db.ScopeAddrMap[db.KeyScopeBIP0084]
+
+	props, err := store.ImportAccount(t.Context(), db.ImportAccountParams{
+		WalletID:          0,
+		Name:              name,
+		Scope:             db.KeyScope(waddrmgr.KeyScopeBIP0084),
+		AccountKey:        accountKey,
+		MasterFingerprint: 202,
+		AddrSchema:        &schema,
+		DryRun:            true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, name, props.AccountName)
+
+	_, err = store.GetAccount(t.Context(), db.GetAccountQuery{
+		WalletID: 0,
+		Scope:    db.KeyScope(waddrmgr.KeyScopeBIP0084),
+		Name:     &name,
+	})
+	require.ErrorIs(t, err, db.ErrAccountNotFound)
+}
+
 func createLegacyAccount(t *testing.T, dbConn walletdb.DB,
 	addrStore *waddrmgr.Manager, scope waddrmgr.KeyScope,
 	name string) *waddrmgr.AccountProperties {
@@ -182,4 +255,34 @@ func createLegacyAccount(t *testing.T, dbConn walletdb.DB,
 	require.NoError(t, err)
 
 	return props
+}
+
+func testAccountPubKey(t *testing.T,
+	scope waddrmgr.KeyScope) *hdkeychain.ExtendedKey {
+
+	t.Helper()
+
+	seed := make([]byte, 32)
+	for i := range seed {
+		seed[i] = byte(i + 1)
+	}
+
+	key, err := hdkeychain.NewMaster(seed, &chaincfg.RegressionNetParams)
+	require.NoError(t, err)
+
+	path := []uint32{
+		scope.Purpose + hdkeychain.HardenedKeyStart,
+		scope.Coin + hdkeychain.HardenedKeyStart,
+		hdkeychain.HardenedKeyStart,
+	}
+
+	for _, child := range path {
+		key, err = key.Derive(child)
+		require.NoError(t, err)
+	}
+
+	key, err = key.Neuter()
+	require.NoError(t, err)
+
+	return key
 }
