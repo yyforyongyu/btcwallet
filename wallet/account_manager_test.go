@@ -14,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
@@ -22,6 +23,10 @@ import (
 
 func hardenedKey(key uint32) uint32 {
 	return key + hdkeychain.HardenedKeyStart
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }
 
 func deriveAcctPubKey(t *testing.T, root *hdkeychain.ExtendedKey,
@@ -653,15 +658,16 @@ func TestBalance(t *testing.T) {
 	_, err := w.NewAccount(t.Context(), scope, testAccountName)
 	require.NoError(t, err)
 
-	// Mock expectations for initial balance (0).
-	deps.txStore.On("UnspentOutputs", mock.Anything).
-		Return([]wtxmgr.Credit(nil), nil).Once()
-
-	deps.addrStore.On("FetchScopedKeyManager", scope).
-		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("LookupAccount", mock.Anything, testAccountName).
-		Return(uint32(1), nil).Once()
+	deps.store.On("GetAccount", mock.Anything, db.GetAccountQuery{
+		WalletID: 0,
+		Scope:    db.KeyScope(scope),
+		Name:     ptr(testAccountName),
+	}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
+	deps.store.On("Balance", mock.Anything, db.BalanceParams{
+		WalletID: 0,
+		Account:  ptr(uint32(1)),
+		MinConfs: ptr(int32(1)),
+	}).Return(db.BalanceResult{}, nil).Once()
 
 	// The balance should be zero initially.
 	balance, err := w.Balance(t.Context(), 1, scope, testAccountName)
@@ -669,33 +675,16 @@ func TestBalance(t *testing.T) {
 	require.Equal(t, btcutil.Amount(0), balance)
 
 	// Now, we'll add a UTXO to the account.
-	mockAddr, _ := btcutil.NewAddressWitnessPubKeyHash(
-		make([]byte, 20), w.cfg.ChainParams,
-	)
-	pkScript, err := txscript.PayToAddrScript(mockAddr)
-	require.NoError(t, err)
-
-	// Mock expectations for balance with UTXO.
-	deps.txStore.On("UnspentOutputs", mock.Anything).Return([]wtxmgr.Credit{
-		{
-			Amount:   100,
-			PkScript: pkScript,
-			BlockMeta: wtxmgr.BlockMeta{
-				Block: wtxmgr.Block{
-					Height: 1,
-				},
-			},
-		},
-	}, nil).Once()
-
-	deps.addrStore.On("FetchScopedKeyManager", scope).
-		Return(deps.accountManager, nil).Once()
-	deps.addrStore.On("AddrAccount", mock.Anything, mockAddr).
-		Return(deps.accountManager, uint32(1), nil).Once()
-
-	deps.accountManager.On("LookupAccount", mock.Anything, testAccountName).
-		Return(uint32(1), nil).Once()
-	deps.accountManager.On("Scope").Return(scope).Once()
+	deps.store.On("GetAccount", mock.Anything, db.GetAccountQuery{
+		WalletID: 0,
+		Scope:    db.KeyScope(scope),
+		Name:     ptr(testAccountName),
+	}).Return(&db.AccountInfo{AccountNumber: 1}, nil).Once()
+	deps.store.On("Balance", mock.Anything, db.BalanceParams{
+		WalletID: 0,
+		Account:  ptr(uint32(1)),
+		MinConfs: ptr(int32(1)),
+	}).Return(db.BalanceResult{Total: 100}, nil).Once()
 
 	// The balance should now be 100.
 	balance, err = w.Balance(t.Context(), 1, scope, testAccountName)
@@ -703,22 +692,16 @@ func TestBalance(t *testing.T) {
 	require.Equal(t, btcutil.Amount(100), balance)
 
 	// Mock expectations for balance of non-existent account.
-	deps.addrStore.On("FetchScopedKeyManager", scope).
-		Return(deps.accountManager, nil).Once()
-
-	deps.accountManager.On("LookupAccount", mock.Anything, "non-existent").
-		Return(uint32(0), waddrmgr.ManagerError{
-			ErrorCode: waddrmgr.ErrAccountNotFound,
-		}).Once()
+	deps.store.On("GetAccount", mock.Anything, db.GetAccountQuery{
+		WalletID: 0,
+		Scope:    db.KeyScope(scope),
+		Name:     ptr("non-existent"),
+	}).Return((*db.AccountInfo)(nil), db.ErrAccountNotFound).Once()
 
 	// We should get an error when trying to get the balance of a
 	// non-existent account.
 	_, err = w.Balance(t.Context(), 1, scope, "non-existent")
-	require.Error(t, err)
-	require.True(
-		t, waddrmgr.IsError(err, waddrmgr.ErrAccountNotFound),
-		"expected ErrAccountNotFound",
-	)
+	require.ErrorIs(t, err, db.ErrAccountNotFound)
 }
 
 // TestImportAccount tests that the ImportAccount works as expected.
