@@ -173,15 +173,77 @@ func (m *mockStore) CreateImportedAccount(ctx context.Context,
 }
 
 // ImportAccount implements the db.AccountStore interface.
+//
+//nolint:cyclop
 func (m *mockStore) ImportAccount(ctx context.Context,
 	params db.ImportAccountParams) (*db.AccountProperties, error) {
 
-	args := m.Called(ctx, params)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
+	if m.hasExpectation("ImportAccount") || m.addrStore == nil {
+		args := m.Called(ctx, params)
+		if args.Get(0) == nil {
+			return nil, args.Error(1)
+		}
+
+		return args.Get(0).(*db.AccountProperties), args.Error(1)
 	}
 
-	return args.Get(0).(*db.AccountProperties), args.Error(1)
+	manager, err := m.addrStore.FetchScopedKeyManager(
+		waddrmgr.KeyScope(params.Scope),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var addrSchema *waddrmgr.ScopeAddrSchema
+	if params.AddrSchema != nil {
+		addrSchema = &waddrmgr.ScopeAddrSchema{
+			InternalAddrType: waddrmgr.AddressType(
+				params.AddrSchema.InternalAddrType,
+			),
+			ExternalAddrType: waddrmgr.AddressType(
+				params.AddrSchema.ExternalAddrType,
+			),
+		}
+	}
+
+	accountNum, err := manager.NewAccountWatchingOnly(
+		nil,
+		params.Name,
+		params.AccountKey,
+		params.MasterFingerprint,
+		addrSchema,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	props, err := manager.AccountProperties(nil, accountNum)
+	if err != nil {
+		return nil, err
+	}
+
+	if params.DryRun {
+		defer manager.InvalidateAccountCache(accountNum)
+
+		_, err = manager.NextExternalAddresses(nil, accountNum, 1)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = manager.NextInternalAddresses(nil, accountNum, 1)
+		if err != nil {
+			return nil, err
+		}
+
+		props, err = manager.AccountProperties(nil, accountNum)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	result := mockAccountPropertiesFromProps(props)
+
+	return &result, nil
 }
 
 // GetAccount implements the db.AccountStore interface.
@@ -638,6 +700,46 @@ func mockAccountInfoFromProps(
 		time.Time{},
 		db.KeyScope(props.KeyScope),
 	)
+}
+
+func mockAccountPropertiesFromProps(
+	props *waddrmgr.AccountProperties,
+) db.AccountProperties {
+
+	origin := db.DerivedAccount
+
+	accountNum := props.AccountNumber
+	if props.AccountNumber == waddrmgr.ImportedAddrAccount ||
+		props.AccountName == waddrmgr.ImportedAddrAccountName {
+
+		origin = db.ImportedAccount
+		accountNum = 0
+	}
+
+	var addrSchema *db.ScopeAddrSchema
+	if props.AddrSchema != nil {
+		addrSchema = &db.ScopeAddrSchema{
+			InternalAddrType: db.AddressType(
+				props.AddrSchema.InternalAddrType,
+			),
+			ExternalAddrType: db.AddressType(
+				props.AddrSchema.ExternalAddrType,
+			),
+		}
+	}
+
+	return db.AccountProperties{
+		AccountNumber:        accountNum,
+		AccountName:          props.AccountName,
+		Origin:               origin,
+		ExternalKeyCount:     props.ExternalKeyCount,
+		InternalKeyCount:     props.InternalKeyCount,
+		ImportedKeyCount:     props.ImportedKeyCount,
+		MasterKeyFingerprint: props.MasterKeyFingerprint,
+		KeyScope:             db.KeyScope(props.KeyScope),
+		IsWatchOnly:          props.IsWatchOnly,
+		AddrSchema:           addrSchema,
+	}
 }
 
 // mockTxStore is a mock implementation of the wtxmgr.TxStore interface.

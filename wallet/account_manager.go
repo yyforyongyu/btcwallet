@@ -191,6 +191,37 @@ func accountPropertiesFromStoreInfo(
 	}
 }
 
+// accountPropertiesFromStoreProps adapts one store account-properties record to
+// the wallet-facing account properties type.
+func accountPropertiesFromStoreProps(
+	props db.AccountProperties,
+) waddrmgr.AccountProperties {
+
+	result := waddrmgr.AccountProperties{
+		AccountNumber:        props.AccountNumber,
+		AccountName:          props.AccountName,
+		ExternalKeyCount:     props.ExternalKeyCount,
+		InternalKeyCount:     props.InternalKeyCount,
+		ImportedKeyCount:     props.ImportedKeyCount,
+		MasterKeyFingerprint: props.MasterKeyFingerprint,
+		KeyScope:             waddrmgr.KeyScope(props.KeyScope),
+		IsWatchOnly:          props.IsWatchOnly,
+	}
+
+	if props.AddrSchema != nil {
+		result.AddrSchema = &waddrmgr.ScopeAddrSchema{
+			InternalAddrType: waddrmgr.AddressType(
+				props.AddrSchema.InternalAddrType,
+			),
+			ExternalAddrType: waddrmgr.AddressType(
+				props.AddrSchema.ExternalAddrType,
+			),
+		}
+	}
+
+	return result
+}
+
 // accountResultsFromStoreInfos adapts a slice of store account rows to wallet
 // account results.
 func accountResultsFromStoreInfos(infos []db.AccountInfo) []AccountResult {
@@ -432,12 +463,7 @@ func (w *Wallet) ImportAccount(ctx context.Context,
 
 // importAccountInternal is the internal implementation of ImportAccount,
 // allowing callers (like Manager.Create) to bypass the started check.
-//
-// TODO(yy): we will move the db operation to a dedicated method, so we can
-// ignore cyclop for now.
-//
-//nolint:cyclop
-func (w *Wallet) importAccountInternal(_ context.Context,
+func (w *Wallet) importAccountInternal(ctx context.Context,
 	name string, accountKey *hdkeychain.ExtendedKey,
 	masterKeyFingerprint uint32, addrType waddrmgr.AddressType,
 	dryRun bool) (*waddrmgr.AccountProperties, error) {
@@ -457,92 +483,30 @@ func (w *Wallet) importAccountInternal(_ context.Context,
 		return nil, err
 	}
 
-	var props *waddrmgr.AccountProperties
-
-	// We'll perform the import within a database update transaction to ensure
-	// atomicity. If dryRun is enabled, we'll return a special error at the end
-	// to trigger a rollback.
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// Check if a manager for this key scope already exists. If not, we'll
-		// create a new one using the inferred schema.
-		scopedMgr, err := w.addrStore.FetchScopedKeyManager(keyScope)
-		if err != nil {
-			scopedMgr, err = w.addrStore.NewScopedKeyManager(
-				ns, keyScope, *addrSchema,
-			)
-			if err != nil {
-				return err
-			}
+	var storeAddrSchema *db.ScopeAddrSchema
+	if addrSchema != nil {
+		storeAddrSchema = &db.ScopeAddrSchema{
+			InternalAddrType: db.AddressType(addrSchema.InternalAddrType),
+			ExternalAddrType: db.AddressType(addrSchema.ExternalAddrType),
 		}
+	}
 
-		// Create the new watching-only account using the provided key. Since we
-		// only have the public key, the wallet won't be able to sign for this
-		// account unless the private key is also provided later.
-		account, err := scopedMgr.NewAccountWatchingOnly(
-			ns, name, accountKey, masterKeyFingerprint, addrSchema,
-		)
-		if err != nil {
-			return err
-		}
-
-		// Retrieve the properties for the newly created account.
-		props, err = scopedMgr.AccountProperties(ns, account)
-		if !dryRun {
-			return err
-		}
-
-		// If this is a dry-run, we'll generate a few addresses to simulate the
-		// import process and then roll back.
-		props, err = importAccountDryRun(ns, props, scopedMgr)
-		if err != nil {
-			return err
-		}
-
-		// Make sure we always roll back the dry-run transaction by returning an
-		// error here.
-		return walletdb.ErrDryRunRollBack
+	props, err := w.store.ImportAccount(ctx, db.ImportAccountParams{
+		WalletID:          w.id,
+		Name:              name,
+		Scope:             db.KeyScope(keyScope),
+		AccountKey:        accountKey,
+		MasterFingerprint: masterKeyFingerprint,
+		AddrSchema:        storeAddrSchema,
+		DryRun:            dryRun,
 	})
-
-	// If this was a dry-run, we ignore the rollback error.
-	if err != nil && !dryRun && !errors.Is(err, walletdb.ErrDryRunRollBack) {
-		return nil, err
-	}
-
-	return props, nil
-}
-
-// importAccountDryRun simulates an account import by generating a single
-// address for both the internal and external derivation branches. This ensures
-// that the provided account key is valid and can be used to derive addresses.
-// The changes made during this simulation are rolled back by the caller.
-func importAccountDryRun(ns walletdb.ReadWriteBucket,
-	props *waddrmgr.AccountProperties, scopedMgr waddrmgr.AccountStore) (
-	*waddrmgr.AccountProperties, error) {
-
-	// The importAccount method above will cache the imported account within the
-	// scoped manager. Since this is a dry-run attempt, we'll want to invalidate
-	// the cache for it.
-	defer scopedMgr.InvalidateAccountCache(props.AccountNumber)
-
-	_, err := scopedMgr.NextExternalAddresses(ns, props.AccountNumber, 1)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = scopedMgr.NextInternalAddresses(ns, props.AccountNumber, 1)
-	if err != nil {
-		return nil, err
-	}
+	waddrProps := accountPropertiesFromStoreProps(*props)
 
-	// Refresh the account's properties after generating the addresses.
-	props, err = scopedMgr.AccountProperties(ns, props.AccountNumber)
-	if err != nil {
-		return nil, err
-	}
-
-	return props, nil
+	return &waddrProps, nil
 }
 
 // validateExtendedPubKey ensures a sane derived public key is provided.
