@@ -13,8 +13,9 @@ import (
 
 // Store is the SQLite implementation of the WalletStore interface.
 type Store struct {
-	db      *sql.DB
-	queries *sqlc.Queries
+	db           *sql.DB
+	queries      *sqlc.Queries
+	runtimeState storeRuntimeState
 }
 
 // NewStore creates a new SQLite-based WalletStore. It handles the full
