@@ -119,7 +119,7 @@ var _ AccountManager = (*Wallet)(nil)
 // restoring, new accounts may not be created when all of the previous 100
 // accounts have no transaction history (this is a deviation from the BIP0044
 // spec, which allows no unused account gaps).
-func (w *Wallet) NewAccount(_ context.Context, scope waddrmgr.KeyScope,
+func (w *Wallet) NewAccount(ctx context.Context, scope waddrmgr.KeyScope,
 	name string) (*waddrmgr.AccountProperties, error) {
 
 	err := w.state.validateStarted()
@@ -127,29 +127,20 @@ func (w *Wallet) NewAccount(_ context.Context, scope waddrmgr.KeyScope,
 		return nil, err
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(scope)
+	info, err := w.store.CreateDerivedAccount(
+		ctx, db.CreateDerivedAccountParams{
+			WalletID: w.id,
+			Scope:    db.KeyScope(scope),
+			Name:     name,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	var props *waddrmgr.AccountProperties
+	props := accountPropertiesFromStoreInfo(*info)
 
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// Create a new account under the current key scope.
-		accNum, err := manager.NewAccount(addrmgrNs, name)
-		if err != nil {
-			return err
-		}
-
-		// Get the account's properties.
-		props, err = manager.AccountProperties(addrmgrNs, accNum)
-
-		return err
-	})
-
-	return props, err
+	return &props, nil
 }
 
 // AccountResult is the result of a ListAccounts query.
@@ -178,16 +169,25 @@ type AccountsResult struct {
 // account result.
 func accountResultFromStoreInfo(info db.AccountInfo) AccountResult {
 	return AccountResult{
-		AccountProperties: waddrmgr.AccountProperties{
-			AccountNumber:    info.AccountNumber,
-			AccountName:      info.AccountName,
-			ExternalKeyCount: info.ExternalKeyCount,
-			InternalKeyCount: info.InternalKeyCount,
-			ImportedKeyCount: info.ImportedKeyCount,
-			KeyScope:         waddrmgr.KeyScope(info.KeyScope),
-			IsWatchOnly:      info.IsWatchOnly,
-		},
-		TotalBalance: info.ConfirmedBalance + info.UnconfirmedBalance,
+		AccountProperties: accountPropertiesFromStoreInfo(info),
+		TotalBalance:      info.ConfirmedBalance + info.UnconfirmedBalance,
+	}
+}
+
+// accountPropertiesFromStoreInfo adapts one store account row to legacy wallet
+// account properties.
+func accountPropertiesFromStoreInfo(
+	info db.AccountInfo,
+) waddrmgr.AccountProperties {
+
+	return waddrmgr.AccountProperties{
+		AccountNumber:    info.AccountNumber,
+		AccountName:      info.AccountName,
+		ExternalKeyCount: info.ExternalKeyCount,
+		InternalKeyCount: info.InternalKeyCount,
+		ImportedKeyCount: info.ImportedKeyCount,
+		KeyScope:         waddrmgr.KeyScope(info.KeyScope),
+		IsWatchOnly:      info.IsWatchOnly,
 	}
 }
 

@@ -121,12 +121,43 @@ func (m *mockStore) Balance(ctx context.Context,
 func (m *mockStore) CreateDerivedAccount(ctx context.Context,
 	params db.CreateDerivedAccountParams) (*db.AccountInfo, error) {
 
-	args := m.Called(ctx, params)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
+	if m.hasExpectation("CreateDerivedAccount") || m.addrStore == nil {
+		args := m.Called(ctx, params)
+		if args.Get(0) == nil {
+			return nil, args.Error(1)
+		}
+
+		return args.Get(0).(*db.AccountInfo), args.Error(1)
 	}
 
-	return args.Get(0).(*db.AccountInfo), args.Error(1)
+	manager, err := m.addrStore.FetchScopedKeyManager(
+		waddrmgr.KeyScope(params.Scope),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	canAddManager, ok := manager.(interface{ CanAddAccount() error })
+	if ok {
+		err = canAddManager.CanAddAccount()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	accountNum, err := manager.NewAccount(nil, params.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	props, err := manager.AccountProperties(nil, accountNum)
+	if err != nil {
+		return nil, err
+	}
+
+	info := mockAccountInfoFromProps(props)
+
+	return &info, nil
 }
 
 // CreateImportedAccount implements the db.AccountStore interface.
