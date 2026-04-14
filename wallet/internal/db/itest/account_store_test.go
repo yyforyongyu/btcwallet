@@ -110,7 +110,7 @@ func TestCreateDerivedAccountDuplicateName(t *testing.T) {
 	// Attempt to create second account with same name in same scope.
 	_, err = store.CreateDerivedAccount(t.Context(), params)
 	require.Error(t, err)
-	require.ErrorContains(t, err, "constraint")
+	requireConstraintSQLError(t, err)
 }
 
 // TestCreateDerivedAccountSameNameDifferentScopes verifies that accounts with

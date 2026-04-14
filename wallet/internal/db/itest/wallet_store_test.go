@@ -82,13 +82,7 @@ func TestCreateWallet_DuplicateName(t *testing.T) {
 	// Attempt to create second wallet with same name.
 	_, err = store.CreateWallet(t.Context(), params)
 	require.Error(t, err, "expected error creating duplicate wallet")
-
-	// We still do not normalize this error across database backends,
-	// and each engine returns its own message. Because of that,
-	// we only check for the shared parts of the message here.
-	require.ErrorContains(t, err, "wallets")
-	require.ErrorContains(t, err, "name")
-	require.ErrorContains(t, err, "constraint")
+	requireConstraintSQLError(t, err)
 }
 
 // TestCreateWallet_Variants tests different wallet types.
