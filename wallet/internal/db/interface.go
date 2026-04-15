@@ -120,17 +120,14 @@ var (
 // Until we break the wallet into independent components, we use this monolithic
 // Store abstraction as a transitional step.
 //
-// For this PR, Store only includes UTXOStore. Over time it is expected to grow
-// to include WalletStore, AccountStore, AddressStore, and TxStore as those
+// For this PR, Store includes UTXOStore and TxStore. Over time it is expected
+// to grow to include WalletStore, AccountStore, and AddressStore as those
 // callers migrate to the new internal db interfaces.
 //
 // TODO(yy): Break down wallet managers into independent components.
-//
-// TODO(yy): Remove the linter ignore once Store grows beyond UTXOStore.
-//
-//nolint:iface // Transitional alias until Store grows beyond UTXOStore.
 type Store interface {
 	UTXOStore
+	TxStore
 }
 
 // WalletStore defines the methods for wallet-level operations.
@@ -363,8 +360,6 @@ type TxStore interface {
 }
 
 // UTXOStore defines the database actions for managing the UTXO set.
-//
-//nolint:iface // Store is a transitional wrapper over UTXOStore.
 type UTXOStore interface {
 	// GetUtxo retrieves a single unspent transaction output (UTXO) by its
 	// outpoint. It returns a UtxoInfo struct containing the UTXO's details
