@@ -156,8 +156,8 @@ func TestNewAddress(t *testing.T) {
 				require.FailNow(t, "unknown address type", tc.addrType)
 			}
 
-			scope, ok := tc.addrType.KeyScope()
-			require.True(t, ok)
+			scope, err := tc.addrType.KeyScope()
+			require.NoError(t, err)
 
 			expectStoreNewAddress(
 				t, w, deps, tc.accountName, scope, tc.change, addr,
@@ -169,7 +169,7 @@ func TestNewAddress(t *testing.T) {
 			deps.addr.On("Internal").Return(tc.change).Once()
 			deps.addr.On("Compressed").Return(true).Once()
 
-			addr, err := w.NewAddress(
+			addr, err = w.NewAddress(
 				t.Context(), tc.accountName,
 				tc.addrType, tc.change,
 			)
