@@ -13,6 +13,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 )
 
@@ -458,7 +459,7 @@ var _ SpendDetails = (*SegwitV0SpendDetails)(nil)
 var _ SpendDetails = (*TaprootSpendDetails)(nil)
 
 // DerivePubKey derives a public key from a full BIP-32 derivation path.
-func (w *Wallet) DerivePubKey(_ context.Context, path BIP32Path) (
+func (w *Wallet) DerivePubKey(ctx context.Context, path BIP32Path) (
 	*btcec.PublicKey, error) {
 
 	err := w.state.validateStarted()
@@ -466,7 +467,7 @@ func (w *Wallet) DerivePubKey(_ context.Context, path BIP32Path) (
 		return nil, err
 	}
 
-	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(path)
+	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -474,67 +475,26 @@ func (w *Wallet) DerivePubKey(_ context.Context, path BIP32Path) (
 	return managedPubKeyAddr.PubKey(), nil
 }
 
-// fetchManagedPubKeyAddress is a helper function that encapsulates the common
-// logic of fetching a scoped key manager, deriving a managed address from a
-// BIP32 path, and ensuring it is a public key address.
-//
-// Time Complexity:
-//   - Average Case: O(1) - This is the common case where the account
-//     information is already cached in memory. The function performs a few
-//     map lookups and constant-time cryptographic operations.
-//   - Worst Case: O(log N) - This occurs on a cache miss (e.g., the first
-//     time an account is used). The function must perform a single, indexed
-//     database lookup to fetch the account's master key. N is the number of
-//     accounts in the wallet.
-//
-// Database Actions:
-//   - This method performs a single read-only database transaction
-//     (`walletdb.View`).
-//   - The transaction's only purpose is to call `DeriveFromKeyPath`, which
-//     performs at most one indexed database lookup for account information if
-//     that information is not already in the in-memory cache.
-func (w *Wallet) fetchManagedPubKeyAddress(path BIP32Path) (
+// fetchManagedPubKeyAddress resolves one BIP32 path into the corresponding
+// managed pubkey address through the transitional signer store.
+func (w *Wallet) fetchManagedPubKeyAddress(
+	ctx context.Context, path BIP32Path,
+) (
 	waddrmgr.ManagedPubKeyAddress, error) {
 
-	// Fetch the scoped key manager for the given key scope. This can be
-	// done outside of the database transaction as it only deals with
-	// in-memory state.
-	manager, err := w.addrStore.FetchScopedKeyManager(path.KeyScope)
+	managedPubKeyAddr, err := w.store.GetManagedPubKeyAddressByPath(
+		ctx, db.SignerPathQuery{
+			WalletID:       w.id,
+			Scope:          db.KeyScope(path.KeyScope),
+			DerivationPath: path.DerivationPath,
+		},
+	)
 	if err != nil {
-		return nil, fmt.Errorf("cannot fetch scoped key manager: %w",
-			err)
-	}
-
-	// The derivation of the address is the only part that requires a
-	// database transaction.
-	var addr waddrmgr.ManagedAddress
-
-	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		// Derive the managed address from the derivation path.
-		derivedAddr, err := manager.DeriveFromKeyPath(
-			addrmgrNs, path.DerivationPath,
-		)
-		if err != nil {
-			return fmt.Errorf("cannot derive from key path: %w",
-				err)
+		if errors.Is(err, db.ErrNotManagedPubKeyAddress) {
+			return nil, fmt.Errorf("%w: %w", ErrNotPubKeyAddress, err)
 		}
 
-		addr = derivedAddr
-
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cannot view wallet database: %w", err)
-	}
-
-	// The post-processing of the address can be done outside of the
-	// database transaction as it only deals with the in-memory struct.
-	managedPubKeyAddr, ok := addr.(waddrmgr.ManagedPubKeyAddress)
-	if !ok {
-		return nil, fmt.Errorf("%w: addr %s", ErrNotPubKeyAddress,
-			addr.Address())
+		return nil, fmt.Errorf("get managed pubkey address by path: %w", err)
 	}
 
 	return managedPubKeyAddr, nil
@@ -543,7 +503,7 @@ func (w *Wallet) fetchManagedPubKeyAddress(path BIP32Path) (
 // ECDH performs a scalar multiplication (ECDH-like operation) between a key
 // from the wallet and a remote public key. The output returned will be the
 // sha256 of the resulting shared point serialized in compressed format.
-func (w *Wallet) ECDH(_ context.Context, path BIP32Path,
+func (w *Wallet) ECDH(ctx context.Context, path BIP32Path,
 	pub *btcec.PublicKey) ([32]byte, error) {
 
 	err := w.state.canSign()
@@ -551,7 +511,7 @@ func (w *Wallet) ECDH(_ context.Context, path BIP32Path,
 		return [32]byte{}, err
 	}
 
-	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(path)
+	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(ctx, path)
 	if err != nil {
 		return [32]byte{}, err
 	}
@@ -599,7 +559,7 @@ func validateSignDigestIntent(intent *SignDigestIntent) error {
 }
 
 // SignDigest signs a message digest based on the provided intent.
-func (w *Wallet) SignDigest(_ context.Context, path BIP32Path,
+func (w *Wallet) SignDigest(ctx context.Context, path BIP32Path,
 	intent *SignDigestIntent) (Signature, error) {
 
 	err := w.state.canSign()
@@ -612,7 +572,7 @@ func (w *Wallet) SignDigest(_ context.Context, path BIP32Path,
 		return nil, err
 	}
 
-	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(path)
+	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -919,7 +879,7 @@ func redeemSigScript(redeemScript []byte) ([]byte, error) {
 
 // ComputeRawSig generates a raw signature for a single transaction input. The
 // caller is responsible for assembling the final witness.
-func (w *Wallet) ComputeRawSig(_ context.Context, params *RawSigParams) (
+func (w *Wallet) ComputeRawSig(ctx context.Context, params *RawSigParams) (
 	RawSignature, error) {
 
 	err := w.state.canSign()
@@ -929,7 +889,7 @@ func (w *Wallet) ComputeRawSig(_ context.Context, params *RawSigParams) (
 
 	// Get the managed address for the specified derivation path. This will
 	// be used to retrieve the private key.
-	managedAddr, err := w.fetchManagedPubKeyAddress(params.Path)
+	managedAddr, err := w.fetchManagedPubKeyAddress(ctx, params.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -964,7 +924,7 @@ func (w *Wallet) ComputeRawSig(_ context.Context, params *RawSigParams) (
 // path.
 //
 // DANGER: This method exports sensitive key material.
-func (w *Wallet) DerivePrivKey(_ context.Context, path BIP32Path) (
+func (w *Wallet) DerivePrivKey(ctx context.Context, path BIP32Path) (
 	*btcec.PrivateKey, error) {
 
 	err := w.state.canSign()
@@ -972,7 +932,7 @@ func (w *Wallet) DerivePrivKey(_ context.Context, path BIP32Path) (
 		return nil, err
 	}
 
-	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(path)
+	managedPubKeyAddr, err := w.fetchManagedPubKeyAddress(ctx, path)
 	if err != nil {
 		return nil, err
 	}
