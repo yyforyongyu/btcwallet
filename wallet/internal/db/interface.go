@@ -5,6 +5,7 @@ import (
 	"errors"
 	"iter"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
@@ -33,6 +34,12 @@ var (
 	// ErrAddressNotFound is returned when an address is not found in the
 	// database.
 	ErrAddressNotFound = errors.New("address not found")
+
+	// ErrNotManagedPubKeyAddress is returned when a transitional signer lookup
+	// resolves to a managed address that does not expose pubkey operations.
+	ErrNotManagedPubKeyAddress = errors.New(
+		"managed address is not a pubkey address",
+	)
 
 	// ErrKeyScopeNotFound is returned when a key scope is not found in the
 	// database.
@@ -122,8 +129,8 @@ var (
 // Until we break the wallet into independent components, we use this monolithic
 // Store abstraction as a transitional step.
 //
-// For this PR, Store includes UTXOStore, TxStore, and AddressStore. Over time
-// it is expected to grow to include WalletStore and AccountStore as those
+// For this PR, Store includes account, address, signer, tx, and UTXO store
+// interfaces. Over time it is expected to grow to include WalletStore as those
 // callers migrate to the new internal db interfaces.
 //
 // TODO(yy): Break down wallet managers into independent components.
@@ -132,6 +139,7 @@ type Store interface {
 	UTXOStore
 	TxStore
 	AddressStore
+	SignerStore
 }
 
 // WalletStore defines the methods for wallet-level operations.
@@ -311,6 +319,31 @@ type AddressStore interface {
 	// GetAddressType returns the AddressTypeInfo associated with the given
 	// address type identifier. An error is returned if the type is unknown.
 	GetAddressType(ctx context.Context, id AddressType) (AddressTypeInfo, error)
+}
+
+// SignerStore defines transitional signer-specific compatibility methods.
+//
+// NOTE: These methods intentionally expose legacy waddrmgr and btcec types
+// while wallet signer flows are migrated behind db.Store.
+type SignerStore interface {
+	// GetManagedPubKeyAddressByPath resolves one BIP32 derivation path into the
+	// corresponding legacy managed pubkey address view.
+	GetManagedPubKeyAddressByPath(ctx context.Context,
+		query SignerPathQuery) (waddrmgr.ManagedPubKeyAddress, error)
+
+	// GetManagedPubKeyAddress resolves one wallet address into the
+	// corresponding legacy managed pubkey address view.
+	GetManagedPubKeyAddress(ctx context.Context,
+		query SignerAddressQuery) (waddrmgr.ManagedPubKeyAddress, error)
+
+	// GetPrivKeyByPath resolves one derived private key by BIP32 path.
+	GetPrivKeyByPath(ctx context.Context,
+		query SignerPathQuery) (*btcec.PrivateKey, error)
+
+	// GetPrivKeyForAddress resolves the private key associated with one wallet
+	// address.
+	GetPrivKeyForAddress(ctx context.Context,
+		query SignerAddressQuery) (*btcec.PrivateKey, error)
 }
 
 // TxStore defines the database actions for managing transaction records.

@@ -766,6 +766,35 @@ type GetManagedAddressQuery struct {
 	Address string
 }
 
+// SignerPathQuery contains the parameters for signer lookups by full BIP32
+// derivation path.
+type SignerPathQuery struct {
+	// WalletID is the ID of the wallet to query.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	WalletID uint32
+
+	// Scope is the key scope that owns the derivation path.
+	Scope KeyScope
+
+	// DerivationPath is the full BIP32 derivation path within the key scope.
+	DerivationPath waddrmgr.DerivationPath
+}
+
+// SignerAddressQuery contains the parameters for signer lookups by wallet
+// address.
+type SignerAddressQuery struct {
+	// WalletID is the ID of the wallet to query.
+	//
+	// NOTE: uint32 is used to ensure compatibility with standard SQL
+	// databases (signed 64-bit integers).
+	WalletID uint32
+
+	// Address is the encoded address string to look up.
+	Address string
+}
+
 // GetAddressDetailsQuery contains the parameters for querying the wallet-
 // facing details of one address by script pubkey.
 type GetAddressDetailsQuery struct {

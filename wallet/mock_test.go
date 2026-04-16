@@ -441,6 +441,54 @@ func (m *mockStore) GetManagedAddress(ctx context.Context,
 	return args.Get(0).(waddrmgr.ManagedAddress), args.Error(1)
 }
 
+// GetManagedPubKeyAddressByPath implements the db.SignerStore interface.
+func (m *mockStore) GetManagedPubKeyAddressByPath(ctx context.Context,
+	query db.SignerPathQuery) (waddrmgr.ManagedPubKeyAddress, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(waddrmgr.ManagedPubKeyAddress), args.Error(1)
+}
+
+// GetManagedPubKeyAddress implements the db.SignerStore interface.
+func (m *mockStore) GetManagedPubKeyAddress(ctx context.Context,
+	query db.SignerAddressQuery) (waddrmgr.ManagedPubKeyAddress, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(waddrmgr.ManagedPubKeyAddress), args.Error(1)
+}
+
+// GetPrivKeyByPath implements the db.SignerStore interface.
+func (m *mockStore) GetPrivKeyByPath(ctx context.Context,
+	query db.SignerPathQuery) (*btcec.PrivateKey, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*btcec.PrivateKey), args.Error(1)
+}
+
+// GetPrivKeyForAddress implements the db.SignerStore interface.
+func (m *mockStore) GetPrivKeyForAddress(ctx context.Context,
+	query db.SignerAddressQuery) (*btcec.PrivateKey, error) {
+
+	args := m.Called(ctx, query)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	return args.Get(0).(*btcec.PrivateKey), args.Error(1)
+}
+
 // GetAddressDetails implements the db.AddressStore interface.
 func (m *mockStore) GetAddressDetails(ctx context.Context,
 	query db.GetAddressDetailsQuery) (bool, string, db.AddressType, error) {
@@ -612,6 +660,23 @@ func (m *mockStore) RollbackToBlock(ctx context.Context, height uint32) error {
 func (m *mockStore) hasExpectation(method string) bool {
 	for i := range m.ExpectedCalls {
 		if m.ExpectedCalls[i].Method == method {
+			return true
+		}
+	}
+
+	return false
+}
+
+func managedPubKeyAddrHasExpectation(addr waddrmgr.ManagedPubKeyAddress,
+	method string) bool {
+
+	mockAddr, ok := addr.(*mockManagedPubKeyAddr)
+	if !ok {
+		return false
+	}
+
+	for i := range mockAddr.ExpectedCalls {
+		if mockAddr.ExpectedCalls[i].Method == method {
 			return true
 		}
 	}
