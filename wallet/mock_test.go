@@ -9,6 +9,7 @@ package wallet
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"time"
 
@@ -445,6 +446,30 @@ func (m *mockStore) GetManagedAddress(ctx context.Context,
 func (m *mockStore) GetManagedPubKeyAddressByPath(ctx context.Context,
 	query db.SignerPathQuery) (waddrmgr.ManagedPubKeyAddress, error) {
 
+	if !m.hasExpectation("GetManagedPubKeyAddressByPath") &&
+		m.addrStore != nil {
+
+		manager, err := m.addrStore.FetchScopedKeyManager(
+			waddrmgr.KeyScope(query.Scope),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		managedAddr, err := manager.DeriveFromKeyPath(nil, query.DerivationPath)
+		if err != nil {
+			return nil, err
+		}
+
+		pubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
+		if !ok {
+			return nil, fmt.Errorf("%w: addr %s", ErrNotPubKeyAddress,
+				managedAddr.Address())
+		}
+
+		return pubKeyAddr, nil
+	}
+
 	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -456,6 +481,25 @@ func (m *mockStore) GetManagedPubKeyAddressByPath(ctx context.Context,
 // GetManagedPubKeyAddress implements the db.SignerStore interface.
 func (m *mockStore) GetManagedPubKeyAddress(ctx context.Context,
 	query db.SignerAddressQuery) (waddrmgr.ManagedPubKeyAddress, error) {
+
+	if !m.hasExpectation("GetManagedPubKeyAddress") && m.addrStore != nil {
+		addr, err := btcutil.DecodeAddress(query.Address, m.chainParams)
+		if err != nil {
+			return nil, err
+		}
+
+		managedAddr, err := m.addrStore.Address(nil, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		pubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
+		if !ok {
+			return nil, db.ErrNotManagedPubKeyAddress
+		}
+
+		return pubKeyAddr, nil
+	}
 
 	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
