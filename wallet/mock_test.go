@@ -1285,6 +1285,13 @@ func (m *mockAccountStore) DeriveFromKeyPath(ns walletdb.ReadBucket,
 	return args.Get(0).(waddrmgr.ManagedAddress), args.Error(1)
 }
 
+// CanAddAccount mirrors the legacy pre-check helper still exercised by wallet
+// unit tests through mock expectations.
+func (m *mockAccountStore) CanAddAccount() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
 // CanAddAccountDeprecated implements the waddrmgr.AccountStore interface.
 func (m *mockAccountStore) CanAddAccountDeprecated() error {
 	args := m.Called()
