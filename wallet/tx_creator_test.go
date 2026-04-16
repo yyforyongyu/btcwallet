@@ -10,8 +10,8 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/pkg/btcunit"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -409,18 +409,6 @@ func TestDetermineChangeSource(t *testing.T) {
 	}
 }
 
-type mockReadBucket struct {
-	walletdb.ReadBucket
-}
-
-type mockReadTx struct {
-	walletdb.ReadTx
-}
-
-func (m *mockReadTx) ReadBucket(key []byte) walletdb.ReadBucket {
-	return &mockReadBucket{}
-}
-
 // TestGetEligibleUTXOsFromList tests that the getEligibleUTXOsFromList method
 // correctly filters a list of UTXOs based on their confirmation status. It
 // ensures that UTXOs with sufficient confirmations are included, while those
@@ -492,7 +480,7 @@ func TestGetEligibleUTXOsFromList(t *testing.T) {
 		name          string
 		source        *CoinSourceUTXOs
 		minconf       uint32
-		expectedUtxos []wtxmgr.Credit
+		expectedUtxos []db.UtxoInfo
 		expectedErr   error
 	}{
 		{
@@ -501,8 +489,10 @@ func TestGetEligibleUTXOsFromList(t *testing.T) {
 				UTXOs: []wire.OutPoint{utxo1, utxo2, utxo3},
 			},
 			minconf: 0,
-			expectedUtxos: []wtxmgr.Credit{
-				*credit1, *credit2, *credit3,
+			expectedUtxos: []db.UtxoInfo{
+				*mockStoreUtxoInfo(credit1),
+				*mockStoreUtxoInfo(credit2),
+				*mockStoreUtxoInfo(credit3),
 			},
 		},
 		{
@@ -510,8 +500,11 @@ func TestGetEligibleUTXOsFromList(t *testing.T) {
 			source: &CoinSourceUTXOs{
 				UTXOs: []wire.OutPoint{utxo1, utxo2, utxo3},
 			},
-			minconf:       1,
-			expectedUtxos: []wtxmgr.Credit{*credit1, *credit2},
+			minconf: 1,
+			expectedUtxos: []db.UtxoInfo{
+				*mockStoreUtxoInfo(credit1),
+				*mockStoreUtxoInfo(credit2),
+			},
 		},
 		{
 			name: "6 confs required",
@@ -519,7 +512,7 @@ func TestGetEligibleUTXOsFromList(t *testing.T) {
 				UTXOs: []wire.OutPoint{utxo1, utxo2, utxo3},
 			},
 			minconf:       6,
-			expectedUtxos: []wtxmgr.Credit{*credit2},
+			expectedUtxos: []db.UtxoInfo{*mockStoreUtxoInfo(credit2)},
 		},
 		{
 			name: "7 confs required",
@@ -527,7 +520,7 @@ func TestGetEligibleUTXOsFromList(t *testing.T) {
 				UTXOs: []wire.OutPoint{utxo1, utxo2, utxo3},
 			},
 			minconf:       7,
-			expectedUtxos: []wtxmgr.Credit{},
+			expectedUtxos: []db.UtxoInfo{},
 		},
 		{
 			name: "utxo not found",
@@ -543,9 +536,8 @@ func TestGetEligibleUTXOsFromList(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			dbtx := &mockReadTx{}
 			utxos, err := w.getEligibleUTXOsFromList(
-				dbtx, tc.source, tc.minconf, blockStamp,
+				t.Context(), tc.source, tc.minconf, blockStamp,
 			)
 
 			require.ErrorIs(t, err, tc.expectedErr)
@@ -587,7 +579,7 @@ func TestGetEligibleUTXOsFromAccount(t *testing.T) {
 		Return(uint32(0), errNotFound)
 
 	_, err := w.getEligibleUTXOsFromAccount(
-		&mockReadTx{},
+		t.Context(),
 		&ScopedAccount{
 			AccountName: "unknown",
 			KeyScope:    keyScope,
@@ -692,7 +684,7 @@ func TestGetEligibleUTXOs(t *testing.T) {
 			tc.setupMocks(mocks, tc.source)
 
 			_, err := w.getEligibleUTXOs(
-				&mockReadTx{}, tc.source, minconf,
+				t.Context(), tc.source, minconf,
 			)
 
 			require.ErrorIs(t, err, tc.expectedErr)
@@ -709,8 +701,6 @@ func TestCreateManualInputSource(t *testing.T) {
 	t.Parallel()
 
 	w, mocks := createStartedWalletWithMocks(t)
-	dbtx := &mockReadTx{}
-
 	utxo1 := wire.OutPoint{Hash: [32]byte{1}, Index: 0}
 	credit1 := &wtxmgr.Credit{OutPoint: utxo1}
 
@@ -754,7 +744,7 @@ func TestCreateManualInputSource(t *testing.T) {
 			tc.setupMocks()
 
 			source, err := w.createManualInputSource(
-				dbtx, tc.inputs,
+				t.Context(), tc.inputs,
 			)
 
 			require.ErrorIs(t, err, tc.expectedErr)
@@ -778,7 +768,6 @@ func TestCreateManualInputSource(t *testing.T) {
 func TestCreatePolicyInputSource(t *testing.T) {
 	t.Parallel()
 
-	dbtx := &mockReadTx{}
 	feeRate := btcunit.NewSatPerKVByte(1000)
 
 	utxo1 := wtxmgr.Credit{
@@ -877,7 +866,7 @@ func TestCreatePolicyInputSource(t *testing.T) {
 			tc.setupMocks(mocks)
 
 			source, err := w.createPolicyInputSource(
-				dbtx, tc.policy, feeRate,
+				t.Context(), tc.policy, feeRate,
 			)
 
 			if tc.expectedErr != nil {
@@ -901,8 +890,6 @@ func TestCreatePolicyInputSource(t *testing.T) {
 // unknown input type is provided.
 func TestCreateInputSource(t *testing.T) {
 	t.Parallel()
-
-	dbtx := &mockReadTx{}
 
 	utxo := wire.OutPoint{Hash: [32]byte{1}, Index: 0}
 	credit := &wtxmgr.Credit{OutPoint: utxo}
@@ -959,7 +946,7 @@ func TestCreateInputSource(t *testing.T) {
 			w, mocks := createStartedWalletWithMocks(t)
 			tc.setupMocks(mocks)
 
-			source, err := w.createInputSource(dbtx, tc.intent)
+			source, err := w.createInputSource(t.Context(), tc.intent)
 
 			require.ErrorIs(t, err, tc.expectedErr)
 
@@ -1264,14 +1251,16 @@ func TestCreateTransactionSuccessNilChangeSourcePolicyInputs(t *testing.T) {
 	// We'll also need to set up the address store to know about the test
 	// account.
 	mockAddr := &mockManagedAddress{}
+	mockAddr.On("AddrType").Return(waddrmgr.TaprootPubKey)
 	mockAddr.On("Account").Return(uint32(1))
-	accountStore.On("Address",
-		mock.Anything, testAddr,
-	).Return(mockAddr, nil)
+	mocks.addrStore.On("Address", mock.Anything, mock.Anything).
+		Return(mockAddr, nil)
 	mocks.addrStore.On("AddrAccount",
 		mock.Anything, mock.Anything,
 	).Return(accountStore, uint32(1), nil)
 	accountStore.On("Scope").Return(waddrmgr.KeyScopeBIP0086)
+	accountStore.On("AccountName", mock.Anything, uint32(1)).
+		Return("test-account", nil)
 
 	mocks.txStore.On("UnspentOutputs",
 		mock.Anything,

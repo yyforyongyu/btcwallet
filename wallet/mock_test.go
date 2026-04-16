@@ -9,6 +9,7 @@ package wallet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
@@ -41,6 +43,7 @@ type mockStore struct {
 	mock.Mock
 
 	addrStore   *mockAddrStore
+	txStore     *mockTxStore
 	chainParams *chaincfg.Params
 }
 
@@ -48,9 +51,20 @@ type mockStore struct {
 // interface.
 var _ db.Store = (*mockStore)(nil)
 
+var errNoDerivedAddresses = errors.New("no derived addresses returned")
+
 // GetUtxo implements the db.UTXOStore interface.
 func (m *mockStore) GetUtxo(ctx context.Context,
 	query db.GetUtxoQuery) (*db.UtxoInfo, error) {
+
+	if !m.hasExpectation("GetUtxo") && m.txStore != nil {
+		credit, err := m.txStore.GetUtxo(nil, query.OutPoint)
+		if err != nil {
+			return nil, err
+		}
+
+		return mockStoreUtxoInfo(credit), nil
+	}
 
 	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
@@ -61,8 +75,61 @@ func (m *mockStore) GetUtxo(ctx context.Context,
 }
 
 // ListUTXOs implements the db.UTXOStore interface.
+//
+//nolint:cyclop,gocognit,nestif
 func (m *mockStore) ListUTXOs(ctx context.Context,
 	query db.ListUtxosQuery) ([]db.UtxoInfo, error) {
+
+	if !m.hasExpectation("ListUTXOs") && m.txStore != nil {
+		credits, err := m.txStore.UnspentOutputs(nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var currentHeight int32
+		if m.addrStore != nil {
+			currentHeight = m.addrStore.SyncedTo().Height
+		}
+
+		utxos := make([]db.UtxoInfo, 0, len(credits))
+		for i := range credits {
+			credit := &credits[i]
+
+			if query.MinConfs != nil &&
+				calcConf(credit.Height, currentHeight) < *query.MinConfs {
+
+				continue
+			}
+
+			if query.MaxConfs != nil &&
+				calcConf(credit.Height, currentHeight) > *query.MaxConfs {
+
+				continue
+			}
+
+			if query.Account != nil && m.addrStore != nil {
+				_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+					credit.PkScript, m.chainParams,
+				)
+				if err != nil || len(addrs) != 1 {
+					continue
+				}
+
+				_, account, err := m.addrStore.AddrAccount(nil, addrs[0])
+				if err != nil {
+					continue
+				}
+
+				if query.Account != nil && account != *query.Account {
+					continue
+				}
+			}
+
+			utxos = append(utxos, *mockStoreUtxoInfo(credit))
+		}
+
+		return utxos, nil
+	}
 
 	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
@@ -95,6 +162,10 @@ func (m *mockStore) ReleaseOutput(ctx context.Context,
 // ListLeasedOutputs implements the db.UTXOStore interface.
 func (m *mockStore) ListLeasedOutputs(ctx context.Context,
 	walletID uint32) ([]db.LeasedOutput, error) {
+
+	if !m.hasExpectation("ListLeasedOutputs") {
+		return []db.LeasedOutput{}, nil
+	}
 
 	args := m.Called(ctx, walletID)
 	if args.Get(0) == nil {
@@ -275,6 +346,16 @@ func (m *mockStore) GetAccount(ctx context.Context,
 		if err != nil {
 			return nil, err
 		}
+
+		if mockMgr, ok := manager.(*mockAccountStore); !ok ||
+			!hasMockExpectation(&mockMgr.Mock, "AccountProperties") {
+
+			return &db.AccountInfo{
+				AccountNumber: accountNum,
+				AccountName:   *query.Name,
+				KeyScope:      query.Scope,
+			}, nil
+		}
 	}
 
 	props, err := manager.AccountProperties(nil, accountNum)
@@ -349,9 +430,64 @@ func (m *mockStore) RenameAccount(ctx context.Context,
 }
 
 // NewDerivedAddress implements the db.AddressStore interface.
+//
+//nolint:cyclop,nestif
 func (m *mockStore) NewDerivedAddress(ctx context.Context,
 	params db.NewDerivedAddressParams,
 	deriveFn db.AddressDerivationFunc) (*db.AddressInfo, error) {
+
+	if !m.hasExpectation("NewDerivedAddress") && m.addrStore != nil {
+		manager, err := m.addrStore.FetchScopedKeyManager(
+			waddrmgr.KeyScope(params.Scope),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		accountNum, err := manager.LookupAccount(nil, params.AccountName)
+		if err != nil {
+			return nil, err
+		}
+
+		var addrs []waddrmgr.ManagedAddress
+		if params.Change {
+			addrs, err = manager.NextInternalAddresses(nil, accountNum, 1)
+		} else {
+			addrs, err = manager.NextExternalAddresses(nil, accountNum, 1)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		if len(addrs) == 0 {
+			return nil, errNoDerivedAddresses
+		}
+
+		scriptPubKey, err := txscript.PayToAddrScript(addrs[0].Address())
+		if err != nil {
+			return nil, err
+		}
+
+		info := &db.AddressInfo{
+			AddrType:     db.AddressType(addrs[0].AddrType()),
+			Origin:       db.DerivedAccount,
+			ScriptPubKey: scriptPubKey,
+			IsWatchOnly:  false,
+		}
+
+		if pubKeyAddr, ok := addrs[0].(waddrmgr.ManagedPubKeyAddress); ok {
+			info.PubKey = pubKeyAddr.PubKey().SerializeCompressed()
+
+			_, path, ok := pubKeyAddr.DerivationInfo()
+			if ok {
+				info.Branch = path.Branch
+				info.Index = path.Index
+			}
+		}
+
+		return info, nil
+	}
 
 	args := m.Called(ctx, params, deriveFn)
 	if args.Get(0) == nil {
@@ -359,6 +495,22 @@ func (m *mockStore) NewDerivedAddress(ctx context.Context,
 	}
 
 	return args.Get(0).(*db.AddressInfo), args.Error(1)
+}
+
+func mockStoreUtxoInfo(credit *wtxmgr.Credit) *db.UtxoInfo {
+	height := db.UnminedHeight
+	if credit.Height >= 0 {
+		height = uint32(credit.Height)
+	}
+
+	return &db.UtxoInfo{
+		OutPoint:     credit.OutPoint,
+		Amount:       credit.Amount,
+		PkScript:     credit.PkScript,
+		Received:     credit.Received.UTC(),
+		FromCoinBase: credit.FromCoinBase,
+		Height:       height,
+	}
 }
 
 // NewImportedAddress implements the db.AddressStore interface.
@@ -601,8 +753,44 @@ func deriveMockPrivKey(manager waddrmgr.AccountStore,
 }
 
 // GetAddressDetails implements the db.AddressStore interface.
+//
+//nolint:nestif
 func (m *mockStore) GetAddressDetails(ctx context.Context,
 	query db.GetAddressDetailsQuery) (bool, string, db.AddressType, error) {
+
+	if !m.hasExpectation("GetAddressDetails") && m.addrStore != nil {
+		addr := extractAddrFromPKScript(query.ScriptPubKey, m.chainParams)
+		if addr == nil {
+			return false, "", 0, ErrUnableToExtractAddress
+		}
+
+		managedAddr, err := m.addrStore.Address(nil, addr)
+		if err != nil {
+			return false, "", 0, err
+		}
+
+		scopedMgr, accountNum, err := m.addrStore.AddrAccount(nil, addr)
+		if err != nil {
+			return false, "", 0, err
+		}
+
+		accountName := defaultAccountName
+		if namer, ok := scopedMgr.(interface {
+			AccountName(ns walletdb.ReadBucket, account uint32) (string, error)
+		}); ok {
+			if mockMgr, ok := scopedMgr.(*mockAccountStore); !ok ||
+				hasMockExpectation(&mockMgr.Mock, "AccountName") {
+
+				accountName, err = namer.AccountName(nil, accountNum)
+				if err != nil {
+					return false, "", 0, err
+				}
+			}
+		}
+
+		return true, accountName,
+			db.AddressType(managedAddr.AddrType()), nil
+	}
 
 	args := m.Called(ctx, query)
 
@@ -769,6 +957,10 @@ func (m *mockStore) RollbackToBlock(ctx context.Context, height uint32) error {
 }
 
 func (m *mockStore) hasExpectation(method string) bool {
+	return hasMockExpectation(&m.Mock, method)
+}
+
+func hasMockExpectation(m *mock.Mock, method string) bool {
 	for i := range m.ExpectedCalls {
 		if m.ExpectedCalls[i].Method == method {
 			return true

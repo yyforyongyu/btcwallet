@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/pkg/btcunit"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	db "github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
 	"github.com/btcsuite/btcwallet/wallet/txsizes"
@@ -453,7 +455,7 @@ func validateTxIntent(intent *TxIntent) error {
 
 // prepareTxAuthSources creates the input and change sources required to
 // author a transaction.
-func (w *Wallet) prepareTxAuthSources(intent *TxIntent) (
+func (w *Wallet) prepareTxAuthSources(ctx context.Context, intent *TxIntent) (
 	txauthor.InputSource, *txauthor.ChangeSource, error) {
 	// Determine the change source. If not specified, a default will be
 	// used.
@@ -467,55 +469,30 @@ func (w *Wallet) prepareTxAuthSources(intent *TxIntent) (
 			changeAccount.AccountName)
 	}
 
-	var (
-		changeSource *txauthor.ChangeSource
-		inputSource  txauthor.InputSource
-	)
-	// We perform the core logic of creating the input and change sources
-	// within a single database transaction to ensure atomicity.
-	err = walletdb.Update(w.cfg.DB, func(dbtx walletdb.ReadWriteTx) error {
-		changeKeyScope := &changeAccount.KeyScope
-		accountName := changeAccount.AccountName
+	var changeSource *txauthor.ChangeSource
 
+	err = walletdb.Update(w.cfg.DB, func(dbtx walletdb.ReadWriteTx) error {
 		addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
 
-		// Query the account's number using the account name.
-		//
-		// TODO(yy): Remove this query in upcoming SQL.
-		account, err := manager.LookupAccount(addrmgrNs, accountName)
-		if err != nil {
-			return fmt.Errorf("%w: %s", ErrAccountNotFound,
-				accountName)
-		}
-
-		// Create the change source, which is a closure that the
-		// txauthor package will use to generate a new change address
-		// when needed.
-		//
-		// TODO(yy): Refactor to ensure atomicity. The underlying
-		// `GetUnusedAddress` call creates its own database
-		// transaction, breaking the atomicity of this
-		// `walletdb.Update` block. A new method should be added to
-		// `AccountStore` that accepts an active database transaction
-		// and returns an unused address. This will allow the address
-		// derivation to occur within the same atomic transaction as
-		// the rest of the tx creation logic.
-		_, changeSource, err = w.addrMgrWithChangeSource(
-			dbtx, changeKeyScope, account,
+		account, err := manager.LookupAccount(
+			addrmgrNs, changeAccount.AccountName,
 		)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: %s", ErrAccountNotFound,
+				changeAccount.AccountName)
 		}
 
-		// Create the input source, which is a closure that the
-		// txauthor package will use to select coins.
-		inputSource, err = w.createInputSource(dbtx, intent)
-		if err != nil {
-			return err
-		}
+		_, changeSource, err = w.addrMgrWithChangeSource(
+			dbtx, &changeAccount.KeyScope, account,
+		)
 
-		return nil
+		return err
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	inputSource, err := w.createInputSource(ctx, intent)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -527,7 +504,7 @@ func (w *Wallet) prepareTxAuthSources(intent *TxIntent) (
 // to the given outputs. It is the main implementation of the TxCreator
 // interface. The method will produce a valid, unsigned transaction, which can
 // then be passed to the Signer interface to be signed.
-func (w *Wallet) CreateTransaction(_ context.Context, intent *TxIntent) (
+func (w *Wallet) CreateTransaction(ctx context.Context, intent *TxIntent) (
 	*txauthor.AuthoredTx, error) {
 
 	err := w.state.validateSynced()
@@ -554,7 +531,7 @@ func (w *Wallet) CreateTransaction(_ context.Context, intent *TxIntent) (
 		return nil, err
 	}
 
-	inputSource, changeSource, err := w.prepareTxAuthSources(intent)
+	inputSource, changeSource, err := w.prepareTxAuthSources(ctx, intent)
 	if err != nil {
 		return nil, err
 	}
@@ -629,19 +606,19 @@ func (w *Wallet) determineChangeSource(intent *TxIntent) *ScopedAccount {
 // instead have methods made on the `txStore`, which takes a db tx and use them
 // here, as the logic will be largely overlapped with the interface methods used
 // in `wallet/utxo_manager.go`.
-func (w *Wallet) createInputSource(dbtx walletdb.ReadTx, intent *TxIntent) (
+func (w *Wallet) createInputSource(ctx context.Context, intent *TxIntent) (
 	txauthor.InputSource, error) {
 
 	switch inputs := intent.Inputs.(type) {
 	// If the inputs are manually specified, we create a "constant" input
 	// source that will only ever return the specified UTXOs.
 	case *InputsManual:
-		return w.createManualInputSource(dbtx, inputs)
+		return w.createManualInputSource(ctx, inputs)
 
 	// If the inputs are policy-based, we create an input source that will
 	// perform coin selection.
 	case *InputsPolicy:
-		return w.createPolicyInputSource(dbtx, inputs, intent.FeeRate)
+		return w.createPolicyInputSource(ctx, inputs, intent.FeeRate)
 
 	// Any other type is unsupported.
 	default:
@@ -652,28 +629,38 @@ func (w *Wallet) createInputSource(dbtx walletdb.ReadTx, intent *TxIntent) (
 // createManualInputSource creates an input source from a list of manually
 // specified UTXOs. It fetches the UTXOs directly from the database and ensures
 // that they are eligible for spending.
-func (w *Wallet) createManualInputSource(dbtx walletdb.ReadTx,
+func (w *Wallet) createManualInputSource(ctx context.Context,
 	inputs *InputsManual) (
 	txauthor.InputSource, error) {
 
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-
 	// Create a slice to hold the eligible UTXOs.
 	eligibleSelectedUtxo := make(
-		[]wtxmgr.Credit, 0, len(inputs.UTXOs),
+		[]db.UtxoInfo, 0, len(inputs.UTXOs),
 	)
+
+	locked, err := w.leasedOutputSet(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	// Iterate through the manually specified UTXOs and ensure that each
 	// one is eligible for spending.
 	for _, outpoint := range inputs.UTXOs {
 		// Fetch the UTXO from the database.
-		credit, err := w.txStore.GetUtxo(txmgrNs, outpoint)
+		credit, err := w.store.GetUtxo(ctx, db.GetUtxoQuery{
+			WalletID: w.id,
+			OutPoint: outpoint,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrUtxoNotEligible,
 				outpoint)
 		}
 
-		// TODO(yy): check for locked utxos and log a warning.
+		if _, ok := locked[outpoint]; ok {
+			return nil, fmt.Errorf("%w: %v", ErrUtxoNotEligible,
+				outpoint)
+		}
+
 		eligibleSelectedUtxo = append(eligibleSelectedUtxo, *credit)
 	}
 
@@ -684,7 +671,7 @@ func (w *Wallet) createManualInputSource(dbtx walletdb.ReadTx,
 
 // createPolicyInputSource creates an input source that will perform automatic
 // coin selection based on the provided policy.
-func (w *Wallet) createPolicyInputSource(dbtx walletdb.ReadTx,
+func (w *Wallet) createPolicyInputSource(ctx context.Context,
 	policy *InputsPolicy, feeRate btcunit.SatPerKVByte) (
 	txauthor.InputSource, error) {
 
@@ -697,7 +684,7 @@ func (w *Wallet) createPolicyInputSource(dbtx walletdb.ReadTx,
 	// Get the full set of eligible UTXOs based on the policy's source
 	// and confirmation requirements.
 	eligible, err := w.getEligibleUTXOs(
-		dbtx, policy.Source, policy.MinConfs,
+		ctx, policy.Source, policy.MinConfs,
 	)
 	if err != nil {
 		return nil, err
@@ -743,8 +730,8 @@ func (w *Wallet) createPolicyInputSource(dbtx walletdb.ReadTx,
 // requirements. A UTXO is considered ineligible if it is not found in the
 // wallet's transaction store or if it does not meet the minimum confirmation
 // requirements.
-func (w *Wallet) getEligibleUTXOs(dbtx walletdb.ReadTx,
-	source CoinSource, minconf uint32) ([]wtxmgr.Credit, error) {
+func (w *Wallet) getEligibleUTXOs(ctx context.Context,
+	source CoinSource, minconf uint32) ([]db.UtxoInfo, error) {
 
 	// TODO(yy): remove this block stamp check. The block stamp should be
 	// passed in as a parameter.
@@ -758,19 +745,20 @@ func (w *Wallet) getEligibleUTXOs(dbtx walletdb.ReadTx,
 	// If the source is nil, we'll use the default account.
 	case nil:
 		return w.filterEligibleOutputs(
-			dbtx, &waddrmgr.KeyScopeBIP0086,
-			waddrmgr.DefaultAccountNum, minconf, bs,
+			ctx, &waddrmgr.KeyScopeBIP0086,
+			waddrmgr.DefaultAccountName, waddrmgr.DefaultAccountNum,
+			minconf, bs,
 		)
 
 	// If the source is a scoped account, we find all eligible outputs for
 	// that specific account and key scope.
 	case *ScopedAccount:
-		return w.getEligibleUTXOsFromAccount(dbtx, source, minconf, bs)
+		return w.getEligibleUTXOsFromAccount(ctx, source, minconf, bs)
 
 	// If the source is a list of UTXOs, we validate and fetch each UTXO
 	// from the provided list.
 	case *CoinSourceUTXOs:
-		return w.getEligibleUTXOsFromList(dbtx, source, minconf, bs)
+		return w.getEligibleUTXOsFromList(ctx, source, minconf, bs)
 
 	// Any other source type is unsupported.
 	default:
@@ -780,57 +768,64 @@ func (w *Wallet) getEligibleUTXOs(dbtx walletdb.ReadTx,
 
 // getEligibleUTXOsFromAccount returns a slice of eligible UTXOs for a specific
 // account and key scope.
-func (w *Wallet) getEligibleUTXOsFromAccount(dbtx walletdb.ReadTx,
+func (w *Wallet) getEligibleUTXOsFromAccount(ctx context.Context,
 	source *ScopedAccount, minconf uint32, bs *waddrmgr.BlockStamp) (
-	[]wtxmgr.Credit, error) {
+	[]db.UtxoInfo, error) {
 
-	keyScope := &source.KeyScope
-
-	manager, err := w.addrStore.FetchScopedKeyManager(*keyScope)
+	info, err := w.store.GetAccount(ctx, db.GetAccountQuery{
+		WalletID: w.id,
+		Scope:    db.KeyScope(source.KeyScope),
+		Name:     &source.AccountName,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound,
 			source.AccountName)
 	}
 
-	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
-
-	account, err := manager.LookupAccount(addrmgrNs, source.AccountName)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound,
-			source.AccountName)
-	}
-
-	return w.filterEligibleOutputs(dbtx, keyScope, account, minconf, bs)
+	return w.filterEligibleOutputs(
+		ctx, &source.KeyScope, source.AccountName, info.AccountNumber,
+		minconf, bs,
+	)
 }
 
 // getEligibleUTXOsFromList returns a slice of eligible UTXOs from a specified
 // list of outpoints.
-func (w *Wallet) getEligibleUTXOsFromList(dbtx walletdb.ReadTx,
+func (w *Wallet) getEligibleUTXOsFromList(ctx context.Context,
 	source *CoinSourceUTXOs, minconf uint32, bs *waddrmgr.BlockStamp) (
-	[]wtxmgr.Credit, error) {
+	[]db.UtxoInfo, error) {
 
 	// Create a slice to hold the eligible UTXOs.
-	eligible := make([]wtxmgr.Credit, 0, len(source.UTXOs))
+	eligible := make([]db.UtxoInfo, 0, len(source.UTXOs))
 
-	// Get the transaction manager's namespace.
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+	locked, err := w.leasedOutputSet(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	// Iterate through the manually specified UTXOs and ensure that each
 	// one is eligible for spending.
 	for _, outpoint := range source.UTXOs {
 		// Fetch the UTXO from the database.
-		credit, err := w.txStore.GetUtxo(txmgrNs, outpoint)
+		credit, err := w.store.GetUtxo(ctx, db.GetUtxoQuery{
+			WalletID: w.id,
+			OutPoint: outpoint,
+		})
 		if err != nil {
+			return nil, fmt.Errorf("%w: %v",
+				ErrUtxoNotEligible, outpoint)
+		}
+
+		if _, ok := locked[outpoint]; ok {
 			return nil, fmt.Errorf("%w: %v",
 				ErrUtxoNotEligible, outpoint)
 		}
 
 		// A UTXO is only eligible if it has reached the required
 		// number of confirmations.
-		if !hasMinConfs(minconf, credit.Height, bs.Height) {
+		if !txCreatorHasMinConfs(minconf, credit.Height, bs.Height) {
 			// Calculate the number of confirmations for the
 			// warning message.
-			confs := calcConf(credit.Height, bs.Height)
+			confs := txCreatorConf(credit.Height, bs.Height)
 
 			log.Warnf("Skipping user-specified UTXO %v "+
 				"because it has %d confs but needs %d",
@@ -883,7 +878,7 @@ func makeInputSource(eligible []Coin) txauthor.InputSource {
 
 // constantInputSource creates an input source function that always returns the
 // static set of user-selected UTXOs.
-func constantInputSource(eligible []wtxmgr.Credit) txauthor.InputSource {
+func constantInputSource(eligible []db.UtxoInfo) txauthor.InputSource {
 	// Current inputs and their total value. These won't change over
 	// different invocations as we want our inputs to remain static since
 	// they're selected by the user.
@@ -909,20 +904,46 @@ func constantInputSource(eligible []wtxmgr.Credit) txauthor.InputSource {
 	}
 }
 
+func constantCreditInputSource(eligible []wtxmgr.Credit) txauthor.InputSource {
+	utxos := make([]db.UtxoInfo, len(eligible))
+	for i := range eligible {
+		height := db.UnminedHeight
+		if eligible[i].Height >= 0 {
+			height = nonNegativeHeightToUint32(eligible[i].Height)
+		}
+
+		utxos[i] = db.UtxoInfo{
+			OutPoint:     eligible[i].OutPoint,
+			Amount:       eligible[i].Amount,
+			PkScript:     eligible[i].PkScript,
+			Received:     eligible[i].Received,
+			FromCoinBase: eligible[i].FromCoinBase,
+			Height:       height,
+		}
+	}
+
+	return constantInputSource(utxos)
+}
+
 // filterEligibleOutputs finds eligible outputs for the given key scope and
 // account.
 //
 // We will build a single query for this operation, so skip the linter for now.
 //
 //nolint:cyclop
-func (w *Wallet) filterEligibleOutputs(dbtx walletdb.ReadTx,
-	keyScope *waddrmgr.KeyScope, account uint32, minconf uint32,
-	bs *waddrmgr.BlockStamp) ([]wtxmgr.Credit, error) {
+func (w *Wallet) filterEligibleOutputs(ctx context.Context,
+	keyScope *waddrmgr.KeyScope, accountName string, account uint32,
+	minconf uint32, bs *waddrmgr.BlockStamp) ([]db.UtxoInfo, error) {
 
-	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
-	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+	unspent, err := w.store.ListUTXOs(ctx, db.ListUtxosQuery{
+		WalletID: w.id,
+		Account:  &account,
+	})
+	if err != nil {
+		return nil, err
+	}
 
-	unspent, err := w.txStore.UnspentOutputs(txmgrNs)
+	locked, err := w.leasedOutputSet(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -932,29 +953,26 @@ func (w *Wallet) filterEligibleOutputs(dbtx walletdb.ReadTx,
 	// Because one of these filters requires matching the output script to
 	// the desired account, this change depends on making wtxmgr a waddrmgr
 	// dependency and requesting unspent outputs for a single account.
-	eligible := make([]wtxmgr.Credit, 0, len(unspent))
+	eligible := make([]db.UtxoInfo, 0, len(unspent))
 	for i := range unspent {
 		output := &unspent[i]
 
 		// Only include this output if it meets the required number of
 		// confirmations. Coinbase transactions must have reached
 		// maturity before their outputs may be spent.
-		if !hasMinConfs(minconf, output.Height, bs.Height) {
+		if !txCreatorHasMinConfs(minconf, output.Height, bs.Height) {
 			continue
 		}
 
 		if output.FromCoinBase {
 			target := w.cfg.ChainParams.CoinbaseMaturity
-			if !hasMinConfs(
-				uint32(target), output.Height, bs.Height,
-			) {
-
+			if !txCreatorHasMinConfs(uint32(target), output.Height, bs.Height) {
 				continue
 			}
 		}
 
 		// Locked unspent outputs are skipped.
-		if output.Locked {
+		if _, ok := locked[output.OutPoint]; ok {
 			continue
 		}
 
@@ -963,25 +981,27 @@ func (w *Wallet) filterEligibleOutputs(dbtx walletdb.ReadTx,
 		//
 		// TODO: Handle multisig outputs by determining if enough of the
 		// addresses are controlled.
-		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-			output.PkScript, w.cfg.ChainParams,
-		)
-		if err != nil || len(addrs) != 1 {
-			continue
-		}
-
-		scopedMgr, addrAcct, err := w.addrStore.AddrAccount(
-			addrmgrNs, addrs[0],
-		)
+		spendable, utxoAccountName, addressType, err :=
+			w.store.GetAddressDetails(ctx, db.GetAddressDetailsQuery{
+				WalletID:     w.id,
+				ScriptPubKey: output.PkScript,
+			})
 		if err != nil {
 			continue
 		}
 
-		if keyScope != nil && scopedMgr.Scope() != *keyScope {
+		if !spendable || utxoAccountName != accountName {
 			continue
 		}
 
-		if addrAcct != account {
+		addrType := waddrmgr.AddressType(addressType)
+
+		utxoScope, err := addrType.KeyScope()
+		if err != nil {
+			continue
+		}
+
+		if keyScope != nil && utxoScope != *keyScope {
 			continue
 		}
 
@@ -989,6 +1009,36 @@ func (w *Wallet) filterEligibleOutputs(dbtx walletdb.ReadTx,
 	}
 
 	return eligible, nil
+}
+
+func (w *Wallet) leasedOutputSet(ctx context.Context) (
+	map[wire.OutPoint]struct{}, error) {
+
+	leases, err := w.store.ListLeasedOutputs(ctx, w.id)
+	if err != nil {
+		return nil, err
+	}
+
+	locked := make(map[wire.OutPoint]struct{}, len(leases))
+	for i := range leases {
+		locked[leases[i].OutPoint] = struct{}{}
+	}
+
+	return locked, nil
+}
+
+func txCreatorHasMinConfs(minconf uint32, height uint32,
+	currentHeight int32) bool {
+
+	return int64(txCreatorConf(height, currentHeight)) >= int64(minconf)
+}
+
+func txCreatorConf(height uint32, currentHeight int32) int32 {
+	if height == db.UnminedHeight || height > uint32(math.MaxInt32) {
+		return 0
+	}
+
+	return calcConf(int32(height), currentHeight)
 }
 
 // inputYieldsPositively returns a boolean indicating whether this input yields

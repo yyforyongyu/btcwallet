@@ -1172,7 +1172,7 @@ func (w *Wallet) FundPsbtDeprecated(packet *psbt.Packet, keyScope *waddrmgr.KeyS
 				PkScript: utxo.PkScript,
 			}
 		}
-		inputSource := constantInputSource(credits)
+		inputSource := constantCreditInputSource(credits)
 
 		// Build the TxCreateOption to retrieve the change scope.
 		opts := defaultTxCreateOptions()
@@ -5819,7 +5819,7 @@ func (w *Wallet) txToOutputs(outputs []*wire.TxOut,
 				)
 			}
 
-			inputSource = constantInputSource(eligibleSelectedUtxo)
+			inputSource = constantCreditInputSource(eligibleSelectedUtxo)
 
 		} else {
 			// Wrap our coins in a type that implements the

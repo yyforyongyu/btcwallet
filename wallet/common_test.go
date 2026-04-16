@@ -123,6 +123,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 	mockPubKeyAddr := &mockManagedPubKeyAddr{}
 	mockTaprootAddr := &mockManagedTaprootScriptAddress{}
 	mockStore.addrStore = mockAddrStore
+	mockStore.txStore = mockTxStore
 	mockStore.chainParams = &chainParams
 
 	ctx, cancel := context.WithCancel(t.Context())
