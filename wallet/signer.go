@@ -14,7 +14,6 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	db "github.com/btcsuite/btcwallet/wallet/internal/db"
-	"github.com/btcsuite/btcwallet/walletdb"
 )
 
 var (
@@ -708,114 +707,6 @@ func (w *Wallet) privKeyForAddress(ctx context.Context, addr btcutil.Address) (
 		}
 
 		return nil, fmt.Errorf("get private key for address: %w", err)
-	}
-
-	return privKey, nil
-}
-
-// loadManagedPubKeyAddr loads a managed pubkey address for signer-private key
-// access.
-func (w *Wallet) loadManagedPubKeyAddr(addr btcutil.Address) (
-	waddrmgr.ManagedPubKeyAddress, error) {
-
-	var pubKeyAddr waddrmgr.ManagedPubKeyAddress
-
-	err := walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		managedAddr, err := w.addrStore.Address(addrmgrNs, addr)
-		if err != nil {
-			return fmt.Errorf("fetch address: %w", err)
-		}
-
-		var ok bool
-
-		pubKeyAddr, ok = managedAddr.(waddrmgr.ManagedPubKeyAddress)
-		if !ok {
-			return fmt.Errorf("%w: addr %s", ErrNotPubKeyAddress,
-				managedAddr.Address())
-		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("view signer address: %w", err)
-	}
-
-	return pubKeyAddr, nil
-}
-
-// resolvePrivKey resolves the private key for a managed pubkey address without
-// using output-script inspection as the private-key lookup seam.
-func (w *Wallet) resolvePrivKey(pubKeyAddr waddrmgr.ManagedPubKeyAddress) (
-	*btcec.PrivateKey, error) {
-
-	// Imported spendable keys have no derivation path, so we fall back to the
-	// dedicated private-key lookup exposed by the managed pubkey address.
-	if pubKeyAddr.Imported() {
-		privKey, err := pubKeyAddr.PrivKey()
-		if err != nil {
-			return nil, fmt.Errorf("fetch imported private key: %w", err)
-		}
-
-		return privKey, nil
-	}
-
-	keyScope, derivationPath, ok := pubKeyAddr.DerivationInfo()
-	if !ok {
-		return nil, fmt.Errorf("%w: addr=%v", ErrDerivationPathNotFound,
-			pubKeyAddr.Address())
-	}
-
-	accountManager, err := w.addrStore.FetchScopedKeyManager(keyScope)
-	if err != nil {
-		return nil, fmt.Errorf("fetch scoped key manager: %w", err)
-	}
-
-	privKey, err := accountManager.DeriveFromKeyPathCache(derivationPath)
-	if err == nil {
-		return privKey, nil
-	}
-
-	if !waddrmgr.IsError(err, waddrmgr.ErrAccountNotCached) {
-		return nil, fmt.Errorf("derive private key from cache: %w", err)
-	}
-
-	return w.resolveDerivedPrivKey(accountManager, derivationPath)
-}
-
-// resolveDerivedPrivKey resolves one derived private key through the normal
-// database-backed derivation path after a cache miss.
-func (w *Wallet) resolveDerivedPrivKey(accountManager waddrmgr.AccountStore,
-	derivationPath waddrmgr.DerivationPath) (*btcec.PrivateKey, error) {
-
-	var privKey *btcec.PrivateKey
-
-	err := walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		managedAddr, err := accountManager.DeriveFromKeyPath(
-			addrmgrNs, derivationPath,
-		)
-		if err != nil {
-			return fmt.Errorf("derive private key from db: %w", err)
-		}
-
-		pubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
-		if !ok {
-			return fmt.Errorf("%w: addr %s", ErrNotPubKeyAddress,
-				managedAddr.Address())
-		}
-
-		privKey, err = pubKeyAddr.PrivKey()
-		if err != nil {
-			return fmt.Errorf("fetch derived private key: %w", err)
-		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("view signer derivation: %w", err)
 	}
 
 	return privKey, nil
