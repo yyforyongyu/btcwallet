@@ -513,6 +513,15 @@ func (m *mockStore) GetManagedPubKeyAddress(ctx context.Context,
 func (m *mockStore) GetPrivKeyByPath(ctx context.Context,
 	query db.SignerPathQuery) (*btcec.PrivateKey, error) {
 
+	if !m.hasExpectation("GetPrivKeyByPath") && m.addrStore != nil {
+		pubKeyAddr, err := m.GetManagedPubKeyAddressByPath(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+
+		return pubKeyAddr.PrivKey()
+	}
+
 	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -525,12 +534,70 @@ func (m *mockStore) GetPrivKeyByPath(ctx context.Context,
 func (m *mockStore) GetPrivKeyForAddress(ctx context.Context,
 	query db.SignerAddressQuery) (*btcec.PrivateKey, error) {
 
+	if !m.hasExpectation("GetPrivKeyForAddress") && m.addrStore != nil {
+		return fallbackPrivKeyForAddress(m, ctx, query)
+	}
+
 	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 
 	return args.Get(0).(*btcec.PrivateKey), args.Error(1)
+}
+
+func fallbackPrivKeyForAddress(m *mockStore, ctx context.Context,
+	query db.SignerAddressQuery) (*btcec.PrivateKey, error) {
+
+	pubKeyAddr, err := m.GetManagedPubKeyAddress(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	if !managedPubKeyAddrHasExpectation(pubKeyAddr, "DerivationInfo") {
+		return pubKeyAddr.PrivKey()
+	}
+
+	if pubKeyAddr.Imported() {
+		return pubKeyAddr.PrivKey()
+	}
+
+	scope, derivationPath, ok := pubKeyAddr.DerivationInfo()
+	if !ok {
+		return nil, ErrDerivationPathNotFound
+	}
+
+	manager, err := m.addrStore.FetchScopedKeyManager(scope)
+	if err != nil {
+		return nil, err
+	}
+
+	return deriveMockPrivKey(manager, derivationPath)
+}
+
+func deriveMockPrivKey(manager waddrmgr.AccountStore,
+	derivationPath waddrmgr.DerivationPath) (*btcec.PrivateKey, error) {
+
+	privKey, err := manager.DeriveFromKeyPathCache(derivationPath)
+	if err == nil {
+		return privKey, nil
+	}
+
+	if !waddrmgr.IsError(err, waddrmgr.ErrAccountNotCached) {
+		return nil, err
+	}
+
+	managedAddr, deriveErr := manager.DeriveFromKeyPath(nil, derivationPath)
+	if deriveErr != nil {
+		return nil, deriveErr
+	}
+
+	derivedPubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
+	if !ok {
+		return nil, ErrNotPubKeyAddress
+	}
+
+	return derivedPubKeyAddr.PrivKey()
 }
 
 // GetAddressDetails implements the db.AddressStore interface.
