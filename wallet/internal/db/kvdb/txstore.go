@@ -12,12 +12,7 @@ import (
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
-var (
-	// txLabelsBucketKey matches the legacy wtxmgr tx-label bucket key.
-	txLabelsBucketKey = []byte("l")
-
-	errLegacyHeightOverflow = errors.New("legacy height overflows int32")
-)
+var errLegacyHeightOverflow = errors.New("legacy height overflows int32")
 
 // CreateTx is not yet implemented for kvdb.
 func (s *Store) CreateTx(ctx context.Context, _ db.CreateTxParams) error {
