@@ -687,7 +687,8 @@ func buildScriptsForAddressInfo(addressInfo AddressInfo, pkScript []byte,
 
 		redeemScript = pushes[0]
 		witnessProgram = redeemScript
-	} else if spendType != waddrmgr.SpendTypeWitnessKey &&
+	} else if spendType != waddrmgr.SpendTypeLegacyKey &&
+		spendType != waddrmgr.SpendTypeWitnessKey &&
 		spendType != waddrmgr.SpendTypeTaprootKeyPath {
 
 		return nil, nil, nil, fmt.Errorf("%w: %v", ErrUnsupportedAddressType,
