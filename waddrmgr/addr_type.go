@@ -3,6 +3,12 @@ package waddrmgr
 import (
 	"errors"
 	"fmt"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
 )
 
 const (
@@ -199,6 +205,9 @@ func (a AddressType) SpendType() SpendType {
 	case TaprootScript:
 		return SpendTypeTaprootScriptPath
 
+	case RawPubKey:
+		return SpendTypeUnknown
+
 	default:
 		return SpendTypeUnknown
 	}
@@ -220,6 +229,9 @@ func (a AddressType) DerivationScheme() DerivationScheme {
 	case TaprootPubKey:
 		return DerivationSchemeBIP86
 
+	case Script, RawPubKey, WitnessScript, TaprootScript:
+		return DerivationSchemeNone
+
 	default:
 		return DerivationSchemeNone
 	}
@@ -240,8 +252,11 @@ func (a AddressType) KeyScope() (KeyScope, error) {
 	case TaprootPubKey:
 		return KeyScopeBIP0086, nil
 
-	default:
+	case Script, RawPubKey, WitnessScript, TaprootScript:
 		return KeyScope{}, fmt.Errorf("%w: %v", ErrUnsupportedAddressType, a)
+
+	default:
+		return KeyScope{}, fmt.Errorf("%w: %v", ErrUnknownAddressType, a)
 	}
 }
 
@@ -265,8 +280,11 @@ func (a AddressType) ScopeAddrSchema() (*ScopeAddrSchema, error) {
 			InternalAddrType: a,
 		}, nil
 
-	default:
+	case Script, RawPubKey, WitnessScript, TaprootScript:
 		return nil, fmt.Errorf("%w: %v", ErrUnsupportedAddressType, a)
+
+	default:
+		return nil, fmt.Errorf("%w: %v", ErrUnknownAddressType, a)
 	}
 }
 
@@ -289,8 +307,11 @@ func (a AddressType) ScriptPubKeySize() (int, error) {
 	case TaprootPubKey, TaprootScript:
 		return p2trPkScriptSize, nil
 
-	default:
+	case RawPubKey:
 		return 0, fmt.Errorf("%w: %v", ErrUnsupportedAddressType, a)
+
+	default:
+		return 0, fmt.Errorf("%w: %v", ErrUnknownAddressType, a)
 	}
 }
 
@@ -304,8 +325,11 @@ func (a AddressType) WitnessVersion() (byte, error) {
 	case TaprootPubKey, TaprootScript:
 		return witnessVersionV1, nil
 
-	default:
+	case PubKeyHash, Script, RawPubKey:
 		return 0, fmt.Errorf("%w: %v", ErrUnsupportedAddressType, a)
+
+	default:
+		return 0, fmt.Errorf("%w: %v", ErrUnknownAddressType, a)
 	}
 }
 
@@ -321,7 +345,112 @@ func (a AddressType) SigningMethod() SigningMethod {
 	case TaprootPubKey:
 		return SigningMethodTaprootKeySpend
 
+	case Script, RawPubKey, WitnessScript, TaprootScript:
+		return SigningMethodUnsupported
+
 	default:
 		return SigningMethodUnsupported
 	}
+}
+
+// addrFromPubKeyBytes reconstructs the standard address from the serialized
+// public key form stored by the wallet.
+func (a AddressType) addrFromPubKeyBytes(pubKeyBytes []byte,
+	net *chaincfg.Params) (btcutil.Address, error) {
+
+	switch a {
+	case PubKeyHash:
+		address, err := btcutil.NewAddressPubKeyHash(
+			btcutil.Hash160(pubKeyBytes), net,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("new pubkey hash address: %w", err)
+		}
+
+		return address, nil
+
+	case NestedWitnessPubKey:
+		return nestedWitnessAddrFromPubKeyBytes(pubKeyBytes, net)
+
+	case WitnessPubKey:
+		address, err := btcutil.NewAddressWitnessPubKeyHash(
+			btcutil.Hash160(pubKeyBytes), net,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("new witness pubkey hash address: %w", err)
+		}
+
+		return address, nil
+
+	case TaprootPubKey:
+		return taprootAddrFromPubKeyBytes(pubKeyBytes, net)
+
+	case Script, RawPubKey, WitnessScript, TaprootScript:
+		return nil, fmt.Errorf("%w: %v", ErrUnsupportedAddressType, a)
+
+	default:
+		return nil, fmt.Errorf("%w: %v", ErrUnknownAddressType, a)
+	}
+}
+
+// nestedWitnessProgramFromPubKeyBytes builds the nested witness redeem program
+// from serialized pubkey bytes.
+func nestedWitnessProgramFromPubKeyBytes(pubKeyBytes []byte,
+	net *chaincfg.Params) ([]byte, error) {
+
+	witnessAddr, err := btcutil.NewAddressWitnessPubKeyHash(
+		btcutil.Hash160(pubKeyBytes), net,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("new witness pubkey hash: %w", err)
+	}
+
+	script, err := txscript.PayToAddrScript(witnessAddr)
+	if err != nil {
+		return nil, fmt.Errorf("pay to witness address: %w", err)
+	}
+
+	return script, nil
+}
+
+// nestedWitnessAddrFromPubKeyBytes builds the outer P2SH address for a nested
+// witness pubkey-hash spend.
+func nestedWitnessAddrFromPubKeyBytes(pubKeyBytes []byte,
+	net *chaincfg.Params) (btcutil.Address, error) {
+
+	witnessProgram, err := nestedWitnessProgramFromPubKeyBytes(
+		pubKeyBytes, net,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build nested witness program: %w", err)
+	}
+
+	address, err := btcutil.NewAddressScriptHash(witnessProgram, net)
+	if err != nil {
+		return nil, fmt.Errorf("new nested witness address: %w", err)
+	}
+
+	return address, nil
+}
+
+// taprootAddrFromPubKeyBytes builds a P2TR address from serialized internal
+// pubkey bytes.
+func taprootAddrFromPubKeyBytes(pubKeyBytes []byte,
+	net *chaincfg.Params) (btcutil.Address, error) {
+
+	internalPubKey, err := btcec.ParsePubKey(pubKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse taproot internal pubkey: %w", err)
+	}
+
+	outputKey := schnorr.SerializePubKey(
+		txscript.ComputeTaprootKeyNoScript(internalPubKey),
+	)
+
+	address, err := btcutil.NewAddressTaproot(outputKey, net)
+	if err != nil {
+		return nil, fmt.Errorf("new taproot address: %w", err)
+	}
+
+	return address, nil
 }
