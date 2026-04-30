@@ -19,6 +19,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
@@ -40,11 +41,9 @@ import (
 type mockStore struct {
 	mock.Mock
 
-	// addrStore optionally backs GetWallet and UpdateWallet so the kvdb
-	// adapter pattern can be exercised end-to-end without programming a
-	// Called expectation for every field. When nil the methods fall back to
-	// mock.Called.
-	addrStore waddrmgr.AddrStore
+	addrStore   *mockAddrStore
+	txStore     *mockTxStore
+	chainParams *chaincfg.Params
 }
 
 // A compile-time assertion to ensure that mockStore implements the db.Store
@@ -283,6 +282,23 @@ func (m *mockStore) NewDerivedAddress(ctx context.Context,
 	return args.Get(0).(*db.AddressInfo), args.Error(1)
 }
 
+// mockStoreUtxoInfo adapts a legacy credit into a store UTXO test record.
+func mockStoreUtxoInfo(credit *wtxmgr.Credit) *db.UtxoInfo {
+	height := db.UnminedHeight
+	if credit.Height >= 0 {
+		height = uint32(credit.Height)
+	}
+
+	return &db.UtxoInfo{
+		OutPoint:     credit.OutPoint,
+		Amount:       credit.Amount,
+		PkScript:     credit.PkScript,
+		Received:     credit.Received.UTC(),
+		FromCoinBase: credit.FromCoinBase,
+		Height:       height,
+	}
+}
+
 // NewImportedAddress implements the db.AddressStore interface.
 func (m *mockStore) NewImportedAddress(ctx context.Context,
 	params db.NewImportedAddressParams) (*db.AddressInfo, error) {
@@ -379,6 +395,15 @@ func (m *mockStore) GetAddressType(ctx context.Context,
 func (m *mockStore) GetUtxo(ctx context.Context,
 	query db.GetUtxoQuery) (*db.UtxoInfo, error) {
 
+	if !m.hasExpectation("GetUtxo") && m.txStore != nil {
+		credit, err := m.txStore.GetUtxo(nil, query.OutPoint)
+		if err != nil {
+			return nil, err
+		}
+
+		return mockStoreUtxoInfo(credit), nil
+	}
+
 	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -390,6 +415,10 @@ func (m *mockStore) GetUtxo(ctx context.Context,
 // ListUTXOs implements the db.UTXOStore interface.
 func (m *mockStore) ListUTXOs(ctx context.Context,
 	query db.ListUtxosQuery) ([]db.UtxoInfo, error) {
+
+	if !m.hasExpectation("ListUTXOs") && m.txStore != nil {
+		return m.listLegacyUTXOs(query)
+	}
 
 	args := m.Called(ctx, query)
 	if args.Get(0) == nil {
@@ -422,6 +451,10 @@ func (m *mockStore) ReleaseOutput(ctx context.Context,
 // ListLeasedOutputs implements the db.UTXOStore interface.
 func (m *mockStore) ListLeasedOutputs(ctx context.Context,
 	walletID uint32) ([]db.LeasedOutput, error) {
+
+	if !m.hasExpectation("ListLeasedOutputs") {
+		return []db.LeasedOutput{}, nil
+	}
 
 	args := m.Called(ctx, walletID)
 	if args.Get(0) == nil {
@@ -542,6 +575,81 @@ func (m *mockStore) hasExpectation(method string) bool {
 	}
 
 	return false
+}
+
+// listLegacyUTXOs adapts the legacy transaction-store mock into store UTXO
+// rows when a test has not programmed an explicit ListUTXOs expectation.
+func (m *mockStore) listLegacyUTXOs(
+	query db.ListUtxosQuery) ([]db.UtxoInfo, error) {
+
+	credits, err := m.txStore.UnspentOutputs(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	currentHeight := m.currentMockHeight()
+	utxos := make([]db.UtxoInfo, 0, len(credits))
+
+	for i := range credits {
+		credit := &credits[i]
+		if !m.legacyCreditMatchesQuery(credit, currentHeight, query) {
+			continue
+		}
+
+		utxos = append(utxos, *mockStoreUtxoInfo(credit))
+	}
+
+	return utxos, nil
+}
+
+// currentMockHeight returns the mocked wallet sync height when available.
+func (m *mockStore) currentMockHeight() int32 {
+	if m.addrStore == nil {
+		return 0
+	}
+
+	return m.addrStore.SyncedTo().Height
+}
+
+// legacyCreditMatchesQuery reports whether one mocked legacy credit satisfies
+// the store-level UTXO query filters.
+func (m *mockStore) legacyCreditMatchesQuery(credit *wtxmgr.Credit,
+	currentHeight int32, query db.ListUtxosQuery) bool {
+
+	confs := calcConf(credit.Height, currentHeight)
+	if query.MinConfs != nil && confs < *query.MinConfs {
+		return false
+	}
+
+	if query.MaxConfs != nil && confs > *query.MaxConfs {
+		return false
+	}
+
+	if query.Account == nil || m.addrStore == nil {
+		return true
+	}
+
+	return m.legacyCreditMatchesAccount(credit, *query.Account)
+}
+
+// legacyCreditMatchesAccount reports whether one mocked legacy credit belongs
+// to the requested account number.
+func (m *mockStore) legacyCreditMatchesAccount(credit *wtxmgr.Credit,
+	account uint32) bool {
+
+	_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+		credit.PkScript, m.chainParams,
+	)
+	if err != nil || len(addrs) != 1 {
+		return false
+	}
+
+	_, creditAccount, err := m.addrStore.AddrAccount(nil, addrs[0])
+	if err != nil {
+		return false
+	}
+
+	return creditAccount == account
 }
 
 // mockTxStore is a mock implementation of the wtxmgr.TxStore interface.
@@ -1451,24 +1559,6 @@ func (m *mockManagedAddress) DerivationInfo() (
 
 	return args.Get(0).(waddrmgr.KeyScope),
 		args.Get(1).(waddrmgr.DerivationPath), args.Bool(2)
-}
-
-// mockCoinSelectionStrategy is a mock implementation of the
-// CoinSelectionStrategy interface used for testing purposes.
-type mockCoinSelectionStrategy struct {
-	mock.Mock
-}
-
-// ArrangeCoins implements the CoinSelectionStrategy interface.
-func (m *mockCoinSelectionStrategy) ArrangeCoins(coins []Coin,
-	feePerKb btcutil.Amount) ([]Coin, error) {
-
-	args := m.Called(coins, feePerKb)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
-	}
-
-	return args.Get(0).([]Coin), args.Error(1)
 }
 
 // mockChain is a mock implementation of the chain.Interface.
