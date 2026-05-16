@@ -7,11 +7,102 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/require"
 )
+
+// TestCreateTxUnminedWithCreditSuccess verifies that kvdb.Store records an
+// unmined transaction, label, credit, and address-used state through wtxmgr.
+func TestCreateTxUnminedWithCreditSuccess(t *testing.T) {
+	t.Parallel()
+
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+
+	newAddrmgrNamespace(t, dbConn)
+	txStore := newTxStore(t, dbConn)
+
+	addr, script := newTestAddressScript(t)
+	addrStore := &testAddrStore{
+		addressByAddr: map[string]waddrmgr.ManagedAddress{
+			addr.String(): &testManagedAddress{
+				addr:     addr,
+				internal: true,
+			},
+		},
+		usedAddrs: make(map[string]bool),
+	}
+	store := NewStore(dbConn, txStore, addrStore)
+
+	txMsg := &wire.MsgTx{Version: 1}
+	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash: chainhash.Hash{60},
+	}})
+	txMsg.AddTxOut(&wire.TxOut{Value: 7_000, PkScript: script})
+
+	label := "published"
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: 0,
+		Tx:       txMsg,
+		Received: time.Unix(1710003000, 0),
+		Status:   db.TxStatusPublished,
+		Label:    label,
+		Credits:  map[uint32]btcutil.Address{0: addr},
+	})
+	require.NoError(t, err)
+
+	txid := txMsg.TxHash()
+	err = walletdb.View(dbConn, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(wtxmgrNamespaceKey)
+		require.NotNil(t, ns)
+
+		details, err := txStore.TxDetails(ns, &txid)
+		require.NoError(t, err)
+		require.NotNil(t, details)
+		require.Equal(t, label, details.Label)
+		require.Len(t, details.Credits, 1)
+		require.Equal(t, uint32(0), details.Credits[0].Index)
+		require.True(t, details.Credits[0].Change)
+
+		return nil
+	})
+	require.NoError(t, err)
+	require.True(t, addrStore.usedAddrs[addr.String()])
+}
+
+// TestCreateTxDuplicateReturnsStoreError verifies that duplicate unmined tx
+// inserts are translated to db.ErrTxAlreadyExists.
+func TestCreateTxDuplicateReturnsStoreError(t *testing.T) {
+	t.Parallel()
+
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+
+	newAddrmgrNamespace(t, dbConn)
+	txStore := newTxStore(t, dbConn)
+	store := NewStore(dbConn, txStore, nil)
+
+	txMsg := &wire.MsgTx{Version: 1}
+	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash: chainhash.Hash{61},
+	}})
+	txMsg.AddTxOut(&wire.TxOut{Value: 8_000, PkScript: []byte{0x51}})
+
+	params := db.CreateTxParams{
+		WalletID: 0,
+		Tx:       txMsg,
+		Received: time.Unix(1710003100, 0),
+		Status:   db.TxStatusPublished,
+	}
+	err := store.CreateTx(t.Context(), params)
+	require.NoError(t, err)
+
+	err = store.CreateTx(t.Context(), params)
+	require.ErrorIs(t, err, db.ErrTxAlreadyExists)
+}
 
 // TestUpdateTxLabelOnlySuccess verifies that kvdb.Store can apply a label-only
 // UpdateTx patch through the legacy label path.

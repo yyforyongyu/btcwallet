@@ -6,18 +6,123 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
+// A compile-time assertion to ensure Store implements the transaction store.
+var _ db.TxStore = (*Store)(nil)
+
 // errLegacyHeightOverflow reports that one db height cannot fit into the
 // signed legacy wtxmgr height domain.
 var errLegacyHeightOverflow = errors.New("legacy height overflows int32")
 
-// CreateTx is not yet implemented for kvdb.
-func (s *Store) CreateTx(ctx context.Context, _ db.CreateTxParams) error {
-	return notImplemented(ctx, "CreateTx")
+// CreateTx records an unmined transaction through the legacy wtxmgr path.
+func (s *Store) CreateTx(ctx context.Context,
+	params db.CreateTxParams) error {
+
+	req, err := db.NewCreateTxRequest(params)
+	if err != nil {
+		return fmt.Errorf("create tx request: %w", err)
+	}
+
+	if req.Params.Block != nil {
+		return notImplemented(ctx, "CreateTx confirmed")
+	}
+
+	if len(req.Params.Credits) > 0 && s.addrStore == nil {
+		return fmt.Errorf("kvdb.Store.CreateTx: %w", errMissingAddrStore)
+	}
+
+	txRec, err := wtxmgr.NewTxRecordFromMsgTx(req.Params.Tx, req.Received)
+	if err != nil {
+		return fmt.Errorf("build tx record: %w", err)
+	}
+
+	err = walletdb.Update(s.db, func(tx walletdb.ReadWriteTx) error {
+		return s.createTxWithTx(tx, txRec, req.Params)
+	})
+	if err != nil {
+		return fmt.Errorf("kvdb.Store.CreateTx: %w", err)
+	}
+
+	return nil
+}
+
+// createTxWithTx records a transaction within one legacy walletdb update.
+func (s *Store) createTxWithTx(tx walletdb.ReadWriteTx,
+	txRec *wtxmgr.TxRecord, params db.CreateTxParams) error {
+
+	addrmgrNs := tx.ReadWriteBucket(waddrmgr.NamespaceKey)
+	if addrmgrNs == nil {
+		return errMissingAddrmgrNamespace
+	}
+
+	txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+	if txmgrNs == nil {
+		return errMissingTxmgrNamespace
+	}
+
+	exists, err := s.txStore.InsertTxCheckIfExists(
+		txmgrNs, txRec, nil,
+	)
+	if err != nil {
+		return fmt.Errorf("insert transaction: %w", err)
+	}
+
+	if exists {
+		return db.ErrTxAlreadyExists
+	}
+
+	if len(params.Label) != 0 {
+		err := s.txStore.PutTxLabel(
+			txmgrNs, txRec.Hash, params.Label,
+		)
+		if err != nil {
+			return fmt.Errorf("put transaction label: %w", err)
+		}
+	}
+
+	return s.addCreateTxCredits(
+		addrmgrNs, txmgrNs, txRec, params.Credits,
+	)
+}
+
+// addCreateTxCredits records wallet-owned outputs for a legacy transaction.
+func (s *Store) addCreateTxCredits(addrmgrNs,
+	txmgrNs walletdb.ReadWriteBucket, txRec *wtxmgr.TxRecord,
+	credits map[uint32]btcutil.Address) error {
+
+	for index, addr := range credits {
+		managedAddr, err := s.addrStore.Address(addrmgrNs, addr)
+		if waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound) {
+			return fmt.Errorf("credit output %d: %w", index,
+				db.ErrAddressNotFound)
+		}
+
+		if err != nil {
+			return fmt.Errorf("lookup credit address %d: %w", index,
+				err)
+		}
+
+		err = s.txStore.AddCredit(
+			txmgrNs, txRec, nil, index, managedAddr.Internal(),
+		)
+		if err != nil {
+			return fmt.Errorf("add credit output %d: %w", index, err)
+		}
+
+		err = s.addrStore.MarkUsed(addrmgrNs, addr)
+		if err != nil {
+			return fmt.Errorf("mark credit address used %d: %w",
+				index, err)
+		}
+	}
+
+	return nil
 }
 
 // UpdateTx re-implements the legacy kvdb label update path through the
