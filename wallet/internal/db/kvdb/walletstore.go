@@ -103,11 +103,99 @@ func (s *Store) IterWallets(ctx context.Context,
 	}
 }
 
-// UpdateWallet is not yet implemented for kvdb.
-func (s *Store) UpdateWallet(ctx context.Context,
-	_ db.UpdateWalletParams) error {
+// UpdateWallet writes wallet runtime metadata through the legacy address
+// manager.
+func (s *Store) UpdateWallet(_ context.Context,
+	params db.UpdateWalletParams) error {
 
-	return notImplemented(ctx, "UpdateWallet")
+	if s.addrStore == nil {
+		return fmt.Errorf("kvdb.Store.UpdateWallet: %w",
+			errMissingAddrStore)
+	}
+
+	addrStore := s.addrStore
+
+	err := walletdb.Update(s.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgr.NamespaceKey)
+		if ns == nil {
+			return errMissingAddrmgrNamespace
+		}
+
+		err := updateWalletBirthday(ns, addrStore, params)
+		if err != nil {
+			return err
+		}
+
+		err = updateWalletBirthdayBlock(ns, addrStore, params)
+		if err != nil {
+			return err
+		}
+
+		return updateWalletSyncedTo(ns, addrStore, params)
+	})
+	if err != nil {
+		return fmt.Errorf("kvdb.Store.UpdateWallet: %w", err)
+	}
+
+	return nil
+}
+
+// updateWalletBirthday writes the wallet birthday timestamp when requested.
+func updateWalletBirthday(ns walletdb.ReadWriteBucket,
+	addrStore waddrmgr.AddrStore, params db.UpdateWalletParams) error {
+
+	if params.Birthday == nil {
+		return nil
+	}
+
+	err := addrStore.SetBirthday(ns, params.Birthday.UTC())
+	if err != nil {
+		return fmt.Errorf("set birthday: %w", err)
+	}
+
+	return nil
+}
+
+// updateWalletBirthdayBlock writes the verified birthday block when requested.
+func updateWalletBirthdayBlock(ns walletdb.ReadWriteBucket,
+	addrStore waddrmgr.AddrStore, params db.UpdateWalletParams) error {
+
+	if params.BirthdayBlock == nil {
+		return nil
+	}
+
+	block, err := kvdbBlockToBlockStamp(params.BirthdayBlock)
+	if err != nil {
+		return err
+	}
+
+	err = addrStore.SetBirthdayBlock(ns, block, true)
+	if err != nil {
+		return fmt.Errorf("set birthday block: %w", err)
+	}
+
+	return nil
+}
+
+// updateWalletSyncedTo writes the wallet sync tip when requested.
+func updateWalletSyncedTo(ns walletdb.ReadWriteBucket,
+	addrStore waddrmgr.AddrStore, params db.UpdateWalletParams) error {
+
+	if params.SyncedTo == nil {
+		return nil
+	}
+
+	block, err := kvdbBlockToBlockStamp(params.SyncedTo)
+	if err != nil {
+		return err
+	}
+
+	err = addrStore.SetSyncedTo(ns, &block)
+	if err != nil {
+		return fmt.Errorf("set synced to: %w", err)
+	}
+
+	return nil
 }
 
 // GetEncryptedHDSeed reads the encrypted master HD private key from the
@@ -176,4 +264,21 @@ func kvdbOptionalBlockFromBlockStamp(
 	}
 
 	return kvdbBlockFromBlockStamp(block)
+}
+
+// kvdbBlockToBlockStamp converts store block metadata into the legacy block
+// stamp shape.
+func kvdbBlockToBlockStamp(block *db.Block) (waddrmgr.BlockStamp, error) {
+	height, err := db.Uint32ToInt32(block.Height)
+	if err != nil {
+		return waddrmgr.BlockStamp{}, fmt.Errorf("%w: store block "+
+			"height %d exceeds max int32", db.ErrInvalidParam,
+			block.Height)
+	}
+
+	return waddrmgr.BlockStamp{
+		Height:    height,
+		Hash:      block.Hash,
+		Timestamp: block.Timestamp,
+	}, nil
 }
