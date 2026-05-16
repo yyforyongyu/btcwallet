@@ -89,6 +89,8 @@ type testAddrStore struct {
 	chainParams   *chaincfg.Params
 	currentHeight int32
 	accountByAddr map[string]uint32
+	addressByAddr map[string]waddrmgr.ManagedAddress
+	usedAddrs     map[string]bool
 }
 
 // ActiveScopedKeyManagers returns no scoped managers for this test double.
@@ -96,9 +98,14 @@ func (s *testAddrStore) ActiveScopedKeyManagers() []waddrmgr.AccountStore {
 	return nil
 }
 
-// Address fails legacy address lookup for this test double.
+// Address returns the managed address registered for this test double.
 func (s *testAddrStore) Address(_ walletdb.ReadBucket,
-	_ btcutil.Address) (waddrmgr.ManagedAddress, error) {
+	addr btcutil.Address) (waddrmgr.ManagedAddress, error) {
+
+	managedAddr, ok := s.addressByAddr[addr.String()]
+	if ok {
+		return managedAddr, nil
+	}
 
 	return nil, errTestAccountNotFound
 }
@@ -153,9 +160,13 @@ func (s *testAddrStore) Decrypt(_ waddrmgr.CryptoKeyType,
 	return in, nil
 }
 
-// MarkUsed accepts address-used updates for this test double.
+// MarkUsed records address-used updates for this test double.
 func (s *testAddrStore) MarkUsed(_ walletdb.ReadWriteBucket,
-	_ btcutil.Address) error {
+	addr btcutil.Address) error {
+
+	if s.usedAddrs != nil {
+		s.usedAddrs[addr.String()] = true
+	}
 
 	return nil
 }
@@ -305,4 +316,36 @@ func newTestAddressScript(t *testing.T) (btcutil.Address, []byte) {
 	require.NoError(t, err)
 
 	return addr, pkScript
+}
+
+// testManagedAddress is a minimal managed address used by kvdb store tests.
+type testManagedAddress struct {
+	addr     btcutil.Address
+	internal bool
+}
+
+// InternalAccount returns the default account for this test address.
+func (a *testManagedAddress) InternalAccount() uint32 { return 0 }
+
+// Address returns the backing bitcoin address.
+func (a *testManagedAddress) Address() btcutil.Address { return a.addr }
+
+// AddrHash returns no address hash for this test double.
+func (a *testManagedAddress) AddrHash() []byte { return nil }
+
+// Imported reports that this test address is derived.
+func (a *testManagedAddress) Imported() bool { return false }
+
+// Internal returns whether this test address is an internal address.
+func (a *testManagedAddress) Internal() bool { return a.internal }
+
+// Compressed reports that this test address uses compressed keys.
+func (a *testManagedAddress) Compressed() bool { return true }
+
+// Used reports that this test address is unused.
+func (a *testManagedAddress) Used(_ walletdb.ReadBucket) bool { return false }
+
+// AddrType returns the default witness-pubkey type for this test address.
+func (a *testManagedAddress) AddrType() waddrmgr.AddressType {
+	return waddrmgr.WitnessPubKey
 }
