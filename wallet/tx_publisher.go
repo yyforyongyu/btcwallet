@@ -23,8 +23,6 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
-	"github.com/btcsuite/btcwallet/walletdb"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/davecgh/go-spew/spew"
 )
 
@@ -132,7 +130,7 @@ func (w *Wallet) Broadcast(ctx context.Context, tx *wire.MsgTx,
 	}
 
 	// Now, we'll attempt to publish the tx. On successful attempt, we
-	// return immediately. On any failures, we remove it from the tx store
+	// return immediately. On any failures, we invalidate it in the tx store
 	// to prevent subsequent attempts with stale transaction data.
 	err = w.publishTx(tx, ourAddrs)
 	if err == nil {
@@ -142,17 +140,17 @@ func (w *Wallet) Broadcast(ctx context.Context, tx *wire.MsgTx,
 	txid := tx.TxHash()
 	log.Errorf("%v: broadcast failed: %v", txid, err)
 
-	// If the tx was rejected for any other reason, then we'll remove it
+	// If the tx was rejected for any other reason, then we'll invalidate it
 	// from the tx store, as otherwise, we'll attempt to continually
 	// re-broadcast it, and the UTXO state of the wallet won't be accurate.
-	removeErr := w.removeUnminedTx(tx)
+	removeErr := w.invalidateUnminedTx(ctx, tx)
 	if removeErr != nil {
-		log.Warnf("Unable to remove tx %v after broadcast failed: %v",
+		log.Warnf("Unable to invalidate tx %v after broadcast failed: %v",
 			txid, removeErr)
 
 		// Return a wrapped error to give the caller full context.
 		return fmt.Errorf("broadcast failed: %w; and failed to "+
-			"remove from wallet: %v", err, removeErr)
+			"invalidate in wallet: %v", err, removeErr)
 	}
 
 	return err
@@ -487,26 +485,24 @@ func (w *Wallet) publishTx(tx *wire.MsgTx, ourAddrs []btcutil.Address) error {
 	return rpcErr
 }
 
-// removeUnminedTx removes a tx from the unconfirmed store.
-func (w *Wallet) removeUnminedTx(tx *wire.MsgTx) error {
+// invalidateUnminedTx marks a tx as failed in the unconfirmed store.
+func (w *Wallet) invalidateUnminedTx(ctx context.Context,
+	tx *wire.MsgTx) error {
+
 	txHash := tx.TxHash()
 
-	dbErr := walletdb.Update(w.cfg.DB, func(dbTx walletdb.ReadWriteTx) error {
-		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-		txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
-		if err != nil {
-			return err
-		}
-
-		return w.txStore.RemoveUnminedTx(txmgrNs, txRec)
+	dbErr := w.store.InvalidateUnminedTx(ctx, db.InvalidateUnminedTxParams{
+		WalletID: w.id,
+		Txid:     txHash,
 	})
 	if dbErr != nil {
-		log.Warnf("Unable to remove invalid tx %v: %v", txHash, dbErr)
+		log.Warnf("Unable to invalidate invalid tx %v: %v", txHash,
+			dbErr)
+
 		return dbErr
 	}
 
-	log.Infof("Removed invalid tx: %v", txHash)
+	log.Infof("Invalidated invalid tx: %v", txHash)
 
 	// The serialized tx is for logging only, don't fail on the error.
 	var txRaw bytes.Buffer
@@ -516,12 +512,12 @@ func (w *Wallet) removeUnminedTx(tx *wire.MsgTx) error {
 	// Optionally log the tx in debug when the size is manageable.
 	const maxTxSizeForLog = 1_000_000
 	if txRaw.Len() < maxTxSizeForLog {
-		log.Debugf("Removed invalid tx: %v \n hex=%x",
+		log.Debugf("Invalidated invalid tx: %v \n hex=%x",
 			newLogClosure(func() string {
 				return spew.Sdump(tx)
 			}), txRaw.Bytes())
 	} else {
-		log.Debugf("Removed invalid tx %v due to its size "+
+		log.Debugf("Invalidated invalid tx %v due to its size "+
 			"being too large", txHash)
 	}
 

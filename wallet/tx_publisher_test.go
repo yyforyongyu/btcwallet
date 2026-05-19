@@ -337,6 +337,7 @@ func TestFilterOwnedAddresses(t *testing.T) {
 		w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
+
 	ownedScript := mustPayToAddrScript(ownedAddr)
 	unownedScript := mustPayToAddrScript(unownedAddr)
 
@@ -477,6 +478,7 @@ func TestAddTxToWallet(t *testing.T) {
 		unownedPrivKey.PubKey().SerializeCompressed(), &chainParams,
 	)
 	require.NoError(t, err)
+
 	ownedScript := mustPayToAddrScript(ownedAddr)
 	unownedScript := mustPayToAddrScript(unownedAddr)
 
@@ -578,9 +580,9 @@ func mustPayToAddrScript(addr btcutil.Address) []byte {
 	return pkScript
 }
 
-// TestRemoveUnminedTx tests the removeUnminedTx method to ensure it correctly
-// removes a transaction from the unconfirmed store.
-func TestRemoveUnminedTx(t *testing.T) {
+// TestInvalidateUnminedTx tests the invalidateUnminedTx method to ensure it
+// correctly marks a transaction failed in the unconfirmed store.
+func TestInvalidateUnminedTx(t *testing.T) {
 	t.Parallel()
 
 	w, mocks := createStartedWalletWithMocks(t)
@@ -593,13 +595,14 @@ func TestRemoveUnminedTx(t *testing.T) {
 		}},
 	}
 
-	// Set up the mock for the transaction store.
-	mocks.txStore.On(
-		"RemoveUnminedTx", mock.Anything, mock.Anything,
+	txid := tx.TxHash()
+	mocks.store.On(
+		"InvalidateUnminedTx", mock.Anything,
+		matchInvalidateUnminedTxParams(w.id, txid),
 	).Return(nil).Once()
 
 	// Call the method under test.
-	err := w.removeUnminedTx(tx)
+	err := w.invalidateUnminedTx(t.Context(), tx)
 	require.NoError(t, err)
 }
 
@@ -852,9 +855,8 @@ func TestBroadcastPublishFailsRemoveSucceeds(t *testing.T) {
 		mock.Anything, mock.Anything,
 	).Return(nil, errPublish)
 
-	// Mock removeUnminedTx to succeed.
-	m.txStore.On("RemoveUnminedTx",
-		mock.Anything, mock.Anything,
+	m.store.On("InvalidateUnminedTx", mock.Anything,
+		matchInvalidateUnminedTxParams(w.id, tx.TxHash()),
 	).Return(nil).Once()
 
 	err = w.Broadcast(t.Context(), tx, label)
@@ -904,9 +906,8 @@ func TestBroadcastPublishFailsRemoveFails(t *testing.T) {
 		mock.Anything, mock.Anything,
 	).Return(nil, errPublish)
 
-	// Mock removeUnminedTx to fail.
-	m.txStore.On("RemoveUnminedTx",
-		mock.Anything, mock.Anything,
+	m.store.On("InvalidateUnminedTx", mock.Anything,
+		matchInvalidateUnminedTxParams(w.id, tx.TxHash()),
 	).Return(errRemove).Once()
 
 	err = w.Broadcast(t.Context(), tx, label)
