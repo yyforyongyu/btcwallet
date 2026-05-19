@@ -382,50 +382,17 @@ func utxoConfirmations(height uint32, currentHeight int32) (int32, error) {
 	return calcConf(txHeight, currentHeight), nil
 }
 
-// GetUtxo returns the output information for a given outpoint.
+// GetUtxo returns one wallet-owned UTXO together with its wallet-facing
+// metadata.
 //
-// This method provides a detailed view of a single UTXO, identified by its
-// outpoint. The result is enriched with detailed information about the UTXO,
-// such as its address, account, and spendability.
-//
-// How it works:
-// The method performs a direct lookup of the UTXO in the wallet's transaction
-// store (`wtxmgr`). If the UTXO is found, it then performs an additional
-// lookup in the address manager (`waddrmgr`) to enrich the UTXO data with
-// details like the owning account name, address type, and spendability.
-//
-// Logical Steps:
-//  1. Initiate a single, read-only database transaction to ensure a
-//     consistent view of the data.
-//  2. Fetch the unspent transaction output from the `wtxmgr` namespace using
-//     the provided outpoint.
-//  3. If the UTXO is not found, return a `wtxmgr.ErrUtxoNotFound` error.
-//  4. Calculate its current confirmation status based on the wallet's
-//     synced block height.
-//  5. Extract the address from the UTXO's public key script. For
-//     multi-address scripts, the first address is used.
-//  6. Call `waddrmgr.AddressDetails` to get the spendability status,
-//     account name, and address type in a single, efficient lookup.
-//  7. Construct the final `Utxo` struct with all the combined data.
-//  8. Return the final `Utxo` struct.
-//
-// Database Actions:
-//   - This method performs a single read-only database transaction
-//     (`walletdb.View`).
-//   - It reads from both the `wtxmgr` (for the UTXO) and `waddrmgr` (for
-//     address details) namespaces.
-//
-// Time Complexity:
-//   - The complexity is O(A_l), where A_l is the average cost of the
-//     address and account lookups (`AddressDetails`).
-//
-// TODO(yy): The current implementation of GetUtxo performs separate database
-// lookups for the UTXO and its details. The upcoming SQL schema redesign should
-// address this issue by denormalizing the data, which would turn the multiple
-// lookups into a single, efficient query.
+// TODO(yy): Collapse the SQL-backed GetUtxo path into one enriched store read
+// by (1) extending GetUtxo to return account, address type, spendable, and
+// locked state, (2) having the SQL backends populate those fields from one
+// joined query, and (3) removing the follow-up ListLeasedOutputs/GetAddress
+// composition here.
 //
 // NOTE: This is part of the UtxoManager interface implementation.
-func (w *Wallet) GetUtxo(_ context.Context,
+func (w *Wallet) GetUtxo(ctx context.Context,
 	prevOut wire.OutPoint) (*Utxo, error) {
 
 	err := w.state.validateStarted()
@@ -433,65 +400,39 @@ func (w *Wallet) GetUtxo(_ context.Context,
 		return nil, err
 	}
 
-	// Calculate the current confirmation status based on the wallet's
-	// synced block height.
-	syncBlock := w.addrStore.SyncedTo()
-	currentHeight := syncBlock.Height
+	currentHeight := w.addrStore.SyncedTo().Height
 
-	var utxo *Utxo
-
-	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		// First, fetch the unspent transaction output from the UTXO
-		// set.
-		output, err := w.txStore.GetUtxo(txmgrNs, prevOut)
-		if err != nil {
-			return err
-		}
-
-		// If the output is not found, return an error.
-		if output == nil {
-			return wtxmgr.ErrUtxoNotFound
-		}
-
-		confs := calcConf(output.Height, currentHeight)
-
-		// Extract the address from the UTXO's public key script.
-		// For multi-address scripts, the first address is used.
-		addr := extractAddrFromPKScript(
-			output.PkScript, w.cfg.ChainParams,
-		)
-		if addr == nil {
-			return wtxmgr.ErrUtxoNotFound
-		}
-
-		// In a single lookup, get all the required
-		// address-related details: spendability, account name,
-		// and address type. This avoids the N+1 query problem.
-		spendable, account, addrType := w.addrStore.AddressDetails(
-			addrmgrNs, addr,
-		)
-
-		// If all filters pass, construct the final Utxo struct
-		// with all the combined data.
-		utxo = &Utxo{
-			OutPoint:      output.OutPoint,
-			Amount:        output.Amount,
-			PkScript:      output.PkScript,
-			Confirmations: confs,
-			Spendable:     spendable,
-			Address:       addr,
-			Account:       account,
-			AddressType:   addrType,
-			Locked:        output.Locked,
-		}
-
-		return nil
+	info, err := w.store.GetUtxo(ctx, db.GetUtxoQuery{
+		WalletID: w.id,
+		OutPoint: prevOut,
 	})
+	if err != nil {
+		if errors.Is(err, db.ErrUtxoNotFound) {
+			return nil, wtxmgr.ErrUtxoNotFound
+		}
 
-	return utxo, err
+		return nil, fmt.Errorf("get utxo: %w", err)
+	}
+
+	leases, err := w.store.ListLeasedOutputs(ctx, w.id)
+	if err != nil {
+		return nil, fmt.Errorf("list leased outputs: %w", err)
+	}
+
+	lockedOutputs := leasedOutputSet(leases)
+
+	utxo, include, err := w.buildWalletUtxoFromStore(
+		ctx, info, currentHeight, "", lockedOutputs[info.OutPoint],
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if !include {
+		return nil, wtxmgr.ErrUtxoNotFound
+	}
+
+	return utxo, nil
 }
 
 // LeaseOutput locks an output for a given duration, preventing it from being
