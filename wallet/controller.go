@@ -603,12 +603,21 @@ func (w *Wallet) verifyBirthday(ctx context.Context) error {
 		return fmt.Errorf("locate birthday block: %w", err)
 	}
 
-	err = w.DBPutBirthdayBlock(ctx, *newBirthdayBlock)
+	storeBlock, err := blockStampToStoreBlock(*newBirthdayBlock)
+	if err != nil {
+		return err
+	}
+
+	err = w.store.UpdateWallet(ctx, db.UpdateWalletParams{
+		WalletID:      w.id,
+		BirthdayBlock: storeBlock,
+		SyncedTo:      storeBlock,
+	})
 	if err != nil {
 		log.Errorf("Unable to sanity check wallet birthday "+
 			"block: %v", err)
 
-		return err
+		return fmt.Errorf("update birthday block: %w", err)
 	}
 
 	w.birthdayBlock = *newBirthdayBlock
@@ -629,6 +638,23 @@ func storeBlockToBlockStamp(block *db.Block) (waddrmgr.BlockStamp, error) {
 	return waddrmgr.BlockStamp{
 		Height:    height,
 		Hash:      block.Hash,
+		Timestamp: block.Timestamp,
+	}, nil
+}
+
+// blockStampToStoreBlock converts legacy block-stamp metadata into the database
+// store block shape.
+func blockStampToStoreBlock(
+	block waddrmgr.BlockStamp) (*db.Block, error) {
+
+	height, err := db.Int64ToUint32(int64(block.Height))
+	if err != nil {
+		return nil, fmt.Errorf("block height %d: %w", block.Height, err)
+	}
+
+	return &db.Block{
+		Hash:      block.Hash,
+		Height:    height,
 		Timestamp: block.Timestamp,
 	}, nil
 }

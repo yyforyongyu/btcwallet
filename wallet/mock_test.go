@@ -40,9 +40,10 @@ import (
 type mockStore struct {
 	mock.Mock
 
-	// addrStore optionally backs GetWallet so the kvdb adapter pattern can
-	// be exercised end-to-end without programming a Called expectation for
-	// every field. When nil the method falls back to mock.Called.
+	// addrStore optionally backs GetWallet and UpdateWallet so the kvdb
+	// adapter pattern can be exercised end-to-end without programming a
+	// Called expectation for every field. When nil the methods fall back to
+	// mock.Called.
 	addrStore waddrmgr.AddrStore
 }
 
@@ -150,9 +151,45 @@ func (m *mockStore) IterWallets(ctx context.Context,
 func (m *mockStore) UpdateWallet(ctx context.Context,
 	params db.UpdateWalletParams) error {
 
-	args := m.Called(ctx, params)
+	if m.hasExpectation("UpdateWallet") || m.addrStore == nil {
+		args := m.Called(ctx, params)
+		return args.Error(0)
+	}
 
-	return args.Error(0)
+	if params.BirthdayBlock != nil {
+		height, err := db.Uint32ToInt32(params.BirthdayBlock.Height)
+		if err != nil {
+			return err
+		}
+
+		block := waddrmgr.BlockStamp{
+			Height:    height,
+			Hash:      params.BirthdayBlock.Hash,
+			Timestamp: params.BirthdayBlock.Timestamp,
+		}
+
+		err = m.addrStore.SetBirthdayBlock(nil, block, true)
+		if err != nil {
+			return err
+		}
+	}
+
+	if params.SyncedTo != nil {
+		height, err := db.Uint32ToInt32(params.SyncedTo.Height)
+		if err != nil {
+			return err
+		}
+
+		block := waddrmgr.BlockStamp{
+			Height:    height,
+			Hash:      params.SyncedTo.Hash,
+			Timestamp: params.SyncedTo.Timestamp,
+		}
+
+		return m.addrStore.SetSyncedTo(nil, &block)
+	}
+
+	return nil
 }
 
 // GetEncryptedHDSeed implements the db.WalletStore interface.
