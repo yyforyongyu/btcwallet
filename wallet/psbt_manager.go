@@ -486,7 +486,7 @@ func (w *Wallet) fetchAndValidateUtxo(ctx context.Context, txIn *wire.TxIn) (
 
 	outPoint := txIn.PreviousOutPoint
 
-	_, err := w.store.GetUtxo(ctx, db.GetUtxoQuery{
+	utxoInfo, err := w.store.GetUtxo(ctx, db.GetUtxoQuery{
 		WalletID: w.id,
 		OutPoint: outPoint,
 	})
@@ -508,9 +508,11 @@ func (w *Wallet) fetchAndValidateUtxo(ctx context.Context, txIn *wire.TxIn) (
 		return nil, nil, fmt.Errorf("%w: %v", ErrUtxoLocked, outPoint)
 	}
 
-	// Next, fetch the transaction details from the legacy transaction store.
-	txDetail, err := w.fetchTxDetails(&outPoint.Hash)
-	if errors.Is(err, ErrTxNotFound) {
+	txDetail, err := w.store.GetTxDetail(ctx, db.GetTxDetailQuery{
+		WalletID: w.id,
+		Txid:     outPoint.Hash,
+	})
+	if errors.Is(err, db.ErrTxNotFound) {
 		return nil, nil, fmt.Errorf("%w: %v", ErrNotMine, outPoint)
 	}
 
@@ -522,14 +524,37 @@ func (w *Wallet) fetchAndValidateUtxo(ctx context.Context, txIn *wire.TxIn) (
 	// Now that we've confirmed we know about the UTXO, we'll proceed to
 	// gather the rest of the information required to decorate the PSBT
 	// input.
-	tx := &txDetail.MsgTx
-	utxo := tx.TxOut[outPoint.Index]
+	tx, err := txFromDetail(*txDetail)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	utxo, err := validatePsbtParentOutput(outPoint, utxoInfo, tx)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	return tx, utxo, nil
 }
 
 // validatePsbtParentOutput returns the parent transaction output for the
 // store-backed UTXO, ensuring the tx index and output fields match.
+// txFromDetail returns the decoded transaction for one store tx-detail record.
+func txFromDetail(detail db.TxDetailInfo) (*wire.MsgTx, error) {
+	if detail.MsgTx != nil {
+		return detail.MsgTx, nil
+	}
+
+	var msgTx wire.MsgTx
+
+	err := msgTx.Deserialize(bytes.NewReader(detail.SerializedTx))
+	if err != nil {
+		return nil, fmt.Errorf("deserialize tx %v: %w", detail.Hash, err)
+	}
+
+	return &msgTx, nil
+}
+
 func validatePsbtParentOutput(outPoint wire.OutPoint,
 	utxoInfo *db.UtxoInfo, tx *wire.MsgTx) (*wire.TxOut, error) {
 
