@@ -260,8 +260,8 @@ func TestFetchAndValidateUtxoTxStoreError(t *testing.T) {
 	require.Nil(t, utxo)
 }
 
-// TestFetchAndValidateUtxoLocked verifies that legacy locked-credit state still
-// prevents PSBT decoration before leases are routed through the Store layer.
+// TestFetchAndValidateUtxoLocked verifies that store-backed leased-output state
+// prevents PSBT decoration.
 func TestFetchAndValidateUtxoLocked(t *testing.T) {
 	t.Parallel()
 
@@ -270,32 +270,44 @@ func TestFetchAndValidateUtxoLocked(t *testing.T) {
 	txIn := &wire.TxIn{PreviousOutPoint: outPoint}
 	txOut := &wire.TxOut{Value: 1000}
 	utxoInfo := testStoreUtxoInfo(outPoint, txOut)
-
-	lockedDetails := &wtxmgr.TxDetails{
-		TxRecord: wtxmgr.TxRecord{
-			MsgTx: wire.MsgTx{
-				TxOut: []*wire.TxOut{{Value: 1000}, txOut},
-			},
-		},
-		Credits: []wtxmgr.CreditRecord{
-			{Index: 0},
-			{Index: 1, Locked: true},
-		},
-	}
 	w, mocks := createStartedWalletWithMocks(t)
 
 	mocks.store.On("GetUtxo", mock.Anything, db.GetUtxoQuery{
 		WalletID: w.id,
 		OutPoint: outPoint,
 	}).Return(utxoInfo, nil)
-	mocks.txStore.On("TxDetails", mock.Anything,
-		mock.MatchedBy(func(h *chainhash.Hash) bool {
-			return h.IsEqual(&txHash)
-		}),
-	).Return(lockedDetails, nil)
+	mocks.store.On("ListLeasedOutputs", mock.Anything, w.id).Return(
+		[]db.LeasedOutput{{OutPoint: outPoint}}, nil,
+	)
 
 	tx, utxo, err := w.fetchAndValidateUtxo(t.Context(), txIn)
 	require.ErrorIs(t, err, ErrUtxoLocked)
+	require.Nil(t, tx)
+	require.Nil(t, utxo)
+}
+
+// TestFetchAndValidateUtxoLeasesError verifies that leased-output lookup
+// failures are returned to the caller.
+func TestFetchAndValidateUtxoLeasesError(t *testing.T) {
+	t.Parallel()
+
+	txHash := chainhash.Hash{1}
+	outPoint := wire.OutPoint{Hash: txHash, Index: 0}
+	txIn := &wire.TxIn{PreviousOutPoint: outPoint}
+	txOut := &wire.TxOut{Value: 1000}
+	utxoInfo := testStoreUtxoInfo(outPoint, txOut)
+	w, mocks := createStartedWalletWithMocks(t)
+
+	mocks.store.On("GetUtxo", mock.Anything, db.GetUtxoQuery{
+		WalletID: w.id,
+		OutPoint: outPoint,
+	}).Return(utxoInfo, nil)
+	mocks.store.On("ListLeasedOutputs", mock.Anything, w.id).Return(
+		nil, errDb,
+	)
+
+	tx, utxo, err := w.fetchAndValidateUtxo(t.Context(), txIn)
+	require.ErrorIs(t, err, errDb)
 	require.Nil(t, tx)
 	require.Nil(t, utxo)
 }
