@@ -23,6 +23,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/davecgh/go-spew/spew"
@@ -126,7 +127,7 @@ func (w *Wallet) Broadcast(ctx context.Context, tx *wire.MsgTx,
 	// allow us to track the tx's confirmation status, and also
 	// re-broadcast it upon startup. If any of the subsequent steps fail,
 	// this tx must be removed.
-	ourAddrs, err := w.addTxToWallet(tx, label)
+	ourAddrs, err := w.addTxToWallet(ctx, tx, label)
 	if err != nil {
 		return err
 	}
@@ -260,13 +261,8 @@ type ownedAddrInfo struct {
 // transaction. This transaction contains no business logic and only performs
 // the necessary database writes, ensuring that the exclusive database lock is
 // held for the shortest possible time.
-func (w *Wallet) addTxToWallet(tx *wire.MsgTx,
+func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 	label string) ([]btcutil.Address, error) {
-
-	txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
-	if err != nil {
-		return nil, err
-	}
 
 	// Stage 1: Extract potential addresses from all transaction outputs.
 	// This is a CPU-intensive operation that is performed entirely in
@@ -319,7 +315,7 @@ func (w *Wallet) addTxToWallet(tx *wire.MsgTx,
 	// Stage 4: Atomically execute the write plan. This is the only stage
 	// that takes an exclusive database lock, and it is designed to be as
 	// fast as possible, containing no business logic.
-	err = w.recordTxAndCredits(txRec, label, creditsToWrite)
+	err = w.recordTxAndCredits(ctx, tx, label, creditsToWrite)
 	if err != nil {
 		return nil, err
 	}
@@ -329,58 +325,40 @@ func (w *Wallet) addTxToWallet(tx *wire.MsgTx,
 
 // recordTxAndCredits performs a single atomic database transaction to execute a
 // pre-computed "write plan" for a transaction.
-func (w *Wallet) recordTxAndCredits(txRec *wtxmgr.TxRecord, label string,
-	creditsToWrite []creditInfo) error {
+func (w *Wallet) recordTxAndCredits(ctx context.Context, tx *wire.MsgTx,
+	label string, creditsToWrite []creditInfo) error {
 
-	return walletdb.Update(w.cfg.DB, func(dbTx walletdb.ReadWriteTx) error {
-		addrmgrNs := dbTx.ReadWriteBucket(waddrmgrNamespaceKey)
-		txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
+	credits := make(map[uint32]btcutil.Address, len(creditsToWrite))
+	for _, credit := range creditsToWrite {
+		credits[credit.index] = credit.addr
+	}
 
-		// If there is a label we should write, get the namespace key
-		// and record it in the tx store.
-		if len(label) != 0 {
-			txHash := txRec.MsgTx.TxHash()
-
-			err := w.txStore.PutTxLabel(txmgrNs, txHash, label)
-			if err != nil {
-				return err
-			}
-		}
-
-		// At the moment all notified txs are assumed to actually be
-		// relevant. This assumption will not hold true when SPV
-		// support is added, but until then, simply insert the tx
-		// because there should either be one or more relevant inputs
-		// or outputs.
-		exists, err := w.txStore.InsertTxCheckIfExists(
-			txmgrNs, txRec, nil,
-		)
-		if err != nil {
-			return err
-		}
-
-		// If the tx has already been recorded, we can return early.
-		if exists {
-			return nil
-		}
-
-		// Now, execute the write plan.
-		for _, credit := range creditsToWrite {
-			err := w.txStore.AddCredit(
-				txmgrNs, txRec, nil, credit.index,
-				credit.ma.Internal(),
-			)
-			if err != nil {
-				return err
-			}
-
-			err = w.addrStore.MarkUsed(addrmgrNs, credit.addr)
-			if err != nil {
-				return err
-			}
-		}
-
+	err := w.store.CreateTx(ctx, db.CreateTxParams{
+		WalletID: w.id,
+		Tx:       tx,
+		Received: time.Now(),
+		Status:   db.TxStatusPublished,
+		Label:    label,
+		Credits:  credits,
+	})
+	if err == nil {
 		return nil
+	}
+
+	if !errors.Is(err, db.ErrTxAlreadyExists) {
+		return err
+	}
+
+	if len(label) == 0 {
+		return nil
+	}
+
+	txHash := tx.TxHash()
+
+	return w.store.UpdateTx(ctx, db.UpdateTxParams{
+		WalletID: w.id,
+		Txid:     txHash,
+		Label:    &label,
 	})
 }
 

@@ -9,7 +9,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcjson"
@@ -21,7 +20,6 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
-	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -375,14 +373,12 @@ func TestFilterOwnedAddresses(t *testing.T) {
 func TestRecordTxAndCredits(t *testing.T) {
 	t.Parallel()
 
-	// Create a sample TxRecord from a transaction with one input and one
-	// output with a value of 10000.
+	// Create a sample transaction with one input and one output with a value
+	// of 10000.
 	tx := &wire.MsgTx{
 		TxIn:  []*wire.TxIn{{}},
 		TxOut: []*wire.TxOut{{Value: 10000}},
 	}
-	txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
-	require.NoError(t, err)
 
 	// Create a sample credit for a P2PK address.
 	privKey, err := btcec.NewPrivateKey()
@@ -392,33 +388,30 @@ func TestRecordTxAndCredits(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	mockManagedAddr := &mockManagedAddress{}
-	mockManagedAddr.On("Internal").Return(false)
 	credits := []creditInfo{{
 		index: 0,
-		ma:    mockManagedAddr,
 		addr:  addr,
 	}}
+	expectedCredits := map[uint32]btcutil.Address{0: addr}
 
 	testCases := []struct {
-		name      string
-		withLabel bool
-		txExists  bool
+		name        string
+		withLabel   bool
+		createErr   error
+		updateLabel bool
 	}{
 		{
 			name:      "new tx with label",
 			withLabel: true,
-			txExists:  false,
 		},
 		{
-			name:      "existing tx",
-			withLabel: true,
-			txExists:  true,
+			name:        "existing tx",
+			withLabel:   true,
+			createErr:   db.ErrTxAlreadyExists,
+			updateLabel: true,
 		},
 		{
-			name:      "no label",
-			withLabel: false,
-			txExists:  false,
+			name: "no label",
 		},
 	}
 
@@ -434,27 +427,21 @@ func TestRecordTxAndCredits(t *testing.T) {
 				label = testTxLabel
 			}
 
-			mocks.txStore.On("InsertTxCheckIfExists",
-				mock.Anything, txRec, mock.Anything,
-			).Return(tc.txExists, nil).Once()
+			mocks.store.On("CreateTx", mock.Anything,
+				matchCreateTxParams(
+					w.id, tx, label, expectedCredits,
+				),
+			).Return(tc.createErr).Once()
 
-			if tc.withLabel {
-				mocks.txStore.On("PutTxLabel",
-					mock.Anything, txid, label,
+			if tc.updateLabel {
+				mocks.store.On("UpdateTx", mock.Anything,
+					matchUpdateTxLabelParams(w.id, txid, label),
 				).Return(nil).Once()
 			}
 
-			if !tc.txExists {
-				mocks.txStore.On("AddCredit",
-					mock.Anything, txRec, mock.Anything,
-					uint32(0), false,
-				).Return(nil).Once()
-				mocks.addrStore.On("MarkUsed",
-					mock.Anything, addr,
-				).Return(nil).Once()
-			}
-
-			err := w.recordTxAndCredits(txRec, label, credits)
+			err := w.recordTxAndCredits(
+				t.Context(), tx, label, credits,
+			)
 			require.NoError(t, err)
 		})
 	}
@@ -500,7 +487,6 @@ func TestAddTxToWallet(t *testing.T) {
 			},
 		},
 	}
-	txid := tx.TxHash()
 	label := testTxLabel
 
 	t.Run("tx with owned outputs", func(t *testing.T) {
@@ -515,7 +501,6 @@ func TestAddTxToWallet(t *testing.T) {
 		//
 		// Set up the mock for the address store.
 		mockManagedAddr := &mockManagedAddress{}
-		mockManagedAddr.On("Internal").Return(false)
 
 		errAddrNotFound := waddrmgr.ManagerError{
 			ErrorCode: waddrmgr.ErrAddressNotFound,
@@ -528,31 +513,16 @@ func TestAddTxToWallet(t *testing.T) {
 			mock.Anything, unownedAddr,
 		).Return(nil, errAddrNotFound)
 
-		// Set up the mocks for the transaction store.
-		m.txStore.On("PutTxLabel",
-			mock.Anything, txid, label,
+		expectedCredits := map[uint32]btcutil.Address{
+			0: ownedAddr,
+			2: ownedAddr,
+		}
+		m.store.On("CreateTx", mock.Anything,
+			matchCreateTxParams(w.id, tx, label, expectedCredits),
 		).Return(nil).Once()
-		m.txStore.On("InsertTxCheckIfExists",
-			mock.Anything, mock.Anything,
-			mock.Anything,
-		).Return(false, nil).Once()
-
-		// We expect two credits to be added for the two owned
-		// outputs.
-		m.txStore.On("AddCredit",
-			mock.Anything, mock.Anything,
-			mock.Anything, uint32(0), false,
-		).Return(nil).Once()
-		m.txStore.On("AddCredit",
-			mock.Anything, mock.Anything,
-			mock.Anything, uint32(2), false,
-		).Return(nil).Once()
-		m.addrStore.On("MarkUsed",
-			mock.Anything, ownedAddr,
-		).Return(nil).Twice()
 
 		// Add the transaction to the wallet.
-		ourAddrs, err := w.addTxToWallet(tx, label)
+		ourAddrs, err := w.addTxToWallet(t.Context(), tx, label)
 		require.NoError(t, err)
 
 		// Check that the returned addresses are correct.
@@ -590,7 +560,7 @@ func TestAddTxToWallet(t *testing.T) {
 		).Return(nil, errAddrNotFound)
 
 		// Add the transaction to the wallet.
-		ourAddrs, err := w.addTxToWallet(tx, label)
+		ourAddrs, err := w.addTxToWallet(t.Context(), tx, label)
 		require.NoError(t, err)
 
 		// We expect no addresses to be returned and no calls to the
@@ -801,23 +771,14 @@ func TestBroadcastSuccess(t *testing.T) {
 		mock.Anything, mock.Anything,
 	).Return([]*btcjson.TestMempoolAcceptResult{{Allowed: true}}, nil)
 
-	// Mock addTxToWallet to succeed.
 	mockManagedAddr := &mockManagedAddress{}
-	mockManagedAddr.On("Internal").Return(false)
 	m.addrStore.On("Address",
 		mock.Anything, ownedAddr,
 	).Return(mockManagedAddr, nil).Once()
-	m.txStore.On("PutTxLabel",
-		mock.Anything, tx.TxHash(), label,
-	).Return(nil).Once()
-	m.txStore.On("InsertTxCheckIfExists",
-		mock.Anything, mock.Anything, mock.Anything,
-	).Return(false, nil).Once()
-	m.txStore.On("AddCredit",
-		mock.Anything, mock.Anything, mock.Anything, uint32(0), false,
-	).Return(nil).Once()
-	m.addrStore.On("MarkUsed",
-		mock.Anything, ownedAddr,
+	m.store.On("CreateTx", mock.Anything,
+		matchCreateTxParams(w.id, tx, label, map[uint32]btcutil.Address{
+			0: ownedAddr,
+		}),
 	).Return(nil).Once()
 
 	// Mock publishTx to succeed.
@@ -879,23 +840,14 @@ func TestBroadcastPublishFailsRemoveSucceeds(t *testing.T) {
 		mock.Anything, mock.Anything,
 	).Return([]*btcjson.TestMempoolAcceptResult{{Allowed: true}}, nil)
 
-	// Mock addTxToWallet to succeed.
 	mockManagedAddr := &mockManagedAddress{}
-	mockManagedAddr.On("Internal").Return(false)
 	m.addrStore.On("Address",
 		mock.Anything, ownedAddr,
 	).Return(mockManagedAddr, nil).Once()
-	m.txStore.On("PutTxLabel",
-		mock.Anything, tx.TxHash(), label,
-	).Return(nil).Once()
-	m.txStore.On("InsertTxCheckIfExists",
-		mock.Anything, mock.Anything, mock.Anything,
-	).Return(false, nil).Once()
-	m.txStore.On("AddCredit",
-		mock.Anything, mock.Anything, mock.Anything, uint32(0), false,
-	).Return(nil).Once()
-	m.addrStore.On("MarkUsed",
-		mock.Anything, ownedAddr,
+	m.store.On("CreateTx", mock.Anything,
+		matchCreateTxParams(w.id, tx, label, map[uint32]btcutil.Address{
+			0: ownedAddr,
+		}),
 	).Return(nil).Once()
 
 	// Mock publishTx to fail.
@@ -941,27 +893,16 @@ func TestBroadcastPublishFailsRemoveFails(t *testing.T) {
 		mock.Anything, mock.Anything,
 	).Return([]*btcjson.TestMempoolAcceptResult{{Allowed: true}}, nil)
 
-	// Mock addTxToWallet to succeed.
 	mockManagedAddr := &mockManagedAddress{}
-	mockManagedAddr.On("Internal").Return(false)
 
 	// Mock addrStore to succeed.
 	m.addrStore.On("Address",
 		mock.Anything, ownedAddr,
 	).Return(mockManagedAddr, nil).Once()
-	m.addrStore.On("MarkUsed",
-		mock.Anything, ownedAddr,
-	).Return(nil).Once()
-
-	// Mock txStore to succeed.
-	m.txStore.On("PutTxLabel",
-		mock.Anything, tx.TxHash(), label,
-	).Return(nil).Once()
-	m.txStore.On("InsertTxCheckIfExists",
-		mock.Anything, mock.Anything, mock.Anything,
-	).Return(false, nil).Once()
-	m.txStore.On("AddCredit",
-		mock.Anything, mock.Anything, mock.Anything, uint32(0), false,
+	m.store.On("CreateTx", mock.Anything,
+		matchCreateTxParams(w.id, tx, label, map[uint32]btcutil.Address{
+			0: ownedAddr,
+		}),
 	).Return(nil).Once()
 
 	// Mock publishTx to fail.
