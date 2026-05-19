@@ -22,7 +22,6 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
-	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
@@ -219,9 +218,6 @@ type creditInfo struct {
 	// index is the output index of the credit.
 	index uint32
 
-	// ma is the managed address of the credit.
-	ma waddrmgr.ManagedAddress
-
 	// addr is the address of the credit.
 	addr btcutil.Address
 }
@@ -229,8 +225,12 @@ type creditInfo struct {
 // ownedAddrInfo holds information about a wallet-owned address and the
 // transaction output indices that pay to it.
 type ownedAddrInfo struct {
-	// managedAddr represents the managed address.
-	managedAddr waddrmgr.ManagedAddress
+	// addr is the wallet-owned address.
+	addr btcutil.Address
+
+	// scriptPubKey is the script used to identify the wallet-owned address in
+	// the Store layer.
+	scriptPubKey []byte
 
 	// outputIndices contains the transaction output indices that contain
 	// this address. The indices are not guaranteed to be sorted in any
@@ -247,10 +247,9 @@ type ownedAddrInfo struct {
 // This is done outside of any database transaction to avoid holding locks
 // during computationally expensive work.
 //
-// 2. Filter: Second, it uses a fast, read-only database transaction to
-// filter the large list of potential addresses down to the small set that is
-// actually owned by the wallet. This minimizes the time spent in the final,
-// more expensive write transaction.
+// 2. Filter: Second, it uses Store address lookups to filter the large list of
+// potential addresses down to the small set that is actually owned by the
+// wallet. This minimizes the time spent in the final, more expensive write.
 //
 // 3. Plan: Third, it prepares a definitive "write plan" in memory. This plan
 // is a simple slice of structs that contains all the information needed to
@@ -270,9 +269,8 @@ func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 	txOutAddrs := w.extractTxAddrs(tx)
 
 	// Stage 2: Filter the extracted addresses to find which ones are owned
-	// by the wallet. This is done in a fast, read-only database
-	// transaction to minimize contention.
-	ownedAddrs, err := w.filterOwnedAddresses(txOutAddrs)
+	// by the wallet.
+	ownedAddrs, err := w.filterOwnedAddresses(ctx, tx, txOutAddrs)
 	if err != nil {
 		return nil, err
 	}
@@ -300,16 +298,15 @@ func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 	// Iterate directly over owned addresses and their pre-computed output
 	// indices. This correctly handles the edge case where a single
 	// transaction has multiple outputs paying to the same address.
-	for addr, info := range ownedAddrs {
+	for _, info := range ownedAddrs {
 		for _, index := range info.outputIndices {
 			creditsToWrite = append(creditsToWrite, creditInfo{
 				index: index,
-				ma:    info.managedAddr,
-				addr:  addr,
+				addr:  info.addr,
 			})
 		}
 
-		ourAddrs = append(ourAddrs, addr)
+		ourAddrs = append(ourAddrs, info.addr)
 	}
 
 	// Stage 4: Atomically execute the write plan. This is the only stage
@@ -395,54 +392,51 @@ func (w *Wallet) extractTxAddrs(tx *wire.MsgTx) map[uint32][]btcutil.Address {
 // filters a potentially large set of addresses down to the small subset that
 // the wallet needs to act on.
 //
-// The function is optimized to handle transactions with multiple outputs
-// paying to the same address. It internally de-duplicates the addresses to
-// ensure that the expensive database lookup (`w.addrStore.Address`) is
-// performed only once for each unique address.
+// The function is optimized to handle transactions with multiple outputs paying
+// to the same address. It internally de-duplicates the addresses to ensure that
+// the expensive database lookup is performed only once for each unique address.
 func (w *Wallet) filterOwnedAddresses(
+	ctx context.Context, tx *wire.MsgTx,
 	txOutAddrs map[uint32][]btcutil.Address) (
-	map[btcutil.Address]ownedAddrInfo, error) {
+	map[string]ownedAddrInfo, error) {
 
-	ownedAddrs := make(map[btcutil.Address]ownedAddrInfo)
+	ownedAddrs := make(map[string]ownedAddrInfo)
 
-	// Pre-deduplicate addresses outside the DB transaction.
-	uniqueAddrs := make(map[btcutil.Address][]uint32)
+	// Pre-deduplicate addresses outside the Store write path.
+	uniqueAddrs := make(map[string]ownedAddrInfo)
 	for index, addrs := range txOutAddrs {
 		for _, addr := range addrs {
-			uniqueAddrs[addr] = append(uniqueAddrs[addr], index)
+			key := addr.EncodeAddress()
+			info := uniqueAddrs[key]
+
+			if info.addr == nil {
+				info.addr = addr
+				info.scriptPubKey = tx.TxOut[index].PkScript
+			}
+
+			info.outputIndices = append(info.outputIndices, index)
+			uniqueAddrs[key] = info
 		}
 	}
 
-	err := walletdb.View(w.cfg.DB, func(dbTx walletdb.ReadTx) error {
-		addrmgrNs := dbTx.ReadBucket(waddrmgrNamespaceKey)
+	for key, info := range uniqueAddrs {
+		_, err := w.store.GetAddress(ctx, db.GetAddressQuery{
+			WalletID:     w.id,
+			ScriptPubKey: info.scriptPubKey,
+		})
 
-		for addr, indices := range uniqueAddrs {
-			ma, err := w.addrStore.Address(addrmgrNs, addr)
-
-			// If the address is not found, it simply means
-			// it does not belong to the wallet. This is
-			// the expected case for most addresses, so we
-			// can safely continue to the next one.
-			if waddrmgr.IsError(
-				err, waddrmgr.ErrAddressNotFound) {
-
-				continue
-			}
-
-			if err != nil {
-				return err
-			}
-
-			ownedAddrs[addr] = ownedAddrInfo{
-				managedAddr:   ma,
-				outputIndices: indices,
-			}
+		// If the address is not found, it simply means it does not
+		// belong to the wallet. This is the expected case for most
+		// addresses, so we can safely continue to the next one.
+		if errors.Is(err, db.ErrAddressNotFound) {
+			continue
 		}
 
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+
+		ownedAddrs[key] = info
 	}
 
 	return ownedAddrs, nil

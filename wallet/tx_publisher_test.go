@@ -18,7 +18,6 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
-	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -338,6 +337,16 @@ func TestFilterOwnedAddresses(t *testing.T) {
 		w.cfg.ChainParams,
 	)
 	require.NoError(t, err)
+	ownedScript := mustPayToAddrScript(ownedAddr)
+	unownedScript := mustPayToAddrScript(unownedAddr)
+
+	tx := &wire.MsgTx{
+		TxOut: []*wire.TxOut{
+			{PkScript: ownedScript},
+			{PkScript: unownedScript},
+			{PkScript: ownedScript},
+		},
+	}
 
 	// Create an input map with both addresses, with the owned address
 	// appearing twice.
@@ -347,25 +356,26 @@ func TestFilterOwnedAddresses(t *testing.T) {
 		2: {ownedAddr}, // Duplicate
 	}
 
-	// Set up the mock for the address store.
-	mockManagedAddr := &mockManagedAddress{}
-	errAddrNotFound := waddrmgr.ManagerError{
-		ErrorCode: waddrmgr.ErrAddressNotFound,
-	}
-
-	mocks.addrStore.On("Address", mock.Anything, ownedAddr).
-		Return(mockManagedAddr, nil).Once()
-	mocks.addrStore.On("Address", mock.Anything, unownedAddr).
-		Return(nil, errAddrNotFound).Once()
+	// Set up the mock for the Store address lookup.
+	mocks.store.On("GetAddress", mock.Anything,
+		matchGetAddressQuery(w.id, ownedScript),
+	).Return(&db.AddressInfo{ScriptPubKey: ownedScript}, nil).Once()
+	mocks.store.On("GetAddress", mock.Anything,
+		matchGetAddressQuery(w.id, unownedScript),
+	).Return(nil, db.ErrAddressNotFound).Once()
 
 	// Filter the addresses.
-	ownedAddrs, err := w.filterOwnedAddresses(txOutAddrs)
+	ownedAddrs, err := w.filterOwnedAddresses(
+		t.Context(), tx, txOutAddrs,
+	)
 	require.NoError(t, err)
 
 	// Check that the result contains only the owned address.
 	require.Len(t, ownedAddrs, 1)
-	_, ok := ownedAddrs[ownedAddr]
+	info, ok := ownedAddrs[ownedAddr.EncodeAddress()]
 	require.True(t, ok)
+	require.ElementsMatch(t, []uint32{uint32(0), uint32(2)},
+		info.outputIndices)
 }
 
 // TestRecordTxAndCredits tests the recordTxAndCredits method to ensure it
@@ -467,6 +477,8 @@ func TestAddTxToWallet(t *testing.T) {
 		unownedPrivKey.PubKey().SerializeCompressed(), &chainParams,
 	)
 	require.NoError(t, err)
+	ownedScript := mustPayToAddrScript(ownedAddr)
+	unownedScript := mustPayToAddrScript(unownedAddr)
 
 	// Create a transaction with outputs to both owned and unowned
 	// addresses.
@@ -475,15 +487,15 @@ func TestAddTxToWallet(t *testing.T) {
 		TxOut: []*wire.TxOut{
 			{
 				Value:    10000,
-				PkScript: mustPayToAddrScript(ownedAddr),
+				PkScript: ownedScript,
 			},
 			{
 				Value:    20000,
-				PkScript: mustPayToAddrScript(unownedAddr),
+				PkScript: unownedScript,
 			},
 			{
 				Value:    30000,
-				PkScript: mustPayToAddrScript(ownedAddr),
+				PkScript: ownedScript,
 			},
 		},
 	}
@@ -499,19 +511,12 @@ func TestAddTxToWallet(t *testing.T) {
 		// the wallet to identify these outputs, record the
 		// transaction, and credit the wallet with the new UTXOs.
 		//
-		// Set up the mock for the address store.
-		mockManagedAddr := &mockManagedAddress{}
-
-		errAddrNotFound := waddrmgr.ManagerError{
-			ErrorCode: waddrmgr.ErrAddressNotFound,
-		}
-
-		m.addrStore.On("Address",
-			mock.Anything, ownedAddr,
-		).Return(mockManagedAddr, nil)
-		m.addrStore.On("Address",
-			mock.Anything, unownedAddr,
-		).Return(nil, errAddrNotFound)
+		m.store.On("GetAddress", mock.Anything,
+			matchGetAddressQuery(w.id, ownedScript),
+		).Return(&db.AddressInfo{ScriptPubKey: ownedScript}, nil).Once()
+		m.store.On("GetAddress", mock.Anything,
+			matchGetAddressQuery(w.id, unownedScript),
+		).Return(nil, db.ErrAddressNotFound).Once()
 
 		expectedCredits := map[uint32]btcutil.Address{
 			0: ownedAddr,
@@ -526,14 +531,10 @@ func TestAddTxToWallet(t *testing.T) {
 		require.NoError(t, err)
 
 		// Check that the returned addresses are correct.
-		require.Len(t, ourAddrs, 2)
+		require.Len(t, ourAddrs, 1)
 		require.Equal(
 			t, ownedAddr.String(),
 			ourAddrs[0].String(),
-		)
-		require.Equal(
-			t, ownedAddr.String(),
-			ourAddrs[1].String(),
 		)
 	})
 
@@ -547,17 +548,14 @@ func TestAddTxToWallet(t *testing.T) {
 		// expect the wallet to identify this and exit early
 		// without recording the transaction.
 		//
-		// Set up the mock for the address store to own no
+		// Set up the mock for the Store to own no
 		// addresses.
-		errAddrNotFound := waddrmgr.ManagerError{
-			ErrorCode: waddrmgr.ErrAddressNotFound,
-		}
-		m.addrStore.On("Address",
-			mock.Anything, ownedAddr,
-		).Return(nil, errAddrNotFound)
-		m.addrStore.On("Address",
-			mock.Anything, unownedAddr,
-		).Return(nil, errAddrNotFound)
+		m.store.On("GetAddress", mock.Anything,
+			matchGetAddressQuery(w.id, ownedScript),
+		).Return(nil, db.ErrAddressNotFound).Once()
+		m.store.On("GetAddress", mock.Anything,
+			matchGetAddressQuery(w.id, unownedScript),
+		).Return(nil, db.ErrAddressNotFound).Once()
 
 		// Add the transaction to the wallet.
 		ourAddrs, err := w.addTxToWallet(t.Context(), tx, label)
@@ -771,10 +769,9 @@ func TestBroadcastSuccess(t *testing.T) {
 		mock.Anything, mock.Anything,
 	).Return([]*btcjson.TestMempoolAcceptResult{{Allowed: true}}, nil)
 
-	mockManagedAddr := &mockManagedAddress{}
-	m.addrStore.On("Address",
-		mock.Anything, ownedAddr,
-	).Return(mockManagedAddr, nil).Once()
+	m.store.On("GetAddress", mock.Anything,
+		matchGetAddressQuery(w.id, pkScript),
+	).Return(&db.AddressInfo{ScriptPubKey: pkScript}, nil).Once()
 	m.store.On("CreateTx", mock.Anything,
 		matchCreateTxParams(w.id, tx, label, map[uint32]btcutil.Address{
 			0: ownedAddr,
@@ -840,10 +837,9 @@ func TestBroadcastPublishFailsRemoveSucceeds(t *testing.T) {
 		mock.Anything, mock.Anything,
 	).Return([]*btcjson.TestMempoolAcceptResult{{Allowed: true}}, nil)
 
-	mockManagedAddr := &mockManagedAddress{}
-	m.addrStore.On("Address",
-		mock.Anything, ownedAddr,
-	).Return(mockManagedAddr, nil).Once()
+	m.store.On("GetAddress", mock.Anything,
+		matchGetAddressQuery(w.id, pkScript),
+	).Return(&db.AddressInfo{ScriptPubKey: pkScript}, nil).Once()
 	m.store.On("CreateTx", mock.Anything,
 		matchCreateTxParams(w.id, tx, label, map[uint32]btcutil.Address{
 			0: ownedAddr,
@@ -893,12 +889,9 @@ func TestBroadcastPublishFailsRemoveFails(t *testing.T) {
 		mock.Anything, mock.Anything,
 	).Return([]*btcjson.TestMempoolAcceptResult{{Allowed: true}}, nil)
 
-	mockManagedAddr := &mockManagedAddress{}
-
-	// Mock addrStore to succeed.
-	m.addrStore.On("Address",
-		mock.Anything, ownedAddr,
-	).Return(mockManagedAddr, nil).Once()
+	m.store.On("GetAddress", mock.Anything,
+		matchGetAddressQuery(w.id, pkScript),
+	).Return(&db.AddressInfo{ScriptPubKey: pkScript}, nil).Once()
 	m.store.On("CreateTx", mock.Anything,
 		matchCreateTxParams(w.id, tx, label, map[uint32]btcutil.Address{
 			0: ownedAddr,
