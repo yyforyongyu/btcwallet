@@ -308,34 +308,28 @@ func storeAddressPubKeyCompressed(pubKey []byte) bool {
 	return len(pubKey) == btcec.PubKeyBytesLenCompressed
 }
 
-// legacyAddressBalances returns wallet address balances from the legacy
-// transaction store.
-func (w *Wallet) legacyAddressBalances() (map[string]btcutil.Amount, error) {
+// addrBalances returns wallet address balances from store UTXO rows.
+func (w *Wallet) addrBalances(ctx context.Context) (map[string]btcutil.Amount,
+	error) {
+
 	balances := make(map[string]btcutil.Amount)
 
-	err := walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-
-		utxos, err := w.txStore.UnspentOutputs(txmgrNs)
-		if err != nil {
-			return err
-		}
-
-		for i := range utxos {
-			addr := extractAddrFromPKScript(
-				utxos[i].PkScript, w.cfg.ChainParams,
-			)
-			if addr == nil {
-				continue
-			}
-
-			balances[addr.String()] += utxos[i].Amount
-		}
-
-		return nil
+	utxos, err := w.store.ListUTXOs(ctx, db.ListUtxosQuery{
+		WalletID: w.id,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list utxos: %w", err)
+	}
+
+	for i := range utxos {
+		addr := extractAddrFromPKScript(
+			utxos[i].PkScript, w.cfg.ChainParams,
+		)
+		if addr == nil {
+			continue
+		}
+
+		balances[addr.String()] += utxos[i].Amount
 	}
 
 	return balances, nil
@@ -678,9 +672,7 @@ func (w *Wallet) ListAddresses(ctx context.Context, accountName string,
 		return nil, err
 	}
 
-	// TODO(yy): switch to Store.ListUTXOs once it is implemented for
-	// kvdb (PR #1238).
-	balances, err := w.legacyAddressBalances()
+	balances, err := w.addrBalances(ctx)
 	if err != nil {
 		return nil, err
 	}
