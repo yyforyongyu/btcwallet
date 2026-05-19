@@ -262,6 +262,18 @@ type ListWalletsQuery struct {
 	Page page.Request[uint32]
 }
 
+// ListSyncedBlocksQuery contains the requested synced block height range.
+type ListSyncedBlocksQuery struct {
+	// WalletID is the ID of the wallet whose synced chain view is queried.
+	WalletID uint32
+
+	// StartHeight is the first block height to include.
+	StartHeight uint32
+
+	// EndHeight is the final block height to include.
+	EndHeight uint32
+}
+
 // CreateWalletParams contains the parameters required to create a new wallet.
 type CreateWalletParams struct {
 	// Name is the name of the new wallet.
@@ -1000,6 +1012,53 @@ type CreateTxParams struct {
 	// (`params.Tx.TxOut[index].PkScript`), which is the canonical key
 	// used by the address schema.
 	Credits map[uint32]btcutil.Address
+}
+
+// TxBatchParams contains a wallet transaction batch and optional sync-tip
+// update that should be applied atomically.
+type TxBatchParams struct {
+	// WalletID is the ID of the wallet receiving the batch.
+	WalletID uint32
+
+	// Transactions contains the transaction records to apply.
+	Transactions []CreateTxParams
+
+	// SyncedTo optionally records the wallet's new chain sync tip as part of
+	// the same batch.
+	SyncedTo *Block
+}
+
+// ScanHorizon records the highest recovered address index for one account
+// branch.
+type ScanHorizon struct {
+	// Scope is the key scope containing the branch.
+	Scope KeyScope
+
+	// Account is the account number containing the branch.
+	Account uint32
+
+	// Branch is the account branch number.
+	Branch uint32
+
+	// Index is the highest discovered address child index on the branch.
+	Index uint32
+}
+
+// ScanBatchParams contains the database updates produced by one recovery scan
+// batch.
+type ScanBatchParams struct {
+	// WalletID is the ID of the wallet receiving the batch.
+	WalletID uint32
+
+	// Horizons contains address horizon extensions discovered by the scan.
+	Horizons []ScanHorizon
+
+	// Transactions contains relevant transaction records found by the scan.
+	Transactions []CreateTxParams
+
+	// SyncedBlocks contains the synced block sequence to connect after writing
+	// horizons and transactions. Targeted rescans leave this empty.
+	SyncedBlocks []Block
 }
 
 // UpdateTxState contains one requested transaction-state change.
