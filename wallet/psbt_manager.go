@@ -19,6 +19,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/pkg/btcunit"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -153,6 +154,14 @@ var (
 	// flow (skipping inputs that don't belong to this wallet) and should
 	// not be exposed to the caller.
 	errComputeRawSig = errors.New("cannot compute raw signature")
+
+	// errTxOutputIndexOutOfRange is returned when a transaction output is
+	// missing the referenced index.
+	errTxOutputIndexOutOfRange = errors.New("tx output index out of range")
+
+	// errUtxoParentMismatch is returned when a UTXO does not match its
+	// parent transaction output.
+	errUtxoParentMismatch = errors.New("utxo parent output mismatch")
 )
 
 const (
@@ -514,6 +523,27 @@ func (w *Wallet) fetchAndValidateUtxo(txIn *wire.TxIn) (
 	utxo := tx.TxOut[txIn.PreviousOutPoint.Index]
 
 	return tx, utxo, nil
+}
+
+// validatePsbtParentOutput returns the parent transaction output for the
+// store-backed UTXO, ensuring the tx index and output fields match.
+func validatePsbtParentOutput(outPoint wire.OutPoint,
+	utxoInfo *db.UtxoInfo, tx *wire.MsgTx) (*wire.TxOut, error) {
+
+	if uint64(outPoint.Index) >= uint64(len(tx.TxOut)) {
+		return nil, fmt.Errorf("%w: tx %v output index %d",
+			errTxOutputIndexOutOfRange, outPoint.Hash, outPoint.Index)
+	}
+
+	utxo := tx.TxOut[outPoint.Index]
+	if utxo.Value != int64(utxoInfo.Amount) ||
+		!bytes.Equal(utxo.PkScript, utxoInfo.PkScript) {
+
+		return nil, fmt.Errorf("%w: %v", errUtxoParentMismatch,
+			outPoint)
+	}
+
+	return utxo, nil
 }
 
 // findCredit determines whether a transaction's details contain a credit for a

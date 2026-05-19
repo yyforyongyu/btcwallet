@@ -279,6 +279,52 @@ func TestFetchAndValidateUtxoError(t *testing.T) {
 	}
 }
 
+// TestValidatePsbtParentOutputSuccess verifies that a matching store UTXO row
+// returns the corresponding parent transaction output.
+func TestValidatePsbtParentOutputSuccess(t *testing.T) {
+	t.Parallel()
+
+	outPoint := wire.OutPoint{Hash: chainhash.Hash{2}, Index: 0}
+	txOut := &wire.TxOut{Value: 1000, PkScript: []byte{0x51}}
+	tx := &wire.MsgTx{TxOut: []*wire.TxOut{txOut}}
+	utxoInfo := testStoreUtxoInfo(outPoint, txOut)
+
+	utxo, err := validatePsbtParentOutput(outPoint, utxoInfo, tx)
+	require.NoError(t, err)
+	require.Equal(t, txOut, utxo)
+}
+
+// TestValidatePsbtParentOutputIndexOutOfRange verifies that a missing parent
+// output is rejected before indexing the transaction output slice.
+func TestValidatePsbtParentOutputIndexOutOfRange(t *testing.T) {
+	t.Parallel()
+
+	outPoint := wire.OutPoint{Hash: chainhash.Hash{3}, Index: 1}
+	txOut := &wire.TxOut{Value: 1000, PkScript: []byte{0x51}}
+	tx := &wire.MsgTx{TxOut: []*wire.TxOut{txOut}}
+	utxoInfo := testStoreUtxoInfo(outPoint, txOut)
+
+	utxo, err := validatePsbtParentOutput(outPoint, utxoInfo, tx)
+	require.ErrorIs(t, err, errTxOutputIndexOutOfRange)
+	require.Nil(t, utxo)
+}
+
+// TestValidatePsbtParentOutputMismatch verifies that mismatched store UTXO and
+// parent transaction fields are rejected.
+func TestValidatePsbtParentOutputMismatch(t *testing.T) {
+	t.Parallel()
+
+	outPoint := wire.OutPoint{Hash: chainhash.Hash{4}, Index: 0}
+	txOut := &wire.TxOut{Value: 1000, PkScript: []byte{0x51}}
+	tx := &wire.MsgTx{TxOut: []*wire.TxOut{txOut}}
+	utxoInfo := testStoreUtxoInfo(outPoint, txOut)
+	utxoInfo.Amount--
+
+	utxo, err := validatePsbtParentOutput(outPoint, utxoInfo, tx)
+	require.ErrorIs(t, err, errUtxoParentMismatch)
+	require.Nil(t, utxo)
+}
+
 // TestDecorateInputSegWitV0 tests that decorateInput correctly populates
 // PSBT input fields for a SegWit v0 (P2WKH) input.
 func TestDecorateInputSegWitV0(t *testing.T) {
