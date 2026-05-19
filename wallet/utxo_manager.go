@@ -13,15 +13,22 @@ package wallet
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/addresstype"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
+)
+
+var (
+	errUtxoHeightOverflow = errors.New("utxo height overflows int32")
 )
 
 // Utxo provides a detailed overview of an unspent transaction output.
@@ -276,6 +283,103 @@ func (w *Wallet) processUnspentOutput(addrmgrNs walletdb.ReadBucket,
 		AddressType:   addrType,
 		Locked:        locked,
 	}
+}
+
+// buildWalletUtxoFromStore converts one store-level UTXO row into the wallet's
+// public Utxo view.
+func (w *Wallet) buildWalletUtxoFromStore(ctx context.Context,
+	info *db.UtxoInfo, currentHeight int32,
+	accountFilter string, locked bool) (*Utxo, bool, error) {
+
+	addr := extractAddrFromPKScript(info.PkScript, w.cfg.ChainParams)
+	if addr == nil {
+		return nil, false, nil
+	}
+
+	spendable, account, addrType, err := w.lookupStoreAddress(
+		ctx, info.PkScript,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if accountFilter != "" && account != accountFilter {
+		return nil, false, nil
+	}
+
+	confirmations, err := utxoConfirmations(info.Height, currentHeight)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if info.FromCoinBase {
+		maturity := w.cfg.ChainParams.CoinbaseMaturity
+		if confirmations < int32(maturity) {
+			spendable = false
+		}
+	}
+
+	return &Utxo{
+		OutPoint:      info.OutPoint,
+		Amount:        info.Amount,
+		PkScript:      info.PkScript,
+		Confirmations: confirmations,
+		Spendable:     spendable,
+		Address:       addr,
+		Account:       account,
+		AddressType:   addrType,
+		Locked:        locked,
+	}, true, nil
+}
+
+// leasedOutputSet builds the active locked-outpoint set from one lease list.
+func leasedOutputSet(leases []db.LeasedOutput) map[wire.OutPoint]bool {
+	locked := make(map[wire.OutPoint]bool, len(leases))
+	for i := range leases {
+		locked[leases[i].OutPoint] = true
+	}
+
+	return locked
+}
+
+// lookupStoreAddress resolves the wallet-facing address metadata for one UTXO
+// script.
+func (w *Wallet) lookupStoreAddress(ctx context.Context,
+	pkScript []byte) (bool, string, waddrmgr.AddressType, error) {
+
+	addrInfo, err := w.store.GetAddress(
+		ctx, db.GetAddressQuery{
+			WalletID:     w.id,
+			ScriptPubKey: pkScript,
+		},
+	)
+	if err != nil {
+		return false, "", 0, fmt.Errorf("get address: %w", err)
+	}
+
+	walletAddrType, err := addresstype.ToWallet(
+		addrInfo.AddrType, addrInfo.HasScript,
+	)
+	if err != nil {
+		return false, "", 0, err
+	}
+
+	return !addrInfo.IsWatchOnly, addrInfo.AccountName, walletAddrType, nil
+}
+
+// utxoConfirmations converts one db-native UTXO height into wallet confirmation
+// semantics.
+func utxoConfirmations(height uint32, currentHeight int32) (int32, error) {
+	if height == db.UnminedHeight {
+		return 0, nil
+	}
+
+	txHeight, ok := safeUint32ToInt32(height)
+	if !ok {
+		return 0, fmt.Errorf("%w: %d", errUtxoHeightOverflow, height)
+	}
+
+	return calcConf(txHeight, currentHeight), nil
 }
 
 // GetUtxo returns the output information for a given outpoint.
