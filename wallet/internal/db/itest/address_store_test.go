@@ -244,13 +244,22 @@ func TestNewImportedAddress(t *testing.T) {
 			require.NotNil(t, info.ScriptPubKey)
 			require.Equal(t, tc.expectedAddrType, info.AddrType)
 
-			// Verify account imported_key_count incremented.
+			// Verify address creation returned complete account metadata.
 			account, err := store.GetAccount(
 				t.Context(), getAccountQueryByName(
 					walletID, tc.scope, "imported",
 				),
 			)
 			require.NoError(t, err)
+			require.Equal(t, account.AccountNumber, info.AccountNumber)
+			require.Equal(t, account.AccountName, info.AccountName)
+			require.Equal(t, account.KeyScope, info.KeyScope)
+			require.Equal(
+				t, account.MasterKeyFingerprint,
+				info.MasterKeyFingerprint,
+			)
+
+			// Verify account imported_key_count incremented.
 			require.Positive(t, account.ImportedKeyCount)
 
 			// Verify address_secrets row for imported addresses.
@@ -1660,6 +1669,9 @@ func TestNewDerivedAddress(t *testing.T) {
 	// Create account in BIP44 scope.
 	accountName := "derived-test"
 	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0044, accountName)
+	account := getAccountByName(
+		t, store, walletID, db.KeyScopeBIP0044, accountName,
+	)
 
 	testCases := []struct {
 		name           string
@@ -1692,6 +1704,13 @@ func TestNewDerivedAddress(t *testing.T) {
 			require.Equal(t, tc.expectedBranch, info.Branch)
 			require.NotNil(t, info.ScriptPubKey)
 			require.Nil(t, info.PubKey)
+			require.Equal(t, account.AccountNumber, info.AccountNumber)
+			require.Equal(t, account.AccountName, info.AccountName)
+			require.Equal(t, account.KeyScope, info.KeyScope)
+			require.Equal(
+				t, account.MasterKeyFingerprint,
+				info.MasterKeyFingerprint,
+			)
 		})
 	}
 }

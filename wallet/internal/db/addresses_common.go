@@ -597,6 +597,10 @@ type DerivedAddressAdapters[QTX any, AccountRow any, AccountParams any,
 
 	// RowCreatedAt extracts the creation time from an address row.
 	RowCreatedAt func(AddrRow) time.Time
+
+	// ApplyAccountMetadata copies account metadata from the account row
+	// onto the address result inside the create transaction.
+	ApplyAccountMetadata func(*AddressInfo, AccountRow) error
 }
 
 // ImportedAddressAdapters groups the functions needed to create an
@@ -636,6 +640,10 @@ type ImportedAddressAdapters[QTX any, AccountRow any,
 
 	// RowCreatedAt extracts the creation time from an address row.
 	RowCreatedAt func(AddrRow) time.Time
+
+	// ApplyAccountMetadata copies account metadata from the account row
+	// onto the address result inside the create transaction.
+	ApplyAccountMetadata func(*AddressInfo, AccountRow) error
 }
 
 // GetAddressFunc defines a function signature for retrieving a single address.
@@ -808,6 +816,12 @@ func NewDerivedAddressWithTx[QTX any, AccountRow any,
 				return errAddr
 			}
 
+			errMeta := adapters.ApplyAccountMetadata(info, row)
+			if errMeta != nil {
+				return fmt.Errorf("apply address account metadata: %w",
+					errMeta)
+			}
+
 			result = info
 
 			return nil
@@ -867,6 +881,12 @@ func NewImportedAddressWithTx[QTX any, AccountRow any, AccountParams any,
 				adapters.RowCreatedAt)
 			if errAddr != nil {
 				return errAddr
+			}
+
+			errMeta := adapters.ApplyAccountMetadata(info, row)
+			if errMeta != nil {
+				return fmt.Errorf("apply address account metadata: %w",
+					errMeta)
 			}
 
 			result = info
