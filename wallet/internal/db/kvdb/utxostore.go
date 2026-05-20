@@ -37,13 +37,6 @@ func notImplemented(_ context.Context, method string) error {
 	return fmt.Errorf("kvdb.Store.%s: %w", method, errNotImplemented)
 }
 
-// IsNotImplemented reports whether err was produced by a kvdb Store method
-// stub that has not yet been implemented. Wallet-side fallback paths use
-// this predicate to detect when to fall back to legacy walletdb walks.
-func IsNotImplemented(err error) bool {
-	return errors.Is(err, errNotImplemented)
-}
-
 // GetUtxo retrieves one current wallet-owned UTXO through the legacy wtxmgr
 // query path.
 func (s *Store) GetUtxo(_ context.Context,
@@ -77,11 +70,30 @@ func (s *Store) GetUtxo(_ context.Context,
 	return utxo, nil
 }
 
-// ListUTXOs is not yet implemented for kvdb.
-func (s *Store) ListUTXOs(ctx context.Context,
-	_ db.ListUtxosQuery) ([]db.UtxoInfo, error) {
+// ListUTXOs lists current wallet-owned UTXOs through the legacy wtxmgr query
+// path.
+func (s *Store) ListUTXOs(_ context.Context,
+	query db.ListUtxosQuery) ([]db.UtxoInfo, error) {
 
-	return nil, notImplemented(ctx, "ListUTXOs")
+	if s.addrStore == nil {
+		return nil, fmt.Errorf("kvdb.Store.ListUTXOs: %w",
+			errMissingAddrStore)
+	}
+
+	var utxos []db.UtxoInfo
+
+	err := walletdb.View(s.db, func(tx walletdb.ReadTx) error {
+		return s.listUTXOsInView(tx, query, &utxos)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kvdb.Store.ListUTXOs: %w", err)
+	}
+
+	if len(utxos) == 0 {
+		return []db.UtxoInfo{}, nil
+	}
+
+	return utxos, nil
 }
 
 // LeaseOutput is not yet implemented for kvdb.
@@ -384,5 +396,117 @@ func utxoInfo(credit *wtxmgr.Credit) *db.UtxoInfo {
 		Received:     credit.Received.UTC(),
 		FromCoinBase: credit.FromCoinBase,
 		Height:       height,
+	}
+}
+
+// listUTXOsInView performs the legacy UTXO scan using one walletdb view.
+func (s *Store) listUTXOsInView(tx walletdb.ReadTx,
+	query db.ListUtxosQuery, utxos *[]db.UtxoInfo) error {
+
+	txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
+	if txmgrNs == nil {
+		return errMissingTxmgrNamespace
+	}
+
+	addrmgrNs := tx.ReadBucket(waddrmgr.NamespaceKey)
+	if addrmgrNs == nil {
+		return errMissingAddrmgrNamespace
+	}
+
+	credits, err := s.txStore.UnspentOutputs(txmgrNs)
+	if err != nil {
+		return fmt.Errorf("list unspent outputs: %w", err)
+	}
+
+	currentHeight := s.addrStore.SyncedTo().Height
+	chainParams := s.addrStore.ChainParams()
+
+	for i := range credits {
+		credit := &credits[i]
+
+		include, err := s.shouldIncludeUtxo(
+			addrmgrNs, credit, currentHeight, chainParams, query,
+		)
+		if err != nil {
+			return err
+		}
+
+		if include {
+			*utxos = append(*utxos, *utxoInfo(credit))
+		}
+	}
+
+	return nil
+}
+
+// utxoMatchesConfirmations applies the optional db.ListUtxosQuery confirmation
+// filters using legacy current-height state.
+func utxoMatchesConfirmations(txHeight int32, currentHeight int32,
+	query db.ListUtxosQuery) bool {
+
+	confs := calcConfirmations(txHeight, currentHeight)
+
+	if query.MinConfs != nil && confs < *query.MinConfs {
+		return false
+	}
+
+	if query.MaxConfs != nil && confs > *query.MaxConfs {
+		return false
+	}
+
+	return true
+}
+
+// shouldIncludeUtxo applies the legacy confirmation and optional account
+// filters to one credit before it is adapted to db.UtxoInfo.
+func (s *Store) shouldIncludeUtxo(addrmgrNs walletdb.ReadBucket,
+	credit *wtxmgr.Credit, currentHeight int32,
+	chainParams *chaincfg.Params,
+	query db.ListUtxosQuery) (bool, error) {
+
+	if !utxoMatchesConfirmations(credit.Height, currentHeight, query) {
+		return false, nil
+	}
+
+	if query.Account == nil {
+		return true, nil
+	}
+
+	return s.utxoMatchesAccount(
+		addrmgrNs, credit.PkScript, chainParams, *query.Account,
+	)
+}
+
+// utxoMatchesAccount checks whether one legacy UTXO belongs to the caller's
+// requested account number.
+func (s *Store) utxoMatchesAccount(addrmgrNs walletdb.ReadBucket,
+	pkScript []byte, chainParams *chaincfg.Params,
+	account uint32) (bool, error) {
+
+	addr, err := addressFromPkScript(pkScript, chainParams)
+	if err != nil {
+		return false, err
+	}
+
+	_, utxoAccount, err := s.addrStore.AddrAccount(addrmgrNs, addr)
+	if err != nil {
+		return false, fmt.Errorf("lookup utxo account: %w", err)
+	}
+
+	return utxoAccount == account, nil
+}
+
+// calcConfirmations mirrors the wallet confirmation calculation used by the
+// public UTXO manager.
+func calcConfirmations(txHeight, currentHeight int32) int32 {
+	switch {
+	case txHeight == -1:
+		return 0
+
+	case txHeight > currentHeight:
+		return 0
+
+	default:
+		return currentHeight - txHeight + 1
 	}
 }
