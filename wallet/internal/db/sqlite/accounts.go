@@ -14,7 +14,13 @@ import (
 // Ensure Store satisfies the AccountStore interface.
 var _ db.AccountStore = (*Store)(nil)
 
-var errDryRunRollback = errors.New("sqlite imported account dry run rollback")
+var (
+	errDryRunRollback = errors.New("sqlite imported account dry run rollback")
+
+	errMissingDerivedAccountNumber = errors.New(
+		"missing derived account number",
+	)
+)
 
 // GetAccount retrieves information about a specific account, identified by its
 // name or account number within a given key scope.
@@ -382,12 +388,64 @@ func derivedAddressGetAccountID(
 	return row.ID
 }
 
+// derivedAddressGetAccountNumber extracts the derived account number from a
+// row.
+func derivedAddressGetAccountNumber(
+	row sqlc.GetAccountByWalletScopeAndNameRow) (uint32, error) {
+
+	if !row.AccountNumber.Valid {
+		return 0, errMissingDerivedAccountNumber
+	}
+
+	if row.AccountNumber.Int64 > int64(db.MaxAccountNumber) {
+		return 0, fmt.Errorf("%w: account number %d exceeds max %d",
+			db.ErrMaxAccountNumberReached, row.AccountNumber.Int64,
+			db.MaxAccountNumber)
+	}
+
+	accountNumber, err := db.Int64ToUint32(row.AccountNumber.Int64)
+	if err != nil {
+		return 0, err
+	}
+
+	return accountNumber, nil
+}
+
 // derivedAddressGetWalletWatchOnly extracts the wallet-level watch-only state
 // from a row.
 func derivedAddressGetWalletWatchOnly(
 	row sqlc.GetAccountByWalletScopeAndNameRow) bool {
 
 	return row.WalletIsWatchOnly
+}
+
+// derivedAddressGetAccountAddrSchema returns the scope-default
+// address schema for the account derived from the returned row.
+// The SQL backend does not model a per-account override, so the
+// schema is fully determined by (purpose, coin_type).
+func derivedAddressGetAccountAddrSchema(
+	row sqlc.GetAccountByWalletScopeAndNameRow) (db.ScopeAddrSchema,
+	error) {
+
+	purpose, err := db.Int64ToUint32(row.Purpose)
+	if err != nil {
+		return db.ScopeAddrSchema{}, fmt.Errorf("purpose: %w", err)
+	}
+
+	coin, err := db.Int64ToUint32(row.CoinType)
+	if err != nil {
+		return db.ScopeAddrSchema{}, fmt.Errorf("coin: %w", err)
+	}
+
+	scope := db.KeyScope{Purpose: purpose, Coin: coin}
+	schema, ok := db.ScopeAddrMap[scope]
+
+	if !ok {
+		return db.ScopeAddrSchema{}, fmt.Errorf("%w: scope %d/%d",
+			db.ErrUnknownKeyScope, purpose, coin)
+	}
+
+	return schema, nil
 }
 
 // importedAddressGetAccountID extracts the account ID from a row.

@@ -19,17 +19,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// mockDeriveFunc is a test helper that returns a mock AddressDerivationFunc
-// for testing NewDerivedAddress. It generates deterministic script_pub_key
-// values based on accountID, branch, and index to ensure uniqueness.
+// mockDeriveFunc returns a test address derivation function. It generates
+// deterministic script pubkeys from scope, account number, branch, and index so
+// derived test addresses are unique across scopes.
 func mockDeriveFunc() db.AddressDerivationFunc {
-	return func(ctx context.Context, accountID uint32, branch uint32,
-		index uint32) (*db.DerivedAddressData, error) {
+	return func(ctx context.Context, scope db.KeyScope, accountNumber uint32,
+		branch uint32, index uint32) (*db.DerivedAddressData, error) {
 
 		scriptPubKey := make([]byte, 20)
-		binary.BigEndian.PutUint32(scriptPubKey[0:4], accountID)
+		binary.BigEndian.PutUint32(scriptPubKey[0:4], accountNumber)
 		binary.BigEndian.PutUint32(scriptPubKey[4:8], branch)
 		binary.BigEndian.PutUint32(scriptPubKey[8:12], index)
+		binary.BigEndian.PutUint32(scriptPubKey[12:16], scope.Purpose)
+		binary.BigEndian.PutUint32(scriptPubKey[16:20], scope.Coin)
 
 		return &db.DerivedAddressData{
 			ScriptPubKey: scriptPubKey,
@@ -49,7 +51,7 @@ func newDerivedAddress(t *testing.T, store db.AddressStore, walletID uint32,
 			Scope:       scope,
 			AccountName: accountName,
 			Change:      change,
-		}, mockDeriveFunc(),
+		},
 	)
 	require.NoError(t, err)
 
@@ -1687,46 +1689,71 @@ func TestNewDerivedAddress(t *testing.T) {
 	}
 }
 
+// TestNewDerivedAddressDerivesByAccountNumber verifies that the derivation
+// callback receives the BIP44 account number, not the SQL account row ID.
+func TestNewDerivedAddressDerivesByAccountNumber(t *testing.T) {
+	t.Parallel()
+
+	var derivedAccountNumber uint32
+
+	baseDerive := mockDeriveFunc()
+	deriveFn := func(ctx context.Context, scope db.KeyScope,
+		accountNumber uint32, branch uint32,
+		index uint32) (*db.DerivedAddressData, error) {
+
+		derivedAccountNumber = accountNumber
+
+		return baseDerive(ctx, scope, accountNumber, branch, index)
+	}
+
+	store := NewTestStoreWithDerive(t, deriveFn)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-derived-account-number")
+
+	createDerivedAccount(
+		t, store, walletID, db.KeyScopeBIP0084, "first-account",
+	)
+
+	scopeID := GetKeyScopeID(t, queries, walletID, db.KeyScopeBIP0084)
+
+	const accountNumber uint32 = 17
+
+	accountName := "account-number-17"
+	CreateAccountWithNumber(t, queries, scopeID, accountNumber, accountName)
+
+	info, err := store.NewDerivedAddress(
+		t.Context(), db.NewDerivedAddressParams{
+			WalletID:    walletID,
+			Scope:       db.KeyScopeBIP0084,
+			AccountName: accountName,
+		},
+	)
+	require.NoError(t, err)
+
+	require.NotEqual(t, info.AccountID, info.AccountNumber)
+	require.Equal(t, accountNumber, info.AccountNumber)
+	require.Equal(t, accountNumber, derivedAccountNumber)
+}
+
 // TestNewDerivedAddressDerivationGuards verifies that NewDerivedAddress returns
 // errors instead of panicking when the derivation callback is nil or returns
 // nil derived data.
 func TestNewDerivedAddressDerivationGuards(t *testing.T) {
 	t.Parallel()
 
-	store := NewTestStore(t)
-	walletID := newWallet(t, store, "wallet-derived-guards")
-	accountName := "derived-guard-test"
-	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, accountName)
-
-	params := db.NewDerivedAddressParams{
-		WalletID:    walletID,
-		Scope:       db.KeyScopeBIP0084,
-		AccountName: accountName,
-		Change:      false,
-	}
-
 	t.Run("nil derive callback", func(t *testing.T) {
-		var (
-			info *db.AddressInfo
-			err  error
+		store := NewTestStoreWithDerive(t, nil)
+		walletID := newWallet(t, store, "wallet-derived-nil-derive")
+		accountName := "derived-guard-test"
+		createDerivedAccount(
+			t, store, walletID, db.KeyScopeBIP0084, accountName,
 		)
 
-		require.NotPanics(
-			t, func() {
-				info, err = store.NewDerivedAddress(t.Context(), params, nil)
-			},
-		)
-
-		require.Nil(t, info)
-		require.Error(t, err)
-	})
-
-	t.Run("nil derived data", func(t *testing.T) {
-		deriveFn := func(ctx context.Context, accountID uint32, branch uint32,
-			index uint32) (*db.DerivedAddressData, error) {
-
-			//nolint:nilnil // Intentionally exercise nil-data success guard.
-			return nil, nil
+		params := db.NewDerivedAddressParams{
+			WalletID:    walletID,
+			Scope:       db.KeyScopeBIP0084,
+			AccountName: accountName,
+			Change:      false,
 		}
 
 		var (
@@ -1736,9 +1763,44 @@ func TestNewDerivedAddressDerivationGuards(t *testing.T) {
 
 		require.NotPanics(
 			t, func() {
-				info, err = store.NewDerivedAddress(
-					t.Context(), params, deriveFn,
-				)
+				info, err = store.NewDerivedAddress(t.Context(), params)
+			},
+		)
+
+		require.Nil(t, info)
+		require.Error(t, err)
+	})
+
+	t.Run("nil derived data", func(t *testing.T) {
+		deriveFn := func(ctx context.Context, scope db.KeyScope,
+			accountNumber, branch, index uint32) (*db.DerivedAddressData,
+			error) {
+
+			//nolint:nilnil // Intentionally exercise nil-data success guard.
+			return nil, nil
+		}
+		store := NewTestStoreWithDerive(t, deriveFn)
+		walletID := newWallet(t, store, "wallet-derived-nil-data")
+		accountName := "derived-guard-test"
+		createDerivedAccount(
+			t, store, walletID, db.KeyScopeBIP0084, accountName,
+		)
+
+		params := db.NewDerivedAddressParams{
+			WalletID:    walletID,
+			Scope:       db.KeyScopeBIP0084,
+			AccountName: accountName,
+			Change:      false,
+		}
+
+		var (
+			info *db.AddressInfo
+			err  error
+		)
+
+		require.NotPanics(
+			t, func() {
+				info, err = store.NewDerivedAddress(t.Context(), params)
 			},
 		)
 
@@ -1822,7 +1884,7 @@ func TestGetAddressSecret_DerivedAddress(t *testing.T) {
 		Change:      false,
 	}
 	addrInfo, err := store.NewDerivedAddress(
-		t.Context(), params, mockDeriveFunc(),
+		t.Context(), params,
 	)
 	require.NoError(t, err)
 
@@ -2389,7 +2451,7 @@ func TestNewDerivedAddressErrors(t *testing.T) {
 			tc.params.WalletID = walletID
 
 			info, err := store.NewDerivedAddress(
-				t.Context(), tc.params, mockDeriveFunc(),
+				t.Context(), tc.params,
 			)
 			require.ErrorIs(t, err, tc.wantErr)
 			require.Nil(t, info)
@@ -2421,7 +2483,7 @@ func TestNewDerivedAddress_WalletAccountMismatch(t *testing.T) {
 			Scope:       db.KeyScopeBIP0084,
 			AccountName: accountName,
 			Change:      false,
-		}, mockDeriveFunc(),
+		},
 	)
 	require.ErrorIs(t, err, db.ErrAccountNotFound)
 	require.Nil(t, info)
@@ -2452,8 +2514,6 @@ func TestNewDerivedAddressConcurrent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	deriveFn := mockDeriveFunc()
-
 	for range workers {
 		wg.Add(1)
 
@@ -2466,7 +2526,7 @@ func TestNewDerivedAddressConcurrent(t *testing.T) {
 					Scope:       db.KeyScopeBIP0084,
 					AccountName: accountName,
 					Change:      false,
-				}, deriveFn,
+				},
 			)
 			if err != nil {
 				resultCh <- deriveResult{err: err}
@@ -2641,7 +2701,7 @@ func TestNewDerivedAddressMaxIndex(t *testing.T) {
 			Scope:       db.KeyScopeBIP0084,
 			AccountName: "max-acct",
 			Change:      false,
-		}, mockDeriveFunc(),
+		},
 	)
 	require.ErrorIs(t, err, db.ErrMaxAddressIndexReached)
 }
@@ -2681,7 +2741,7 @@ func TestNewDerivedAddressMaxIndexInternal(t *testing.T) {
 			Scope:       db.KeyScopeBIP0084,
 			AccountName: "max-acct",
 			Change:      true,
-		}, mockDeriveFunc(),
+		},
 	)
 	require.ErrorIs(t, err, db.ErrMaxAddressIndexReached)
 }

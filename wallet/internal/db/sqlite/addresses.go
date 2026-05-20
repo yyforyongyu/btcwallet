@@ -124,27 +124,28 @@ func (s *Store) GetAddressSecret(ctx context.Context,
 // NewDerivedAddress creates a new address for a given account and key
 // scope.
 func (s *Store) NewDerivedAddress(ctx context.Context,
-	params db.NewDerivedAddressParams,
-	deriveFn db.AddressDerivationFunc) (*db.AddressInfo, error) {
+	params db.NewDerivedAddressParams) (*db.AddressInfo, error) {
 
 	adapters := db.DerivedAddressAdapters[
 		*sqlc.Queries,
 		sqlc.GetAccountByWalletScopeAndNameRow,
 		db.AccountLookupKey,
 		sqlc.CreateDerivedAddressRow]{
-		GetAccount:         getAccountFromKey(s.queries),
-		AccountParams:      db.AccountKeyFromParams,
-		GetAccountID:       derivedAddressGetAccountID,
-		GetWalletWatchOnly: derivedAddressGetWalletWatchOnly,
-		GetExtIndex:        derivedAddressGetExtIndex,
-		GetIntIndex:        derivedAddressGetIntIndex,
-		CreateAddr:         derivedAddressCreateAddr,
-		RowID:              derivedAddressRowID,
-		RowCreatedAt:       derivedAddressRowCreatedAt,
+		GetAccount:           getAccountFromKey(s.queries),
+		AccountParams:        db.AccountKeyFromParams,
+		GetAccountID:         derivedAddressGetAccountID,
+		GetAccountNumber:     derivedAddressGetAccountNumber,
+		GetWalletWatchOnly:   derivedAddressGetWalletWatchOnly,
+		GetAccountAddrSchema: derivedAddressGetAccountAddrSchema,
+		GetExtIndex:          derivedAddressGetExtIndex,
+		GetIntIndex:          derivedAddressGetIntIndex,
+		CreateAddr:           derivedAddressCreateAddr,
+		RowID:                derivedAddressRowID,
+		RowCreatedAt:         derivedAddressRowCreatedAt,
 	}
 
 	return db.NewDerivedAddressWithTx(
-		ctx, params, s.execWrite, adapters, deriveFn,
+		ctx, params, s.execWrite, adapters, s.deriveAddress,
 	)
 }
 
@@ -171,7 +172,9 @@ func (s *Store) NewImportedAddress(ctx context.Context,
 		RowCreatedAt:       importedAddressRowCreatedAt,
 	}
 
-	return db.NewImportedAddressWithTx(ctx, params, s.execWrite, adapters)
+	return db.NewImportedAddressWithTx(
+		ctx, params, s.execWrite, adapters,
+	)
 }
 
 // getAccountFromKey returns a helper to look up accounts by key.
@@ -208,15 +211,14 @@ func derivedAddressGetIntIndex(
 }
 
 // derivedAddressCreateAddr returns the derived address insert helper.
-func derivedAddressCreateAddr(
-	qtx *sqlc.Queries,
-) func(context.Context, int64, int64, db.AddressType, uint32, uint32, []byte) (
-	sqlc.CreateDerivedAddressRow, error,
-) {
+func derivedAddressCreateAddr(qtx *sqlc.Queries) func(
+	context.Context, int64, int64, db.AddressType, uint32, uint32, []byte,
+	[]byte) (sqlc.CreateDerivedAddressRow, error) {
 
 	return func(ctx context.Context, walletID int64, accountID int64,
 		addrType db.AddressType, branch uint32, index uint32,
-		scriptPubKey []byte) (sqlc.CreateDerivedAddressRow, error) {
+		scriptPubKey []byte,
+		pubKey []byte) (sqlc.CreateDerivedAddressRow, error) {
 
 		return qtx.CreateDerivedAddress(
 			ctx, sqlc.CreateDerivedAddressParams{
@@ -232,7 +234,7 @@ func derivedAddressCreateAddr(
 					Int64: int64(index),
 					Valid: true,
 				},
-				PubKey: nil,
+				PubKey: pubKey,
 			},
 		)
 	}
