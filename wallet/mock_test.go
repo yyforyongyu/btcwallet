@@ -39,6 +39,11 @@ import (
 // exercising a real database backend.
 type mockStore struct {
 	mock.Mock
+
+	// addrStore optionally backs GetWallet so the kvdb adapter pattern can
+	// be exercised end-to-end without programming a Called expectation for
+	// every field. When nil the method falls back to mock.Called.
+	addrStore waddrmgr.AddrStore
 }
 
 // A compile-time assertion to ensure that mockStore implements the db.Store
@@ -67,12 +72,48 @@ func (m *mockStore) CreateWallet(ctx context.Context,
 func (m *mockStore) GetWallet(ctx context.Context,
 	name string) (*db.WalletInfo, error) {
 
-	args := m.Called(ctx, name)
-	if args.Get(0) == nil {
-		return nil, args.Error(1)
+	if m.hasExpectation("GetWallet") || m.addrStore == nil {
+		args := m.Called(ctx, name)
+		if args.Get(0) == nil {
+			return nil, args.Error(1)
+		}
+
+		return args.Get(0).(*db.WalletInfo), args.Error(1)
 	}
 
-	return args.Get(0).(*db.WalletInfo), args.Error(1)
+	var birthdayBlock *db.Block
+
+	block, verified, err := m.addrStore.BirthdayBlock(nil)
+	if err != nil && !waddrmgr.IsError(
+		err, waddrmgr.ErrBirthdayBlockNotSet,
+	) {
+
+		return nil, err
+	}
+
+	if err == nil && verified {
+		height, err := db.Int64ToUint32(int64(block.Height))
+		if err != nil {
+			return nil, err
+		}
+
+		birthdayBlock = &db.Block{
+			Hash:      block.Hash,
+			Height:    height,
+			Timestamp: block.Timestamp,
+		}
+	}
+
+	info := &db.WalletInfo{
+		Name:          name,
+		BirthdayBlock: birthdayBlock,
+	}
+
+	if birthdayBlock == nil {
+		info.Birthday = m.addrStore.Birthday()
+	}
+
+	return info, nil
 }
 
 // ListWallets implements the db.WalletStore interface.
@@ -452,6 +493,18 @@ func (m *mockStore) RollbackToBlock(ctx context.Context, height uint32) error {
 	args := m.Called(ctx, height)
 
 	return args.Error(0)
+}
+
+// hasExpectation reports whether the mock has an On(...) expectation
+// registered for the given method name.
+func (m *mockStore) hasExpectation(method string) bool {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == method {
+			return true
+		}
+	}
+
+	return false
 }
 
 // mockTxStore is a mock implementation of the wtxmgr.TxStore interface.
