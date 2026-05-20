@@ -54,9 +54,6 @@ var (
 	// ErrUnableToExtractAddress is returned when an address cannot be
 	// extracted from a pkscript.
 	ErrUnableToExtractAddress = errors.New("unable to extract address")
-	// errStopIteration is a special error used to stop the iteration in
-	// ForEachAccountAddress.
-	errStopIteration = errors.New("stop iteration")
 )
 
 // addressManagerPageLimit is the transitional address iteration page size.
@@ -204,6 +201,8 @@ var _ AddressManager = (*Wallet)(nil)
 
 // addressInfoFromManagedAddress converts one legacy managed address into the
 // wallet-owned metadata shape used by the prep work.
+//
+//nolint:unparam // Preserve the legacy caller error shape during migration.
 func addressInfoFromManagedAddress(
 	managedAddr waddrmgr.ManagedAddress) (AddressInfo, error) {
 
@@ -632,77 +631,8 @@ func (w *Wallet) GetUnusedAddress(ctx context.Context, accountName string,
 	return w.NewAddress(ctx, accountName, addrType, change)
 }
 
-// findUnusedAddress scans for an unused address for the given account.
-func (w *Wallet) findUnusedAddress(manager waddrmgr.AccountStore,
-	accountName string, change bool) (btcutil.Address, error) {
-
-	var unusedAddr btcutil.Address
-
-	err := walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		// First, look up the account number for the passed account
-		// name.
-		acctNum, err := manager.LookupAccount(addrmgrNs, accountName)
-		if err != nil {
-			return err
-		}
-
-		// Now, iterate through all addresses for the account and
-		// return the first one that is unused.
-		return manager.ForEachAccountAddress(
-			addrmgrNs, acctNum,
-			func(maddr waddrmgr.ManagedAddress) error {
-				// We only want to consider addresses that match
-				// the change parameter.
-				if maddr.Internal() != change {
-					return nil
-				}
-
-				if !maddr.Used(addrmgrNs) {
-					unusedAddr = maddr.Address()
-
-					// Return a special error to signal
-					// that the iteration should be
-					// stopped. This is the idiomatic way
-					// to halt a ForEach* loop in this
-					// codebase.
-					return errStopIteration
-				}
-
-				return nil
-			},
-		)
-	})
-
-	return unusedAddr, err
-}
-
 // GetAddressInfo returns detailed information regarding a wallet address.
-//
-// This method provides metadata about a managed address, such as its type,
-// derivation path, and whether it's internal or compressed.
-//
-// How it works:
-// The method performs a direct lookup in the address manager to find the
-// requested address.
-//
-// Logical Steps:
-//  1. Initiate a read-only database transaction.
-//  2. Call the underlying address manager's `Address` method to look up the
-//     address.
-//  3. Return the managed address information.
-//
-// Database Actions:
-//   - This method performs a single read-only database transaction
-//     (`walletdb.View`).
-//   - It reads from the `waddrmgr` namespace to find the address.
-//
-// Time Complexity:
-//   - The operation is a direct database lookup, making its complexity roughly
-//     O(1) or O(log N) depending on the database backend's indexing strategy
-//     for addresses. It is a very fast operation.
-func (w *Wallet) GetAddressInfo(_ context.Context, a btcutil.Address) (
+func (w *Wallet) GetAddressInfo(ctx context.Context, a btcutil.Address) (
 	AddressInfo, error) {
 
 	err := w.state.validateStarted()
@@ -710,20 +640,22 @@ func (w *Wallet) GetAddressInfo(_ context.Context, a btcutil.Address) (
 		return AddressInfo{}, err
 	}
 
-	var managedAddress waddrmgr.ManagedAddress
+	scriptPubKey, err := txscript.PayToAddrScript(a)
+	if err != nil {
+		return AddressInfo{}, fmt.Errorf("pay to addr script: %w", err)
+	}
 
-	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		managedAddress, err = w.addrStore.Address(addrmgrNs, a)
-
-		return err
-	})
+	storeAddr, err := w.store.GetAddress(
+		ctx, db.GetAddressQuery{
+			WalletID:     w.id,
+			ScriptPubKey: scriptPubKey,
+		},
+	)
 	if err != nil {
 		return AddressInfo{}, err
 	}
 
-	return addressInfoFromManagedAddress(managedAddress)
+	return addressInfoFromStoreAddress(storeAddr, w.cfg.ChainParams)
 }
 
 // ListAddresses lists all addresses for a given account, including their
@@ -935,9 +867,10 @@ func (w *Wallet) ImportTaprootScript(ctx context.Context,
 //     sign for (e.g., P2WKH, NP2WKH, P2TR).
 //  3. Based on the address type, construct the appropriate scripts:
 //     - For nested P2WKH (NP2WKH), it returns the inner witness program as the
-//     redeem script.
+//     redeem script and also builds the single-push sigScript wrapper used in
+//     the final input.
 //     - For native SegWit outputs (P2WKH, P2TR), the `witnessProgram` is the
-//     output's `pkScript`, while the redeem script is nil.
+//     output's `pkScript`, while the redeem script and sigScript are nil.
 //
 // Database Actions:
 //   - This method performs a read-only database access to fetch address
@@ -968,58 +901,19 @@ func (w *Wallet) ScriptForOutput(ctx context.Context, output wire.TxOut) (
 			"for %s: %w", addr.String(), err)
 	}
 
-	if addressInfo.PubKey == nil {
-		return OutputScriptInfo{}, fmt.Errorf("%w: addr %s",
-			ErrNotPubKeyAddress, addressInfo.Addr)
-	}
-
-	witnessProgram := output.PkScript
-
-	var redeemScript []byte
-	if addressInfo.AddrType == waddrmgr.NestedWitnessPubKey {
-		redeemScript, err = nestedWitnessProgramFromPubKey(
-			addressInfo.PubKey, w.cfg.ChainParams,
-		)
-		if err != nil {
-			return OutputScriptInfo{}, err
-		}
-
-		// For nested P2WPKH-in-P2SH, the redeem script committed by the outer
-		// P2SH output is the same inner witness program used for signing.
-		witnessProgram = redeemScript
-	} else if addressInfo.AddrType != waddrmgr.PubKeyHash &&
-		addressInfo.AddrType != waddrmgr.WitnessPubKey &&
-		addressInfo.AddrType != waddrmgr.TaprootPubKey {
-
-		return OutputScriptInfo{}, fmt.Errorf("%w: %v",
-			ErrUnsupportedAddressType, addressInfo.AddrType)
+	witnessProgram, redeemScript, sigScript, err := buildScriptsForAddressInfo(
+		addressInfo, output.PkScript, w.cfg.ChainParams,
+	)
+	if err != nil {
+		return OutputScriptInfo{}, err
 	}
 
 	return OutputScriptInfo{
 		AddressInfo:    addressInfo,
 		WitnessProgram: witnessProgram,
 		RedeemScript:   redeemScript,
+		SigScript:      sigScript,
 	}, nil
-}
-
-// nestedWitnessProgramFromPubKey builds the inner witness program used by a
-// nested P2WPKH-in-P2SH output from one compressed public key.
-func nestedWitnessProgramFromPubKey(pubKey *btcec.PublicKey,
-	chainParams *chaincfg.Params) ([]byte, error) {
-
-	witnessAddr, err := btcutil.NewAddressWitnessPubKeyHash(
-		btcutil.Hash160(pubKey.SerializeCompressed()), chainParams,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("new witness pubkey hash: %w", err)
-	}
-
-	witnessProgram, err := txscript.PayToAddrScript(witnessAddr)
-	if err != nil {
-		return nil, fmt.Errorf("pay to witness address: %w", err)
-	}
-
-	return witnessProgram, nil
 }
 
 // buildScriptsForAddressInfo constructs the witness program, redeem script,
