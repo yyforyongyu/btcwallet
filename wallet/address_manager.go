@@ -446,7 +446,7 @@ func encryptTaprootScript(vault keyvault.Vault,
 //     transaction to persist the new address.
 //     This ensures that we only save an address after we are confident that
 //     it is being watched by the backend, preventing fund loss.
-func (w *Wallet) NewAddress(_ context.Context, accountName string,
+func (w *Wallet) NewAddress(ctx context.Context, accountName string,
 	addrType waddrmgr.AddressType, change bool) (btcutil.Address, error) {
 
 	err := w.state.validateStarted()
@@ -464,14 +464,22 @@ func (w *Wallet) NewAddress(_ context.Context, accountName string,
 		return nil, fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
+	addrInfo, err := w.store.NewDerivedAddress(
+		ctx, db.NewDerivedAddressParams{
+			WalletID:    w.id,
+			AccountName: accountName,
+			Scope:       db.KeyScope(keyScope),
+			Change:      change,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	addr, err := w.newAddress(manager, accountName, change)
-	if err != nil {
-		return nil, err
+	addr := extractAddrFromPKScript(addrInfo.ScriptPubKey, w.cfg.ChainParams)
+	if addr == nil {
+		return nil, fmt.Errorf("%w: from pkscript %x",
+			ErrUnableToExtractAddress, addrInfo.ScriptPubKey)
 	}
 
 	// Notify the rpc server about the newly created address.
@@ -483,25 +491,47 @@ func (w *Wallet) NewAddress(_ context.Context, accountName string,
 	return addr, nil
 }
 
-// newAddress returns the next external chained address for a wallet. It
-// wraps the database transaction and the call to the scoped key manager's
-// NewAddress method. The underlying address manager handles its own
-// synchronization to ensure that in-memory state remains consistent with the
-// database, preventing race conditions during address creation.
-func (w *Wallet) newAddress(manager waddrmgr.AccountStore,
-	accountName string, change bool) (btcutil.Address, error) {
+// deriveAddressData derives one address script through the legacy address
+// manager while the store owns address persistence.
+func (w *Wallet) deriveAddressData(_ context.Context,
+	scope waddrmgr.KeyScope, accountID, branch,
+	index uint32) (*db.DerivedAddressData, error) {
 
-	var (
-		addr btcutil.Address
-		err  error
-	)
+	manager, err := w.addrStore.FetchScopedKeyManager(scope)
+	if err != nil {
+		return nil, fmt.Errorf("fetch scoped key manager: %w", err)
+	}
 
-	err = walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
-		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+	var derived *db.DerivedAddressData
 
-		addr, err = manager.NewAddress(addrmgrNs, accountName, change)
+	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		path := waddrmgr.DerivationPath{
+			InternalAccount: accountID,
+			Account:         accountID + hdkeychain.HardenedKeyStart,
+			Branch:          branch,
+			Index:           index,
+		}
+
+		managedAddr, err := manager.DeriveFromKeyPath(ns, path)
 		if err != nil {
-			return err
+			return fmt.Errorf("derive key path: %w", err)
+		}
+
+		scriptPubKey, err := txscript.PayToAddrScript(
+			managedAddr.Address(),
+		)
+		if err != nil {
+			return fmt.Errorf("pay to addr: %w", err)
+		}
+
+		derived = &db.DerivedAddressData{
+			ScriptPubKey: scriptPubKey,
+		}
+
+		pubKeyAddr, ok := managedAddr.(waddrmgr.ManagedPubKeyAddress)
+		if ok {
+			derived.PubKey = pubKeyAddr.PubKey().SerializeCompressed()
 		}
 
 		return nil
@@ -510,7 +540,7 @@ func (w *Wallet) newAddress(manager waddrmgr.AccountStore,
 		return nil, err
 	}
 
-	return addr, nil
+	return derived, nil
 }
 
 // GetUnusedAddress returns the first, oldest, unused address by scanning
@@ -565,19 +595,35 @@ func (w *Wallet) GetUnusedAddress(ctx context.Context, accountName string,
 		return nil, fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
 	}
 
-	manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
+	req, err := addressPageRequest()
 	if err != nil {
 		return nil, err
 	}
 
-	unusedAddr, err := w.findUnusedAddress(manager, accountName, change)
-	// We'll ignore the special error that we use to stop the iteration.
-	if err != nil && !errors.Is(err, errStopIteration) {
-		return nil, err
-	}
+	addresses := w.store.IterAddresses(
+		ctx, db.ListAddressesQuery{
+			WalletID:    w.id,
+			AccountName: accountName,
+			Scope:       db.KeyScope(keyScope),
+			Page:        req,
+		},
+	)
+	for storeAddr, err := range addresses {
+		if err != nil {
+			return nil, err
+		}
 
-	// If we found an unused address, we can return it now.
-	if unusedAddr != nil {
+		unusedAddr, ok, err := nextUnusedStoreAddress(
+			storeAddr, change, w.cfg.ChainParams,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if !ok {
+			continue
+		}
+
 		return unusedAddr, nil
 	}
 
