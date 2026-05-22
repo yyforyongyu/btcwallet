@@ -216,35 +216,39 @@ func derivedAddressCreateAddr(qtx *sqlc.Queries) func(
 	context.Context, int64, int64, db.AddressType, uint32, uint32, []byte,
 	[]byte) (sqlc.CreateDerivedAddressRow, error) {
 
-	return func(ctx context.Context, walletID int64, accountID int64,
-		addrType db.AddressType, branch uint32, index uint32,
-		scriptPubKey []byte,
-		pubKey []byte) (sqlc.CreateDerivedAddressRow, error) {
+	return db.DerivedAddressCreateAddr(
+		qtx.CreateDerivedAddress, buildDerivedAddressParams,
+	)
+}
 
-		branchNum, err := db.Uint32ToInt16(branch)
-		if err != nil {
-			return sqlc.CreateDerivedAddressRow{},
-				fmt.Errorf("address branch: %w", err)
-		}
+// buildDerivedAddressParams maps common derived-address inputs to PostgreSQL
+// sqlc insert params.
+func buildDerivedAddressParams(walletID int64, accountID int64,
+	addrType db.AddressType, branch uint32, index uint32,
+	scriptPubKey []byte,
+	pubKey []byte) (sqlc.CreateDerivedAddressParams, error) {
 
-		return qtx.CreateDerivedAddress(
-			ctx, sqlc.CreateDerivedAddressParams{
-				WalletID:     walletID,
-				AccountID:    accountID,
-				ScriptPubKey: scriptPubKey,
-				TypeID:       int16(addrType),
-				AddressBranch: sql.NullInt16{
-					Int16: branchNum,
-					Valid: true,
-				},
-				AddressIndex: sql.NullInt64{
-					Int64: int64(index),
-					Valid: true,
-				},
-				PubKey: pubKey,
-			},
-		)
+	branchNum, err := db.Uint32ToInt16(branch)
+	if err != nil {
+		return sqlc.CreateDerivedAddressParams{},
+			fmt.Errorf("address branch: %w", err)
 	}
+
+	return sqlc.CreateDerivedAddressParams{
+		WalletID:     walletID,
+		AccountID:    accountID,
+		ScriptPubKey: scriptPubKey,
+		TypeID:       int16(addrType),
+		AddressBranch: sql.NullInt16{
+			Int16: branchNum,
+			Valid: true,
+		},
+		AddressIndex: sql.NullInt64{
+			Int64: int64(index),
+			Valid: true,
+		},
+		PubKey: pubKey,
+	}, nil
 }
 
 // derivedAddressRowID returns the created address ID.

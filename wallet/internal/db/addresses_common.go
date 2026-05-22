@@ -646,6 +646,32 @@ type ImportedAddressAdapters[QTX any, AccountRow any,
 	ApplyAccountMetadata func(*AddressInfo, AccountRow) error
 }
 
+// DerivedAddressCreateAddr returns a derived-address insert adapter from a
+// backend-specific sqlc create method and parameter builder.
+func DerivedAddressCreateAddr[CreateParams any, AddrRow any](
+	create func(context.Context, CreateParams) (AddrRow, error),
+	buildParams func(int64, int64, AddressType, uint32, uint32, []byte,
+		[]byte) (CreateParams, error)) func(context.Context, int64, int64,
+	AddressType, uint32, uint32, []byte, []byte) (AddrRow, error) {
+
+	return func(ctx context.Context, walletID int64, accountID int64,
+		addrType AddressType, branch uint32, index uint32,
+		scriptPubKey []byte, pubKey []byte) (AddrRow, error) {
+
+		params, err := buildParams(
+			walletID, accountID, addrType, branch, index, scriptPubKey,
+			pubKey,
+		)
+		if err != nil {
+			var zero AddrRow
+
+			return zero, err
+		}
+
+		return create(ctx, params)
+	}
+}
+
 // GetAddressFunc defines a function signature for retrieving a single address.
 type GetAddressFunc func(context.Context, GetAddressQuery) (*AddressInfo, error)
 

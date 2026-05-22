@@ -1715,6 +1715,42 @@ func TestNewDerivedAddress(t *testing.T) {
 	}
 }
 
+// TestNewDerivedAddressUsesStoredScopeSchema verifies that derived addresses
+// use the address schema persisted on the key scope instead of recomputing the
+// default schema from the scope tuple.
+func TestNewDerivedAddressUsesStoredScopeSchema(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-derived-stored-schema")
+
+	strictBIP49 := &db.ScopeAddrSchema{
+		ExternalAddrType: db.NestedWitnessPubKey,
+		InternalAddrType: db.NestedWitnessPubKey,
+	}
+
+	_, err := store.CreateImportedAccount(
+		t.Context(), db.CreateImportedAccountParams{
+			WalletID:   walletID,
+			Scope:      db.KeyScopeBIP0049Plus,
+			Name:       "strict-bip49-import",
+			PublicKey:  RandomBytes(32),
+			AddrSchema: strictBIP49,
+		},
+	)
+	require.NoError(t, err)
+
+	accountName := "derived-on-strict-bip49"
+	createDerivedAccount(
+		t, store, walletID, db.KeyScopeBIP0049Plus, accountName,
+	)
+
+	info := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0049Plus, accountName, true,
+	)
+	require.Equal(t, db.NestedWitnessPubKey, info.AddrType)
+}
+
 // TestNewDerivedAddressDerivesByAccountNumber verifies that the derivation
 // callback receives the BIP44 account number, not the SQL account row ID.
 func TestNewDerivedAddressDerivesByAccountNumber(t *testing.T) {
