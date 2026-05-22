@@ -660,36 +660,7 @@ func (w *Wallet) GetAddressInfo(ctx context.Context, a btcutil.Address) (
 
 // ListAddresses lists all addresses for a given account, including their
 // balances.
-//
-// This method provides a comprehensive view of all addresses within a
-// specific account, along with their current confirmed balances.
-//
-// How it works:
-// The method first calculates the balances of all UTXOs in the wallet and
-// stores them in a map. It then iterates through all addresses of the
-// specified account and looks up their balance in the map.
-//
-// Logical Steps:
-//  1. Build a map of address balances through the legacy transaction store.
-//  2. Initiate a read-only database transaction.
-//  3. Fetch the scoped key manager for the given address type.
-//  4. Look up the account number for the given account name.
-//  5. Iterate through all addresses in that account.
-//  6. For each address, create an `AddressProperty` with the address and its
-//     balance from the map.
-//  7. Return the list of `AddressProperty` objects.
-//
-// Database Actions:
-//   - This method reads balances from the legacy transaction store, then opens
-//     a read-only database transaction (`walletdb.View`) over the address
-//     manager namespace.
-//
-// Time Complexity:
-//   - The complexity is O(U + A), where U is the number of unspent
-//     transaction outputs in the wallet and A is the number of addresses in
-//     the specified account. This is because it iterates through all UTXOs to
-//     build the balance map and then iterates through all account addresses.
-func (w *Wallet) ListAddresses(_ context.Context, accountName string,
+func (w *Wallet) ListAddresses(ctx context.Context, accountName string,
 	addrType waddrmgr.AddressType) ([]AddressProperty, error) {
 
 	err := w.state.validateStarted()
@@ -697,44 +668,49 @@ func (w *Wallet) ListAddresses(_ context.Context, accountName string,
 		return nil, err
 	}
 
+	keyScope, err := addrType.KeyScope()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
+	}
+
+	req, err := addressPageRequest()
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO(yy): switch to Store.ListUTXOs once it is implemented for
+	// kvdb (PR #1238).
 	balances, err := w.legacyAddressBalances()
 	if err != nil {
 		return nil, err
 	}
 
-	var properties []AddressProperty
+	properties := make([]AddressProperty, 0)
 
-	err = walletdb.View(w.cfg.DB, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		keyScope, err := addrType.KeyScope()
+	addresses := w.store.IterAddresses(
+		ctx, db.ListAddressesQuery{
+			WalletID:    w.id,
+			AccountName: accountName,
+			Scope:       db.KeyScope(keyScope),
+			Page:        req,
+		},
+	)
+	for storeAddr, err := range addresses {
 		if err != nil {
-			return fmt.Errorf("%w: %v", ErrUnknownAddrType, addrType)
+			return nil, err
 		}
 
-		manager, err := w.addrStore.FetchScopedKeyManager(keyScope)
-		if err != nil {
-			return err
+		addr := extractAddrFromPKScript(
+			storeAddr.ScriptPubKey, w.cfg.ChainParams,
+		)
+		if addr == nil {
+			continue
 		}
 
-		acctNum, err := manager.LookupAccount(addrmgrNs, accountName)
-		if err != nil {
-			return err
-		}
-
-		return manager.ForEachAccountAddress(addrmgrNs, acctNum,
-			func(maddr waddrmgr.ManagedAddress) error {
-				addr := maddr.Address()
-				properties = append(properties, AddressProperty{
-					Address: addr,
-					Balance: balances[addr.String()],
-				})
-
-				return nil
-			})
-	})
-	if err != nil {
-		return nil, err
+		properties = append(properties, AddressProperty{
+			Address: addr,
+			Balance: balances[addr.String()],
+		})
 	}
 
 	return properties, nil
