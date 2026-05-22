@@ -370,6 +370,7 @@ func addressRowToInfo[T addressInfoRow](row T) (*db.AddressInfo, error) {
 		AddressIndex:      base.AddressIndex,
 		ScriptPubKey:      base.ScriptPubKey,
 		PubKey:            base.PubKey,
+		IsUsed:            base.IsUsed,
 		IDToAddrType:      db.IDToAddressType[int64],
 		IDToOrigin:        db.IDToOrigin[int64],
 	})
