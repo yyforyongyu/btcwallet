@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -13,8 +14,10 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/btcsuite/btcwallet/internal/zero"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
 	"github.com/btcsuite/btcwallet/walletdb"
 )
 
@@ -34,6 +37,14 @@ var (
 	// ErrInvalidSignParam is returned when the parameters for the signing
 	// operation are invalid.
 	ErrInvalidSignParam = errors.New("invalid signing parameters")
+
+	// ErrWatchOnlyAccount is returned when account metadata exists but has no
+	// private key material available for signing.
+	ErrWatchOnlyAccount = errors.New("account is watch-only")
+
+	// ErrAccountNotInStore is returned when neither legacy waddrmgr nor the
+	// durable store can resolve the signing account.
+	ErrAccountNotInStore = errors.New("account not in store")
 )
 
 // Signer provides an interface for common, safe cryptographic operations,
@@ -893,6 +904,66 @@ func (w *Wallet) resolveDerivedPrivKey(accountManager waddrmgr.AccountStore,
 	}
 
 	return privKey, nil
+}
+
+// deriveStoredAccountChildKey decrypts an account's encrypted private key with
+// the wallet's keyVault and walks the branch and index derivation to produce
+// the leaf private key. The decrypted byte slice and intermediate HD keys are
+// zeroed before the call returns. Note that hdkeychain/base58 parsing allocates
+// a transient immutable string copy of the decrypted bytes that cannot be
+// wiped and is left to the garbage collector.
+func deriveStoredAccountChildKey(vault keyvault.Vault,
+	encryptedAccountPriv []byte,
+	path waddrmgr.DerivationPath) (*btcec.PrivateKey, error) {
+
+	plaintext, err := vault.Decrypt(
+		waddrmgr.CKTPrivate, encryptedAccountPriv,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt account priv: %w", err)
+	}
+
+	acctPriv, err := hdkeychain.NewKeyFromString(string(plaintext))
+	if err != nil {
+		zero.Bytes(plaintext)
+		return nil, fmt.Errorf("parse account priv: %w", err)
+	}
+
+	zero.Bytes(plaintext)
+
+	defer acctPriv.Zero()
+
+	branchKey, err := deriveChildKey(acctPriv, path.Branch)
+	if err != nil {
+		return nil, fmt.Errorf("derive branch: %w", err)
+	}
+	defer branchKey.Zero()
+
+	addrKey, err := deriveChildKey(branchKey, path.Index)
+	if err != nil {
+		return nil, fmt.Errorf("derive index: %w", err)
+	}
+	defer addrKey.Zero()
+
+	privKey, err := addrKey.ECPrivKey()
+	if err != nil {
+		return nil, fmt.Errorf("derive private key: %w", err)
+	}
+
+	return privKey, nil
+}
+
+// isWaddrmgrAccountClassError reports whether err wraps a waddrmgr
+// ManagerError whose code belongs to the supplied set.
+func isWaddrmgrAccountClassError(err error,
+	codes ...waddrmgr.ErrorCode) bool {
+
+	var mErr waddrmgr.ManagerError
+	if !errors.As(err, &mErr) {
+		return false
+	}
+
+	return slices.Contains(codes, mErr.ErrorCode)
 }
 
 // signAndAssembleScript is a helper function that performs the final signing
