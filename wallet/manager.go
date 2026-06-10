@@ -12,7 +12,6 @@ import (
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
-	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
 )
 
 var (
@@ -340,14 +339,12 @@ func (m *Manager) Load(cfg Config) (*Wallet, error) {
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
 
 	w := &Wallet{
-		cfg:       cfg,
-		id:        walletID,
-		addrStore: addrMgr,
-		store:     store,
-		cache:     newStoreRuntimeCache(store),
-		keyVault: keyvault.NewWalletVault(
-			store, walletID, addrMgr.WatchOnly(),
-		),
+		cfg:               cfg,
+		id:                walletID,
+		addrStore:         addrMgr,
+		store:             store,
+		cache:             newStoreRuntimeCache(store),
+		keyVault:          kvdb.NewLegacyManagerVault(cfg.DB, addrMgr),
 		txStore:           txMgr,
 		requestChan:       make(chan any),
 		lifetimeCtx:       lifetimeCtx,
