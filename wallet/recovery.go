@@ -328,7 +328,28 @@ func (rs *RecoveryState) ProcessBlock(block *wire.MsgBlock) (
 		foundHorizons   map[waddrmgr.BranchScope]uint32
 	)
 
+	// filterTx mutates rs.outpoints in place: it deletes a watched outpoint
+	// the moment it sees a spend of it. When a same-block lookahead hit
+	// triggers a horizon expansion we re-run filterBlock over the same
+	// block, but by then the spent outpoint is already gone, so the second
+	// pass no longer recognizes that spend and the overwritten final result
+	// would silently drop a spend-only transaction. Snapshot the watched
+	// set up front and restore it before every pass so each filterBlock run
+	// observes the same starting outpoints and is idempotent; the final
+	// pass then leaves rs.outpoints with the correct post-block state.
+	outpointsSnapshot := make(map[wire.OutPoint][]byte, len(rs.outpoints))
+	for op, script := range rs.outpoints {
+		outpointsSnapshot[op] = script
+	}
+
 	for {
+		rs.outpoints = make(
+			map[wire.OutPoint][]byte, len(outpointsSnapshot),
+		)
+		for op, script := range outpointsSnapshot {
+			rs.outpoints[op] = script
+		}
+
 		relevantTxs, foundScopes, relevantOutputs = rs.filterBlock(
 			block,
 		)
