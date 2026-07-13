@@ -26,6 +26,13 @@ const (
 	// without error to be considered "stable", at which point the retry
 	// backoff is reset to initialBackoff.
 	stableRunTime = 10 * time.Minute
+
+	// deferredStopPollInterval is how often Stop re-checks the lifecycle
+	// while waiting for an in-flight Start to finish the teardown that Stop
+	// deferred to it. It only runs in the narrow window where a Stop lands
+	// while the wallet is still Starting, so a short interval keeps the
+	// reported shutdown latency low without meaningful overhead.
+	deferredStopPollInterval = 5 * time.Millisecond
 )
 
 var (
@@ -36,6 +43,14 @@ var (
 	// ErrWalletAlreadyStarted is returned when an attempt is made to start
 	// the wallet when it is already started.
 	ErrWalletAlreadyStarted = errors.New("wallet already started")
+
+	// ErrWalletStopped is returned when Start is called on a wallet
+	// instance that has already been stopped. Stop closes the instance's
+	// runtime, legacy, and cache stores and does not reopen them, so the
+	// pointer cannot be restarted. Obtain a fresh wallet via Manager.Load
+	// instead.
+	ErrWalletStopped = errors.New("wallet instance stopped; load a fresh " +
+		"instance to start again")
 
 	// ErrStateChanged is returned when the wallet state changes
 	// unexpectedly during an operation, such as a rescan setup.
@@ -146,10 +161,32 @@ type Controller interface {
 //
 // This is part of the Controller interface.
 func (w *Wallet) Start(startCtx context.Context) error {
-	// 1. Attempt to transition from Stopped to Starting.
-	err := w.state.toStarting()
+	// 1. Claim the Stopped->Starting transition and clear any stale stop
+	//    request from a prior lifecycle in the same critical section. The
+	//    clear must be atomic with claiming Starting: a concurrent Stop can
+	//    only record a stop request once the wallet is Starting and only by
+	//    taking the same lock, so doing both here guarantees the clear never
+	//    erases a stop request aimed at this start.
+	err := w.state.beginStart(&w.stopRequested)
 	if err != nil {
 		return err
+	}
+
+	// Refuse to restart a stopped instance. Stop closes w.store, w.cache,
+	// w.addrStore, w.txStore, and the legacy store, and finishStop does not
+	// reopen them; proceeding would run performRuntimeSetup against closed
+	// stores. Revert the state we just claimed and fail with a typed error
+	// so the caller knows to obtain a fresh wallet via Manager.Load. This
+	// is checked while holding the Starting state so it cannot race a
+	// concurrent finishStop into a half-open wallet.
+	if w.stopped.Load() {
+		stopErr := w.state.toStopped()
+		if stopErr != nil {
+			log.Warnf("Failed to revert state to stopped: %v",
+				stopErr)
+		}
+
+		return ErrWalletStopped
 	}
 
 	// 2. Setup background resources.
@@ -178,6 +215,18 @@ func (w *Wallet) Start(startCtx context.Context) error {
 		return err
 	}
 
+	// A Stop that arrived while we were Starting could not move the state
+	// out of Starting, so it recorded its intent. Honor it here before
+	// launching workers or marking the wallet started, so a stopped wallet
+	// is never observed as started.
+	if w.stopRequested.Load() {
+		w.cancel()
+		w.finishStop()
+
+		return fmt.Errorf("%w: start aborted by concurrent stop",
+			ErrStateForbidden)
+	}
+
 	// 4. Start background goroutines.
 	w.wg.Add(1)
 
@@ -191,10 +240,42 @@ func (w *Wallet) Start(startCtx context.Context) error {
 		w.runSyncLoop()
 	}()
 
-	// 5. Mark the wallet as fully started.
-	err = w.state.toStarted()
+	// 5. Mark the wallet as fully started, in the same critical section
+	//    that observes a concurrent stop request, so a Stop arriving after
+	//    the workers launched cannot leave the wallet running while having
+	//    reported success. finalizeStart serializes with Stop's requestStop
+	//    via the lifecycle's startStopMu.
+	aborted, err := w.state.finalizeStart(&w.stopRequested)
 	if err != nil {
+		// A concurrent stop moved us out of Starting after we launched
+		// the workers; cancel, wait for them to exit, and finalize.
+		w.cancel()
+		w.wg.Wait()
+		w.finishStop()
+
 		return err
+	}
+
+	// A Stop ran while we were Starting and could only record its intent
+	// (it could not transition Starting->Stopping). finalizeStart has left
+	// us Started, so we own the teardown: move through the normal
+	// Started->Stopping->Stopped path and report the start as aborted
+	// rather than handing back a wallet the caller already asked to stop.
+	// toStopping must run before finishStop because finishStop only admits
+	// a Stopping (or Starting) wallet into Stopped.
+	if aborted {
+		stopErr := w.state.toStopping()
+		if stopErr != nil {
+			log.Warnf("Failed to begin stopping aborted start: %v",
+				stopErr)
+		}
+
+		w.cancel()
+		w.wg.Wait()
+		w.finishStop()
+
+		return fmt.Errorf("%w: start aborted by concurrent stop",
+			ErrStateForbidden)
 	}
 
 	return nil
@@ -315,46 +396,153 @@ func (w *Wallet) performRuntimeSetup(startCtx context.Context) error {
 //
 // This is part of the Controller interface.
 func (w *Wallet) Stop(stopCtx context.Context) error {
-	// Attempt to transition from Started to Stopping.
-	err := w.state.toStopping()
-	if err != nil {
-		// If the wallet is not started, we can consider it stopped.
-		log.Warnf("Wallet already stopped: %v", err)
+	// Attempt to transition from Started to Stopping. requestStop performs
+	// this under the lifecycle's startStopMu so it cannot race a concurrent
+	// Start's finalizeStart: either we transition and own the teardown
+	// below, or the wallet is still Starting and we record the stop intent
+	// for that in-flight Start to honor, or it is already stopping/stopped
+	// and the stop is a no-op.
+	transitioned, deferred := w.state.requestStop(&w.stopRequested)
+	if !transitioned {
+		// The wallet was still Starting, so we could not own the
+		// teardown; we recorded the intent and the in-flight Start will
+		// perform it. Honor the documented contract that Stop blocks
+		// until the wallet has fully exited by waiting for that Start to
+		// drive the lifecycle to Stopped before returning, rather than
+		// reporting completion while teardown is still in flight.
+		if deferred {
+			return w.waitForStopped(stopCtx)
+		}
+
+		// A false/false return means the wallet was already stopping or
+		// stopped, so there is nothing to wait on and the stop is a
+		// no-op.
+		log.Warnf("Stop requested while not started: %v", &w.state)
+
 		return nil
 	}
 
-	// Signal all background processes to stop.
-	//
-	// It is safe to call w.cancel() here because the successful transition
-	// to Stopping guarantees that we were previously in the Started state,
-	// which in turn guarantees that start() has completed initialization
-	// of w.lifetimeCtx and w.cancel.
-	//
-	// Additionally, w.cancel() is idempotent, so it is safe to call even
-	// if it has effectively already been called (though the state machine
-	// guarantees we only reach this point once).
+	// Signal all background processes to stop. Safe and idempotent: the
+	// successful Started->Stopping transition guarantees Start finished
+	// initializing w.lifetimeCtx and w.cancel.
 	w.cancel()
 
-	// Wait for all goroutines to finish.
+	// Finalize the shutdown in the background so a cancelled stopCtx cannot
+	// abandon the transition to Stopped, which would otherwise wedge a
+	// later restart.
 	done := make(chan struct{})
 	go func() {
 		w.wg.Wait()
+		w.finishStop()
+
 		close(done)
 	}()
 
 	select {
 	case <-done:
+		return nil
+
 	case <-stopCtx.Done():
 		return fmt.Errorf("stop request cancelled: %w", stopCtx.Err())
 	}
+}
 
-	// Mark the wallet as stopped.
-	err = w.state.toStopped()
-	if err != nil {
-		return err
+// waitForStopped blocks until the wallet's lifecycle reaches Stopped, i.e.
+// until the in-flight Start that owns the deferred teardown has run
+// finishStop. It returns nil once stopped, or a context-aware error if stopCtx
+// fires first. The lifecycle is polled rather than waited on a dedicated
+// signal because Stop deferred ownership of the teardown to Start; finishStop
+// (run by that Start) is the single writer that drives the lifecycle to
+// Stopped, and every one of Start's abort paths ends by calling it.
+func (w *Wallet) waitForStopped(stopCtx context.Context) error {
+	// Fast path: the in-flight Start may already have finished tearing down
+	// by the time we get here, so avoid arming a timer in the common case.
+	if w.state.isStopped() {
+		return nil
 	}
 
-	return nil
+	ticker := time.NewTicker(deferredStopPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if w.state.isStopped() {
+				return nil
+			}
+
+		case <-stopCtx.Done():
+			return fmt.Errorf("stop request cancelled: %w",
+				stopCtx.Err())
+		}
+	}
+}
+
+// finishStop completes a shutdown: it marks the wallet stopped, closes owned
+// stores, and runs the deregister hook. The toStopped CAS succeeds for exactly
+// one caller (from Stopping or Starting), so the teardown runs at most once
+// even if Stop's waiter and Start's abort path both reach here.
+func (w *Wallet) finishStop() {
+	// Mark the instance terminal BEFORE flipping the lifecycle to Stopped.
+	// toStopped re-enables the Stopped->Starting transition, so a Start
+	// racing to restart this pointer could win that CAS the instant the
+	// lifecycle flips. Setting stopped first guarantees that such a Start
+	// observes stopped==true in its post-toStarting guard and fails fast
+	// with ErrWalletStopped instead of running setup against the stores
+	// this function is about to close. stopped is monotone, so setting it
+	// before the CAS (which still admits exactly one teardown owner) is
+	// safe even when toStopped reports another caller already stopped.
+	w.stopped.Store(true)
+
+	err := w.state.toStopped()
+	if err != nil {
+		log.Warnf("Failed to mark wallet stopped: %v", err)
+
+		return
+	}
+
+	err = w.closeRuntimeStore()
+	if err != nil {
+		log.Errorf("Failed to close runtime store on stop: %v", err)
+	}
+
+	if w.onStopped != nil {
+		w.onStopped()
+	}
+}
+
+// discardUnstarted tears down a wallet that was loaded but never started,
+// for use on a Manager.Create error path that fails after Load has already
+// registered the wallet and opened its stores. It cancels the load-time
+// context, releases the store handles, and runs the deregister hook so the
+// manager cache is not left holding a partial wallet with live stores.
+//
+// Unlike finishStop this skips the Started->Stopping->Stopped lifecycle
+// transition, which does not apply to a wallet whose main loop never ran.
+// It marks the instance terminal so a later Start on the same pointer fails
+// fast instead of running against closed stores.
+func (w *Wallet) discardUnstarted() error {
+	w.stopped.Store(true)
+	w.cancel()
+	err := w.closeRuntimeStore()
+
+	if w.onStopped != nil {
+		w.onStopped()
+	}
+
+	return err
+}
+
+// closeRuntimeStore closes the owned runtime store, if one exists.
+func (w *Wallet) closeRuntimeStore() error {
+	if w.runtimeStoreClose == nil {
+		return nil
+	}
+
+	closeFn := w.runtimeStoreClose
+	w.runtimeStoreClose = nil
+
+	return closeFn()
 }
 
 // Unlock unlocks the wallet with a passphrase.
@@ -440,11 +628,12 @@ func (w *Wallet) Info(_ context.Context) (*Info, error) {
 	}
 
 	info := &Info{
-		BirthdayBlock:    w.birthdayBlock,
-		Backend:          w.cfg.Chain.BackEnd(),
-		ChainParams:      w.cfg.ChainParams,
-		Locked:           !w.state.isUnlocked(),
-		Synced:           w.state.isSynced(),
+		BirthdayBlock: w.birthdayBlock,
+		Backend:       w.cfg.Chain.BackEnd(),
+		ChainParams:   w.cfg.ChainParams,
+		Locked:        !w.state.isUnlocked(),
+		Synced:        w.state.isSynced(),
+		//nolint:contextcheck // SyncedTo takes no context.
 		SyncedTo:         w.SyncedTo(),
 		IsRecoveryMode:   w.state.isRecoveryMode(),
 		RecoveryProgress: 0,
@@ -704,9 +893,18 @@ func (w *Wallet) handleUnlockReq(req unlockReq) {
 	// Attempt to unlock the key vault. We pass a negative timeout to
 	// disable the vault's own auto-lock: the controller keeps owning the
 	// auto-lock schedule through its lockTimer below.
+	// Lock first so Unlock always validates the passphrase: the vault does
+	// not re-validate when already unlocked, so a repeat unlock (to renew the
+	// auto-lock timer) would otherwise skip validation. Lock is idempotent, so
+	// the initial unlock is unaffected.
+	w.keyVault.Lock()
+
 	err = w.keyVault.Unlock(w.lifetimeCtx, req.req.Passphrase)
 	if err != nil {
+		w.state.toLocked()
+
 		req.resp <- err
+
 		return
 	}
 

@@ -39,8 +39,13 @@ func (h *HarnessTest) CreateEmptyWallet() *wallet.Wallet {
 	name := "itest-" + strings.ReplaceAll(h.Name(), "/", "_")
 
 	cfg := wallet.Config{
-		// Use the subtest-scoped DB and chain client prepared by the harness.
-		DB:    h.WalletDB,
+		// Use the subtest-scoped DB path and chain client prepared by the
+		// harness.
+		DB: wallet.DBConfig{
+			KVDB: wallet.KVDBConfig{
+				DBPath: h.WalletDBPath,
+			},
+		},
 		Chain: h.ChainClient,
 
 		// Keep network and startup behavior deterministic across tests.
@@ -119,8 +124,8 @@ func (h *HarnessTest) CreateFundedWallet() *wallet.Wallet {
 	return w
 }
 
+// init uses fast scrypt options for tests to avoid CPU exhaustion and timeouts,
+// especially when running with -race.
 func init() {
-	// Use fast scrypt options for tests to avoid CPU exhaustion and
-	// timeouts, especially when running with -race.
 	waddrmgr.DefaultScryptOptions = waddrmgr.FastScryptOptions
 }

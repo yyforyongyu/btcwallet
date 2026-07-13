@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/btcsuite/btcwallet/wallet/internal/bwtest/keyvaultmock"
 	walletmock "github.com/btcsuite/btcwallet/wallet/internal/bwtest/mock"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/walletdb"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 	"github.com/stretchr/testify/mock"
@@ -21,7 +23,6 @@ import (
 
 var (
 	errDBMock         = errors.New("db error")
-	errMock           = errors.New("mock error")
 	errChainMock      = errors.New("chain error")
 	errPutMock        = errors.New("put error")
 	errDBFail         = errors.New("db fail")
@@ -31,20 +32,13 @@ var (
 	errCFilterFail    = errors.New("cfilter fail")
 	errActiveMgrsFail = errors.New("active managers fail")
 
-	errSetFail   = errors.New("set fail")
 	errOther     = errors.New("other error")
 	errBroadcast = errors.New("broadcast fail")
 	errScan      = errors.New("scan fail")
 	errBlocks    = errors.New("blocks fail")
-	errDBInsert  = errors.New("db insert fail")
 	errBestBlock = errors.New("best block fail")
-	errAddr      = errors.New("addr fail")
-	errInsert    = errors.New("insert fail")
-	errManager   = errors.New("manager fail")
-	errUtxo      = errors.New("utxo fail")
 	errGetBlocks = errors.New("get blocks fail")
 	errBlockHash = errors.New("block hash fail")
-	errSetSync   = errors.New("set sync fail")
 	errRemote    = errors.New("remote fail")
 	errNotify    = errors.New("notify fail")
 	errHashes    = errors.New("hashes fail")
@@ -93,6 +87,46 @@ func setupTestDB(t *testing.T) (walletdb.DB, func()) {
 	return db, cleanup
 }
 
+// testDBConfig returns a DB config with a placeholder kvdb path for
+// package-local tests that do not open a wallet through Manager. It pins the
+// kvdb backend explicitly because these tests assert legacy kvdb runtime
+// behavior, while the default backend is now SQLite.
+func testDBConfig(db walletdb.DB) DBConfig {
+	_ = db
+
+	return DBConfig{
+		Backend: DBBackendKVDB,
+		KVDB:    KVDBConfig{DBPath: "test-wallet.db"},
+	}
+}
+
+// testKVDBPath returns an unused test walletdb path and cleanup function.
+func testKVDBPath(t *testing.T) (string, func()) {
+	t.Helper()
+
+	dbPath := filepath.Join(t.TempDir(), "wallet.db")
+	cleanup := func() {
+		_ = os.Remove(dbPath)
+	}
+
+	return dbPath, cleanup
+}
+
+// testKVDBConfig returns a path-backed kvdb config for Manager tests. It pins
+// the kvdb backend explicitly because these tests assert legacy kvdb runtime
+// behavior, while the default backend is now SQLite.
+func testKVDBConfig(t *testing.T) DBConfig {
+	t.Helper()
+
+	dbPath, cleanup := testKVDBPath(t)
+	t.Cleanup(cleanup)
+
+	return DBConfig{
+		Backend: DBBackendKVDB,
+		KVDB:    KVDBConfig{DBPath: dbPath},
+	}
+}
+
 // mockWalletDeps holds the mocked dependencies for the Wallet.
 type mockWalletDeps struct {
 	addrStore      *bwmock.AddrStore
@@ -133,6 +167,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 		addrStore:   mockAddrStore,
 		store:       mockStore,
 		txStore:     mockTxStore,
+		legacyStore: kvdb.NewStore(db, mockTxStore, mockAddrStore),
 		keyVault:    mockVault,
 		sync:        mockSyncer,
 		state:       newWalletState(mockSyncer),
@@ -144,7 +179,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 			Height: 100,
 		},
 		cfg: Config{
-			DB:          db,
+			DB:          testDBConfig(db),
 			Chain:       mockChain,
 			ChainParams: &chainParams,
 		},

@@ -29,7 +29,6 @@ import (
 	"github.com/btcsuite/btcwallet/internal/prompt"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
-	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
 	"github.com/btcsuite/btcwallet/walletdb"
@@ -392,7 +391,7 @@ func (w *Wallet) MakeMultiSigScript(addrs []address.Address,
 			if dbtx == nil {
 				var err error
 
-				dbtx, err = w.cfg.DB.BeginReadTx()
+				dbtx, err = w.db.BeginReadTx()
 				if err != nil {
 					return nil, err
 				}
@@ -425,7 +424,7 @@ func (w *Wallet) ImportP2SHRedeemScript(script []byte) (*address.AddressScriptHa
 
 	var p2shAddr *address.AddressScriptHash
 
-	err := walletdb.Update(w.cfg.DB, func(tx walletdb.ReadWriteTx) error {
+	err := walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 		// TODO(oga) blockstamp current block?
@@ -785,6 +784,8 @@ type OutputSelectionPolicy struct {
 	RequiredConfirmations int32
 }
 
+// meetsRequiredConfs reports whether txHeight satisfies the policy's
+// confirmation requirement at curHeight.
 func (p *OutputSelectionPolicy) meetsRequiredConfs(txHeight,
 	curHeight int32) bool {
 
@@ -993,7 +994,7 @@ func (w *Wallet) FetchDerivationInfo(pkScript []byte) (*psbt.Bip32Derivation,
 	return derivation, nil
 }
 
-// hasOutpoint takes an output identified by its output index and determines
+// hasOutput takes an output identified by its output index and determines
 // whether the TxDetails contains this output. If the TxDetails doesn't have
 // this output, it means this output doesn't belong to our wallet.
 //
@@ -2804,7 +2805,6 @@ func (w *Wallet) Locked() bool {
 //
 // TODO: To prevent the above scenario, perhaps closures should be passed
 // to the walletLocker goroutine and disallow callers from explicitly
-
 // handling the locking mechanism.
 func (w *Wallet) holdUnlock() (heldUnlock, error) {
 	req := make(chan heldUnlock)
@@ -5088,10 +5088,12 @@ type AccountBalanceResult struct {
 // output index.
 type creditSlice []wtxmgr.Credit
 
+// Len returns the number of credits in the slice.
 func (s creditSlice) Len() int {
 	return len(s)
 }
 
+// Less reports whether credit i sorts before credit j.
 func (s creditSlice) Less(i, j int) bool {
 	switch {
 	// If both credits are from the same tx, sort by output index.
@@ -5114,6 +5116,7 @@ func (s creditSlice) Less(i, j int) bool {
 	}
 }
 
+// Swap exchanges two credits in the slice.
 func (s creditSlice) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
@@ -5126,6 +5129,8 @@ type ListLeasedOutputResult struct {
 	PkScript []byte
 }
 
+// newAddressDeprecated creates a new external address and returns the updated
+// account properties for deprecated callers.
 func (w *Wallet) newAddressDeprecated(addrmgrNs walletdb.ReadWriteBucket,
 	account uint32, scope waddrmgr.KeyScope) (address.Address,
 	*waddrmgr.AccountProperties, error) {
@@ -5335,6 +5340,8 @@ func (w *Wallet) DeriveFromKeyPathAddAccount(scope waddrmgr.KeyScope,
 	return privKey, nil
 }
 
+// handleChainNotifications processes chain client notifications for the
+// deprecated wallet lifecycle.
 func (w *Wallet) handleChainNotifications() {
 	defer w.wg.Done()
 
@@ -5629,6 +5636,8 @@ func (w *Wallet) disconnectBlock(dbtx walletdb.ReadWriteTx, b wtxmgr.BlockMeta) 
 	return nil
 }
 
+// addRelevantTx records a relevant transaction and marks any matching outputs
+// as wallet credits.
 func (w *Wallet) addRelevantTx(dbtx walletdb.ReadWriteTx, rec *wtxmgr.TxRecord,
 	block *wtxmgr.BlockMeta) error {
 
@@ -5864,6 +5873,7 @@ type secretSource struct {
 	addrmgrNs walletdb.ReadBucket
 }
 
+// GetKey returns the private key for a managed public-key address.
 func (s secretSource) GetKey(addr address.Address) (*btcec.PrivateKey, bool, error) {
 	ma, err := s.Address(s.addrmgrNs, addr)
 	if err != nil {
@@ -5883,6 +5893,7 @@ func (s secretSource) GetKey(addr address.Address) (*btcec.PrivateKey, bool, err
 	return privKey, ma.Compressed(), nil
 }
 
+// GetScript returns the redeem script for a managed script address.
 func (s secretSource) GetScript(addr address.Address) ([]byte, error) {
 	ma, err := s.Address(s.addrmgrNs, addr)
 	if err != nil {
@@ -6449,11 +6460,11 @@ func (w *Wallet) ImportAccountDryRun(name string,
 	return accountProps, externalAddrs, internalAddrs, nil
 }
 
-// ImportPublicKey imports a single derived public key into the address manager.
-// The address type can usually be inferred from the key's version, but in the
-// case of legacy versions (xpub, tpub), an address type must be specified as we
-// intend to not support importing BIP-44 keys into the wallet using the legacy
-// pay-to-pubkey-hash (P2PKH) scheme.
+// ImportPublicKeyDeprecated imports a single derived public key into the
+// address manager. The address type can usually be inferred from the key's
+// version, but in the case of legacy versions (xpub, tpub), an address type
+// must be specified as we intend to not support importing BIP-44 keys into the
+// wallet using the legacy pay-to-pubkey-hash (P2PKH) scheme.
 func (w *Wallet) ImportPublicKeyDeprecated(pubKey *btcec.PublicKey,
 	addrType waddrmgr.AddressType) error {
 
@@ -7209,17 +7220,24 @@ func OpenWithRetry(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 	}
 
 	walletID := uint32(0)
-	store := kvdb.NewStore(db, txMgr, addrMgr)
+	legacyStore := kvdb.NewStore(db, txMgr, addrMgr)
 
 	w := &Wallet{
-		id:        walletID,
-		addrStore: addrMgr,
-		store:     store,
-		keyVault: keyvault.NewWalletVault(
-			store, walletID, addrMgr.WatchOnly(),
-		),
+		id:               walletID,
+		addrStore:        addrMgr,
+		store:            legacyStore,
+		keyVault:         kvdb.NewLegacyManagerVault(db, addrMgr),
 		txStore:          txMgr,
 		walletDeprecated: deprecated,
+
+		// This deprecated constructor wires the kvdb store directly, so
+		// pin the kvdb backend explicitly. The runtime store now
+		// defaults to SQLite, and the backend-dependent legacy paths
+		// (e.g. storeSyncedTo, import mirroring) must keep treating a
+		// wallet opened here as kvdb.
+		cfg: Config{
+			DB: DBConfig{Backend: DBBackendKVDB},
+		},
 	}
 
 	w.NtfnServer = newNotificationServer(w)
@@ -7652,6 +7670,7 @@ func (l *Loader) CreateNewWatchingOnlyWallet(pubPassphrase []byte,
 	)
 }
 
+// createNewWallet creates and opens a wallet for the legacy loader.
 func (l *Loader) createNewWallet(pubPassphrase, privPassphrase []byte,
 	rootKey *hdkeychain.ExtendedKey, bday time.Time,
 	isWatchingOnly bool) (*Wallet, error) {
@@ -7721,6 +7740,7 @@ func (l *Loader) createNewWallet(pubPassphrase, privPassphrase []byte,
 
 var errNoConsole = errors.New("db upgrade requires console access for additional input")
 
+// noConsole rejects database upgrade prompts when no console is available.
 func noConsole() ([]byte, error) {
 	return nil, errNoConsole
 }
@@ -7840,6 +7860,7 @@ func (l *Loader) UnloadWallet() error {
 	return nil
 }
 
+// fileExists reports whether the provided file path exists.
 func fileExists(filePath string) (bool, error) {
 	_, err := os.Stat(filePath)
 	if err != nil {

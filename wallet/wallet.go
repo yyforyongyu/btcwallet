@@ -17,14 +17,15 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
@@ -169,8 +170,8 @@ const (
 // Config holds the configuration options for creating a new
 // WalletController.
 type Config struct {
-	// DB is the underlying database for the wallet.
-	DB walletdb.DB
+	// DB selects the database backend used by wallet runtime managers.
+	DB DBConfig
 
 	// Chain is the interface to the blockchain (e.g. bitcoind,
 	// neutrino). If set, the wallet will automatically synchronize with
@@ -214,10 +215,6 @@ type Config struct {
 
 // validate checks the configuration for consistency and completeness.
 func (c *Config) validate() error {
-	if c.DB == nil {
-		return fmt.Errorf("%w: DB", ErrMissingParam)
-	}
-
 	if c.Chain == nil {
 		return fmt.Errorf("%w: Chain", ErrMissingParam)
 	}
@@ -233,6 +230,20 @@ func (c *Config) validate() error {
 	if c.RecoveryWindow < MinRecoveryWindow {
 		return fmt.Errorf("%w: RecoveryWindow must be at least %d",
 			ErrInvalidParam, MinRecoveryWindow)
+	}
+
+	// The legacy kvdb path is required only when kvdb is the selected
+	// backend. SQL backends may omit it entirely when they supply their own
+	// SQL path; an explicit SQLite backend can still use it to derive the
+	// default SQLite path.
+	err := c.DB.validateLegacyKVDB()
+	if err != nil {
+		return err
+	}
+
+	err = c.DB.Validate()
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -340,6 +351,11 @@ type Wallet struct {
 	// querying the wallet's transaction history and unspent outputs.
 	txStore wtxmgr.TxStore
 
+	// legacyStore is the kvdb compatibility adapter for legacy manager paths.
+	// New wallet code must not open walletdb transactions directly; use
+	// db.Store, keyvault, or kvdb adapter methods instead.
+	legacyStore *kvdb.Store
+
 	// keyVault provides encryption and decryption for wallet key material.
 	keyVault keyvault.Vault
 
@@ -347,6 +363,10 @@ type Wallet struct {
 	//
 	// TODO(yy): Migrate UTXO-related callers behind db.UTXOStore.
 	store db.Store
+
+	// runtimeStoreClose closes stores owned by the modern manager load path.
+	// It is nil for wallets constructed by legacy loader paths.
+	runtimeStoreClose func() error
 
 	// cache is the wallet-private runtime seam between wallet managers and
 	// the durable db.Store. It exposes pass-through reads and absorbs
@@ -400,6 +420,24 @@ type Wallet struct {
 	// cancel is the cancellation function for lifetimeCtx.
 	cancel context.CancelFunc
 
+	// onStopped, if set, is invoked once the wallet has fully stopped. The
+	// manager uses it to deregister a stopped wallet so a later Load
+	// rebuilds it with fresh stores rather than returning a closed one.
+	onStopped func()
+
+	// stopRequested records that Stop was called while the wallet was still
+	// Starting (and so could not be transitioned out of Starting). Start
+	// checks it after setup to abort instead of completing a start the
+	// caller already cancelled.
+	stopRequested atomic.Bool
+
+	// stopped records that finishStop has closed this instance's stores.
+	// Stop is terminal for the pointer: once the runtime, legacy, and
+	// cache stores are closed they are not reopened, so Start refuses to
+	// restart onto them. Callers that want a running wallet again must
+	// obtain a fresh instance via Manager.Load.
+	stopped atomic.Bool
+
 	// requestChan is the central communication channel for incoming
 	// lifecycle and authentication requests.
 	requestChan chan any
@@ -446,9 +484,43 @@ func (w *Wallet) ID() uint32 {
 	return w.id
 }
 
-// SyncedTo calls the `SyncedTo` method on the wallet's manager.
+// SyncedTo returns the wallet's current synced-to block.
 func (w *Wallet) SyncedTo() waddrmgr.BlockStamp {
+	stamp, ok := w.storeSyncedTo()
+	if ok {
+		return stamp
+	}
+
+	if w.addrStore == nil {
+		return waddrmgr.BlockStamp{Height: -1}
+	}
+
 	return w.addrStore.SyncedTo()
+}
+
+// storeSyncedTo returns the synced tip read from the runtime Store on non-kvdb
+// backends. The bool is false when the kvdb backend is selected or the Store
+// has no usable synced tip, so the caller falls back to the legacy manager.
+func (w *Wallet) storeSyncedTo() (waddrmgr.BlockStamp, bool) {
+	if w.store == nil || w.cfg.DB.withDefaults().Backend == DBBackendKVDB {
+		return waddrmgr.BlockStamp{}, false
+	}
+
+	info, err := w.store.GetWallet(context.Background(), w.cfg.Name)
+	if err != nil {
+		return waddrmgr.BlockStamp{}, false
+	}
+
+	if info.SyncedTo == nil {
+		return waddrmgr.BlockStamp{Height: -1}, true
+	}
+
+	stamp, err := db.BlockStampFromBlock(info.SyncedTo)
+	if err != nil {
+		return waddrmgr.BlockStamp{}, false
+	}
+
+	return stamp, true
 }
 
 // hasMinConfs checks whether a transaction at height txHeight has met minconf

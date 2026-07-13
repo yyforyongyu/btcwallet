@@ -11,14 +11,16 @@ import (
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/gcs"
 	"github.com/btcsuite/btcd/btcutil/v2/gcs/builder"
+	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/addresstype"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
-	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
@@ -33,6 +35,12 @@ var (
 
 	// ErrScanBatchEmpty is returned when a scan batch contains no blocks.
 	ErrScanBatchEmpty = errors.New("scan batch empty")
+
+	// errUnexpectedTipHashCount is returned when the chain backend returns
+	// a number of hashes other than one for a single-height tip query.
+	errUnexpectedTipHashCount = errors.New(
+		"unexpected synced tip hash count",
+	)
 
 	// ErrUnknownRescanJobType is returned when an unknown rescan job type
 	// is encountered.
@@ -64,6 +72,12 @@ var (
 	// ErrNoScanTargets is returned when a targeted rescan is requested with
 	// no targets.
 	ErrNoScanTargets = errors.New("at least one target must be specified")
+
+	// errUnexpectedScanTargetCount is returned when the legacy manager
+	// resolves a single scan target to a number of results other than one.
+	errUnexpectedScanTargetCount = errors.New(
+		"unexpected resolved scan target count",
+	)
 )
 
 const (
@@ -230,6 +244,9 @@ type syncer struct {
 	// txStore is the transaction manager.
 	txStore wtxmgr.TxStore
 
+	// legacyStore is the kvdb adapter for legacy identity lookups.
+	legacyStore *kvdb.Store
+
 	// store is the transitional database store used by migrated runtime paths.
 	store db.Store
 
@@ -294,7 +311,12 @@ func (s *syncer) initChainSync(ctx context.Context) error {
 	// checkpoint, leading to unnecessary network I/O and delayed wallet
 	// readiness.
 	if cc, ok := s.cfg.Chain.(*chain.NeutrinoClient); ok {
-		cc.SetStartTime(s.addrStore.Birthday())
+		birthday, err := s.walletBirthday(ctx)
+		if err != nil {
+			return err
+		}
+
+		cc.SetStartTime(birthday)
 	}
 
 	// Wait for the backend to be synced to the network. We require the
@@ -313,14 +335,131 @@ func (s *syncer) initChainSync(ctx context.Context) error {
 		return fmt.Errorf("unable to check for rollback: %w", err)
 	}
 
-	// Enable block notifications from the chain backend.
-	err = s.cfg.Chain.NotifyBlocks()
+	// Register the wallet's existing addresses and unspent outputs with the
+	// backend before enabling live block notifications. The catch-up scan
+	// matches blocks client-side, but once synced the backend filters live
+	// blocks against its own watch list; without seeding that list with the
+	// wallet's existing addresses, a live block paying an existing address
+	// is filtered out as irrelevant while the sync tip still advances past
+	// it, permanently missing the deposit. The same applies to the wallet's
+	// existing unspent outputs: the live notification path only inspects
+	// transaction outputs (receives), so a live block spending an existing
+	// UTXO is filtered out unless that outpoint is on the backend watch
+	// list, permanently missing the spend.
+	_, addrs, unspent, err := s.loadWalletScanData(ctx)
 	if err != nil {
-		return fmt.Errorf("unable to start block notifications: %w",
+		return fmt.Errorf("unable to load existing scan targets: %w",
 			err)
 	}
 
+	err = s.registerScanTargets(ctx, addrs, unspent)
+	if err != nil {
+		return err
+	}
+
+	// Explicitly request connected/disconnected block notifications. Only
+	// the bitcoind and neutrino wrappers enable block notifications as a
+	// side effect of NotifyReceived; btcd's NotifyReceived (the embedded
+	// rpcclient method) registers only address notifications, so without
+	// this call a btcd-backed wallet would stop receiving live block
+	// connect/disconnect events. The call is idempotent on the wrappers
+	// that already enabled notifications, so it is safe for all backends.
+	err = s.cfg.Chain.NotifyBlocks()
+	if err != nil {
+		return fmt.Errorf("unable to start block notifications: %w", err)
+	}
+
 	return nil
+}
+
+// walletBirthday returns the wallet birthday from the active backend. SQL
+// wallets have no legacy address manager, so their birthday is sourced from
+// the runtime store.
+func (s *syncer) walletBirthday(ctx context.Context) (time.Time, error) {
+	if s.addrStore != nil {
+		return s.addrStore.Birthday(), nil
+	}
+
+	info, err := s.store.GetWallet(ctx, s.cfg.Name)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("load wallet birthday: %w", err)
+	}
+
+	return info.Birthday, nil
+}
+
+// registerScanTargets seeds the backend watch list with the wallet's existing
+// addresses and unspent outputs before the sync tip advances over live blocks.
+//
+// When there are no outputs to watch the cheaper NotifyReceived path is used:
+// it registers only the address filter and avoids a backend rescan, which also
+// sidesteps the empty-wallet case where there is no synced tip to start a
+// rescan from. When there are outputs to watch, the outpoints must be added to
+// the backend watch list so live spends are reported, and the only chain
+// interface method that accepts outpoints is Rescan. The startup rescan mirrors
+// the legacy initial-sync RescanJob: it registers both the addresses and the
+// unspent outpoints from the synced tip, so the backend reports both live
+// receives and live spends of existing UTXOs.
+func (s *syncer) registerScanTargets(ctx context.Context,
+	addrs []address.Address, unspent []wtxmgr.Credit) error {
+
+	outpoints, err := s.outpointsToWatch(unspent)
+	if err != nil {
+		return fmt.Errorf("unable to collect watched outpoints: %w", err)
+	}
+
+	if len(outpoints) == 0 {
+		err = s.cfg.Chain.NotifyReceived(addrs)
+		if err != nil {
+			return fmt.Errorf("unable to register addresses: %w",
+				err)
+		}
+
+		return nil
+	}
+
+	syncedTo, err := s.syncedTo(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to read synced tip: %w", err)
+	}
+
+	err = s.cfg.Chain.Rescan(&syncedTo.Hash, addrs, outpoints)
+	if err != nil {
+		return fmt.Errorf("unable to register addresses and "+
+			"outpoints: %w", err)
+	}
+
+	return nil
+}
+
+// outpointsToWatch converts the wallet's unspent credits into the outpoint set
+// the backend watches for spends, keyed by the first address recovered from
+// each output script. It mirrors the legacy rescan target construction so the
+// store-backed startup rescan watches the same outpoints the legacy wallet did.
+func (s *syncer) outpointsToWatch(
+	unspent []wtxmgr.Credit) (map[wire.OutPoint]address.Address, error) {
+
+	outpoints := make(map[wire.OutPoint]address.Address, len(unspent))
+	for _, output := range unspent {
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+			output.PkScript, s.cfg.ChainParams,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("extract outpoint %v script: %w",
+				output.OutPoint, err)
+		}
+
+		// A standard credit always yields at least one address; a
+		// script that yields none cannot be watched by address, so skip
+		// it rather than index into an empty slice.
+		if len(addrs) == 0 {
+			continue
+		}
+
+		outpoints[output.OutPoint] = addrs[0]
+	}
+
+	return outpoints, nil
 }
 
 // waitUntilBackendSynced blocks until the chain backend considers itself
@@ -352,6 +491,8 @@ func (s *syncer) waitUntilBackendSynced(ctx context.Context) error {
 // checkRollback ensures the wallet is synchronized with the current chain tip.
 // It checks if the wallet's synced tip is still on the main chain, and if not,
 // rewinds the wallet state to the common ancestor.
+//
+//nolint:cyclop // Sequential reorg detection reads clearest as one function.
 func (s *syncer) checkRollback(ctx context.Context) error {
 	// batchSize is the number of blocks to fetch from the chain backend in
 	// a single batch when checking for a rollback. A value of 10 is chosen
@@ -368,6 +509,20 @@ func (s *syncer) checkRollback(ctx context.Context) error {
 	}
 
 	syncedHeight := syncedTo.Height
+	if syncedHeight <= 0 {
+		return nil
+	}
+
+	// If the current synced tip is still on the main chain, then all of its
+	// ancestors are also on the main chain and no rollback is needed.
+	onMainChain, err := s.syncedTipOnMainChain(syncedTo)
+	if err != nil {
+		return err
+	}
+
+	if onMainChain {
+		return nil
+	}
 
 	var (
 		localHashes  []*chainhash.Hash
@@ -445,6 +600,33 @@ func (s *syncer) checkRollback(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// syncedTipOnMainChain reports whether the wallet's synced tip is still on the
+// chain backend's main chain. When it is, every ancestor is also on the main
+// chain, so no rollback is needed. This avoids requiring SQL backends to hold
+// a contiguous pre-birthday local block range before the first recovery scan
+// has populated one.
+func (s *syncer) syncedTipOnMainChain(syncedTo waddrmgr.BlockStamp) (bool,
+	error) {
+
+	if s.cfg.Chain == nil {
+		return false, fmt.Errorf("%w: Chain", ErrMissingParam)
+	}
+
+	height := int64(syncedTo.Height)
+
+	tipHashes, err := s.cfg.Chain.GetBlockHashes(height, height)
+	if err != nil {
+		return false, fmt.Errorf("remote get synced tip hash: %w", err)
+	}
+
+	if len(tipHashes) != 1 {
+		return false, fmt.Errorf("%w: got %d, want 1",
+			errUnexpectedTipHashCount, len(tipHashes))
+	}
+
+	return syncedTo.Hash.IsEqual(&tipHashes[0]), nil
 }
 
 // rewindToBlock rewinds wallet sync and transaction state to the given fork
@@ -2069,6 +2251,16 @@ func (s *syncer) storeAccountProperties(info db.AccountInfo,
 		return nil, err
 	}
 
+	accountPubKey, err := storeAccountPubKey(info)
+	if err != nil {
+		return nil, err
+	}
+
+	addrSchema, err := storeAccountAddrSchema(info.AddrSchema)
+	if err != nil {
+		return nil, err
+	}
+
 	return &waddrmgr.AccountProperties{
 		AccountNumber:        accountNumber,
 		AccountName:          info.AccountName,
@@ -2078,22 +2270,69 @@ func (s *syncer) storeAccountProperties(info db.AccountInfo,
 		MasterKeyFingerprint: info.MasterKeyFingerprint,
 		KeyScope:             waddrmgr.KeyScope(info.KeyScope),
 		IsWatchOnly:          info.IsWatchOnly,
+		AccountPubKey:        accountPubKey,
+		AddrSchema:           addrSchema,
 	}, nil
 }
 
-// storeAccountRecoveryNumber returns the account number RecoveryState must use
-// for waddrmgr derivation. Store masks imported xpub account numbers, so
-// callers may pass a non-masked fallback from resolveScanTargets; untargeted
-// imported xpubs resolve the same identity from waddrmgr by account name.
+// storeAccountPubKey parses the account public key loaded from the store into
+// the legacy AccountProperties shape recovery still uses as its snapshot type.
+func storeAccountPubKey(
+	info db.AccountInfo) (*hdkeychain.ExtendedKey, error) {
+
+	if len(info.PublicKey) == 0 {
+		return nil, nil //nolint:nilnil
+	}
+
+	key, err := hdkeychain.NewKeyFromString(string(info.PublicKey))
+	if err != nil {
+		return nil, fmt.Errorf("parse account public key: %w", err)
+	}
+
+	return key, nil
+}
+
+// storeAccountAddrSchema converts the db-native account address schema into the
+// AccountProperties schema recovery consumes.
+func storeAccountAddrSchema(
+	schema db.ScopeAddrSchema) (*waddrmgr.ScopeAddrSchema, error) {
+
+	external, err := addresstype.ToWallet(schema.ExternalAddrType, false)
+	if err != nil {
+		return nil, fmt.Errorf("external address type: %w", err)
+	}
+
+	internal, err := addresstype.ToWallet(schema.InternalAddrType, false)
+	if err != nil {
+		return nil, fmt.Errorf("internal address type: %w", err)
+	}
+
+	return &waddrmgr.ScopeAddrSchema{
+		ExternalAddrType: external,
+		InternalAddrType: internal,
+	}, nil
+}
+
+// storeAccountRecoveryNumber returns the account identity RecoveryState must
+// use as its in-memory branch key. Derived accounts use their BIP44 account
+// number.
+// SQL imported-xpub accounts have no BIP44 account number, so they use the
+// stable store account ID; horizons still persist by AccountID, not by this
+// synthetic in-memory number. KVDB imported-xpub accounts fall back to the
+// non-masked legacy manager number when no store account ID is available.
 func (s *syncer) storeAccountRecoveryNumber(info db.AccountInfo,
 	fallbackNumber *uint32) (uint32, error) {
 
-	if fallbackNumber != nil {
-		return *fallbackNumber, nil
-	}
-
 	if info.AccountNumber != nil {
 		return *info.AccountNumber, nil
+	}
+
+	if info.IsImported && info.AccountID != nil {
+		return *info.AccountID, nil
+	}
+
+	if fallbackNumber != nil {
+		return *fallbackNumber, nil
 	}
 
 	if !info.IsImported {
@@ -2112,31 +2351,14 @@ func (s *syncer) storeAccountRecoveryNumber(info db.AccountInfo,
 // non-masked waddrmgr account number so RecoveryState can derive lookahead
 // addresses without colliding with the default account at number 0.
 func (s *syncer) lookupStoreAccountNumber(info db.AccountInfo) (uint32, error) {
-	if s.cfg.DB == nil || s.addrStore == nil {
+	if s.legacyStore == nil || s.addrStore == nil {
 		return 0, fmt.Errorf("lookup scan account %q: %w",
 			info.AccountName, errMissingLegacyAddressManager)
 	}
 
-	var account uint32
-
-	err := walletdb.View(s.cfg.DB, func(tx walletdb.ReadTx) error {
-		ns := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		scopedMgr, err := s.addrStore.FetchScopedKeyManager(
-			waddrmgr.KeyScope(info.KeyScope),
-		)
-		if err != nil {
-			return fmt.Errorf("fetch scoped manager: %w", err)
-		}
-
-		account, err = scopedMgr.LookupAccount(ns, info.AccountName)
-		if err != nil {
-			return fmt.Errorf("lookup account %q: %w", info.AccountName,
-				err)
-		}
-
-		return nil
-	})
+	account, err := s.legacyStore.LookupAccountNumber(
+		waddrmgr.KeyScope(info.KeyScope), info.AccountName,
+	)
 	if err != nil {
 		return 0, fmt.Errorf("lookup store account number: %w", err)
 	}
@@ -2154,8 +2376,8 @@ func keylessImportedAccount(info db.AccountInfo) bool {
 // storeScanAddresses loads active scan addresses through the store, paging per
 // (key scope, account) pair because ListAddresses is scoped to a single pair.
 //
-// This reproduces the legacy ForEachRelevantActiveAddress filtering that
-// DBGetScanData relies on: for default key scopes every active address is
+// This reproduces the legacy ForEachRelevantActiveAddress filtering used by
+// the old scan-data reader: for default key scopes every active address is
 // watched, while for non-default key scopes only internal-branch (change)
 // addresses are watched. The non-default external branches are intentionally
 // skipped because they only ever existed due to a since-fixed bug, and
@@ -2413,64 +2635,146 @@ func (s *syncer) loadTargetedScanData(ctx context.Context,
 }
 
 // resolveScanTargets converts the public AccountScope rescan targets into the
-// internal, identity-aware scanTargets used by the Store path. It resolves each
-// target once through the legacy address manager, which still keys accounts by
-// their non-masked number and is therefore the only backend that can
-// disambiguate an imported-xpub account from the default derived account before
-// the Store (which masks imported numbers to 0) is consulted.
+// internal, identity-aware scanTargets used by the Store path. It prefers each
+// target's durable AccountScope.Name whenever the caller set one, falling back
+// to the account number otherwise, and resolves the durable account name
+// through the Store so an account that exists only in the Store -- a derived
+// account created through CreateDerivedAccount but never written to the legacy
+// address manager -- still resolves, where the legacy-only resolution returned
+// ErrAccountNotFound.
 //
 // The keyless legacy imported-address bucket is carried through with an empty
 // AccountName so storeScanHorizons skips it before any lookup; every other
 // target carries the durable AccountName resolved here so Store horizon loading
 // can key on the name instead of the maskable number.
-func (s *syncer) resolveScanTargets(_ context.Context,
+func (s *syncer) resolveScanTargets(ctx context.Context,
 	targets []waddrmgr.AccountScope) ([]scanTarget, error) {
 
 	resolved := make([]scanTarget, 0, len(targets))
-
-	err := walletdb.View(s.cfg.DB, func(tx walletdb.ReadTx) error {
-		ns := tx.ReadBucket(waddrmgrNamespaceKey)
-
-		for _, target := range targets {
-			// The keyless imported-address bucket has no resolvable
-			// name; carry it verbatim so the Store path skips it
-			// before any lookup.
-			if target.Account == waddrmgr.ImportedAddrAccount {
-				resolved = append(resolved, scanTarget{
-					Scope:   target.Scope,
-					Account: target.Account,
-				})
-
-				continue
-			}
-
-			scopedMgr, err := s.addrStore.FetchScopedKeyManager(
-				target.Scope,
-			)
-			if err != nil {
-				return fmt.Errorf("fetch scoped manager: %w",
-					err)
-			}
-
-			name, err := scopedMgr.AccountName(ns, target.Account)
-			if err != nil {
-				return fmt.Errorf("scan target name: %w", err)
-			}
-
-			resolved = append(resolved, scanTarget{
-				Scope:       target.Scope,
-				Account:     target.Account,
-				AccountName: name,
-			})
+	for _, target := range targets {
+		t, err := s.resolveScanTarget(ctx, target)
+		if err != nil {
+			return nil, fmt.Errorf("resolve scan targets: %w", err)
 		}
 
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("resolve scan targets: %w", err)
+		resolved = append(resolved, t)
 	}
 
 	return resolved, nil
+}
+
+// resolveScanTarget resolves a single public rescan target into its
+// identity-aware scanTarget through the Store. AccountScope.Name is the
+// durable, scope-unique identity, so it is always preferred over the maskable
+// account number: when Name is set the Store is queried by name and the number
+// is ignored, which is the only way a named imported-xpub target addressed at
+// the masked account number 0 can avoid resolving to the default derived
+// account.
+func (s *syncer) resolveScanTarget(ctx context.Context,
+	target waddrmgr.AccountScope) (scanTarget, error) {
+
+	// The keyless legacy imported-address bucket has no account row and no
+	// durable name, so it is carried through unresolved; storeScanHorizons
+	// skips it before issuing any lookup. It is keyed by a reserved sentinel
+	// number that no named account ever owns, so this sentinel check stays
+	// ahead of the name preference below.
+	if target.Account == waddrmgr.ImportedAddrAccount {
+		return scanTarget{
+			Scope:   target.Scope,
+			Account: target.Account,
+		}, nil
+	}
+
+	// Prefer the durable name when the caller supplied one. The name is more
+	// specific than the masked account number, so a named imported-xpub
+	// target with account number 0 resolves the imported account rather than
+	// colliding with the default derived account at the shared masked 0. A
+	// non-empty but unknown name is a genuine not-found and must surface as
+	// such, never fall back to a number lookup of account 0.
+	if target.Name != "" {
+		name := target.Name
+
+		info, err := s.store.GetAccount(ctx, db.GetAccountQuery{
+			WalletID:    s.walletID,
+			Scope:       db.KeyScope(target.Scope),
+			Name:        &name,
+			SkipBalance: true,
+		})
+		if err != nil {
+			return scanTarget{}, fmt.Errorf("resolve scan target "+
+				"by name: %w", err)
+		}
+
+		return scanTarget{
+			Scope:       target.Scope,
+			Account:     target.Account,
+			AccountName: info.AccountName,
+		}, nil
+	}
+
+	account := target.Account
+
+	info, err := s.store.GetAccount(ctx, db.GetAccountQuery{
+		WalletID:      s.walletID,
+		Scope:         db.KeyScope(target.Scope),
+		AccountNumber: &account,
+		SkipBalance:   true,
+	})
+	if err == nil {
+		return scanTarget{
+			Scope:       target.Scope,
+			Account:     target.Account,
+			AccountName: info.AccountName,
+		}, nil
+	}
+
+	// The Store rejects a by-number lookup of an imported account because it
+	// masks every imported account's number to 0; an imported-xpub target
+	// addressed by its non-masked number and no name therefore surfaces as
+	// not-found. Such a target is, by construction, present in the
+	// identity-aware address manager (it has a non-masked number to be
+	// addressed by), so fall back to resolving its durable name there. Any
+	// other failure -- including a genuinely unknown account in both
+	// backends -- is returned.
+	if !errors.Is(err, db.ErrAccountNotFound) {
+		return scanTarget{}, fmt.Errorf("resolve scan target "+
+			"account: %w", err)
+	}
+
+	return s.resolveScanTargetByManager(target)
+}
+
+// resolveScanTargetByManager resolves a target's durable name through the
+// identity-aware address manager. It is the fallback for an imported-xpub
+// target addressed by its non-masked number, which the Store cannot resolve by
+// number because it masks imported account numbers to 0. The manager keys every
+// account by its non-masked number, so it disambiguates the imported account
+// from the default derived account that shares the masked number 0.
+func (s *syncer) resolveScanTargetByManager(
+	target waddrmgr.AccountScope) (scanTarget, error) {
+
+	if s.legacyStore == nil || s.addrStore == nil {
+		return scanTarget{}, errMissingLegacyAddressManager
+	}
+
+	managerTargets, err := s.legacyStore.ResolveScanTargets(
+		s.addrStore, []waddrmgr.AccountScope{target},
+	)
+	if err != nil {
+		return scanTarget{}, fmt.Errorf("resolve scan target via "+
+			"manager: %w", err)
+	}
+
+	if len(managerTargets) != 1 {
+		return scanTarget{}, fmt.Errorf("%w: got %d, want 1",
+			errUnexpectedScanTargetCount, len(managerTargets))
+	}
+
+	return scanTarget{
+		Scope:       managerTargets[0].Scope,
+		Account:     managerTargets[0].Account,
+		AccountName: managerTargets[0].AccountName,
+	}, nil
 }
 
 // loadWalletScanData retrieves all necessary data from the database to
