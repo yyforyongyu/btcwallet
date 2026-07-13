@@ -377,9 +377,15 @@ type UpdateWalletSecretsParams struct {
 // AccountInfo contains all information about a single account, including its
 // properties and balances.
 type AccountInfo struct {
-	// AccountID is the optional store-local account identity. SQL backends set
-	// this from accounts.id. Backends without a durable account row ID leave it
-	// nil rather than fabricating one from other account fields.
+	// AccountID is the durable per-account store identity, set for every
+	// account regardless of type. It is distinct from the BIP44 AccountNumber:
+	// AccountNumber is nil for imported xpub accounts and is masked to 0 for
+	// them by both backends, whereas AccountID is always populated and never
+	// collides across accounts in a wallet. SQL backends set it from
+	// accounts.id; kvdb sets it from waddrmgr's internal, scope-unique account
+	// number. Callers that need a stable account identity -- for example
+	// recovery-state keying or horizon extension -- use AccountID rather than
+	// AccountNumber.
 	AccountID *uint32
 
 	// AccountNumber is the BIP44 account index used for derived accounts.

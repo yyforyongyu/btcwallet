@@ -108,29 +108,35 @@ type RecoveryState struct {
 	// TODO(yy): Deprecated, remove.
 	scopes map[waddrmgr.KeyScope]*ScopeRecoveryState
 
-	// branchStates maintains the recovery state for every branch (scope +
-	// account + branch). This is the source of truth.
+	// branchStates maintains the recovery state for every branch. It is keyed
+	// by (scope + store AccountID + branch), not the maskable BIP44 account
+	// number, so an imported account never collides with a derived account
+	// that shares the same BIP44 number in the same scope. This is the source
+	// of truth.
 	branchStates map[waddrmgr.BranchScope]*BranchRecoveryState
 
 	// accountDerivers holds store-native derivation adapters for accounts
 	// whose lookahead can be derived from SQL-loaded public account metadata.
-	// KVDB recovery leaves this empty and derives through addrMgr instead.
+	// It is keyed by (scope + store AccountID). KVDB recovery leaves this
+	// empty and derives through addrMgr instead.
 	accountDerivers map[waddrmgr.AccountScope]recoveryAddressDeriver
 
 	// accountNames maps every account loaded into the recovery state to its
-	// durable name. The horizon map is keyed only by branch scope (scope +
-	// account number + branch), but a backend resolving an emitted horizon
-	// must prefer the name: both store backends mask an imported account's
-	// number to 0, so resolving an imported-xpub horizon by number alone
-	// would mis-resolve to the default derived account or fail. This lookup
-	// lets the syncer stamp ScanHorizon.AccountName at emission.
+	// durable name, keyed by (scope + store AccountID). A backend resolving
+	// an emitted horizon must prefer the name: both store backends mask an
+	// imported account's number to 0, so resolving an imported-xpub horizon
+	// by number alone would mis-resolve to the default derived account or
+	// fail. This lookup lets the syncer stamp ScanHorizon.AccountName at
+	// emission.
 	accountNames map[waddrmgr.AccountScope]string
 
 	// accountIDs maps every account loaded into the recovery state to its
-	// stable Store account row identity when the active backend exposes one.
-	// The syncer resolves this identity when the account snapshot is loaded,
-	// then emits it directly with ScanHorizon so later account renames cannot
-	// break horizon extension.
+	// stable store account row identity, keyed by (scope + store AccountID).
+	// The map value equals the key's AccountID; the map is retained so the
+	// syncer can stamp ScanHorizon.AccountID at emission and so callers can
+	// distinguish a known account from an unknown one. The identity is emitted
+	// directly with ScanHorizon so later account renames cannot break horizon
+	// extension.
 	accountIDs map[waddrmgr.AccountScope]*uint32
 
 	// watchedOutPoints contains the set of all outpoints known to the
@@ -244,9 +250,9 @@ func (rs *RecoveryState) WatchListSize() int {
 }
 
 // AccountName returns the durable name of the account at the given scope and
-// number, as loaded into the recovery state. The bool reports whether the
-// account was found; callers that fail to find a name MUST fall back to the
-// account-number identity rather than emitting an empty name, since an empty
+// store AccountID, as loaded into the recovery state. The bool reports whether
+// the account was found; callers that fail to find a name MUST fall back to the
+// account-identity number rather than emitting an empty name, since an empty
 // name would resolve to no account at the backend.
 func (rs *RecoveryState) AccountName(scope waddrmgr.KeyScope,
 	account uint32) (string, bool) {
@@ -259,9 +265,9 @@ func (rs *RecoveryState) AccountName(scope waddrmgr.KeyScope,
 	return name, ok
 }
 
-// AccountID returns the stable Store account ID for the given scope and number,
-// as resolved when the account was loaded into the recovery state. The bool
-// reports whether an account ID was found.
+// AccountID returns the stable store account ID for the given scope and store
+// AccountID key, as loaded into the recovery state. The bool reports whether an
+// account ID was found.
 func (rs *RecoveryState) AccountID(scope waddrmgr.KeyScope,
 	account uint32) (*uint32, bool) {
 
@@ -548,13 +554,18 @@ func copyOutpointMap(src map[wire.OutPoint][]byte) map[wire.OutPoint][]byte {
 func (rs *RecoveryState) initAccountState(
 	props *waddrmgr.AccountProperties) error {
 
-	// Record the account name so emitted horizons can carry the durable,
-	// backend-agnostic identity rather than relying on the account number,
-	// which both store backends mask to 0 for imported accounts.
-	rs.accountNames[waddrmgr.AccountScope{
+	// props.AccountNumber carries the stable store AccountID that recovery
+	// state keys every per-account map on. Record the account name and the
+	// AccountID under that key so emitted horizons can carry the durable,
+	// backend-agnostic identity rather than relying on the maskable account
+	// number, which both store backends mask to 0 for imported accounts.
+	accountScope := waddrmgr.AccountScope{
 		Scope:   props.KeyScope,
 		Account: props.AccountNumber,
-	}] = props.AccountName
+	}
+	rs.accountNames[accountScope] = props.AccountName
+	accountID := props.AccountNumber
+	rs.accountIDs[accountScope] = &accountID
 
 	err := rs.registerAccountDeriver(props)
 	if err != nil {

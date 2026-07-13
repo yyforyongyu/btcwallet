@@ -1074,9 +1074,6 @@ func (m *Manager) buildWallet(cfg Config) (*Wallet, error) {
 	}
 
 	syncer := newSyncer(cfg, w.addrStore, w.txStore, w, w.store, w.id)
-	if legacyStore != nil {
-		syncer.legacyStore = legacyStore.Store
-	}
 
 	w.sync = syncer
 	w.state = newWalletState(w.sync)

@@ -378,10 +378,10 @@ func TestSyncerLoadScanState(t *testing.T) {
 			return query.WalletID == walletID && query.SkipBalance
 		},
 	)).Return([]db.AccountInfo{{
+		AccountID:     &accountNumber0,
 		AccountNumber: &accountNumber0,
 		KeyScope:      db.KeyScopeBIP0084,
 	}}, nil).Twice()
-	expectRecoveryAccountIDLookups(store)
 
 	store.On("ListAddresses", mock.Anything, mock.Anything).Return(
 		page.Result[db.AddressInfo, uint32]{}, nil,
@@ -605,10 +605,13 @@ func TestScanBatch(t *testing.T) {
 		store, uint32(0),
 	)
 
+	scanAccountID := uint32(0)
 	store.On("ListAccounts", mock.Anything, mock.Anything).Return(
-		[]db.AccountInfo{{KeyScope: db.KeyScopeBIP0084}}, nil,
+		[]db.AccountInfo{{
+			AccountID: &scanAccountID,
+			KeyScope:  db.KeyScopeBIP0084,
+		}}, nil,
 	).Twice()
-	expectRecoveryAccountIDLookups(store)
 	store.On("ListAddresses", mock.Anything, mock.Anything).Return(
 		page.Result[db.AddressInfo, uint32]{}, nil,
 	).Maybe()
@@ -727,11 +730,11 @@ func TestAdvanceChainSync(t *testing.T) {
 	accountNumber0 := uint32(0)
 	store.On("ListAccounts", mock.Anything, mock.Anything).Return(
 		[]db.AccountInfo{{
+			AccountID:     &accountNumber0,
 			AccountNumber: &accountNumber0,
 			KeyScope:      db.KeyScopeBIP0084,
 		}}, nil,
 	).Twice()
-	expectRecoveryAccountIDLookups(store)
 	store.On("ListAddresses", mock.Anything, mock.Anything).Return(
 		page.Result[db.AddressInfo, uint32]{}, nil,
 	).Maybe()
@@ -981,16 +984,6 @@ func expectSyncedTip(store *walletmock.Store, tip waddrmgr.BlockStamp) {
 
 	store.On("GetWallet", mock.Anything, mock.Anything).Return(
 		&info, nil).Maybe()
-}
-
-// expectRecoveryAccountIDLookups allows scan-state fixtures to satisfy the
-// Store account ID lookup without asserting a specific backend row identity.
-func expectRecoveryAccountIDLookups(store *walletmock.Store) {
-	store.On("GetAccount", mock.Anything, mock.MatchedBy(
-		func(query db.GetAccountQuery) bool {
-			return query.SkipBalance
-		},
-	)).Return(&db.AccountInfo{}, nil).Maybe()
 }
 
 // serializeTx returns the wire encoding of tx, for stubbing TxInfo.SerializedTx
@@ -1823,54 +1816,38 @@ func TestPutTargetedBatchStore(t *testing.T) {
 	store.AssertExpectations(t)
 }
 
-// TestStampRecoveryAccountIDsCarriesStableID verifies that the scan state keeps
-// the stable account ID resolved from the loaded account snapshot, so horizon
-// emission does not need a later name lookup that could race an account rename.
-func TestStampRecoveryAccountIDsCarriesStableID(t *testing.T) {
+// TestInitializeCarriesStableAccountID verifies that Initialize records the
+// stable store AccountID it keys each account on, so horizon emission carries
+// that identity without a later name lookup that could race an account rename.
+func TestInitializeCarriesStableAccountID(t *testing.T) {
 	t.Parallel()
 
-	const walletID uint32 = 13
-
-	store := &walletmock.Store{}
-	s := newSyncer(
-		Config{}, nil, nil, &mockTxPublisher{}, store, walletID,
-	)
 	scanState := NewRecoveryState(0, &chainParams, nil)
 
+	// props.AccountNumber is the stable store AccountID recovery state keys
+	// on, distinct from the account's mutable name.
+	const accountID uint32 = 77
+
+	addrSchema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0084]
 	props := &waddrmgr.AccountProperties{
 		KeyScope:      waddrmgr.KeyScopeBIP0084,
-		AccountNumber: 5,
+		AccountNumber: accountID,
 		AccountName:   "before-rename",
+		AccountPubKey: storeDerivationAccountPubKey(t),
+		AddrSchema:    &addrSchema,
 	}
-	scanState.accountNames[waddrmgr.AccountScope{
-		Scope:   props.KeyScope,
-		Account: props.AccountNumber,
-	}] = props.AccountName
 
-	accountID := uint32(77)
-	store.On("GetAccount", mock.Anything, mock.MatchedBy(
-		func(query db.GetAccountQuery) bool {
-			return query.WalletID == walletID &&
-				query.Scope == db.KeyScopeBIP0084 &&
-				query.Name != nil &&
-				*query.Name == "before-rename" &&
-				query.AccountNumber == nil &&
-				query.SkipBalance
-		},
-	)).Return(&db.AccountInfo{
-		AccountID: &accountID,
-	}, nil).Once()
-
-	err := s.stampRecoveryAccountIDs(
-		t.Context(), scanState, []*waddrmgr.AccountProperties{props},
+	err := scanState.Initialize(
+		[]*waddrmgr.AccountProperties{props}, nil, nil,
 	)
 	require.NoError(t, err)
 
+	// A later rename does not change the identity recorded at load time.
 	props.AccountName = "after-rename"
 	horizons := scanHorizonParams(scanState, map[waddrmgr.BranchScope]uint32{
 		{
 			Scope:   props.KeyScope,
-			Account: props.AccountNumber,
+			Account: accountID,
 			Branch:  waddrmgr.ExternalBranch,
 		}: 3,
 	})
@@ -1878,7 +1855,6 @@ func TestStampRecoveryAccountIDsCarriesStableID(t *testing.T) {
 	require.NotNil(t, horizons[0].AccountID)
 	require.Equal(t, accountID, *horizons[0].AccountID)
 	require.Equal(t, "before-rename", horizons[0].AccountName)
-	store.AssertExpectations(t)
 }
 
 // TestScanHorizonParamsStampsAccountIdentity verifies that scanHorizonParams
@@ -1935,6 +1911,125 @@ func TestScanHorizonParamsStampsAccountIdentity(t *testing.T) {
 	require.Equal(t, uint32(7), byAccount[9].Index)
 }
 
+// TestRecoveryStateKeysByStoreAccountID is the collision regression test for
+// store-migration §2c. It exercises two accounts in the same scope where one
+// account's store AccountID equals the other's BIP44 account number:
+//
+//   - an imported xpub account with store AccountID 3 and no BIP44 number, and
+//   - a derived account with BIP44 number 3 and a distinct store AccountID 1.
+//
+// Before the fix the recovery state keyed on a bare number that mixed derived
+// BIP44 numbers and synthetic store IDs, so the imported account (keyed by its
+// store ID 3) and the derived account (keyed by its BIP44 number 3) collided
+// under waddrmgr.AccountScope{scope, 3} and one overwrote the other's deriver,
+// name, and horizons. Keying every recovery-state map on the stable store
+// AccountID keeps them separate.
+func TestRecoveryStateKeysByStoreAccountID(t *testing.T) {
+	t.Parallel()
+
+	const walletID uint32 = 71
+
+	store := &walletmock.Store{}
+	s := newSyncer(
+		Config{}, nil, nil, &mockTxPublisher{}, store, walletID,
+	)
+
+	scope := waddrmgr.KeyScopeBIP0084
+	pubKey := storeDerivationAccountPubKey(t)
+
+	// The imported account: store AccountID 3, masked BIP44 number (nil). Its
+	// store AccountID collides numerically with the derived account's BIP44
+	// number below.
+	importedID := uint32(3)
+
+	// The derived account: BIP44 number 3, but a distinct store AccountID 1.
+	derivedBIP44 := uint32(3)
+	derivedID := uint32(1)
+
+	addrSchema := db.ScopeAddrSchema{
+		ExternalAddrType: db.WitnessPubKey,
+		InternalAddrType: db.WitnessPubKey,
+	}
+	accounts := []db.AccountInfo{
+		{
+			AccountID:        &importedID,
+			AccountNumber:    nil,
+			AccountName:      "imported-a",
+			IsImported:       true,
+			ExternalKeyCount: 1,
+			InternalKeyCount: 1,
+			KeyScope:         db.KeyScope(scope),
+			AddrSchema:       addrSchema,
+			PublicKey:        []byte(pubKey.String()),
+		},
+		{
+			AccountID:        &derivedID,
+			AccountNumber:    &derivedBIP44,
+			AccountName:      "derived-b",
+			ExternalKeyCount: 1,
+			InternalKeyCount: 1,
+			KeyScope:         db.KeyScope(scope),
+			AddrSchema:       addrSchema,
+			PublicKey:        []byte(pubKey.String()),
+		},
+	}
+
+	store.On("ListAccounts", mock.Anything, mock.MatchedBy(
+		func(query db.ListAccountsQuery) bool {
+			return query.WalletID == walletID && query.SkipBalance
+		},
+	)).Return(accounts, nil).Once()
+
+	// Act: build the recovery horizon snapshot and load it into a fresh
+	// recovery state. addrMgr is nil so accounts derive through their
+	// store-native public material.
+	props, err := s.storeScanHorizons(t.Context(), nil)
+	require.NoError(t, err)
+	require.Len(t, props, 2)
+
+	rs := NewRecoveryState(MinRecoveryWindow, &chaincfg.SimNetParams, nil)
+	err = rs.Initialize(props, nil, nil)
+	require.NoError(t, err)
+
+	// Assert: each account keeps its own identity under its distinct store
+	// AccountID key; neither overwrote the other despite the shared number 3.
+	importedName, ok := rs.AccountName(scope, importedID)
+	require.True(t, ok)
+	require.Equal(t, "imported-a", importedName)
+
+	derivedName, ok := rs.AccountName(scope, derivedID)
+	require.True(t, ok)
+	require.Equal(t, "derived-b", derivedName)
+
+	gotImportedID, ok := rs.AccountID(scope, importedID)
+	require.True(t, ok)
+	require.Equal(t, importedID, *gotImportedID)
+
+	gotDerivedID, ok := rs.AccountID(scope, derivedID)
+	require.True(t, ok)
+	require.Equal(t, derivedID, *gotDerivedID)
+
+	// Both accounts have their own external-branch recovery state keyed by
+	// their store AccountID, and each derived a distinct lookahead address.
+	importedBranch, err := rs.GetBranchState(waddrmgr.BranchScope{
+		Scope:   scope,
+		Account: importedID,
+		Branch:  waddrmgr.ExternalBranch,
+	})
+	require.NoError(t, err)
+
+	derivedBranch, err := rs.GetBranchState(waddrmgr.BranchScope{
+		Scope:   scope,
+		Account: derivedID,
+		Branch:  waddrmgr.ExternalBranch,
+	})
+	require.NoError(t, err)
+
+	require.NotSame(t, importedBranch, derivedBranch)
+
+	store.AssertExpectations(t)
+}
+
 // TestStoreScanHorizonsListAccounts verifies full scan horizon reads use the
 // store account list.
 func TestStoreScanHorizonsListAccounts(t *testing.T) {
@@ -1949,8 +2044,10 @@ func TestStoreScanHorizonsListAccounts(t *testing.T) {
 		store, walletID,
 	)
 	accountNumber2 := uint32(2)
+	accountID := uint32(41)
 
 	accounts := []db.AccountInfo{{
+		AccountID:            &accountID,
 		AccountNumber:        &accountNumber2,
 		AccountName:          "default",
 		ExternalKeyCount:     5,
@@ -1970,10 +2067,11 @@ func TestStoreScanHorizonsListAccounts(t *testing.T) {
 	// Act: Load all scan horizons from the store.
 	props, err := s.storeScanHorizons(t.Context(), nil)
 
-	// Assert: The store account row was converted for RecoveryState.
+	// Assert: The store account row was converted for RecoveryState, keyed on
+	// the stable store AccountID rather than the BIP44 account number.
 	require.NoError(t, err)
 	require.Len(t, props, 1)
-	require.Equal(t, *accounts[0].AccountNumber, props[0].AccountNumber)
+	require.Equal(t, *accounts[0].AccountID, props[0].AccountNumber)
 	require.Equal(t, accounts[0].ExternalKeyCount, props[0].ExternalKeyCount)
 	require.Equal(t, accounts[0].InternalKeyCount, props[0].InternalKeyCount)
 	require.Equal(t, waddrmgr.KeyScopeBIP0084, props[0].KeyScope)
@@ -1981,15 +2079,15 @@ func TestStoreScanHorizonsListAccounts(t *testing.T) {
 	store.AssertExpectations(t)
 }
 
-// TestStoreScanHorizonsGetAccount verifies targeted scan horizon reads resolve
-// the account by its durable AccountName, mirroring the ScanHorizon contract:
-// the resolved scanTarget carries a name, so storeScanHorizons must query the
-// store by name and never by the maskable account number.
+// TestStoreScanHorizonsGetAccount verifies targeted scan horizon reads build
+// account properties from the target's already-resolved store account row,
+// keying recovery state on the stable store AccountID and issuing no further
+// Store lookup.
 func TestStoreScanHorizonsGetAccount(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Create a store-backed syncer and one resolved scanTarget that
-	// carries the durable account name.
+	// carries its resolved store account row.
 	const walletID uint32 = 14
 
 	store := &walletmock.Store{}
@@ -1998,41 +2096,33 @@ func TestStoreScanHorizonsGetAccount(t *testing.T) {
 		store, walletID,
 	)
 
-	target := scanTarget{
-		Scope:       waddrmgr.KeyScopeBIP0084,
-		Account:     7,
-		AccountName: "savings",
-	}
-	targetAccount := target.Account
+	accountID := uint32(31)
+	targetAccount := uint32(7)
 	account := db.AccountInfo{
+		AccountID:        &accountID,
 		AccountNumber:    &targetAccount,
-		AccountName:      target.AccountName,
+		AccountName:      "savings",
 		ExternalKeyCount: 8,
 		InternalKeyCount: 4,
-		KeyScope:         db.KeyScope(target.Scope),
+		KeyScope:         db.KeyScopeBIP0084,
 	}
-
-	// The lookup must key on the durable name, not the account number.
-	store.On("GetAccount", mock.Anything, mock.MatchedBy(
-		func(query db.GetAccountQuery) bool {
-			return query.WalletID == walletID &&
-				query.Scope == db.KeyScope(target.Scope) &&
-				query.AccountNumber == nil &&
-				query.Name != nil &&
-				*query.Name == target.AccountName &&
-				query.SkipBalance
-		},
-	)).Return(&account, nil).Once()
+	target := scanTarget{
+		Scope:       waddrmgr.KeyScopeBIP0084,
+		Account:     targetAccount,
+		AccountName: account.AccountName,
+		info:        &account,
+	}
 
 	// Act: Load targeted scan horizons from the store.
 	props, err := s.storeScanHorizons(
 		t.Context(), []scanTarget{target},
 	)
 
-	// Assert: The targeted account row was converted for RecoveryState.
+	// Assert: The targeted account row was converted for RecoveryState, keyed
+	// on the stable store AccountID, with no additional Store lookup.
 	require.NoError(t, err)
 	require.Len(t, props, 1)
-	require.Equal(t, target.Account, props[0].AccountNumber)
+	require.Equal(t, accountID, props[0].AccountNumber)
 	require.Equal(t, account.ExternalKeyCount, props[0].ExternalKeyCount)
 	require.Equal(t, account.InternalKeyCount, props[0].InternalKeyCount)
 	require.Equal(t, target.Scope, props[0].KeyScope)
@@ -2042,8 +2132,6 @@ func TestStoreScanHorizonsGetAccount(t *testing.T) {
 // TestStoreScanHorizonsGetAccountKeepsImportedXpub verifies that targeted scan
 // horizon reads skip only the keyless imported-address bucket while preserving
 // a true imported xpub account by its durable name.
-//
-//nolint:cyclop // Asserts all three scan-target shapes in one scenario.
 func TestStoreScanHorizonsGetAccountKeepsImportedXpub(t *testing.T) {
 	t.Parallel()
 
@@ -2062,13 +2150,19 @@ func TestStoreScanHorizonsGetAccountKeepsImportedXpub(t *testing.T) {
 		Account: 0,
 	}
 	derivedAccount := derived.Account
+	derivedID := uint32(11)
 	bucket := waddrmgr.AccountScope{
 		Scope:   waddrmgr.KeyScopeBIP0084,
 		Account: waddrmgr.ImportedAddrAccount,
 	}
+
+	// The imported xpub account's masked number collides with the default
+	// derived account at 0, but its stable store AccountID (5) is distinct and
+	// is the key recovery state uses.
+	importedID := uint32(5)
 	importedXpub := waddrmgr.AccountScope{
 		Scope:   waddrmgr.KeyScopeBIP0084,
-		Account: 5,
+		Account: importedID,
 	}
 	master, err := hdkeychain.NewMaster(
 		bytes.Repeat([]byte{0xC1}, hdkeychain.RecommendedSeedLen),
@@ -2080,8 +2174,9 @@ func TestStoreScanHorizonsGetAccountKeepsImportedXpub(t *testing.T) {
 	require.NoError(t, err)
 
 	// The default derived account legitimately owns number 0 and must be
-	// the only horizon emitted.
+	// emitted under its stable store AccountID.
 	derivedInfo := db.AccountInfo{
+		AccountID:        &derivedID,
 		AccountNumber:    &derivedAccount,
 		AccountName:      "default",
 		ExternalKeyCount: 8,
@@ -2091,8 +2186,9 @@ func TestStoreScanHorizonsGetAccountKeepsImportedXpub(t *testing.T) {
 
 	// The true imported xpub account carries an account public key and HD
 	// key counts, but the store masks its number to nil. It must still seed a
-	// horizon under the non-masked target account number.
+	// horizon under its stable store AccountID.
 	importedXpubInfo := db.AccountInfo{
+		AccountID:        &importedID,
 		AccountNumber:    nil,
 		AccountName:      "imported-xpub",
 		ExternalKeyCount: 6,
@@ -2102,38 +2198,15 @@ func TestStoreScanHorizonsGetAccountKeepsImportedXpub(t *testing.T) {
 		PublicKey:        []byte(accountPubKey.String()),
 	}
 
-	// The imported-address bucket target must be skipped before lookup. The
-	// remaining derived and imported-xpub targets carry durable names, so the
-	// store lookups must key by name instead of masked account number 0.
-	store.On("GetAccount", mock.Anything, mock.MatchedBy(
-		func(query db.GetAccountQuery) bool {
-			return query.WalletID == walletID &&
-				query.Scope == db.KeyScopeBIP0084 &&
-				query.AccountNumber == nil &&
-				query.Name != nil &&
-				*query.Name == derivedInfo.AccountName &&
-				query.SkipBalance
-		},
-	)).
-		Return(&derivedInfo, nil).Once()
-	store.On("GetAccount", mock.Anything, mock.MatchedBy(
-		func(query db.GetAccountQuery) bool {
-			return query.WalletID == walletID &&
-				query.Scope == db.KeyScopeBIP0084 &&
-				query.AccountNumber == nil &&
-				query.Name != nil &&
-				*query.Name == importedXpubInfo.AccountName &&
-				query.SkipBalance
-		},
-	)).
-		Return(&importedXpubInfo, nil).Once()
-
-	// Act: load targeted scan horizons.
+	// Act: load targeted scan horizons for three already-resolved targets. The
+	// keyless imported-address bucket carries nil info and must be skipped
+	// before any horizon loading; the other two carry their resolved rows.
 	props, err := s.storeScanHorizons(t.Context(), []scanTarget{
 		{
 			Scope:       derived.Scope,
 			Account:     derived.Account,
 			AccountName: derivedInfo.AccountName,
+			info:        &derivedInfo,
 		},
 		{
 			Scope:   bucket.Scope,
@@ -2143,11 +2216,13 @@ func TestStoreScanHorizonsGetAccountKeepsImportedXpub(t *testing.T) {
 			Scope:       importedXpub.Scope,
 			Account:     importedXpub.Account,
 			AccountName: importedXpubInfo.AccountName,
+			info:        &importedXpubInfo,
 		},
 	})
 
 	// Assert: the keyless imported-address bucket was skipped, while the
-	// default derived account and true imported xpub both emitted horizons.
+	// default derived account and true imported xpub both emitted horizons
+	// keyed on their distinct store AccountIDs.
 	require.NoError(t, err)
 	require.Len(t, props, 2)
 
@@ -2158,7 +2233,7 @@ func TestStoreScanHorizonsGetAccountKeepsImportedXpub(t *testing.T) {
 
 	defaultProps := byName[derivedInfo.AccountName]
 	require.NotNil(t, defaultProps)
-	require.Equal(t, derived.Account, defaultProps.AccountNumber)
+	require.Equal(t, derivedID, defaultProps.AccountNumber)
 	require.Equal(t, derivedInfo.ExternalKeyCount,
 		defaultProps.ExternalKeyCount)
 	require.Equal(t, derivedInfo.InternalKeyCount,
@@ -2166,7 +2241,7 @@ func TestStoreScanHorizonsGetAccountKeepsImportedXpub(t *testing.T) {
 
 	importedProps := byName[importedXpubInfo.AccountName]
 	require.NotNil(t, importedProps)
-	require.Equal(t, importedXpub.Account, importedProps.AccountNumber)
+	require.Equal(t, importedID, importedProps.AccountNumber)
 	require.Equal(t, importedXpubInfo.ExternalKeyCount,
 		importedProps.ExternalKeyCount)
 	require.Equal(t, importedXpubInfo.InternalKeyCount,
@@ -2300,7 +2375,6 @@ func newStoreScanSyncer(t *testing.T) (*syncer, *waddrmgr.Manager,
 		}, mgr,
 		txStore, &mockTxPublisher{}, store, 0,
 	)
-	s.legacyStore = store
 
 	return s, mgr, dbConn
 }
@@ -2972,7 +3046,9 @@ func TestLoadWalletScanDataStore(t *testing.T) {
 	require.NoError(t, err)
 
 	accountNumber3 := uint32(3)
+	accountID3 := uint32(3)
 	accounts := []db.AccountInfo{{
+		AccountID:        &accountID3,
 		AccountNumber:    &accountNumber3,
 		AccountName:      "default",
 		ExternalKeyCount: 4,
@@ -4677,14 +4753,13 @@ func TestScanWithTargets_Errors(t *testing.T) {
 		require.ErrorContains(t, err, "hashes fail")
 	})
 
-	t.Run("FetchScopedKeyManager_Failure", func(t *testing.T) {
+	t.Run("UnknownScope_NotFound", func(t *testing.T) {
 		t.Parallel()
 
-		// Arrange: a real-backend syncer targeting a scope with no
-		// registered scoped key manager. resolveScanTargets resolves
-		// every non-imported target's durable name up front through the
-		// manager, so the unknown scope fails there -- before any Store
-		// horizon lookup.
+		// Arrange: a real-backend syncer targeting an account in a scope
+		// with no registered accounts. resolveScanTargets resolves every
+		// non-imported target through the Store up front, so the missing
+		// account surfaces there -- before any Store horizon lookup.
 		s, _, _ := newStoreScanSyncer(t)
 
 		targets := []waddrmgr.AccountScope{{
@@ -4700,12 +4775,9 @@ func TestScanWithTargets_Errors(t *testing.T) {
 			},
 		)
 
-		// Assert: the failure surfaces from resolving the scan target's
-		// scoped manager, not from a later Store lookup.
-		var mgrErr waddrmgr.ManagerError
-		require.ErrorAs(t, err, &mgrErr)
-		require.Equal(t, waddrmgr.ErrScopeNotFound, mgrErr.ErrorCode)
-		require.ErrorContains(t, err, "fetch scoped manager")
+		// Assert: the failure surfaces as a clear not-found from
+		// resolving the scan target, not from a later Store lookup.
+		require.ErrorIs(t, err, db.ErrAccountNotFound)
 	})
 }
 

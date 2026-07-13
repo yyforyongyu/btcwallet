@@ -314,7 +314,6 @@ func setupBenchmarkWallet(tb testing.TB,
 		syncer := newSyncer(
 			w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
 		)
-		syncer.legacyStore = w.legacyStore
 		w.sync = syncer
 	}
 

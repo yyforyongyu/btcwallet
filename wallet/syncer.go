@@ -19,7 +19,6 @@ import (
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/addresstype"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
-	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -46,12 +45,11 @@ var (
 	// is encountered.
 	ErrUnknownRescanJobType = errors.New("unknown rescan job type")
 
-	// errMissingLegacyAddressManager is returned when Store scan setup needs
-	// the legacy manager to resolve a masked imported-xpub account number but
-	// the syncer was built without it.
-	errMissingLegacyAddressManager = errors.New(
-		"missing legacy address manager",
-	)
+	// errMissingStoreAccountID is returned when a scan account loaded from the
+	// Store has no stable AccountID, which recovery state requires as its
+	// per-account map key. Every backend populates AccountID for both derived
+	// and imported accounts, so a nil value is an internal invariant break.
+	errMissingStoreAccountID = errors.New("missing store account id")
 
 	// ErrInvalidStartHeight is returned when a resync or rescan is
 	// requested with an invalid start height (e.g., zero if not allowed).
@@ -72,12 +70,6 @@ var (
 	// ErrNoScanTargets is returned when a targeted rescan is requested with
 	// no targets.
 	ErrNoScanTargets = errors.New("at least one target must be specified")
-
-	// errUnexpectedScanTargetCount is returned when the legacy manager
-	// resolves a single scan target to a number of results other than one.
-	errUnexpectedScanTargetCount = errors.New(
-		"unexpected resolved scan target count",
-	)
 )
 
 const (
@@ -186,26 +178,29 @@ type scanReq struct {
 // carries (scope, number). That is ambiguous for imported accounts: both Store
 // backends mask an imported account's number to 0, so an imported-xpub target
 // is indistinguishable from the default derived account 0 once it reaches a
-// Store number lookup. scanTarget resolves the durable, non-masked identity
-// up front -- before any Store lookup -- so the targeted path can carry
-// AccountName as the source of truth and never mis-resolve an imported target
-// by number.
+// Store number lookup. scanTarget resolves the target to its durable store
+// account row up front -- before any horizon loading -- so the targeted path
+// keys recovery state on the stable store AccountID and never mis-resolves an
+// imported target by number.
 type scanTarget struct {
 	// Scope is the key scope of the targeted account.
 	Scope waddrmgr.KeyScope
 
 	// Account is the requested account number. For the keyless legacy
 	// imported-address bucket it is waddrmgr.ImportedAddrAccount; for every
-	// other target it is the non-masked number reported by the
-	// identity-aware backend at resolution time.
+	// other target it is the number supplied by the caller.
 	Account uint32
 
-	// AccountName is the durable, scope-unique account identity resolved
-	// from the identity-aware backend. It is empty only for the keyless
-	// imported-address bucket, which is never resolved. Store horizon
-	// loading prefers this name over Account so a masked imported number
-	// can never collide with the default derived account.
+	// AccountName is the durable, scope-unique account name resolved from the
+	// store. It is empty only for the keyless imported-address bucket, which
+	// is never resolved.
 	AccountName string
+
+	// info is the resolved store account row for this target. It is nil only
+	// for the keyless imported-address bucket, which storeScanHorizons skips
+	// before any horizon loading. Its AccountID is the stable store identity
+	// recovery state keys on, distinct from the maskable Account number.
+	info *db.AccountInfo
 }
 
 // scanResult holds the result of processing a single block during a batch
@@ -243,9 +238,6 @@ type syncer struct {
 
 	// txStore is the transaction manager.
 	txStore wtxmgr.TxStore
-
-	// legacyStore is the kvdb adapter for legacy identity lookups.
-	legacyStore *kvdb.Store
 
 	// store is the transitional database store used by migrated runtime paths.
 	store db.Store
@@ -1317,63 +1309,15 @@ func (s *syncer) loadFullScanState(
 		s.cfg.RecoveryWindow, s.cfg.ChainParams, s.addrStore,
 	)
 
-	// Initialize Batch State (History + Lookahead)
+	// Initialize Batch State (History + Lookahead). Initialize records the
+	// stable store AccountID it keys each account on, so no separate
+	// identity-stamping pass is needed here.
 	err = scanState.Initialize(horizonData, initialAddrs, initialUnspent)
 	if err != nil {
 		return nil, fmt.Errorf("init scan state: %w", err)
 	}
 
-	err = s.stampRecoveryAccountIDs(ctx, scanState, horizonData)
-	if err != nil {
-		return nil, err
-	}
-
 	return scanState, nil
-}
-
-// stampRecoveryAccountIDs records stable Store account IDs in the recovery
-// state for every account loaded into the scan snapshot.
-func (s *syncer) stampRecoveryAccountIDs(ctx context.Context,
-	scanState *RecoveryState,
-	accounts []*waddrmgr.AccountProperties) error {
-
-	for _, props := range accounts {
-		accountID, err := s.accountPropertiesAccountID(ctx, props)
-		if err != nil {
-			return err
-		}
-
-		scanState.setAccountID(
-			props.KeyScope, props.AccountNumber, accountID,
-		)
-	}
-
-	return nil
-}
-
-// accountPropertiesAccountID resolves the Store account row identity matching
-// the account properties loaded into a recovery scan snapshot.
-func (s *syncer) accountPropertiesAccountID(ctx context.Context,
-	props *waddrmgr.AccountProperties) (*uint32, error) {
-
-	query := db.GetAccountQuery{
-		WalletID:    s.walletID,
-		Scope:       db.KeyScope(props.KeyScope),
-		SkipBalance: true,
-	}
-	if props.AccountName != "" {
-		query.Name = &props.AccountName
-	} else {
-		account := props.AccountNumber
-		query.AccountNumber = &account
-	}
-
-	info, err := s.store.GetAccount(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("get recovery account ID: %w", err)
-	}
-
-	return info.AccountID, nil
 }
 
 // scanBatchWithFullBlocks implements the fallback scanning by downloading and
@@ -2115,9 +2059,9 @@ func (s *syncer) scanWithTargets(ctx context.Context, req *scanReq) error {
 
 // storeScanHorizons loads account horizon data through the store. Targets are
 // the identity-aware scanTargets produced by resolveScanTargets, so each one
-// already carries the durable AccountName that lets the Store resolve an
-// imported account without colliding with the default derived account at the
-// masked number 0.
+// already carries the resolved store account row whose stable AccountID lets
+// recovery state key an imported account without colliding with the default
+// derived account at the masked number 0.
 func (s *syncer) storeScanHorizons(ctx context.Context,
 	targets []scanTarget) ([]*waddrmgr.AccountProperties, error) {
 
@@ -2125,7 +2069,7 @@ func (s *syncer) storeScanHorizons(ctx context.Context,
 		return s.storeFullScanHorizons(ctx)
 	}
 
-	return s.storeTargetedScanHorizons(ctx, targets)
+	return s.storeTargetedScanHorizons(targets)
 }
 
 // storeFullScanHorizons loads full recovery horizon accounts from the Store,
@@ -2150,7 +2094,7 @@ func (s *syncer) storeFullScanHorizons(
 			continue
 		}
 
-		accountProps, err := s.storeAccountProperties(accounts[i], nil)
+		accountProps, err := s.storeAccountProperties(accounts[i])
 		if err != nil {
 			return nil, err
 		}
@@ -2162,37 +2106,30 @@ func (s *syncer) storeFullScanHorizons(
 }
 
 // storeTargetedScanHorizons loads recovery horizon accounts for already
-// resolved scan targets.
-func (s *syncer) storeTargetedScanHorizons(ctx context.Context,
+// resolved scan targets. Each target already carries its resolved store
+// account row, so no further Store lookup is needed here.
+func (s *syncer) storeTargetedScanHorizons(
 	targets []scanTarget) ([]*waddrmgr.AccountProperties, error) {
 
 	props := make([]*waddrmgr.AccountProperties, 0, len(targets))
 	for _, target := range targets {
-		// The legacy imported-address bucket is a keyless
-		// pseudo-account, not a numeric HD account, and
-		// resolveScanTargets leaves its AccountName empty. Skip it
-		// before any Store lookup: its addresses are already watched
-		// through storeScanAddresses, and the backend has no row keyed
-		// by its reserved number.
-		if target.Account == waddrmgr.ImportedAddrAccount {
+		// The keyless legacy imported-address bucket is a
+		// pseudo-account, not a numeric HD account, and is carried
+		// through unresolved (nil info). Skip it: its addresses are
+		// already watched through storeScanAddresses, and it has no xpub
+		// to seed a recovery horizon.
+		if target.info == nil {
 			continue
-		}
-
-		info, err := s.storeScanHorizonAccount(ctx, target)
-		if err != nil {
-			return nil, err
 		}
 
 		// The keyless imported-address bucket has no xpub to derive
 		// lookahead addresses from. Its materialized addresses are still
 		// watched by storeScanAddresses.
-		if keylessImportedAccount(*info) {
+		if keylessImportedAccount(*target.info) {
 			continue
 		}
 
-		account := target.Account
-
-		accountProps, err := s.storeAccountProperties(*info, &account)
+		accountProps, err := s.storeAccountProperties(*target.info)
 		if err != nil {
 			return nil, err
 		}
@@ -2203,50 +2140,14 @@ func (s *syncer) storeTargetedScanHorizons(ctx context.Context,
 	return props, nil
 }
 
-// storeScanHorizonAccount resolves one targeted scanTarget into its Store
-// account row. The Store lookup prefers the durable AccountName when set,
-// mirroring the ScanHorizon contract and the SQL
-// scanHorizonOps.GetHorizonAccount behavior: both backends mask an imported
-// account's number to 0, so resolving an imported target by number would
-// silently load the default derived account. A number lookup is therefore
-// issued only as the fast path for derived targets whose name resolution is
-// unavailable, never for an imported target.
-func (s *syncer) storeScanHorizonAccount(ctx context.Context,
-	target scanTarget) (*db.AccountInfo, error) {
-
-	query := db.GetAccountQuery{
-		WalletID:    s.walletID,
-		Scope:       db.KeyScope(target.Scope),
-		SkipBalance: true,
-	}
-
-	// Prefer the durable, scope-unique name so a masked imported number can
-	// never resolve to the default derived account; fall back to the number
-	// only when no name was resolved.
-	if target.AccountName != "" {
-		query.Name = &target.AccountName
-	} else {
-		account := target.Account
-		query.AccountNumber = &account
-	}
-
-	info, err := s.store.GetAccount(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("get scan account: %w", err)
-	}
-
-	return info, nil
-}
-
 // storeAccountProperties converts store account metadata into the recovery
-// state horizon shape, preserving the non-masked account number used for
-// waddrmgr derivation when the Store public contract masks imported xpubs.
-func (s *syncer) storeAccountProperties(info db.AccountInfo,
-	fallbackNumber *uint32) (*waddrmgr.AccountProperties, error) {
+// state horizon shape. It keys the account on the stable store AccountID
+// (which recovery state uses as its per-account map key), distinct from the
+// maskable BIP44 account number.
+func (s *syncer) storeAccountProperties(
+	info db.AccountInfo) (*waddrmgr.AccountProperties, error) {
 
-	accountNumber, err := s.storeAccountRecoveryNumber(
-		info, fallbackNumber,
-	)
+	accountNumber, err := storeAccountRecoveryID(info)
 	if err != nil {
 		return nil, err
 	}
@@ -2313,57 +2214,24 @@ func storeAccountAddrSchema(
 	}, nil
 }
 
-// storeAccountRecoveryNumber returns the account identity RecoveryState must
-// use as its in-memory branch key. Derived accounts use their BIP44 account
-// number.
-// SQL imported-xpub accounts have no BIP44 account number, so they use the
-// stable store account ID; horizons still persist by AccountID, not by this
-// synthetic in-memory number. KVDB imported-xpub accounts fall back to the
-// non-masked legacy manager number when no store account ID is available.
-func (s *syncer) storeAccountRecoveryNumber(info db.AccountInfo,
-	fallbackNumber *uint32) (uint32, error) {
-
-	if info.AccountNumber != nil {
-		return *info.AccountNumber, nil
+// storeAccountRecoveryID returns the stable store account identity
+// RecoveryState uses as its in-memory per-account map key. It is always the
+// store AccountID: the durable, scope-unique row identity every backend
+// populates for both derived and imported accounts (SQL from accounts.id, kvdb
+// from the internal waddrmgr account number). Keying on this identity -- rather
+// than the BIP44 account number, which both backends mask to 0 for imported
+// accounts -- keeps an imported account distinct from a derived account that
+// happens to own the same BIP44 number in the same scope. For kvdb the
+// AccountID equals the non-masked waddrmgr account number, so it also doubles
+// as the correct derivation number the scoped-manager deriver expects; the SQL
+// deriver derives from account public material and ignores the number.
+func storeAccountRecoveryID(info db.AccountInfo) (uint32, error) {
+	if info.AccountID == nil {
+		return 0, fmt.Errorf("scan account %q: %w", info.AccountName,
+			errMissingStoreAccountID)
 	}
 
-	if info.IsImported && info.AccountID != nil {
-		return *info.AccountID, nil
-	}
-
-	if fallbackNumber != nil {
-		return *fallbackNumber, nil
-	}
-
-	if !info.IsImported {
-		return 0, nil
-	}
-
-	account, err := s.lookupStoreAccountNumber(info)
-	if err != nil {
-		return 0, err
-	}
-
-	return account, nil
-}
-
-// lookupStoreAccountNumber resolves an imported xpub Store account back to its
-// non-masked waddrmgr account number so RecoveryState can derive lookahead
-// addresses without colliding with the default account at number 0.
-func (s *syncer) lookupStoreAccountNumber(info db.AccountInfo) (uint32, error) {
-	if s.legacyStore == nil || s.addrStore == nil {
-		return 0, fmt.Errorf("lookup scan account %q: %w",
-			info.AccountName, errMissingLegacyAddressManager)
-	}
-
-	account, err := s.legacyStore.LookupAccountNumber(
-		waddrmgr.KeyScope(info.KeyScope), info.AccountName,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("lookup store account number: %w", err)
-	}
-
-	return account, nil
+	return *info.AccountID, nil
 }
 
 // keylessImportedAccount reports whether an account is the reserved raw-import
@@ -2603,14 +2471,11 @@ func (s *syncer) loadTargetedScanState(ctx context.Context,
 		s.cfg.RecoveryWindow, s.cfg.ChainParams, s.addrStore,
 	)
 
+	// Initialize records the stable store AccountID it keys each account on,
+	// so no separate identity-stamping pass is needed here.
 	err = state.Initialize(horizonData, initialAddrs, initialUnspent)
 	if err != nil {
 		return nil, fmt.Errorf("init scan state: %w", err)
-	}
-
-	err = s.stampRecoveryAccountIDs(ctx, state, horizonData)
-	if err != nil {
-		return nil, err
 	}
 
 	return state, nil
@@ -2635,18 +2500,15 @@ func (s *syncer) loadTargetedScanData(ctx context.Context,
 }
 
 // resolveScanTargets converts the public AccountScope rescan targets into the
-// internal, identity-aware scanTargets used by the Store path. It prefers each
-// target's durable AccountScope.Name whenever the caller set one, falling back
-// to the account number otherwise, and resolves the durable account name
-// through the Store so an account that exists only in the Store -- a derived
-// account created through CreateDerivedAccount but never written to the legacy
-// address manager -- still resolves, where the legacy-only resolution returned
-// ErrAccountNotFound.
+// internal, identity-aware scanTargets used by the Store path. Each resolved
+// target carries its durable store account row so recovery state keys on the
+// stable store AccountID rather than the maskable account number.
 //
-// The keyless legacy imported-address bucket is carried through with an empty
-// AccountName so storeScanHorizons skips it before any lookup; every other
-// target carries the durable AccountName resolved here so Store horizon loading
-// can key on the name instead of the maskable number.
+// The keyless legacy imported-address bucket is carried through unresolved (nil
+// info) so storeScanHorizons skips it before any horizon loading; every other
+// target is resolved through the Store so an account that exists only in the
+// Store -- a derived account created through CreateDerivedAccount -- still
+// resolves.
 func (s *syncer) resolveScanTargets(ctx context.Context,
 	targets []waddrmgr.AccountScope) ([]scanTarget, error) {
 
@@ -2664,12 +2526,14 @@ func (s *syncer) resolveScanTargets(ctx context.Context,
 }
 
 // resolveScanTarget resolves a single public rescan target into its
-// identity-aware scanTarget through the Store. AccountScope.Name is the
-// durable, scope-unique identity, so it is always preferred over the maskable
-// account number: when Name is set the Store is queried by name and the number
-// is ignored, which is the only way a named imported-xpub target addressed at
-// the masked account number 0 can avoid resolving to the default derived
-// account.
+// identity-aware scanTarget through the Store, recording the resolved store
+// account row (and its stable AccountID) recovery state keys on.
+//
+// AccountScope.Name is the durable, scope-unique identity, so it is always
+// preferred over the maskable account number: when Name is set the Store is
+// queried by name and the number is ignored, which is the only way a named
+// imported-xpub target addressed at the masked account number 0 can avoid
+// resolving to the default derived account.
 func (s *syncer) resolveScanTarget(ctx context.Context,
 	target waddrmgr.AccountScope) (scanTarget, error) {
 
@@ -2705,11 +2569,7 @@ func (s *syncer) resolveScanTarget(ctx context.Context,
 				"by name: %w", err)
 		}
 
-		return scanTarget{
-			Scope:       target.Scope,
-			Account:     target.Account,
-			AccountName: info.AccountName,
-		}, nil
+		return newResolvedScanTarget(target, info), nil
 	}
 
 	account := target.Account
@@ -2721,60 +2581,69 @@ func (s *syncer) resolveScanTarget(ctx context.Context,
 		SkipBalance:   true,
 	})
 	if err == nil {
-		return scanTarget{
-			Scope:       target.Scope,
-			Account:     target.Account,
-			AccountName: info.AccountName,
-		}, nil
+		return newResolvedScanTarget(target, info), nil
 	}
 
 	// The Store rejects a by-number lookup of an imported account because it
 	// masks every imported account's number to 0; an imported-xpub target
 	// addressed by its non-masked number and no name therefore surfaces as
-	// not-found. Such a target is, by construction, present in the
-	// identity-aware address manager (it has a non-masked number to be
-	// addressed by), so fall back to resolving its durable name there. Any
-	// other failure -- including a genuinely unknown account in both
-	// backends -- is returned.
+	// not-found. Such a target is addressable only by its durable store
+	// AccountID, so resolve it by matching that identity across the account
+	// list. Any other failure -- including a genuinely unknown account -- is
+	// returned.
 	if !errors.Is(err, db.ErrAccountNotFound) {
 		return scanTarget{}, fmt.Errorf("resolve scan target "+
 			"account: %w", err)
 	}
 
-	return s.resolveScanTargetByManager(target)
+	return s.resolveScanTargetByID(ctx, target)
 }
 
-// resolveScanTargetByManager resolves a target's durable name through the
-// identity-aware address manager. It is the fallback for an imported-xpub
-// target addressed by its non-masked number, which the Store cannot resolve by
-// number because it masks imported account numbers to 0. The manager keys every
-// account by its non-masked number, so it disambiguates the imported account
-// from the default derived account that shares the masked number 0.
-func (s *syncer) resolveScanTargetByManager(
+// resolveScanTargetByID resolves a target addressed by a store AccountID that a
+// by-number Store lookup could not find. Both backends mask an imported
+// account's number to 0, so an imported-xpub target addressed by its non-masked
+// store AccountID misses the number lookup; it is instead matched against the
+// stable AccountID every account carries. The account list is scoped to the
+// target's key scope to keep the match unambiguous.
+func (s *syncer) resolveScanTargetByID(ctx context.Context,
 	target waddrmgr.AccountScope) (scanTarget, error) {
 
-	if s.legacyStore == nil || s.addrStore == nil {
-		return scanTarget{}, errMissingLegacyAddressManager
-	}
+	scope := db.KeyScope(target.Scope)
 
-	managerTargets, err := s.legacyStore.ResolveScanTargets(
-		s.addrStore, []waddrmgr.AccountScope{target},
-	)
+	accounts, err := s.store.ListAccounts(ctx, db.ListAccountsQuery{
+		WalletID:    s.walletID,
+		Scope:       &scope,
+		SkipBalance: true,
+	})
 	if err != nil {
-		return scanTarget{}, fmt.Errorf("resolve scan target via "+
-			"manager: %w", err)
+		return scanTarget{}, fmt.Errorf("resolve scan target by id: %w",
+			err)
 	}
 
-	if len(managerTargets) != 1 {
-		return scanTarget{}, fmt.Errorf("%w: got %d, want 1",
-			errUnexpectedScanTargetCount, len(managerTargets))
+	for i := range accounts {
+		info := accounts[i]
+		if info.AccountID == nil || *info.AccountID != target.Account {
+			continue
+		}
+
+		return newResolvedScanTarget(target, &info), nil
 	}
+
+	return scanTarget{}, fmt.Errorf("resolve scan target by id %d: %w",
+		target.Account, db.ErrAccountNotFound)
+}
+
+// newResolvedScanTarget builds a resolved scanTarget from a public target and
+// its resolved store account row.
+func newResolvedScanTarget(target waddrmgr.AccountScope,
+	info *db.AccountInfo) scanTarget {
 
 	return scanTarget{
-		Scope:       managerTargets[0].Scope,
-		Account:     managerTargets[0].Account,
-		AccountName: managerTargets[0].AccountName,
-	}, nil
+		Scope:       target.Scope,
+		Account:     target.Account,
+		AccountName: info.AccountName,
+		info:        info,
+	}
 }
 
 // loadWalletScanData retrieves all necessary data from the database to
