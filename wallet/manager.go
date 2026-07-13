@@ -25,6 +25,20 @@ var (
 	// requested name already exists end to end. A partial wallet left by an
 	// earlier failed create is recoverable and does not trigger this error.
 	ErrWalletExists = errors.New("wallet already exists")
+
+	// ErrWatchOnlyExtKeyNoAccounts is returned when a watch-only wallet is
+	// requested via ModeImportExtKey. That mode records a single master
+	// (BIP32 m/) extended key, but a watch-only wallet cannot derive
+	// accounts from it, so the create would yield a wallet with no account
+	// that CreateAccount cannot populate either. Watch-only wallets are
+	// built from account-level xpubs imported through ModeShell +
+	// InitialAccounts instead. It wraps ErrWalletParams so callers that
+	// match the general sentinel keep working.
+	ErrWatchOnlyExtKeyNoAccounts = fmt.Errorf("%w: a watch-only wallet "+
+		"cannot be created from a master extended key via "+
+		"ModeImportExtKey (it would have no usable account); import "+
+		"account-level xpubs via ModeShell with InitialAccounts "+
+		"instead", ErrWalletParams)
 )
 
 // CreateMode determines how a new wallet is initialized.
@@ -89,16 +103,19 @@ type CreateWalletParams struct {
 
 	// WatchOnly controls whether the resulting wallet is watch-only. A
 	// watch-only wallet must be created from public-only key material, so
-	// WatchOnly=true is only valid with an XPub root (ModeImportExtKey) or a
-	// rootless shell (ModeShell).
-	// - If true with XPub/Shell input: the wallet is watch-only (the XPub case
-	//   simply records the wallet watch-only; the shell case holds no root).
+	// WatchOnly=true is only valid with a rootless shell (ModeShell) whose
+	// InitialAccounts carry account-level xpubs.
+	// - If true with Shell input: the wallet is watch-only and holds no
+	//   root; its accounts are the imported account-level xpubs.
+	// - If true with ModeImportExtKey: rejected with
+	//   ErrWatchOnlyExtKeyNoAccounts. That mode records only a master
+	//   extended key, from which a watch-only wallet can derive no account,
+	//   so it would yield an unusable empty wallet.
 	// - If true with Seed/GenSeed or an XPrv root (ModeImportSeed,
 	//   ModeGenSeed, or ModeImportExtKey with a private key): rejected with
 	//   ErrWalletParams. These modes always yield a private master key, and
 	//   silently discarding it would build a spendable legacy manager while
-	//   recording the wallet watch-only. Neuter the key to an XPub and pass it
-	//   via ModeImportExtKey to create a watch-only wallet from such material.
+	//   recording the wallet watch-only.
 	WatchOnly bool
 
 	// Birthday is the wallet's birthday.
@@ -381,10 +398,12 @@ func NewManager() *Manager {
 
 // createLegacyStore creates the legacy kvdb compatibility store for a new
 // wallet. It reports whether a legacy wallet already existed at this path so
-// Create can distinguish a fresh create from a retry over a partial one.
+// Create can distinguish a fresh create from a retry over a partial one, and
+// (for a retry) the existing wallet's original birthday so the runtime row can
+// reuse it.
 func createLegacyStore(ctx context.Context, cfg Config,
-	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey) ([]byte,
-	bool, time.Time, error) {
+	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey) (bool,
+	time.Time, error) {
 
 	createParams := kvdb.CreateLegacyWalletParams{
 		RootKey:           rootKey,
@@ -406,40 +425,26 @@ func createLegacyStore(ctx context.Context, cfg Config,
 	// layers down and waddrmgr.IsError does not unwrap %w, so match with
 	// errors.As.
 	//
-	// Reopen the existing legacy store to recover its encrypted master HD
-	// key rather than returning a nil seed: a nil seed would let the SQL
-	// runtime row be created with no EncryptedMasterPrivKey for a spendable
-	// wallet, so its later GetEncryptedHDSeed would fail and break SQL
-	// account/key derivation. Reports legacyExisted=true so Create can
-	// decide whether this is a recoverable partial create or a fully
-	// created wallet that must be rejected.
+	// Reopen the existing legacy store to verify the retry key material
+	// matches and to recover its original birthday. Reports
+	// legacyExisted=true so Create can decide whether this is a recoverable
+	// partial create or a fully created wallet that must be rejected.
 	case isLegacyWalletAlreadyExists(err):
-		encryptedSeed, legacyBirthday, err :=
-			readExistingLegacyEncryptedSeed(ctx, cfg, params, rootKey)
+		legacyBirthday, err := readExistingLegacyBirthday(
+			ctx, cfg, rootKey, params.WatchOnly,
+		)
 
-		return encryptedSeed, true, legacyBirthday, err
+		return true, legacyBirthday, err
 
 	case err != nil:
-		return nil, false, time.Time{}, fmt.Errorf(
+		return false, time.Time{}, fmt.Errorf(
 			"create legacy store: %w", err,
-		)
-	}
-
-	// Capture the encrypted master HD private key the legacy create just
-	// persisted, so the runtime store can persist the same blob (the runtime
-	// key vault is backed by this legacy manager, so it decrypts unchanged).
-	encryptedSeed, err := legacyEncryptedSeed(
-		ctx, legacyStore, params, rootKey,
-	)
-	if err != nil {
-		return nil, false, time.Time{}, errors.Join(
-			err, legacyStore.Close(),
 		)
 	}
 
 	err = legacyStore.Close()
 	if err != nil {
-		return nil, false, time.Time{}, fmt.Errorf(
+		return false, time.Time{}, fmt.Errorf(
 			"close legacy store: %w", err,
 		)
 	}
@@ -447,63 +452,54 @@ func createLegacyStore(ctx context.Context, cfg Config,
 	// A fresh create has no pre-existing legacy birthday to reuse; the
 	// runtime row uses the requested birthday with the safety margin
 	// applied. Report a zero time to signal that.
-	return encryptedSeed, false, time.Time{}, nil
+	return false, time.Time{}, nil
 }
 
-// readExistingLegacyEncryptedSeed reopens an already-created legacy store,
-// verifies the retry root key matches the wallet that was originally created,
-// and reads its encrypted master HD key. It is used on the Create retry path,
-// where the legacy wallet exists from an earlier attempt that failed before
-// the runtime row was committed.
+// readExistingLegacyBirthday reopens an already-created legacy store, verifies
+// the retry root key matches the wallet that was originally created, and reads
+// its original birthday. It is used on the Create retry path, where the legacy
+// wallet exists from an earlier attempt that failed before the runtime row was
+// committed.
 //
-// It also returns the legacy wallet's original (safety-margin-applied)
-// birthday so the runtime row reuses it instead of the retry's birthday:
-// callers commonly pass a fresh time.Now() per attempt, and the runtime
-// birthday drives the initial SyncedTo tip, so persisting a later retry
-// birthday would make the wallet skip deposits made before it.
-func readExistingLegacyEncryptedSeed(ctx context.Context, cfg Config,
-	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey) ([]byte,
-	time.Time, error) {
+// It returns the legacy wallet's original (safety-margin-applied) birthday so
+// the runtime row reuses it instead of the retry's birthday: callers commonly
+// pass a fresh time.Now() per attempt, and the runtime birthday drives the
+// initial SyncedTo tip, so persisting a later retry birthday would make the
+// wallet skip deposits made before it.
+func readExistingLegacyBirthday(ctx context.Context, cfg Config,
+	rootKey *hdkeychain.ExtendedKey, watchOnly bool) (time.Time, error) {
 
 	legacyStore, err := openLegacyStore(cfg)
 	if err != nil {
-		return nil, time.Time{}, err
+		return time.Time{}, err
 	}
 
 	// Guard against a retry that supplies different key material from the
 	// original create, or that would downgrade a spendable wallet to
-	// watch-only, before we read the seed and derive any runtime metadata
-	// from rootKey.
+	// watch-only, before we derive any runtime metadata from rootKey.
 	err = verifyRootKeyMatchesLegacy(
-		ctx, legacyStore, cfg.Name, rootKey, params.WatchOnly,
+		ctx, legacyStore, cfg.Name, rootKey, watchOnly,
 	)
 	if err != nil {
-		return nil, time.Time{}, errors.Join(err, legacyStore.Close())
+		return time.Time{}, errors.Join(err, legacyStore.Close())
 	}
 
 	info, err := legacyStore.Store.GetWallet(ctx, cfg.Name)
 	if err != nil {
-		return nil, time.Time{}, errors.Join(
+		return time.Time{}, errors.Join(
 			fmt.Errorf("read existing legacy wallet: %w", err),
 			legacyStore.Close(),
 		)
 	}
 
-	encryptedSeed, err := legacyEncryptedSeed(
-		ctx, legacyStore, params, rootKey,
-	)
-	if err != nil {
-		return nil, time.Time{}, errors.Join(err, legacyStore.Close())
-	}
-
 	err = legacyStore.Close()
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf(
+		return time.Time{}, fmt.Errorf(
 			"close legacy store: %w", err,
 		)
 	}
 
-	return encryptedSeed, info.Birthday, nil
+	return info.Birthday, nil
 }
 
 // verifyRootKeyMatchesLegacy guards the Create retry path against a root key
@@ -560,28 +556,6 @@ func verifyRootKeyMatchesLegacy(ctx context.Context,
 	}
 
 	return nil
-}
-
-// legacyEncryptedSeed reads the encrypted master HD private key from an open
-// legacy store for spendable wallets. Watch-only, shell, and xpub-only wallets
-// hold no master secret, so it returns a nil seed for them.
-func legacyEncryptedSeed(ctx context.Context, legacyStore *kvdb.StoreHandle,
-	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey) ([]byte,
-	error) {
-
-	// Only a spendable wallet backed by a private root key holds an
-	// encrypted master HD key; otherwise the legacy manager was created
-	// watch-only and has no such secret to read.
-	if params.WatchOnly || rootKey == nil || !rootKey.IsPrivate() {
-		return nil, nil
-	}
-
-	encryptedSeed, err := legacyStore.Store.GetEncryptedHDSeed(ctx, 0)
-	if err != nil {
-		return nil, fmt.Errorf("read legacy master HD key: %w", err)
-	}
-
-	return encryptedSeed, nil
 }
 
 // isLegacyWalletAlreadyExists reports whether err indicates the legacy
@@ -731,7 +705,7 @@ func (m *Manager) Create(cfg Config,
 	// wallets. SQL wallets persist their own wallet secrets in the runtime
 	// store and must not create a walletdb sidecar.
 	if isKVDB {
-		_, legacyExisted, legacyBirthday, err = createLegacyStore(
+		legacyExisted, legacyBirthday, err = createLegacyStore(
 			context.Background(), cfg, params, rootKey,
 		)
 		if err != nil {
@@ -900,9 +874,15 @@ func (w *Wallet) importInitialAccounts(ctx context.Context,
 // account matches the retry's key material. It resolves the scope from the
 // xpub exactly as importAccountInternal does, so the lookup targets the scope
 // the account was originally stored under (which need not equal the caller's
-// declared account.Scope). A stored account whose public key differs from the
-// retry's is rejected so a retry cannot silently rebind an existing name to
-// new key material.
+// declared account.Scope).
+//
+// A stored account whose identity-defining fields differ from the retry's is
+// rejected so a retry cannot silently rebind an existing name to new material
+// and then be skipped, leaving the wallet on the original account's stale
+// metadata. Beyond the account public key, this covers the master key
+// fingerprint and the derived address schema: a retry that keeps the xpub but
+// changes the fingerprint or address type would otherwise be accepted as
+// "already imported".
 func (w *Wallet) initialAccountAlreadyImported(ctx context.Context,
 	account WatchOnlyAccount) (bool, error) {
 
@@ -913,7 +893,7 @@ func (w *Wallet) initialAccountAlreadyImported(ctx context.Context,
 
 	addrType := account.AddrType
 
-	scope, _, err := keyScopeFromPubKey(account.XPub, &addrType)
+	scope, addrSchema, err := keyScopeFromPubKey(account.XPub, &addrType)
 	if err != nil {
 		return false, err
 	}
@@ -937,13 +917,83 @@ func (w *Wallet) initialAccountAlreadyImported(ctx context.Context,
 		return false, fmt.Errorf("check imported account: %w", err)
 	}
 
+	// The account public key is the primary identity. A mismatch means the
+	// name was rebound to an entirely different xpub.
 	if string(info.PublicKey) != account.XPub.String() {
-		return false, fmt.Errorf("%w: initial account %q already "+
-			"exists with different key material", ErrWalletParams,
-			account.Name)
+		return false, mismatchedInitialAccountErr(account.Name)
+	}
+
+	// The master key fingerprint is persisted verbatim by both backends, so
+	// a change here reliably signals a different-provenance retry.
+	if info.MasterKeyFingerprint != account.MasterKeyFingerprint {
+		return false, mismatchedInitialAccountErr(account.Name)
+	}
+
+	// The address type resolves to a scope-relative address schema. The
+	// scope is already fixed by the lookup above, but within a scope the
+	// derived schema can still differ (for example a BIP-0049 xpub imported
+	// as nested-everywhere versus the BIP-0049Plus default). Reject a retry
+	// whose schema no longer matches what was stored.
+	match, err := storedAddrSchemaMatches(scope, addrSchema, info.AddrSchema)
+	if err != nil {
+		return false, err
+	}
+
+	if !match {
+		return false, mismatchedInitialAccountErr(account.Name)
 	}
 
 	return true, nil
+}
+
+// mismatchedInitialAccountErr builds the "already exists with different key
+// material" rejection used when an initial-account retry keeps an existing
+// name but changes an identity-defining field.
+func mismatchedInitialAccountErr(name string) error {
+	return fmt.Errorf("%w: initial account %q already exists with "+
+		"different key material", ErrWalletParams, name)
+}
+
+// storedAddrSchemaMatches reports whether the address schema a retry would
+// derive matches the schema stored for an already-imported account.
+//
+// derived is the per-account schema override returned by keyScopeFromPubKey
+// (nil means the account opts into the scope default). stored is the schema
+// the backend actually persisted. A nil derived override is normalized to the
+// scope default before comparison so both sides are compared on equal footing.
+//
+// SQL backends do not model per-account schema overrides and always expose the
+// scope default (see db.ScopeAddrSchema docs), so a stored schema that equals
+// the scope default is treated as compatible with any derived schema: there is
+// no durable override to contradict, and flagging it would falsely reject a
+// legitimate retry.
+func storedAddrSchemaMatches(scope waddrmgr.KeyScope,
+	derived *waddrmgr.ScopeAddrSchema, stored db.ScopeAddrSchema) (bool,
+	error) {
+
+	scopeDefault, ok := db.ScopeAddrMap[db.KeyScope(scope)]
+	if !ok {
+		return false, fmt.Errorf("%w: scope %d'/%d'",
+			db.ErrUnknownKeyScope, scope.Purpose, scope.Coin)
+	}
+
+	// The backend dropped or never held an override; nothing durable to
+	// compare against.
+	if stored == scopeDefault {
+		return true, nil
+	}
+
+	effective := scopeDefault
+	if derived != nil {
+		converted, err := db.ScopeAddrSchemaFromWaddrmgr(*derived)
+		if err != nil {
+			return false, err
+		}
+
+		effective = converted
+	}
+
+	return stored == effective, nil
 }
 
 // Load loads an existing wallet from the provided configuration. It opens the
@@ -1232,6 +1282,8 @@ func (m *Manager) beginLoad(name string) (*Wallet, func(), error) {
 
 // prepareWalletCreation validates the configuration and parameters, and derives
 // the root key for wallet creation.
+//
+//nolint:cyclop // Keep create-time validation and watch-only guards here.
 func (m *Manager) prepareWalletCreation(cfg Config,
 	params CreateWalletParams) (*hdkeychain.ExtendedKey, error) {
 
@@ -1262,12 +1314,24 @@ func (m *Manager) prepareWalletCreation(cfg Config,
 	// private root would build a spendable legacy manager while the runtime
 	// store records the wallet as watch-only. ModeImportSeed and ModeGenSeed
 	// always derive a private master key, so WatchOnly=true is rejected for
-	// them too; create a watch-only wallet from an XPub (ModeImportExtKey) or
-	// a rootless shell (ModeShell) instead.
+	// them too; create a watch-only wallet from a rootless shell (ModeShell)
+	// with account-level xpubs in InitialAccounts instead.
 	if params.WatchOnly && rootKey != nil && rootKey.IsPrivate() {
 		return nil, fmt.Errorf("%w: watch-only wallet requires an xpub "+
 			"or shell input; a seed or private root key is not "+
 			"allowed", ErrWalletParams)
+	}
+
+	// A watch-only ModeImportExtKey wallet is a broken shell: the mode
+	// records only the master (BIP32 m/) extended key, but a watch-only
+	// wallet derives no accounts (seedDefaultAccounts runs only for
+	// spendable wallets) and this mode imports no InitialAccounts, so the
+	// wallet would end up with no account and CreateAccount cannot populate
+	// a watch-only wallet either. Reject it up front rather than create the
+	// shell. Watch-only wallets are built from account-level xpubs via
+	// ModeShell + InitialAccounts.
+	if params.Mode == ModeImportExtKey && params.WatchOnly {
+		return nil, ErrWatchOnlyExtKeyNoAccounts
 	}
 
 	return rootKey, nil

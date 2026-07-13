@@ -211,6 +211,19 @@ func TestManagerCreateError(t *testing.T) {
 			expectedErr: "private key required",
 		},
 		{
+			// A watch-only ModeImportExtKey wallet would have no
+			// account and CreateAccount cannot populate it, so the
+			// combination is rejected up front.
+			name: "Watch-only ModeImportExtKey bare xpub",
+			params: CreateWalletParams{
+				Mode:      ModeImportExtKey,
+				RootKey:   pubKey,
+				WatchOnly: true,
+			},
+			expectedErr: "watch-only wallet cannot be created from " +
+				"a master extended key",
+		},
+		{
 			name: "Unknown Mode",
 			params: CreateWalletParams{
 				Mode: ModeUnknown,
@@ -239,6 +252,265 @@ func TestManagerCreateError(t *testing.T) {
 			// Verify that the error matches our expectation.
 			require.Error(t, err)
 			require.ErrorContains(t, err, tc.expectedErr)
+		})
+	}
+}
+
+// TestManagerCreateWatchOnlyExtKeyRejected verifies that a watch-only wallet
+// requested through ModeImportExtKey is rejected with the typed
+// ErrWatchOnlyExtKeyNoAccounts error (which wraps ErrWalletParams), rather than
+// creating a wallet with no usable account.
+func TestManagerCreateWatchOnlyExtKeyRejected(t *testing.T) {
+	t.Parallel()
+
+	seed, err := hdkeychain.GenerateSeed(hdkeychain.RecommendedSeedLen)
+	require.NoError(t, err)
+
+	rootKey, err := hdkeychain.NewMaster(seed, &chainParams)
+	require.NoError(t, err)
+
+	pubKey, err := rootKey.Neuter()
+	require.NoError(t, err)
+
+	m := NewManager()
+	cfg := Config{
+		DB:             testKVDBConfig(t),
+		Chain:          &bwmock.Chain{},
+		ChainParams:    &chainParams,
+		Name:           "test-wallet",
+		PubPassphrase:  []byte("public"),
+		RecoveryWindow: MinRecoveryWindow,
+	}
+
+	_, err = m.Create(cfg, CreateWalletParams{
+		Mode:          ModeImportExtKey,
+		RootKey:       pubKey,
+		WatchOnly:     true,
+		PubPassphrase: []byte("public"),
+		Birthday:      time.Now(),
+	})
+
+	// The error must be the typed sentinel and remain matchable as an
+	// invalid-params error.
+	require.ErrorIs(t, err, ErrWatchOnlyExtKeyNoAccounts)
+	require.ErrorIs(t, err, ErrWalletParams)
+}
+
+// TestInitialAccountAlreadyImportedIdentity verifies that a partial-create
+// retry of an initial account is treated as already imported only when its
+// identity-defining fields match the stored account. A retry that keeps the
+// xpub but changes the master key fingerprint (or otherwise differs) is
+// rejected rather than silently skipped with stale metadata.
+func TestInitialAccountAlreadyImportedIdentity(t *testing.T) {
+	t.Parallel()
+
+	const walletID uint32 = 7
+
+	seed, err := hdkeychain.GenerateSeed(hdkeychain.RecommendedSeedLen)
+	require.NoError(t, err)
+
+	root, err := hdkeychain.NewMaster(seed, &chainParams)
+	require.NoError(t, err)
+
+	// A BIP-0084 account xpub (m/84'/0'/0') resolves to the BIP0084 scope
+	// with the scope default schema, so the address-type check is neutral
+	// and the test can isolate the xpub and fingerprint checks.
+	acctXPub := deriveAcctPubKey(
+		t, root, waddrmgr.KeyScopeBIP0084, hardenedKey(0),
+	)
+
+	otherXPub := deriveAcctPubKey(
+		t, root, waddrmgr.KeyScopeBIP0084, hardenedKey(1),
+	)
+
+	account := WatchOnlyAccount{
+		Scope:                waddrmgr.KeyScopeBIP0084,
+		XPub:                 acctXPub,
+		MasterKeyFingerprint: 0x11223344,
+		Name:                 db.DefaultImportedAccountName,
+		AddrType:             waddrmgr.WitnessPubKey,
+	}
+
+	// The stored schema mirrors what the backend persists for the resolved
+	// scope, so only the field under test differs per case.
+	scopeDefault := db.ScopeAddrMap[db.KeyScopeBIP0084]
+
+	tests := []struct {
+		name    string
+		stored  *db.AccountInfo
+		wantErr bool
+		want    bool
+	}{
+		{
+			name: "identical account is already imported",
+			stored: &db.AccountInfo{
+				PublicKey: []byte(acctXPub.String()),
+				MasterKeyFingerprint: account.
+					MasterKeyFingerprint,
+				KeyScope:   db.KeyScopeBIP0084,
+				AddrSchema: scopeDefault,
+			},
+			want: true,
+		},
+		{
+			name: "different public key is rejected",
+			stored: &db.AccountInfo{
+				PublicKey: []byte(otherXPub.String()),
+				MasterKeyFingerprint: account.
+					MasterKeyFingerprint,
+				KeyScope:   db.KeyScopeBIP0084,
+				AddrSchema: scopeDefault,
+			},
+			wantErr: true,
+		},
+		{
+			name: "different master fingerprint is rejected",
+			stored: &db.AccountInfo{
+				PublicKey:            []byte(acctXPub.String()),
+				MasterKeyFingerprint: 0x99887766,
+				KeyScope:             db.KeyScopeBIP0084,
+				AddrSchema:           scopeDefault,
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &walletmock.Store{}
+			store.On("GetAccount", mock.Anything, mock.MatchedBy(
+				func(q db.GetAccountQuery) bool {
+					return q.WalletID == walletID &&
+						q.Name != nil &&
+						*q.Name == account.Name
+				},
+			)).Return(tc.stored, nil).Once()
+
+			w := &Wallet{
+				id:    walletID,
+				store: store,
+				cfg:   Config{ChainParams: &chainParams},
+			}
+
+			exists, err := w.initialAccountAlreadyImported(
+				t.Context(), account,
+			)
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrWalletParams)
+				require.ErrorContains(
+					t, err, "different key material",
+				)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.want, exists)
+			}
+
+			store.AssertExpectations(t)
+		})
+	}
+}
+
+// TestInitialAccountNotYetImported verifies that a not-found account lookup is
+// reported as "not imported yet" without error, so a fresh initial-account
+// import proceeds.
+func TestInitialAccountNotYetImported(t *testing.T) {
+	t.Parallel()
+
+	const walletID uint32 = 8
+
+	seed, err := hdkeychain.GenerateSeed(hdkeychain.RecommendedSeedLen)
+	require.NoError(t, err)
+
+	root, err := hdkeychain.NewMaster(seed, &chainParams)
+	require.NoError(t, err)
+
+	acctXPub := deriveAcctPubKey(
+		t, root, waddrmgr.KeyScopeBIP0084, hardenedKey(0),
+	)
+
+	store := &walletmock.Store{}
+	store.On("GetAccount", mock.Anything, mock.Anything).
+		Return((*db.AccountInfo)(nil), db.ErrAccountNotFound).Once()
+
+	w := &Wallet{
+		id:    walletID,
+		store: store,
+		cfg:   Config{ChainParams: &chainParams},
+	}
+
+	exists, err := w.initialAccountAlreadyImported(t.Context(),
+		WatchOnlyAccount{
+			Scope:    waddrmgr.KeyScopeBIP0084,
+			XPub:     acctXPub,
+			Name:     db.DefaultImportedAccountName,
+			AddrType: waddrmgr.WitnessPubKey,
+		})
+	require.NoError(t, err)
+	require.False(t, exists)
+	store.AssertExpectations(t)
+}
+
+// TestStoredAddrSchemaMatches verifies the address-schema reconciliation used
+// by initialAccountAlreadyImported: a stored schema that equals the scope
+// default is compatible with any derived schema (SQL backends drop per-account
+// overrides), while a persisted non-default override must match the derived
+// schema.
+func TestStoredAddrSchemaMatches(t *testing.T) {
+	t.Parallel()
+
+	scope := waddrmgr.KeyScopeBIP0049Plus
+	scopeDefault := db.ScopeAddrMap[db.KeyScope(scope)]
+
+	// The strict BIP-49 override (nested everywhere) differs from the
+	// BIP-0049Plus scope default (nested external, witness internal).
+	overrideSchema := waddrmgr.KeyScopeBIP0049AddrSchema
+	overrideDB, err := db.ScopeAddrSchemaFromWaddrmgr(overrideSchema)
+	require.NoError(t, err)
+	require.NotEqual(t, scopeDefault, overrideDB)
+
+	tests := []struct {
+		name    string
+		derived *waddrmgr.ScopeAddrSchema
+		stored  db.ScopeAddrSchema
+		want    bool
+	}{
+		{
+			name:    "stored default matches nil derived",
+			derived: nil,
+			stored:  scopeDefault,
+			want:    true,
+		},
+		{
+			name:    "stored default matches override derived",
+			derived: &overrideSchema,
+			stored:  scopeDefault,
+			want:    true,
+		},
+		{
+			name:    "stored override matches override derived",
+			derived: &overrideSchema,
+			stored:  overrideDB,
+			want:    true,
+		},
+		{
+			name:    "stored override rejects default derived",
+			derived: nil,
+			stored:  overrideDB,
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := storedAddrSchemaMatches(
+				scope, tc.derived, tc.stored,
+			)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
 		})
 	}
 }
