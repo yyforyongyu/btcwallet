@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -430,6 +431,94 @@ func TestManagerLoad_ExistingWallet(t *testing.T) {
 	// Verify that we got the same wallet instance back.
 	require.NoError(t, err)
 	require.Same(t, wCreated, wLoaded)
+}
+
+// TestManagerConcurrentLoadSingleFlight verifies that concurrent Loads of the
+// same uncached wallet name build the wallet exactly once and all return the
+// same instance. Without the per-name in-flight guard each Load would open its
+// own stores and publish its own wallet (last writer wins), orphaning every
+// instance but the last. The test blocks the single build until all Loads have
+// launched, so the guard is exercised under contention (run with -race).
+//
+//nolint:paralleltest // Mutates the package-level runtimeStoreFactory.
+func TestManagerConcurrentLoadSingleFlight(t *testing.T) {
+	cfg, _ := sqliteCreateConfig(t)
+
+	oldFactory := runtimeStoreFactory
+	t.Cleanup(func() {
+		runtimeStoreFactory = oldFactory
+	})
+
+	const loaders = 8
+
+	var builds atomic.Int32
+
+	// release gates the single build until every Load goroutine has been
+	// launched, widening the window in which a missing guard would let more
+	// than one Load reach the factory.
+	release := make(chan struct{})
+
+	runtimeStoreFactory = func(context.Context, Config,
+		*kvdb.StoreHandle) (*runtimeStoreHandle, error) {
+
+		builds.Add(1)
+		<-release
+
+		return &runtimeStoreHandle{
+			store:      &walletmock.Store{},
+			walletInfo: &db.WalletInfo{ID: 5},
+			closeFn:    func() error { return nil },
+		}, nil
+	}
+
+	m := NewManager()
+
+	// Act: fire many concurrent Loads of the same uncached name.
+	var (
+		wg      sync.WaitGroup
+		results = make([]*Wallet, loaders)
+		errs    = make([]error, loaders)
+	)
+
+	wg.Add(loaders)
+
+	for i := range loaders {
+		go func(i int) {
+			defer wg.Done()
+
+			results[i], errs[i] = m.Load(cfg)
+		}(i)
+	}
+
+	// Give the goroutines time to all block on the guard or the factory,
+	// then release the single build.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	wg.Wait()
+
+	// Assert: exactly one build ran, every Load succeeded, and all returned
+	// the identical instance, which is the one cached.
+	require.EqualValues(t, 1, builds.Load(),
+		"concurrent Loads must build the wallet exactly once")
+
+	first := results[0]
+	require.NotNil(t, first)
+
+	for i := range loaders {
+		require.NoError(t, errs[i])
+		require.Same(t, first, results[i],
+			"all concurrent Loads must return the same instance")
+	}
+
+	m.RLock()
+	cached := m.wallets[cfg.Name]
+	m.RUnlock()
+	require.Same(t, first, cached)
+
+	t.Cleanup(func() {
+		require.NoError(t, first.discardUnstarted())
+	})
 }
 
 // TestManagerLoadError verifies that Load properly handles invalid

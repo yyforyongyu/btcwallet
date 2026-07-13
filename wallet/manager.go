@@ -357,15 +357,17 @@ type Manager struct {
 	// seeding and initial-account import) has completed.
 	wallets map[string]*Wallet
 
-	// creating tracks the wallet names whose Create is in progress, keyed by
-	// name to a channel that is closed when the create completes (whether it
-	// published a wallet or failed and cleaned up). It guards the window
-	// between a wallet's durable rows being written and its post-load
-	// initialization finishing, during which the wallet is in a create-only
-	// state and must not be exposed through the cache. A concurrent Load or
-	// Create for the same name waits on the channel and then re-checks the
-	// cache, so no caller can observe or open a wallet that Create is still
-	// initializing.
+	// creating tracks the wallet names whose Create or Load is in progress,
+	// keyed by name to a channel that is closed when that operation completes
+	// (whether it published a wallet or failed and cleaned up). For a Create
+	// it guards the window between a wallet's durable rows being written and
+	// its post-load initialization finishing, during which the wallet is in a
+	// create-only state and must not be exposed through the cache. For a Load
+	// it serializes concurrent Loads of the same uncached name so only one
+	// opens the stores and publishes. A concurrent Load or Create for the
+	// same name waits on the channel and then re-checks the cache, so no
+	// caller can observe or open a wallet that another Create or Load is
+	// still building.
 	creating map[string]chan struct{}
 }
 
@@ -953,15 +955,25 @@ func (m *Manager) Load(cfg Config) (*Wallet, error) {
 		return nil, err
 	}
 
-	// Wait out any in-progress Create for this name before checking the
-	// cache, so Load never returns a wallet that Create is still
-	// initializing. awaitCreate returns the cached wallet if one is now
-	// published, or signals that we must build it ourselves (no live wallet
-	// and no create in flight).
-	existingW, ok := m.awaitCreate(cfg.Name)
-	if ok {
+	// Acquire the per-name in-flight guard before opening any store, so
+	// concurrent Loads of the same uncached name do not each build the
+	// wallet (opening duplicate stores) and each publish it (last writer
+	// wins, orphaning a live instance whose onStopped no longer matches the
+	// cached pointer). beginLoad also waits out any in-flight Create for the
+	// name so Load never returns a wallet Create is still initializing. It
+	// returns the cached wallet when one is already published (no build), or
+	// installs the guard and returns a release func this Load must invoke
+	// once it publishes or fails.
+	existingW, release, err := m.beginLoad(cfg.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	if existingW != nil {
 		return existingW, nil
 	}
+
+	defer release()
 
 	w, err := m.buildWallet(cfg)
 	if err != nil {
@@ -969,7 +981,9 @@ func (m *Manager) Load(cfg Config) (*Wallet, error) {
 	}
 
 	// Register the wallet. A wallet built here is immediately ready for
-	// runtime use, so it is published as soon as it is constructed.
+	// runtime use, so it is published as soon as it is constructed. The
+	// guard still holds the name, so concurrent Loads block until the
+	// deferred release, then observe this published instance.
 	m.publish(cfg.Name, w)
 
 	return w, nil
@@ -1102,18 +1116,18 @@ func (m *Manager) publish(name string, w *Wallet) {
 }
 
 // beginCreate claims the create-in-progress guard for name before any store is
-// opened or created. It coordinates a Create against both a wallet this
-// manager already has loaded and a concurrent Create of the same name:
+// opened or created. It shares the creating map with beginLoad, so it also
+// serializes against a concurrent Load of the same name:
 //
 //   - if the name is already published in the cache, the wallet is a live
 //     managed wallet and this is an over-create, so it returns ErrWalletExists
 //     immediately without touching any store (task 285);
-//   - if another Create for the same name holds the guard, it waits for that
-//     create to finish and then re-checks rather than opening the stores
-//     concurrently. The earlier create either published the wallet (now a
-//     cache hit, so ErrWalletExists) or failed before publishing (the durable
-//     rows may remain, so this call proceeds into the partial-create retry
-//     path);
+//   - if another Create or Load for the same name holds the guard, it waits
+//     for that operation to finish and then re-checks rather than opening the
+//     stores concurrently. The earlier operation either published the wallet
+//     (now a cache hit, so ErrWalletExists) or failed before publishing (the
+//     durable rows may remain, so this call proceeds into the partial-create
+//     retry path);
 //   - otherwise it installs the guard channel and returns a release func the
 //     caller must invoke once the create publishes or fails.
 //
@@ -1131,8 +1145,8 @@ func (m *Manager) beginCreate(name string) (func(), error) {
 			return nil, fmt.Errorf("%w: %q", ErrWalletExists, name)
 		}
 
-		// Another Create for this name is mid-flight. Wait for it to
-		// finish, then loop to re-evaluate: it may have published the
+		// Another Create or Load for this name is mid-flight. Wait for it
+		// to finish, then loop to re-evaluate: it may have published the
 		// wallet (cache hit above) or failed before publishing (proceed).
 		ch, ok := m.creating[name]
 		if !ok {
@@ -1161,30 +1175,59 @@ func (m *Manager) beginCreate(name string) (func(), error) {
 	return release, nil
 }
 
-// awaitCreate blocks until any in-progress Create for name has finished, so a
-// Load never races a Create's publish. It returns the cached wallet if one is
-// present once no create is in flight; ok is false when the name is neither
-// cached nor being created, signaling the caller to build the wallet itself.
-func (m *Manager) awaitCreate(name string) (*Wallet, bool) {
+// beginLoad claims the per-name in-flight guard on behalf of Load, serializing
+// a Load against a concurrent Create or Load of the same name so at most one of
+// them opens the wallet's stores. It shares the creating map that beginCreate
+// uses, so all three coordinate on the same channel.
+//
+//   - If the name is already published, it returns that cached wallet with a
+//     nil release func; the caller returns it directly and does not build.
+//   - If a Create or Load for the name is mid-flight, it waits for that guard
+//     to release and then re-checks: the other caller either published the
+//     wallet (now a cache hit) or failed before publishing (this Load
+//     proceeds to build it).
+//   - Otherwise it installs the guard channel and returns a nil wallet plus a
+//     release func the caller must invoke once it publishes or fails.
+//
+// Unlike beginCreate it never rejects an already-cached wallet: Load's contract
+// is to return the live instance, not to fail on it. The returned release func
+// is idempotent.
+func (m *Manager) beginLoad(name string) (*Wallet, func(), error) {
 	m.Lock()
 	defer m.Unlock()
 
 	for {
 		if w, ok := m.wallets[name]; ok {
-			return w, true
+			return w, nil, nil
 		}
 
+		// A Create or Load for this name is in flight. Wait for it to
+		// publish or fail, then loop to re-check the cache.
 		ch, ok := m.creating[name]
 		if !ok {
-			return nil, false
+			break
 		}
 
-		// A Create for this name is initializing the wallet. Wait for it
-		// to publish or fail before re-checking the cache.
 		m.Unlock()
 		<-ch
 		m.Lock()
 	}
+
+	ch := make(chan struct{})
+	m.creating[name] = ch
+
+	var once sync.Once
+
+	release := func() {
+		once.Do(func() {
+			m.Lock()
+			delete(m.creating, name)
+			close(ch)
+			m.Unlock()
+		})
+	}
+
+	return nil, release, nil
 }
 
 // prepareWalletCreation validates the configuration and parameters, and derives
