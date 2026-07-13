@@ -83,6 +83,24 @@ WHERE
         )
     );
 
+-- name: GetAccountSecretById :one
+-- Returns account-level key material for signing, selected by account id. The
+-- account row is returned even when no account_secrets row exists so callers
+-- can distinguish a watch-only account from an absent account.
+SELECT
+    a.wallet_id,
+    ks.purpose,
+    ks.coin_type,
+    a.account_number,
+    a.account_name,
+    a.public_key,
+    acs.encrypted_private_key,
+    a.master_fingerprint
+FROM accounts AS a
+INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
+LEFT JOIN account_secrets AS acs ON a.id = acs.account_id
+WHERE a.wallet_id = $1 AND a.id = $2;
+
 -- name: GetAccountByScopeAndName :one
 -- Returns a single account by scope id and account name.
 SELECT

@@ -7,14 +7,23 @@ import "errors"
 var ErrAccountSecretUnavailable = errors.New("account secret unavailable")
 
 // Validate checks whether a GetAccountSecretQuery identifies exactly one
-// account selector.
+// account selector among AccountID, Name, and AccountNumber.
 func (query GetAccountSecretQuery) Validate() error {
-	if query.Name == nil && query.AccountNumber == nil {
-		return ErrInvalidAccountQuery
+	var selectors int
+	if query.AccountID != nil {
+		selectors++
 	}
 
-	if query.Name != nil && query.AccountNumber != nil {
-		return ErrInvalidAccountQuery
+	if query.Name != nil {
+		selectors++
+	}
+
+	if query.AccountNumber != nil {
+		selectors++
+	}
+
+	if selectors != 1 {
+		return ErrInvalidQuery
 	}
 
 	return nil

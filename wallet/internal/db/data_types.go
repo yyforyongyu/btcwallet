@@ -611,14 +611,18 @@ type GetAccountQuery struct {
 }
 
 // GetAccountSecretQuery contains the parameters for querying account-level
-// signing material. The query must specify either the account name or the
-// account number within the provided wallet and scope.
+// signing material. The query must specify exactly one account selector
+// (AccountID, Name, or AccountNumber) within the provided wallet and scope.
 type GetAccountSecretQuery struct {
 	// WalletID is the ID of the wallet to query.
 	WalletID uint32
 
 	// Scope is the key scope of the account.
 	Scope KeyScope
+
+	// AccountID is a store-local account row identity selector; SQL maps it
+	// to accounts.id, kvdb to the durable walletdb account number.
+	AccountID *uint32
 
 	// Name is the name of the account to query. If nil, the query uses
 	// AccountNumber.
@@ -883,7 +887,8 @@ type ResolveOwnedAddressesQuery struct {
 
 // GetAddressSecretQuery contains the parameters for querying an address
 // secret. The query is wallet-scoped: it retrieves the encrypted secret
-// material for a specific address within a wallet.
+// material for a specific address within a wallet. Exactly one selector
+// (AddressID or ScriptPubKey) must be provided.
 type GetAddressSecretQuery struct {
 	// WalletID is the ID of the wallet to query.
 	//
@@ -891,8 +896,13 @@ type GetAddressSecretQuery struct {
 	// databases (signed 64-bit integers).
 	WalletID uint32
 
-	// AddressID is the ID of the address whose secret should be fetched.
-	AddressID uint32
+	// AddressID is the store-local address row identity selector. If nil,
+	// the query uses ScriptPubKey.
+	AddressID *uint32
+
+	// ScriptPubKey is the script pubkey selector for the address whose
+	// secret should be fetched. If empty, the query uses AddressID.
+	ScriptPubKey []byte
 }
 
 // ListAddressesQuery contains the parameters for listing addresses.

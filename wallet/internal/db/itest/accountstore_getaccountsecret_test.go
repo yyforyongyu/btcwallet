@@ -94,3 +94,86 @@ func TestGetAccountSecret(t *testing.T) {
 	)
 	require.ErrorIs(t, err, db.ErrAccountNotFound)
 }
+
+// TestGetAccountSecretByID verifies the AccountID selector of GetAccountSecret
+// resolves the same account row as the AccountNumber selector for a SQL store,
+// where AccountID maps to the durable accounts.id primary key, and reports
+// ErrAccountNotFound for an unknown id.
+func TestGetAccountSecretByID(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+	walletID := newWallet(t, store, "wallet-get-account-secret-by-id")
+	scope := db.KeyScopeBIP0084
+	pubKey := []byte("derived-account-pubkey")
+	privKey := []byte("encrypted-account-privkey")
+
+	const fingerprint = uint32(0xAABBCCDD)
+
+	const name = "derived-by-id"
+
+	derived, err := store.CreateDerivedAccount(
+		t.Context(), db.CreateDerivedAccountParams{
+			WalletID: walletID,
+			Scope:    scope,
+			Name:     name,
+		}, func(_ context.Context, _ db.KeyScope, _ uint32,
+			walletIsWatchOnly bool) (*db.DerivedAccountData, error) {
+
+			require.False(t, walletIsWatchOnly)
+
+			return &db.DerivedAccountData{
+				PublicKey:            pubKey,
+				EncryptedPrivateKey:  privKey,
+				MasterKeyFingerprint: fingerprint,
+			}, nil
+		},
+	)
+	require.NoError(t, err)
+
+	// The AccountID selector is the durable accounts.id primary key for the
+	// SQL store, resolved here through the same scope-and-name lookup the
+	// store uses internally.
+	scopeID := GetKeyScopeID(t, queries, walletID, scope)
+	accountID := uint32(GetAccountID(t, queries, scopeID, name))
+
+	byID, err := store.GetAccountSecret(
+		t.Context(), db.GetAccountSecretQuery{
+			WalletID:  walletID,
+			Scope:     scope,
+			AccountID: &accountID,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, walletID, byID.WalletID)
+	require.Equal(t, scope, byID.Scope)
+	require.Equal(t, *derived.AccountNumber, byID.AccountNumber)
+	require.Equal(t, name, byID.AccountName)
+	require.Equal(t, pubKey, byID.PublicKey)
+	require.Equal(t, privKey, byID.EncryptedPrivateKey)
+	require.Equal(t, fingerprint, byID.MasterKeyFingerprint)
+
+	// The AccountID selector must resolve the same account row as the
+	// AccountNumber selector.
+	byNumber, err := store.GetAccountSecret(
+		t.Context(), db.GetAccountSecretQuery{
+			WalletID:      walletID,
+			Scope:         scope,
+			AccountNumber: derived.AccountNumber,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, byNumber, byID)
+
+	// An unknown account id maps to ErrAccountNotFound.
+	missing := uint32(999)
+	_, err = store.GetAccountSecret(
+		t.Context(), db.GetAccountSecretQuery{
+			WalletID:  walletID,
+			Scope:     scope,
+			AccountID: &missing,
+		},
+	)
+	require.ErrorIs(t, err, db.ErrAccountNotFound)
+}

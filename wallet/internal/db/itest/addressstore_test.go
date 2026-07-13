@@ -307,10 +307,11 @@ func TestNewImportedAddress(t *testing.T) {
 				t, queries, params.ScriptPubKey, walletID,
 			)
 
+			addrID := uint32(addressID)
 			secret, err := store.GetAddressSecret(
 				t.Context(), db.GetAddressSecretQuery{
 					WalletID:  walletID,
-					AddressID: uint32(addressID),
+					AddressID: &addrID,
 				},
 			)
 
@@ -325,6 +326,104 @@ func TestNewImportedAddress(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGetAddressSecretByScriptPubKey verifies the ScriptPubKey selector of
+// GetAddressSecret: it returns encrypted private-key material, encrypted
+// script material, a not-found-secret error for a watch-only address, and a
+// not-found-address error for an unknown script.
+func TestGetAddressSecretByScriptPubKey(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+
+	// An imported address with a private key resolves to its ciphertext.
+	privKeyWalletID := newWallet(t, store, "wallet-secret-by-script-key")
+	privKeyScript := RandomBytes(32)
+	encryptedPrivKey := RandomBytes(32)
+	_, err := store.NewImportedAddress(
+		t.Context(), db.NewImportedAddressParams{
+			WalletID:            privKeyWalletID,
+			AddressType:         db.WitnessPubKey,
+			PubKey:              RandomBytes(33),
+			ScriptPubKey:        privKeyScript,
+			EncryptedPrivateKey: encryptedPrivKey,
+		},
+	)
+	require.NoError(t, err)
+
+	secret, err := store.GetAddressSecret(
+		t.Context(), db.GetAddressSecretQuery{
+			WalletID:     privKeyWalletID,
+			ScriptPubKey: privKeyScript,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, encryptedPrivKey, secret.EncryptedPrivKey)
+	require.Empty(t, secret.EncryptedScript)
+
+	// An imported script address (no private key) resolves to its encrypted
+	// script. A script-only import carries no private-key material, so it
+	// must land in a watch-only wallet.
+	scriptWalletID := newWatchOnlyWallet(
+		t, store, "wallet-secret-by-script-script",
+	)
+	scriptScript := RandomBytes(32)
+	encryptedScript := RandomBytes(48)
+	_, err = store.NewImportedAddress(
+		t.Context(), db.NewImportedAddressParams{
+			WalletID:        scriptWalletID,
+			AddressType:     db.ScriptHash,
+			PubKey:          RandomBytes(33),
+			ScriptPubKey:    scriptScript,
+			EncryptedScript: encryptedScript,
+		},
+	)
+	require.NoError(t, err)
+
+	secret, err = store.GetAddressSecret(
+		t.Context(), db.GetAddressSecretQuery{
+			WalletID:     scriptWalletID,
+			ScriptPubKey: scriptScript,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, encryptedScript, secret.EncryptedScript)
+	require.Empty(t, secret.EncryptedPrivKey)
+
+	// A watch-only imported address exists but carries no secret material,
+	// which the contract represents as ErrSecretNotFound.
+	watchOnlyWalletID := newWatchOnlyWallet(
+		t, store, "wallet-secret-by-script-watch-only",
+	)
+	watchOnlyScript := RandomBytes(32)
+	_, err = store.NewImportedAddress(
+		t.Context(), db.NewImportedAddressParams{
+			WalletID:     watchOnlyWalletID,
+			AddressType:  db.WitnessPubKey,
+			PubKey:       RandomBytes(33),
+			ScriptPubKey: watchOnlyScript,
+		},
+	)
+	require.NoError(t, err)
+
+	_, err = store.GetAddressSecret(
+		t.Context(), db.GetAddressSecretQuery{
+			WalletID:     watchOnlyWalletID,
+			ScriptPubKey: watchOnlyScript,
+		},
+	)
+	require.ErrorIs(t, err, db.ErrSecretNotFound)
+
+	// A script that was never imported has no address row, which maps to
+	// ErrAddressNotFound.
+	_, err = store.GetAddressSecret(
+		t.Context(), db.GetAddressSecretQuery{
+			WalletID:     privKeyWalletID,
+			ScriptPubKey: RandomBytes(32),
+		},
+	)
+	require.ErrorIs(t, err, db.ErrAddressNotFound)
 }
 
 // TestImportedAddressUsesAliasWithoutAccount documents the SQL import policy
@@ -509,10 +608,11 @@ func TestNewImportedAddressWithEncryptedScript(t *testing.T) {
 				t, queries, params.ScriptPubKey, walletID,
 			)
 
+			addrID := uint32(addressID)
 			secret, err := store.GetAddressSecret(
 				t.Context(), db.GetAddressSecretQuery{
 					WalletID:  walletID,
-					AddressID: uint32(addressID),
+					AddressID: &addrID,
 				},
 			)
 			require.NoError(t, err)
@@ -553,10 +653,11 @@ func TestNewImportedAddressNormalizesEmptyPrivateKey(t *testing.T) {
 	require.NotNil(t, info)
 	require.True(t, info.IsWatchOnly)
 
+	addrID := info.ID
 	secret, err := store.GetAddressSecret(
 		t.Context(), db.GetAddressSecretQuery{
 			WalletID:  walletID,
-			AddressID: info.ID,
+			AddressID: &addrID,
 		},
 	)
 	require.NoError(t, err)
@@ -860,10 +961,11 @@ func TestWatchOnlyAddressSecretTriggers(t *testing.T) {
 		)
 		require.NoError(t, err)
 
+		addrID := info.ID
 		secret, err := store.GetAddressSecret(
 			t.Context(), db.GetAddressSecretQuery{
 				WalletID:  walletID,
-				AddressID: info.ID,
+				AddressID: &addrID,
 			},
 		)
 		require.NoError(t, err)
@@ -1323,10 +1425,11 @@ func TestGetAddressSecret(t *testing.T) {
 			require.NoError(t, errNewAddr)
 
 			if tc.shouldHaveSecret {
+				addrID := info.ID
 				secret, err := store.GetAddressSecret(
 					t.Context(), db.GetAddressSecretQuery{
 						WalletID:  walletID,
-						AddressID: info.ID,
+						AddressID: &addrID,
 					},
 				)
 				require.NoError(t, err)
@@ -1337,10 +1440,11 @@ func TestGetAddressSecret(t *testing.T) {
 				)
 				require.Empty(t, secret.EncryptedScript)
 			} else {
+				addrID := info.ID
 				_, err := store.GetAddressSecret(
 					t.Context(), db.GetAddressSecretQuery{
 						WalletID:  walletID,
-						AddressID: info.ID,
+						AddressID: &addrID,
 					},
 				)
 				require.ErrorIs(t, err, db.ErrSecretNotFound)
@@ -1364,10 +1468,11 @@ func TestGetAddressSecret(t *testing.T) {
 		info, err := store.NewImportedAddress(t.Context(), params)
 		require.NoError(t, err)
 
+		addrID := info.ID
 		_, err = store.GetAddressSecret(
 			t.Context(), db.GetAddressSecretQuery{
 				WalletID:  otherWalletID,
-				AddressID: info.ID,
+				AddressID: &addrID,
 			},
 		)
 		require.ErrorIs(t, err, db.ErrAddressNotFound)
@@ -1377,10 +1482,11 @@ func TestGetAddressSecret(t *testing.T) {
 	t.Run("non-existent address", func(t *testing.T) {
 		walletID := newWallet(t, store, "wallet-secrets-nonexistent")
 
+		addrID := uint32(999999)
 		_, err := store.GetAddressSecret(
 			t.Context(), db.GetAddressSecretQuery{
 				WalletID:  walletID,
-				AddressID: 999999,
+				AddressID: &addrID,
 			},
 		)
 		require.ErrorIs(t, err, db.ErrAddressNotFound)
@@ -2385,10 +2491,11 @@ func TestGetAddressSecret_DerivedAddress(t *testing.T) {
 
 	// Attempt to get secret for derived address.
 	// Derived addresses have no row in address_secrets table.
+	addrID := addrInfo.ID
 	_, err = store.GetAddressSecret(
 		t.Context(), db.GetAddressSecretQuery{
 			WalletID:  walletID,
-			AddressID: addrInfo.ID,
+			AddressID: &addrID,
 		},
 	)
 

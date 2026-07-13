@@ -20,6 +20,10 @@ func (s *Store) GetAccountSecret(ctx context.Context,
 		return nil, err
 	}
 
+	if query.AccountID != nil {
+		return s.getAccountSecretByID(ctx, query)
+	}
+
 	var secret *db.AccountSecret
 
 	err = s.execRead(ctx, func(q *sqlc.Queries) error {
@@ -45,38 +49,107 @@ func (s *Store) GetAccountSecret(ctx context.Context,
 	return secret, nil
 }
 
+// getAccountSecretByID resolves account-level signing material through the
+// accounts.id selector. A missing account row maps to db.ErrAccountNotFound.
+func (s *Store) getAccountSecretByID(ctx context.Context,
+	query db.GetAccountSecretQuery) (*db.AccountSecret, error) {
+
+	var secret *db.AccountSecret
+
+	err := s.execRead(ctx, func(q *sqlc.Queries) error {
+		row, err := q.GetAccountSecretById(
+			ctx, sqlc.GetAccountSecretByIdParams{
+				WalletID: int64(query.WalletID),
+				ID:       int64(*query.AccountID),
+			},
+		)
+		if err != nil {
+			return mapGetAccountSecretErr(err, query)
+		}
+
+		secret, err = accountSecretRowToInfo(row)
+
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return secret, nil
+}
+
+// accountSecretRow is a type constraint union of the SQLite account-secret
+// row types that share the same field structure, letting a single generic
+// conversion handle both the scope-selector and account-id-selector queries.
+type accountSecretRow interface {
+	sqlc.GetAccountSecretRow | sqlc.GetAccountSecretByIdRow
+}
+
 // accountSecretRowToInfo converts a SQLite account-secret row to the
 // backend-independent AccountSecret shape.
-func accountSecretRowToInfo(
-	row sqlc.GetAccountSecretRow) (*db.AccountSecret, error) {
+func accountSecretRowToInfo[T accountSecretRow](
+	row T) (*db.AccountSecret, error) {
 
-	walletID, err := db.Int64ToUint32(row.WalletID)
+	var (
+		walletID            int64
+		purpose             int64
+		coinType            int64
+		accountNumber       sql.NullInt64
+		accountName         string
+		publicKey           []byte
+		encryptedPrivateKey []byte
+		masterFingerprint   sql.NullInt64
+	)
+
+	switch base := any(row).(type) {
+	case sqlc.GetAccountSecretRow:
+		walletID = base.WalletID
+		purpose = base.Purpose
+		coinType = base.CoinType
+		accountNumber = base.AccountNumber
+		accountName = base.AccountName
+		publicKey = base.PublicKey
+		encryptedPrivateKey = base.EncryptedPrivateKey
+		masterFingerprint = base.MasterFingerprint
+
+	case sqlc.GetAccountSecretByIdRow:
+		walletID = base.WalletID
+		purpose = base.Purpose
+		coinType = base.CoinType
+		accountNumber = base.AccountNumber
+		accountName = base.AccountName
+		publicKey = base.PublicKey
+		encryptedPrivateKey = base.EncryptedPrivateKey
+		masterFingerprint = base.MasterFingerprint
+	}
+
+	walletIDVal, err := db.Int64ToUint32(walletID)
 	if err != nil {
 		return nil, fmt.Errorf("wallet ID: %w", err)
 	}
 
-	purpose, err := db.Int64ToUint32(row.Purpose)
+	purposeVal, err := db.Int64ToUint32(purpose)
 	if err != nil {
 		return nil, fmt.Errorf("scope purpose: %w", err)
 	}
 
-	coin, err := db.Int64ToUint32(row.CoinType)
+	coin, err := db.Int64ToUint32(coinType)
 	if err != nil {
 		return nil, fmt.Errorf("scope coin type: %w", err)
 	}
 
-	var accountNumber uint32
-	if row.AccountNumber.Valid {
-		accountNumber, err = db.Int64ToUint32(row.AccountNumber.Int64)
+	var accountNumberVal uint32
+	if accountNumber.Valid {
+		accountNumberVal, err = db.Int64ToUint32(accountNumber.Int64)
 		if err != nil {
 			return nil, fmt.Errorf("account number: %w", err)
 		}
 	}
 
-	var masterFingerprint uint32
-	if row.MasterFingerprint.Valid {
-		masterFingerprint, err = db.Int64ToUint32(
-			row.MasterFingerprint.Int64,
+	var masterFingerprintVal uint32
+	if masterFingerprint.Valid {
+		masterFingerprintVal, err = db.Int64ToUint32(
+			masterFingerprint.Int64,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("master fingerprint: %w", err)
@@ -84,13 +157,15 @@ func accountSecretRowToInfo(
 	}
 
 	return &db.AccountSecret{
-		WalletID:             walletID,
-		Scope:                db.KeyScope{Purpose: purpose, Coin: coin},
-		AccountNumber:        accountNumber,
-		AccountName:          row.AccountName,
-		PublicKey:            row.PublicKey,
-		EncryptedPrivateKey:  row.EncryptedPrivateKey,
-		MasterKeyFingerprint: masterFingerprint,
+		WalletID: walletIDVal,
+		Scope: db.KeyScope{
+			Purpose: purposeVal, Coin: coin,
+		},
+		AccountNumber:        accountNumberVal,
+		AccountName:          accountName,
+		PublicKey:            publicKey,
+		EncryptedPrivateKey:  encryptedPrivateKey,
+		MasterKeyFingerprint: masterFingerprintVal,
 	}, nil
 }
 
@@ -103,13 +178,19 @@ func mapGetAccountSecretErr(err error,
 		return fmt.Errorf("get account secret: %w", err)
 	}
 
-	if query.Name != nil {
+	switch {
+	case query.AccountID != nil:
+		return fmt.Errorf("account id %d in wallet %d: %w",
+			*query.AccountID, query.WalletID, db.ErrAccountNotFound)
+
+	case query.Name != nil:
 		return fmt.Errorf("account %q in scope %d/%d: %w", *query.Name,
 			query.Scope.Purpose, query.Scope.Coin,
 			db.ErrAccountNotFound)
-	}
 
-	return fmt.Errorf("account %d in scope %d/%d: %w",
-		*query.AccountNumber, query.Scope.Purpose, query.Scope.Coin,
-		db.ErrAccountNotFound)
+	default:
+		return fmt.Errorf("account %d in scope %d/%d: %w",
+			*query.AccountNumber, query.Scope.Purpose,
+			query.Scope.Coin, db.ErrAccountNotFound)
+	}
 }

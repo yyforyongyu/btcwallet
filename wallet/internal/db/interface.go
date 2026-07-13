@@ -21,6 +21,11 @@ var (
 	// in the database.
 	ErrSecretNotFound = errors.New("secret not found")
 
+	// ErrInvalidQuery is returned when a query does not identify its target
+	// with exactly one selector (either zero or more than one selector was
+	// provided).
+	ErrInvalidQuery = errors.New("invalid query")
+
 	// ErrWatchOnlyViolation is returned when an operation violates watch-only
 	// invariants. Watch-only means the wallet or address lacks private key
 	// material and cannot sign transactions.

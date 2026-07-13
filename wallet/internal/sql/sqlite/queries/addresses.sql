@@ -100,6 +100,20 @@ FROM addresses AS a
 LEFT JOIN address_secrets AS s ON a.id = s.address_id
 WHERE a.wallet_id = ? AND a.id = ?;
 
+-- name: GetAddressSecretByScriptPubKey :one
+-- Retrieves secret information for an address by its script pubkey. Uses
+-- LEFT JOIN to distinguish:
+-- - Address exists with secret: returns full row
+-- - Address exists without secret row: returns row with NULL secret fields
+-- - Address does not exist: returns no rows (sql.ErrNoRows)
+SELECT
+    a.id AS address_id,
+    s.encrypted_priv_key,
+    s.encrypted_script
+FROM addresses AS a
+LEFT JOIN address_secrets AS s ON a.id = s.address_id
+WHERE a.wallet_id = ? AND a.script_pub_key = ?;
+
 -- name: CreateDerivedAddress :one
 -- Creates the parent address row for an HD-derived address. The caller inserts
 -- the path and account ownership into derived_addresses in the same transaction.

@@ -453,12 +453,120 @@ func (s *Store) IterAddresses(ctx context.Context,
 	)
 }
 
-// GetAddressSecret is not yet implemented for kvdb.
-func (s *Store) GetAddressSecret(ctx context.Context,
-	_ db.GetAddressSecretQuery) (*db.AddressSecret, error) {
-
-	return nil, notImplemented(ctx, "GetAddressSecret")
+// addressSecretReader is the narrow slice of *waddrmgr.ScopedKeyManager that
+// GetAddressSecret needs. ManagedAddressSecret lives on the concrete type
+// rather than the AccountStore interface, so kvdb asserts to this local
+// interface (mirroring accountSecretReader) instead of widening AccountStore.
+type addressSecretReader interface {
+	// ManagedAddressSecret returns the encrypted private key and encrypted
+	// script for an address, both nil when the address exists but carries
+	// no secret material.
+	ManagedAddressSecret(ns walletdb.ReadBucket,
+		addr address.Address) ([]byte, []byte, error)
 }
+
+// GetAddressSecret retrieves the encrypted secret material for an address.
+// kvdb is queried by script pubkey: it converts the script to a standard
+// address, resolves the owning scoped key manager across the active scopes,
+// and reads the persisted ciphertext without decrypting it. An address that
+// resolves but has no secret, and one that does not resolve at all, both map
+// to ErrSecretNotFound.
+func (s *Store) GetAddressSecret(_ context.Context,
+	query db.GetAddressSecretQuery) (*db.AddressSecret, error) {
+
+	// kvdb has no synthetic per-address row identity, so it can only be
+	// queried by script pubkey; AddressID-based lookups are SQL-only.
+	if query.AddressID != nil {
+		return nil, db.ErrSecretNotFound
+	}
+
+	if len(query.ScriptPubKey) == 0 {
+		return nil, db.ErrSecretNotFound
+	}
+
+	addr := addressFromScript(query.ScriptPubKey, s.addrStore.ChainParams())
+	if addr == nil {
+		return nil, db.ErrSecretNotFound
+	}
+
+	var secret *db.AddressSecret
+
+	err := walletdb.View(s.db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgr.NamespaceKey)
+		if ns == nil {
+			return errMissingAddrmgrNamespace
+		}
+
+		var err error
+
+		secret, err = s.buildAddressSecret(ns, addr)
+
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return secret, nil
+}
+
+// buildAddressSecret resolves the owning scoped key manager for addr within
+// the given namespace and returns its encrypted secret material. It is the
+// read body of GetAddressSecret, factored out so the exported method stays
+// thin. An address that resolves but carries no secret maps to
+// ErrSecretNotFound.
+func (s *Store) buildAddressSecret(ns walletdb.ReadBucket,
+	addr address.Address) (*db.AddressSecret, error) {
+
+	// AddrAccount iterates the active scoped managers and returns the one
+	// that owns the address, so the caller need not know its scope in
+	// advance.
+	scopedMgr, _, err := s.addrStore.AddrAccount(ns, addr)
+	if err != nil {
+		if waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound) {
+			return nil, db.ErrSecretNotFound
+		}
+
+		return nil, fmt.Errorf("lookup address account: %w", err)
+	}
+
+	reader, ok := scopedMgr.(addressSecretReader)
+	if !ok {
+		return nil, errScopedAddressSecretUnsupported
+	}
+
+	encPriv, encScript, err := reader.ManagedAddressSecret(ns, addr)
+	if err != nil {
+		if waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound) {
+			return nil, db.ErrSecretNotFound
+		}
+
+		return nil, fmt.Errorf("read address secret: %w", err)
+	}
+
+	// A resolved address with neither ciphertext has no secret to return,
+	// which the contract represents as ErrSecretNotFound.
+	if encPriv == nil && encScript == nil {
+		return nil, db.ErrSecretNotFound
+	}
+
+	return &db.AddressSecret{
+		// kvdb has no synthetic address row identity.
+		AddressID:        0,
+		EncryptedPrivKey: encPriv,
+		EncryptedScript:  encScript,
+	}, nil
+}
+
+// errScopedAddressSecretUnsupported is returned when a mocked or alternate
+// scoped manager does not expose kvdb's encrypted-address-secret reader.
+var errScopedAddressSecretUnsupported = errors.New(
+	"kvdb: scoped address secret export unsupported",
+)
+
+// compile-time guard: the concrete waddrmgr scoped manager satisfies the
+// narrow reader interface GetAddressSecret asserts to.
+var _ addressSecretReader = (*waddrmgr.ScopedKeyManager)(nil)
 
 // ListAddressTypes returns the static set of address types supported by the
 // store contract.
