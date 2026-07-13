@@ -221,7 +221,10 @@ func (w *Wallet) Start(startCtx context.Context) error {
 	// is never observed as started.
 	if w.stopRequested.Load() {
 		w.cancel()
-		w.finishStop()
+
+		// The store-close error is already logged inside finishStop;
+		// this path returns its own abort error.
+		_ = w.finishStop()
 
 		return fmt.Errorf("%w: start aborted by concurrent stop",
 			ErrStateForbidden)
@@ -248,10 +251,12 @@ func (w *Wallet) Start(startCtx context.Context) error {
 	aborted, err := w.state.finalizeStart(&w.stopRequested)
 	if err != nil {
 		// A concurrent stop moved us out of Starting after we launched
-		// the workers; cancel, wait for them to exit, and finalize.
+		// the workers; cancel, wait for them to exit, and finalize. The
+		// store-close error is logged inside finishStop; this path
+		// returns the finalize error.
 		w.cancel()
 		w.wg.Wait()
-		w.finishStop()
+		_ = w.finishStop()
 
 		return err
 	}
@@ -272,7 +277,10 @@ func (w *Wallet) Start(startCtx context.Context) error {
 
 		w.cancel()
 		w.wg.Wait()
-		w.finishStop()
+
+		// The store-close error is logged inside finishStop; this path
+		// returns its own abort error.
+		_ = w.finishStop()
 
 		return fmt.Errorf("%w: start aborted by concurrent stop",
 			ErrStateForbidden)
@@ -404,22 +412,28 @@ func (w *Wallet) Stop(stopCtx context.Context) error {
 	// and the stop is a no-op.
 	transitioned, deferred := w.state.requestStop(&w.stopRequested)
 	if !transitioned {
-		// The wallet was still Starting, so we could not own the
-		// teardown; we recorded the intent and the in-flight Start will
-		// perform it. Honor the documented contract that Stop blocks
-		// until the wallet has fully exited by waiting for that Start to
-		// drive the lifecycle to Stopped before returning, rather than
-		// reporting completion while teardown is still in flight.
-		if deferred {
-			return w.waitForStopped(stopCtx)
+		// We did not win the Started->Stopping transition, so we do not
+		// own the teardown. In every non-owning case the documented
+		// contract still requires Stop to block until the wallet has
+		// fully exited, so wait for the terminal Stopped state rather
+		// than returning while a shutdown is still in flight:
+		//
+		//   - deferred: the wallet was still Starting, so we recorded
+		//     the stop intent and the in-flight Start will run the
+		//     teardown; wait for it to drive the lifecycle to Stopped.
+		//   - already Stopping: another Stop is already driving the
+		//     teardown; wait for it to finish rather than reporting a
+		//     premature completion (a Stop that returns must mean the
+		//     wallet has fully exited).
+		//   - already Stopped (or never started): waitForStopped
+		//     fast-paths on isStopped and returns immediately, so the
+		//     stop stays a no-op.
+		if !deferred {
+			log.Debugf("Stop requested while not started: %v",
+				&w.state)
 		}
 
-		// A false/false return means the wallet was already stopping or
-		// stopped, so there is nothing to wait on and the stop is a
-		// no-op.
-		log.Warnf("Stop requested while not started: %v", &w.state)
-
-		return nil
+		return w.waitForStopped(stopCtx)
 	}
 
 	// Signal all background processes to stop. Safe and idempotent: the
@@ -429,18 +443,22 @@ func (w *Wallet) Stop(stopCtx context.Context) error {
 
 	// Finalize the shutdown in the background so a cancelled stopCtx cannot
 	// abandon the transition to Stopped, which would otherwise wedge a
-	// later restart.
+	// later restart. finishStop reports the store-close error so a caller
+	// that blocks to completion learns the close failed even though the
+	// wallet is still evicted and marked terminal.
+	var stopErr error
+
 	done := make(chan struct{})
 	go func() {
 		w.wg.Wait()
-		w.finishStop()
+		stopErr = w.finishStop()
 
 		close(done)
 	}()
 
 	select {
 	case <-done:
-		return nil
+		return stopErr
 
 	case <-stopCtx.Done():
 		return fmt.Errorf("stop request cancelled: %w", stopCtx.Err())
@@ -448,12 +466,16 @@ func (w *Wallet) Stop(stopCtx context.Context) error {
 }
 
 // waitForStopped blocks until the wallet's lifecycle reaches Stopped, i.e.
-// until the in-flight Start that owns the deferred teardown has run
-// finishStop. It returns nil once stopped, or a context-aware error if stopCtx
-// fires first. The lifecycle is polled rather than waited on a dedicated
-// signal because Stop deferred ownership of the teardown to Start; finishStop
-// (run by that Start) is the single writer that drives the lifecycle to
-// Stopped, and every one of Start's abort paths ends by calling it.
+// until whichever goroutine owns the teardown has run finishStop. It returns
+// nil once stopped, or a context-aware error if stopCtx fires first. It is
+// used by every Stop that does not itself own the teardown: one that deferred
+// to an in-flight Start, one that arrived while another Stop is already
+// stopping, and one on an already-stopped (or never-started) wallet, which the
+// isStopped fast path returns immediately. The lifecycle is polled rather than
+// waited on a dedicated signal because finishStop (run by the sole teardown
+// owner) is the single writer that drives the lifecycle to Stopped only after
+// the stores are closed and the manager cache entry is evicted, so a caller
+// that observes Stopped here is guaranteed the teardown has fully completed.
 func (w *Wallet) waitForStopped(stopCtx context.Context) error {
 	// Fast path: the in-flight Start may already have finished tearing down
 	// by the time we get here, so avoid arming a timer in the common case.
@@ -478,37 +500,72 @@ func (w *Wallet) waitForStopped(stopCtx context.Context) error {
 	}
 }
 
-// finishStop completes a shutdown: it marks the wallet stopped, closes owned
-// stores, and runs the deregister hook. The toStopped CAS succeeds for exactly
-// one caller (from Stopping or Starting), so the teardown runs at most once
-// even if Stop's waiter and Start's abort path both reach here.
-func (w *Wallet) finishStop() {
-	// Mark the instance terminal BEFORE flipping the lifecycle to Stopped.
-	// toStopped re-enables the Stopped->Starting transition, so a Start
-	// racing to restart this pointer could win that CAS the instant the
-	// lifecycle flips. Setting stopped first guarantees that such a Start
-	// observes stopped==true in its post-toStarting guard and fails fast
-	// with ErrWalletStopped instead of running setup against the stores
-	// this function is about to close. stopped is monotone, so setting it
-	// before the CAS (which still admits exactly one teardown owner) is
-	// safe even when toStopped reports another caller already stopped.
+// finishStop completes a shutdown: it clears in-memory secret material,
+// evicts the wallet from the manager cache, closes owned stores, and only then
+// flips the lifecycle to the terminal Stopped state. It returns the
+// store-close error so Stop can surface a failed close to its caller.
+//
+// Exactly one goroutine drives finishStop per lifecycle: a Stop that won the
+// Started->Stopping transition, or the single in-flight Start that owns an
+// aborted start. The two are mutually exclusive (a Stop can only win the
+// transition once the start has finalized to Started, at which point that
+// start no longer takes an abort path), so the teardown body runs once even
+// though closeRuntimeStore is itself idempotent.
+//
+// Ordering matters. The observable Stopped transition (what isStopped and
+// waitForStopped read, and what re-enables a Stopped->Starting restart) runs
+// last, after the stores are closed and the cache entry is evicted. Flipping
+// Stopped earlier would let a concurrent waitForStopped report a completed
+// shutdown, or a Load hand back this cached instance, while its stores were
+// still open/closing.
+func (w *Wallet) finishStop() error {
+	// Mark the instance terminal FIRST. stopped is monotone and gates a
+	// restart onto this pointer: a Start racing to reuse it observes
+	// stopped==true in its post-toStarting guard and fails fast with
+	// ErrWalletStopped rather than running setup against the stores this
+	// function is about to close. The lifecycle is still Stopping/Starting
+	// here (toStopped runs last), so beginStart's Stopped->Starting CAS
+	// cannot even succeed until the teardown below has completed.
 	w.stopped.Store(true)
 
-	err := w.state.toStopped()
-	if err != nil {
-		log.Warnf("Failed to mark wallet stopped: %v", err)
-
-		return
+	// Clear decrypted secret material before touching the stores so a
+	// terminal wallet does not keep spend-capable keys resident in memory.
+	// Both are idempotent and operate purely in memory, so they are safe to
+	// run before the durable stores are closed.
+	if w.keyVault != nil {
+		w.keyVault.Lock()
 	}
 
-	err = w.closeRuntimeStore()
-	if err != nil {
-		log.Errorf("Failed to close runtime store on stop: %v", err)
+	if w.addrStore != nil {
+		w.addrStore.Close()
 	}
 
+	// Evict from the manager cache before closing the stores so a
+	// concurrent Load can never observe and hand back this instance once
+	// its stores are closing; a Load that misses the cache rebuilds the
+	// wallet with fresh stores instead.
 	if w.onStopped != nil {
 		w.onStopped()
 	}
+
+	// Close owned stores. The error is returned (and logged) rather than
+	// aborting the teardown: the wallet is terminal and already evicted, so
+	// the caller only needs to learn the close failed.
+	closeErr := w.closeRuntimeStore()
+	if closeErr != nil {
+		log.Errorf("Failed to close runtime store on stop: %v", closeErr)
+	}
+
+	// Flip the observable lifecycle to Stopped last, now that the stores
+	// are closed and the cache entry is evicted. A failure here is unusual
+	// (the sole owner transitions from Stopping or Starting) and does not
+	// undo the teardown already performed, so it is only logged.
+	err := w.state.toStopped()
+	if err != nil {
+		log.Warnf("Failed to mark wallet stopped: %v", err)
+	}
+
+	return closeErr
 }
 
 // discardUnstarted tears down a wallet that was loaded but never started,

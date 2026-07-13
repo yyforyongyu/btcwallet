@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"context"
+	"errors"
 	"math"
 	"runtime"
 	"sync"
@@ -277,6 +278,9 @@ func TestControllerStart(t *testing.T) {
 	deps.syncer.On(
 		"run", mock.Anything,
 	).Return(nil).Once()
+
+	// Allow the terminal teardown to clear secret material on Stop.
+	expectTerminalTeardown(deps)
 
 	// Act: Start the wallet.
 	err := w.Start(t.Context())
@@ -561,6 +565,9 @@ func TestControllerStop(t *testing.T) {
 		<-ctx.Done()
 	}).Return(nil).Once()
 
+	// Stop clears secret material via the terminal teardown.
+	expectTerminalTeardown(deps)
+
 	require.NoError(t, w.Start(t.Context()))
 	require.True(t, w.state.isStarted())
 
@@ -578,6 +585,111 @@ func TestControllerStop(t *testing.T) {
 	// Assert: Verify that subsequent Stop calls are safe and return no
 	// error.
 	require.NoError(t, err)
+}
+
+// TestControllerStopPropagatesCloseError verifies that a store-close failure on
+// the terminal teardown is surfaced to the caller of Stop, while the wallet is
+// still marked stopped and its secret material cleared. finishStop logs the
+// close error internally and returns it so a Stop that blocks to completion
+// learns the close failed rather than silently reporting success.
+func TestControllerStopPropagatesCloseError(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: create and start a wallet whose owned runtime store close
+	// returns an error.
+	w, deps := createTestWalletWithMocks(t)
+
+	closeErr := errors.New("boom closing store")
+	w.runtimeStoreClose = func() error {
+		return closeErr
+	}
+
+	deps.store.On("GetWallet", mock.Anything, mock.Anything).Return(
+		&db.WalletInfo{BirthdayBlock: &db.Block{}}, nil).Once()
+	deps.store.On("ListAccounts", mock.Anything,
+		mock.AnythingOfType("db.ListAccountsQuery")).
+		Return([]db.AccountInfo(nil), nil).Once()
+	deps.store.On("DeleteExpiredLeases", mock.Anything,
+		mock.Anything).Return(nil).Once()
+	deps.syncer.On("run", mock.Anything).Run(func(args mock.Arguments) {
+		ctx, ok := args.Get(0).(context.Context)
+		if !ok {
+			return
+		}
+
+		<-ctx.Done()
+	}).Return(nil).Once()
+
+	// The terminal teardown clears secret material; assert the vault is
+	// locked exactly once as part of the stop.
+	deps.vault.On("Lock").Return().Once()
+	deps.addrStore.On("Close").Return().Maybe()
+
+	require.NoError(t, w.Start(t.Context()))
+	require.True(t, w.state.isStarted())
+
+	// Act: stop the wallet.
+	err := w.Stop(t.Context())
+
+	// Assert: the close error is returned, yet the wallet still reached the
+	// terminal stopped state (eviction and teardown still happened).
+	require.ErrorIs(t, err, closeErr)
+	require.True(t, w.state.isStopped())
+	require.False(t, w.state.isStarted())
+}
+
+// TestControllerStopLocksVault verifies that Stop clears decrypted key material
+// by locking the key vault on the terminal teardown, so an unlocked wallet does
+// not leave spend-capable secrets resident in memory after it stops.
+func TestControllerStopLocksVault(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: create, start, and unlock a wallet.
+	w, deps := createTestWalletWithMocks(t)
+
+	deps.store.On("GetWallet", mock.Anything, mock.Anything).Return(
+		&db.WalletInfo{BirthdayBlock: &db.Block{}}, nil).Once()
+	deps.store.On("ListAccounts", mock.Anything,
+		mock.AnythingOfType("db.ListAccountsQuery")).
+		Return([]db.AccountInfo(nil), nil).Once()
+	deps.store.On("DeleteExpiredLeases", mock.Anything,
+		mock.Anything).Return(nil).Once()
+	deps.syncer.On("run", mock.Anything).Run(func(args mock.Arguments) {
+		ctx, ok := args.Get(0).(context.Context)
+		if !ok {
+			return
+		}
+
+		<-ctx.Done()
+	}).Return(nil).Once()
+
+	require.NoError(t, w.Start(t.Context()))
+
+	// Simulate an unlocked wallet holding runtime secrets.
+	w.state.toUnlocked()
+	require.True(t, w.state.isUnlocked())
+
+	// Expect exactly one Lock on the terminal teardown, and allow the
+	// address store to be closed.
+	locked := make(chan struct{})
+	deps.vault.On("Lock").Run(func(mock.Arguments) {
+		close(locked)
+	}).Return().Once()
+	deps.addrStore.On("Close").Return().Maybe()
+
+	// Act: stop the wallet.
+	require.NoError(t, w.Stop(t.Context()))
+
+	// Assert: the vault was locked as part of the stop, and the wallet is
+	// terminal and locked.
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("key vault was not locked on Stop")
+	}
+
+	require.True(t, w.state.isStopped())
+	require.False(t, w.state.isUnlocked())
 }
 
 // TestControllerStartAfterStop verifies that restarting the same wallet
@@ -609,6 +721,9 @@ func TestControllerStartAfterStop(t *testing.T) {
 
 		<-ctx.Done()
 	}).Return(nil).Once()
+
+	// The Stop below clears secret material via the terminal teardown.
+	expectTerminalTeardown(deps)
 
 	require.NoError(t, w.Start(t.Context()))
 	require.True(t, w.state.isStarted())
@@ -833,6 +948,102 @@ func TestControllerStopDeferredContextCancel(t *testing.T) {
 	}
 }
 
+// TestControllerSecondStopWaitsWhileStopping verifies that a Stop arriving
+// while a shutdown is already in progress blocks until the wallet has fully
+// exited, rather than returning early. The first Stop owns the Started->
+// Stopping transition and drives the teardown; a second Stop cannot win that
+// transition and must wait for the terminal Stopped state. Before the fix the
+// second Stop observed the in-progress Stopping and returned nil immediately,
+// violating the contract that a returned Stop means the wallet has exited.
+func TestControllerSecondStopWaitsWhileStopping(t *testing.T) {
+	t.Parallel()
+
+	w := newRaceTestWallet(t)
+
+	// Drive the wallet to Started, then to Stopping, mirroring a first Stop
+	// that won the transition and is still tearing down.
+	require.NoError(t, w.state.toStarting())
+	require.NoError(t, w.state.toStarted())
+	require.NoError(t, w.state.toStopping())
+
+	// A second Stop arrives while the wallet is Stopping. It must block
+	// until the (simulated) first Stop drives the lifecycle to Stopped.
+	stopErr := make(chan error, 1)
+	go func() {
+		stopErr <- w.Stop(context.Background())
+	}()
+
+	// The second Stop must NOT return while the wallet is still Stopping.
+	select {
+	case err := <-stopErr:
+		t.Fatalf("second Stop returned (err=%v) while wallet still "+
+			"Stopping; it must block until fully stopped", err)
+
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Simulate the first Stop completing its teardown by driving the
+	// lifecycle to Stopped, the terminal state a real finishStop reaches
+	// only after closing stores and evicting the cache entry.
+	require.NoError(t, w.state.toStopped())
+
+	// The second Stop must now observe Stopped and return without error.
+	select {
+	case err := <-stopErr:
+		require.NoError(t, err)
+
+	case <-time.After(5 * time.Second):
+		t.Fatal("second Stop did not return after the wallet reached " +
+			"Stopped")
+	}
+}
+
+// TestControllerFinishStopOrder verifies that finishStop flips the observable
+// Stopped state only after it has cleared secret material, evicted the manager
+// cache entry, and closed the owned stores. Both the deregister hook
+// (onStopped) and the store-close callback capture whether the wallet is
+// already reported Stopped when they run; the fix guarantees they run first, so
+// a concurrent waitForStopped or Load cannot observe a completed shutdown while
+// the stores are still closing or the cache still holds the instance.
+func TestControllerFinishStopOrder(t *testing.T) {
+	t.Parallel()
+
+	w := newRaceTestWallet(t)
+
+	var (
+		stoppedAtEvict bool
+		stoppedAtClose bool
+	)
+
+	w.onStopped = func() {
+		stoppedAtEvict = w.state.isStopped()
+	}
+	w.runtimeStoreClose = func() error {
+		stoppedAtClose = w.state.isStopped()
+
+		return nil
+	}
+
+	// Drive the wallet to a Stopping state so finishStop can complete the
+	// terminal transition.
+	require.NoError(t, w.state.toStarting())
+	require.NoError(t, w.state.toStarted())
+	require.NoError(t, w.state.toStopping())
+
+	// Act: run the teardown directly.
+	require.NoError(t, w.finishStop())
+
+	// Assert: neither the eviction hook nor the store close observed the
+	// wallet as already Stopped, so the observable Stopped transition
+	// happened strictly after both. The wallet is Stopped once finishStop
+	// returns.
+	require.False(t, stoppedAtEvict,
+		"cache eviction ran after the Stopped transition")
+	require.False(t, stoppedAtClose,
+		"store close ran after the Stopped transition")
+	require.True(t, w.state.isStopped())
+}
+
 // TestControllerLock verifies the Lock method. It ensures that the wallet
 // can only be locked when it is started and currently unlocked.
 func TestControllerLock(t *testing.T) {
@@ -866,6 +1077,11 @@ func TestControllerLock(t *testing.T) {
 	// Assert: Verify success and that the wallet state is locked.
 	require.NoError(t, err)
 	require.False(t, w.state.isUnlocked())
+
+	// Allow the terminal teardown's extra Lock/Close on Stop. Registered
+	// after the operation's Lock().Once() above so that expectation is
+	// matched first and this pass-through absorbs only the teardown Lock.
+	expectTerminalTeardown(deps)
 
 	// Cleanup: Stop the wallet to release resources.
 	err = w.Stop(t.Context())
@@ -910,6 +1126,10 @@ func TestControllerUnlock(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, w.state.isUnlocked())
 
+	// Allow the terminal teardown's extra Lock/Close on Stop, registered
+	// after the operation's Lock().Once() above.
+	expectTerminalTeardown(deps)
+
 	// Cleanup: Stop the wallet to release resources.
 	err = w.Stop(t.Context())
 	require.NoError(t, err)
@@ -952,6 +1172,9 @@ func TestControllerChangePassphrase(t *testing.T) {
 			PrivateNew:    []byte("new"),
 		},
 	).Return(nil).Once()
+
+	// Allow the terminal teardown to clear secret material on Stop.
+	expectTerminalTeardown(deps)
 
 	// Act: Call ChangePassphrase.
 	err := w.ChangePassphrase(t.Context(), req)
@@ -1073,6 +1296,9 @@ func TestControllerStart_WithAccounts(t *testing.T) {
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()
+
+	// Allow the terminal teardown to clear secret material on Stop.
+	expectTerminalTeardown(deps)
 
 	// Act: Start the wallet.
 	err := w.Start(t.Context())
@@ -1460,6 +1686,9 @@ func TestControllerInfo(t *testing.T) {
 	// Mock syncState to indicate the wallet is fully synced.
 	deps.syncer.On("syncState").Return(syncStateSynced)
 
+	// Allow the terminal teardown to clear secret material on Stop.
+	expectTerminalTeardown(deps)
+
 	require.NoError(t, w.Start(t.Context()))
 
 	// Act: Call the Info method.
@@ -1648,6 +1877,9 @@ func TestControllerStart_BirthdayNotSet(t *testing.T) {
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()
+
+	// Allow the terminal teardown to clear secret material on Stop.
+	expectTerminalTeardown(deps)
 
 	// Act: Start the wallet.
 	err := w.Start(t.Context())

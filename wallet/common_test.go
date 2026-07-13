@@ -217,6 +217,18 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 	return w, deps
 }
 
+// expectTerminalTeardown registers the mock calls finishStop makes on the
+// terminal shutdown path to clear in-memory secret material: it locks the key
+// vault and closes the address store. Both are optional so a test that never
+// stops the wallet is unaffected, and both are registered so a test that does
+// call Stop does not trip the strict mocks. It must be called after any
+// operation-specific Lock().Once() expectation so that expectation is matched
+// first and this pass-through absorbs only the extra teardown-time Lock.
+func expectTerminalTeardown(deps *mockWalletDeps) {
+	deps.vault.On("Lock").Return().Maybe()
+	deps.addrStore.On("Close").Return().Maybe()
+}
+
 // createStartedWalletWithMocks creates a fully started and unlocked Wallet
 // instance with mocked dependencies.
 func createStartedWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
@@ -250,6 +262,10 @@ func createStartedWalletWithID(t *testing.T, walletID uint32) (*Wallet,
 		Return(waddrmgr.BlockStamp{Height: 1}).
 		Maybe()
 	deps.addrStore.On("WatchOnly").Return(false).Maybe()
+
+	// finishStop (run by the cleanup Stop below) clears in-memory secret
+	// material by locking the key vault and closing the address store.
+	expectTerminalTeardown(deps)
 
 	// Mock account loading through the store (runtime startup).
 	deps.store.On("ListAccounts", mock.Anything,
