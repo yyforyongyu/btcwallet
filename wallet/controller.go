@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
 )
 
 const (
@@ -778,8 +779,19 @@ func (w *Wallet) handleChangePassphraseReq(req changePassphraseReq) {
 		return
 	}
 
-	// Persist the passphrase rotation to the database.
-	err = w.DBPutPassphrase(w.lifetimeCtx, req.req)
+	// Rotate the passphrase(s) through the key vault, which owns the
+	// encryption boundary for the wallet's secret material and preserves the
+	// vault's current locked/unlocked state.
+	params := keyvault.ChangePassphraseParams{
+		ChangePublic:  req.req.ChangePublic,
+		PublicOld:     req.req.PublicOld,
+		PublicNew:     req.req.PublicNew,
+		ChangePrivate: req.req.ChangePrivate,
+		PrivateOld:    req.req.PrivateOld,
+		PrivateNew:    req.req.PrivateNew,
+	}
+
+	err = w.keyVault.ChangePassphrase(w.lifetimeCtx, params)
 	if err != nil {
 		req.resp <- err
 		return

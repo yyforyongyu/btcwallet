@@ -104,6 +104,12 @@ type AddressInfo struct {
 	// PubKey is set for managed pubkey addresses.
 	PubKey *btcec.PublicKey
 
+	// HasScript reports whether the address carries encrypted script material
+	// in the store (P2SH/P2WSH redeem or witness scripts, and taproot
+	// script-path imports). It is needed for address families whose output
+	// type alone is ambiguous, such as P2TR key-path versus P2TR script-path.
+	HasScript bool
+
 	// Derivation is set when the wallet knows how to derive the address from a
 	// wallet scope.
 	Derivation *AddressDerivation
@@ -113,6 +119,15 @@ type AddressInfo struct {
 type AddressDerivation struct {
 	// KeyScope identifies the scope that owns the address.
 	KeyScope waddrmgr.KeyScope
+
+	// AccountID is the store-local account row identity that owns the
+	// address. Signing resolves account-level key material by this
+	// identity rather than by Account, because the public BIP44 account
+	// number is not a safe key: the store masks an imported account's
+	// number to 0, which collides with the wallet's default derived
+	// account. It is nil for backends that cannot expose a durable account
+	// row identity.
+	AccountID *uint32
 
 	// Account is the BIP-32 account within the scope.
 	Account uint32
@@ -150,6 +165,14 @@ type OutputScriptInfo struct {
 	// For nested P2WPKH-in-P2SH spends, this is a single push of RedeemScript.
 	// Native witness spends leave this nil.
 	SigScript []byte
+
+	// Script is the plaintext redeem or witness script for a script-based
+	// output (P2SH multisig, P2WSH, taproot script-path). It is decrypted
+	// from the address's stored encrypted script and, for taproot
+	// script-path imports, is the single revealed leaf script. It is nil for
+	// single-key (pubkey-spend) outputs, whose subscript is derived from the
+	// public key instead.
+	Script []byte
 }
 
 // AddressManager provides an interface for generating and inspecting wallet
@@ -280,6 +303,7 @@ func addressInfoFromStoreAddress(storeAddr *db.AddressInfo,
 		Imported:   !storeAddr.HasDerivationPath,
 		Internal:   internal,
 		Compressed: storeAddressPubKeyCompressed(storeAddr.PubKey),
+		HasScript:  storeAddr.HasScript,
 	}
 
 	if len(storeAddr.PubKey) == 0 {
@@ -305,6 +329,7 @@ func addressInfoFromStoreAddress(storeAddr *db.AddressInfo,
 			Purpose: storeAddr.KeyScope.Purpose,
 			Coin:    storeAddr.KeyScope.Coin,
 		},
+		AccountID:            storeAddr.AccountID,
 		Account:              *storeAddr.AccountNumber,
 		Branch:               storeAddr.Branch,
 		Index:                storeAddr.Index,
@@ -873,7 +898,11 @@ func encryptTaprootScript(vault keyvault.Vault,
 		return nil, fmt.Errorf("%w: keyVault", ErrMissingParam)
 	}
 
-	encryptedScript, err := vault.Encrypt(waddrmgr.CKTPublic, encodedScript)
+	// Scripts are stored under the script crypto key so the signer can later
+	// recover them through keyVault.Decrypt(CKTScript, ...). The SQL wallet
+	// vault (WalletVault) does not expose a public crypto key, so the script
+	// crypto key is the portable choice across both backends.
+	encryptedScript, err := vault.Encrypt(waddrmgr.CKTScript, encodedScript)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt tapscript: %w", err)
 	}
@@ -932,6 +961,24 @@ func (w *Wallet) ScriptForOutput(ctx context.Context, output wire.TxOut) (
 	if err != nil {
 		return OutputScriptInfo{}, fmt.Errorf("unable to get address info "+
 			"for %s: %w", addr.String(), err)
+	}
+
+	// Script-based outputs (P2SH multisig, P2WSH, taproot script-path) have
+	// no single spending public key; their subscript is the stored, encrypted
+	// redeem or witness script. Resolve it through the store and key vault
+	// rather than the pubkey-derived script path below.
+	if isScriptSpendAddress(addressInfo) {
+		script, err := w.scriptForAddressInfo(
+			ctx, addressInfo, output.PkScript,
+		)
+		if err != nil {
+			return OutputScriptInfo{}, err
+		}
+
+		return OutputScriptInfo{
+			AddressInfo: addressInfo,
+			Script:      script,
+		}, nil
 	}
 
 	witnessProgram, redeemScript, sigScript, err := buildScriptsForAddressInfo(

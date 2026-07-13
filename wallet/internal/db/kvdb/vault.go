@@ -2,7 +2,6 @@ package kvdb
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/btcsuite/btcwallet/waddrmgr"
@@ -38,6 +37,12 @@ func (v *LegacyManagerVault) Unlock(ctx context.Context,
 	err := checkContext(ctx)
 	if err != nil {
 		return err
+	}
+
+	// Honor the Vault contract: unlocking an already-unlocked vault must
+	// return ErrVaultUnlocked without re-validating the passphrase.
+	if !v.mgr.IsLocked() {
+		return keyvault.ErrVaultUnlocked
 	}
 
 	err = walletdb.View(v.db, func(tx walletdb.ReadTx) error {
@@ -96,20 +101,37 @@ func (v *LegacyManagerVault) Decrypt(keyType waddrmgr.CryptoKeyType,
 	return plaintext, nil
 }
 
-// errLegacyVaultChangePassphrase reports that store-backed passphrase rotation
-// is not available through the legacy manager vault.
-var errLegacyVaultChangePassphrase = errors.New(
-	"legacy manager vault does not support passphrase rotation",
-)
-
-// ChangePassphrase is unsupported by the legacy manager vault: store-backed
-// wallets rotate their passphrase through the WalletVault. The legacy vault
-// only unlocks and decrypts key material for legacy recovery paths, so this is
-// never reached for those wallets.
+// ChangePassphrase rotates the legacy address manager's public and/or private
+// passphrases inside a single walletdb transaction. It maps the keyvault
+// request onto waddrmgr.ChangePassphrasesParams and delegates the validation,
+// row writes, and deferred in-memory swap to the address manager, so it works
+// whether or not the manager is currently unlocked.
 func (v *LegacyManagerVault) ChangePassphrase(_ context.Context,
-	_ []byte) error {
+	params keyvault.ChangePassphraseParams) error {
 
-	return errLegacyVaultChangePassphrase
+	wparams := waddrmgr.ChangePassphrasesParams{
+		ChangePublic:  params.ChangePublic,
+		PublicOld:     params.PublicOld,
+		PublicNew:     params.PublicNew,
+		ChangePrivate: params.ChangePrivate,
+		PrivateOld:    params.PrivateOld,
+		PrivateNew:    params.PrivateNew,
+		Config:        &waddrmgr.DefaultScryptOptions,
+	}
+
+	err := walletdb.Update(v.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgr.NamespaceKey)
+		if ns == nil {
+			return errMissingAddrmgrNamespace
+		}
+
+		return v.mgr.ChangePassphrases(ns, wparams)
+	})
+	if err != nil {
+		return fmt.Errorf("update: %w", err)
+	}
+
+	return nil
 }
 
 // checkContext returns ctx.Err when the context is already canceled.

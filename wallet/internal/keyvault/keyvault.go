@@ -19,6 +19,35 @@ var ErrVaultLocked = errors.New("vault is locked")
 // vault was already unlocked.
 var ErrVaultUnlocked = errors.New("vault is already unlocked")
 
+// ChangePassphraseParams describes an atomic rotation of the public and/or
+// private passphrase guarding a vault. The public and private rotations are
+// independent: either or both may be requested in a single call.
+type ChangePassphraseParams struct {
+	// ChangePublic indicates the public passphrase should be rotated from
+	// PublicOld to PublicNew.
+	ChangePublic bool
+
+	// PublicOld is the current public passphrase. It is only consulted when
+	// ChangePublic is true.
+	PublicOld []byte
+
+	// PublicNew is the desired public passphrase. It is only used when
+	// ChangePublic is true.
+	PublicNew []byte
+
+	// ChangePrivate indicates the private passphrase should be rotated from
+	// PrivateOld to PrivateNew.
+	ChangePrivate bool
+
+	// PrivateOld is the current private passphrase. It is only consulted
+	// when ChangePrivate is true.
+	PrivateOld []byte
+
+	// PrivateNew is the desired private passphrase. It is only used when
+	// ChangePrivate is true.
+	PrivateNew []byte
+}
+
 // Vault manages the lock lifecycle and cryptographic operations for wallet key
 // material.
 type Vault interface {
@@ -45,8 +74,10 @@ type Vault interface {
 	// type.
 	Decrypt(keyType waddrmgr.CryptoKeyType, ciphertext []byte) ([]byte, error)
 
-	// ChangePassphrase rotates persisted wallet secrets to the provided new
-	// private passphrase. The vault must already be unlocked when this method
-	// is called.
-	ChangePassphrase(ctx context.Context, newPassphrase []byte) error
+	// ChangePassphrase rotates persisted wallet secrets to the new
+	// passphrase(s) described by params. The implementation preserves the
+	// vault's original locked/unlocked state: an unlocked vault stays
+	// unlocked with its runtime keys unchanged, and a locked vault leaves no
+	// decrypted state behind.
+	ChangePassphrase(ctx context.Context, params ChangePassphraseParams) error
 }

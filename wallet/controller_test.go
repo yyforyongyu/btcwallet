@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -217,11 +218,14 @@ func TestHandleChangePassphraseReq(t *testing.T) {
 	}
 	req := newChangePassphraseReq(reqStruct)
 
-	// DBPutPassphrase drives the legacy address manager for the private
-	// rotation.
-	deps.addrStore.On(
-		"ChangePassphrase", mock.Anything, []byte("old"),
-		[]byte("new"), true, mock.Anything,
+	// The handler rotates the passphrase through the key vault.
+	deps.vault.On(
+		"ChangePassphrase", mock.Anything,
+		keyvault.ChangePassphraseParams{
+			ChangePrivate: true,
+			PrivateOld:    []byte("old"),
+			PrivateNew:    []byte("new"),
+		},
 	).Return(nil).Once()
 
 	// Act: Call the handler.
@@ -674,11 +678,14 @@ func TestControllerChangePassphrase(t *testing.T) {
 		PrivateNew:    []byte("new"),
 	}
 
-	// DBPutPassphrase drives the legacy address manager for the private
-	// rotation.
-	deps.addrStore.On(
-		"ChangePassphrase", mock.Anything, []byte("old"),
-		[]byte("new"), true, mock.Anything,
+	// ChangePassphrase rotates the passphrase through the key vault.
+	deps.vault.On(
+		"ChangePassphrase", mock.Anything,
+		keyvault.ChangePassphraseParams{
+			ChangePrivate: true,
+			PrivateOld:    []byte("old"),
+			PrivateNew:    []byte("new"),
+		},
 	).Return(nil).Once()
 
 	// Act: Call ChangePassphrase.

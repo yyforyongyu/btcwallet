@@ -105,8 +105,6 @@ func expectStoreNewAddress(t *testing.T, w *Wallet, deps *mockWalletDeps,
 // AddressInfo for tests that exercise the wallet's address-info read
 // path. No call-count constraint — the same address may be looked up
 // multiple times (input decoration + change output info).
-//
-//nolint:unparam // Keep branch metadata in the helper signature.
 func expectSignerAddressInfo(t *testing.T, w *Wallet, deps *mockWalletDeps,
 	addr address.Address, addrType db.AddressType,
 	internal, imported bool, pubKey *btcec.PublicKey) {
@@ -873,7 +871,7 @@ func TestImportTaprootScript(t *testing.T) {
 
 	encryptedScript := []byte("encrypted tapscript")
 	deps.vault.On(
-		"Encrypt", waddrmgr.CKTPublic, encodedScript,
+		"Encrypt", waddrmgr.CKTScript, encodedScript,
 	).Return(encryptedScript, nil).Once()
 	deps.store.On("NewImportedAddress", mock.Anything,
 		db.NewImportedAddressParams{

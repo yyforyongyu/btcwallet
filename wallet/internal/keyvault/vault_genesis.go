@@ -18,14 +18,24 @@ import (
 // decryptWalletSecrets.
 //
 // A watch-only wallet holds no signing material, so only the script crypto key
-// is produced and hdRootKey is ignored (it may be nil). A spendable wallet
-// requires a non-nil hdRootKey.
+// is produced and hdRootKey is ignored (it may be nil or neutered) and the
+// passphrase may be empty. A spendable wallet requires a non-nil, private
+// hdRootKey and a non-empty privatePassphrase; violations are rejected before
+// any secret material is derived.
 //
 // The returned secrets contain only ciphertext; all plaintext key material is
 // zeroed before returning.
 func CreateWalletSecrets(privatePassphrase []byte,
 	hdRootKey *hdkeychain.ExtendedKey, watchOnly bool) (*db.WalletSecrets,
 	error) {
+
+	// Validate the spendable inputs up front, before any secret material is
+	// derived or persisted. Watch-only wallets hold no signing material, so
+	// they accept a nil (or neutered) root key and an empty passphrase.
+	err := validateGenesisInputs(privatePassphrase, hdRootKey, watchOnly)
+	if err != nil {
+		return nil, err
+	}
 
 	// Derive the master private key from the passphrase using the default
 	// scrypt parameters. NewSecretKey generates a fresh salt and derives the
@@ -63,11 +73,6 @@ func CreateWalletSecrets(privatePassphrase []byte,
 		return secrets, nil
 	}
 
-	if hdRootKey == nil {
-		return nil, fmt.Errorf("%w: spendable wallet requires an HD root key",
-			errUnexpectedState)
-	}
-
 	// A spendable wallet additionally holds a private crypto key protecting
 	// private material, plus the master HD private key encrypted under it.
 	cryptoKeyPrivate, err := snacl.GenerateCryptoKey()
@@ -92,4 +97,36 @@ func CreateWalletSecrets(privatePassphrase []byte,
 	secrets.EncryptedMasterHdPrivKey = encryptedMasterHDPrivKey
 
 	return secrets, nil
+}
+
+// validateGenesisInputs rejects invalid spendable-wallet genesis inputs before
+// any secret material is derived or persisted. Watch-only wallets hold no
+// signing material, so they accept a nil (or neutered) root key and an empty
+// passphrase and always pass.
+func validateGenesisInputs(privatePassphrase []byte,
+	hdRootKey *hdkeychain.ExtendedKey, watchOnly bool) error {
+
+	if watchOnly {
+		return nil
+	}
+
+	// A spendable wallet needs an HD root key to derive keys from.
+	if hdRootKey == nil {
+		return fmt.Errorf("%w: spendable wallet requires an HD root "+
+			"key", errUnexpectedState)
+	}
+
+	// The root key must be private; a neutered/xpub key cannot serve as a
+	// spendable wallet's master private key.
+	if !hdRootKey.IsPrivate() {
+		return errRootKeyNotPrivate
+	}
+
+	// The private passphrase protects the master key, so it may not be
+	// empty. This mirrors waddrmgr.Create's rejection.
+	if len(privatePassphrase) == 0 {
+		return errEmptyPassphrase
+	}
+
+	return nil
 }

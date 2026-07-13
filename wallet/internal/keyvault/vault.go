@@ -14,6 +14,26 @@ var (
 	// which may indicate a programming error or data corruption. Normal
 	// operation should not return this error, and that's why it's unexported.
 	errUnexpectedState = errors.New("unexpected state")
+
+	// errPublicPassphraseUnsupported reports that a public passphrase change
+	// was requested on a store-backed vault. The SQL backend has no separate
+	// public passphrase, so only the private passphrase can be rotated.
+	errPublicPassphraseUnsupported = errors.New(
+		"store-backed vault has no public passphrase to change",
+	)
+
+	// errRootKeyNotPrivate reports that a neutered (public/xpub) key was
+	// supplied as the master root key for a spendable wallet. A spendable
+	// wallet must be able to sign, so its root key has to be private.
+	errRootKeyNotPrivate = errors.New(
+		"spendable wallet requires a private root key",
+	)
+
+	// errEmptyPassphrase reports that an empty private passphrase was
+	// supplied for a spendable wallet, mirroring waddrmgr.ErrEmptyPassphrase.
+	errEmptyPassphrase = errors.New(
+		"spendable wallet requires a non-empty private passphrase",
+	)
 )
 
 // WalletVault adapts db.Store wallet secret storage to the wallet key-vault

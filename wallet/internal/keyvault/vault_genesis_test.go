@@ -94,14 +94,91 @@ func TestCreateWalletSecretsWrongPassphrase(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidPassphrase)
 }
 
-// TestCreateWalletSecretsSpendableRequiresRoot verifies that a spendable
-// genesis without an HD root key is rejected rather than silently producing a
-// wallet that cannot sign.
-func TestCreateWalletSecretsSpendableRequiresRoot(t *testing.T) {
+// TestCreateWalletSecretsInputGuards verifies that CreateWalletSecrets rejects
+// invalid spendable inputs before deriving secret material, while watch-only
+// wallets keep accepting a neutered xpub and an empty passphrase.
+func TestCreateWalletSecretsInputGuards(t *testing.T) {
 	t.Parallel()
 
-	_, err := CreateWalletSecrets(
-		[]byte("correct horse battery staple"), nil, false,
-	)
-	require.Error(t, err)
+	passphrase := []byte("correct horse battery staple")
+
+	tests := []struct {
+		name       string
+		passphrase []byte
+		rootKey    func(t *testing.T) *hdkeychain.ExtendedKey
+		watchOnly  bool
+		wantErr    error
+	}{
+		{
+			name:       "spendable private key and passphrase",
+			passphrase: passphrase,
+			rootKey:    testGenesisRootKey,
+			watchOnly:  false,
+			wantErr:    nil,
+		},
+		{
+			name:       "spendable nil root key",
+			passphrase: passphrase,
+			rootKey: func(*testing.T) *hdkeychain.ExtendedKey {
+				return nil
+			},
+			watchOnly: false,
+			wantErr:   errUnexpectedState,
+		},
+		{
+			name:       "spendable neutered root key",
+			passphrase: passphrase,
+			rootKey: func(t *testing.T) *hdkeychain.ExtendedKey {
+				t.Helper()
+
+				neutered, err := testGenesisRootKey(t).Neuter()
+				require.NoError(t, err)
+
+				return neutered
+			},
+			watchOnly: false,
+			wantErr:   errRootKeyNotPrivate,
+		},
+		{
+			name:       "spendable empty passphrase",
+			passphrase: nil,
+			rootKey:    testGenesisRootKey,
+			watchOnly:  false,
+			wantErr:    errEmptyPassphrase,
+		},
+		{
+			name:       "watch-only neutered key empty passphrase",
+			passphrase: nil,
+			rootKey: func(t *testing.T) *hdkeychain.ExtendedKey {
+				t.Helper()
+
+				neutered, err := testGenesisRootKey(t).Neuter()
+				require.NoError(t, err)
+
+				return neutered
+			},
+			watchOnly: true,
+			wantErr:   nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			secrets, err := CreateWalletSecrets(
+				tc.passphrase, tc.rootKey(t), tc.watchOnly,
+			)
+
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				require.Nil(t, secrets)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, secrets)
+		})
+	}
 }

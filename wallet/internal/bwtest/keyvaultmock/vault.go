@@ -2,12 +2,17 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
-package mock
+// Package keyvaultmock contains a testify-based mock for the wallet key-vault
+// interface. It lives in its own package because it imports keyvault, and the
+// keyvault package's own tests depend on the shared mock package; keeping the
+// vault mock separate avoids an import cycle in the keyvault test build.
+package keyvaultmock
 
 import (
 	"context"
 
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -53,9 +58,9 @@ func (m *Vault) IsLocked() bool {
 
 // ChangePassphrase forwards to the configured testify expectations.
 func (m *Vault) ChangePassphrase(ctx context.Context,
-	passphrase []byte) error {
+	params keyvault.ChangePassphraseParams) error {
 
-	args := m.Called(ctx, passphrase)
+	args := m.Called(ctx, params)
 	return args.Error(0)
 }
 

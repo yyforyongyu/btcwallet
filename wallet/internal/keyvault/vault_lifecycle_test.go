@@ -236,17 +236,143 @@ func TestWalletVaultUnlockMalformedScriptKeyLocksVault(t *testing.T) {
 	require.Nil(t, vault.unlockedState)
 }
 
-// TestWalletVaultChangePassphraseLockedRequiresUnlockedState verifies that
-// changing private passphrase state requires an already unlocked vault.
-func TestWalletVaultChangePassphraseLockedRequiresUnlockedState(t *testing.T) {
+// TestWalletVaultChangePassphraseLockedRotates verifies that a locked vault can
+// rotate its passphrase from persisted ciphertext and stays locked with no
+// decrypted state left behind.
+func TestWalletVaultChangePassphraseLockedRotates(t *testing.T) {
 	t.Parallel()
 
-	vault := NewWalletVault(nil, 1, false)
-	err := vault.ChangePassphrase(t.Context(), correctPassphrase)
-	require.Error(t, err)
-	require.ErrorIs(t, err, ErrVaultLocked)
+	oldSecrets, oldExpected := makeWalletSecrets(t, correctPassphrase)
+	newPassphrase := []byte("new-passphrase")
+
+	const walletID = uint32(19)
+
+	var capturedUpdate db.UpdateWalletSecretsParams
+
+	store := new(bwmock.Store)
+	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
+		oldSecrets, nil,
+	).Once()
+	store.On("UpdateWalletSecrets", mock.Anything, mock.MatchedBy(
+		func(params db.UpdateWalletSecretsParams) bool {
+			capturedUpdate = params
+			return true
+		},
+	)).Return(nil).Once()
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+	})
+
+	// Never unlock the vault: it must rotate from persisted ciphertext.
+	vault := NewWalletVault(store, walletID, false)
+	require.True(t, vault.IsLocked())
+
+	err := vault.ChangePassphrase(t.Context(), ChangePassphraseParams{
+		ChangePrivate: true,
+		PrivateOld:    correctPassphrase,
+		PrivateNew:    newPassphrase,
+	})
+	require.NoError(t, err)
+
+	// The vault must remain locked with no runtime state.
 	require.True(t, vault.IsLocked())
 	require.Nil(t, vault.unlockedState)
+
+	// The rotated secrets must decrypt with the new passphrase to the same
+	// runtime keys and reject the old passphrase.
+	updatedSecrets := &db.WalletSecrets{
+		MasterPrivParams:         capturedUpdate.MasterPrivParams,
+		EncryptedCryptoPrivKey:   capturedUpdate.EncryptedCryptoPrivKey,
+		EncryptedCryptoScriptKey: capturedUpdate.EncryptedCryptoScriptKey,
+		EncryptedMasterHdPrivKey: capturedUpdate.EncryptedMasterHdPrivKey,
+	}
+
+	newState, err := decryptWalletSecrets(updatedSecrets, newPassphrase, false)
+	require.NoError(t, err)
+	t.Cleanup(newState.zero)
+	require.Equal(
+		t, oldExpected.cryptoKeyPrivate[:], newState.cryptoKeyPrivate[:],
+	)
+	require.Equal(
+		t, oldExpected.cryptoKeyScript[:], newState.cryptoKeyScript[:],
+	)
+	require.Equal(
+		t, oldExpected.hdRootKey.String(), newState.hdRootKey.String(),
+	)
+
+	_, err = decryptWalletSecrets(updatedSecrets, correctPassphrase, false)
+	require.ErrorIs(t, err, ErrInvalidPassphrase)
+}
+
+// TestWalletVaultChangePassphrasePublicUnsupported verifies that requesting a
+// public passphrase change is rejected because a store-backed vault has no
+// public passphrase.
+func TestWalletVaultChangePassphrasePublicUnsupported(t *testing.T) {
+	t.Parallel()
+
+	// A nil store is fine: the public-change guard runs before any store
+	// access.
+	vault := NewWalletVault(nil, 1, false)
+	err := vault.ChangePassphrase(t.Context(), ChangePassphraseParams{
+		ChangePublic: true,
+		PublicOld:    correctPassphrase,
+		PublicNew:    []byte("new"),
+	})
+	require.ErrorIs(t, err, errPublicPassphraseUnsupported)
+}
+
+// TestWalletVaultChangePassphraseNoOp verifies that a request changing neither
+// passphrase is a no-op that does not touch the store.
+func TestWalletVaultChangePassphraseNoOp(t *testing.T) {
+	t.Parallel()
+
+	// A nil store is fine: a no-op request must not reach store access.
+	vault := NewWalletVault(nil, 1, false)
+	require.NoError(t, vault.ChangePassphrase(
+		t.Context(), ChangePassphraseParams{},
+	))
+}
+
+// TestWalletVaultChangePassphraseWrongOldPassphrase verifies that a wrong old
+// private passphrase is rejected without mutating persisted or runtime state.
+func TestWalletVaultChangePassphraseWrongOldPassphrase(t *testing.T) {
+	t.Parallel()
+
+	oldSecrets, oldExpected := makeWalletSecrets(t, correctPassphrase)
+
+	const walletID = uint32(20)
+
+	store := new(bwmock.Store)
+
+	// Unlock fetches the secrets once; ChangePassphrase fetches them again
+	// before validating the (wrong) old passphrase.
+	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
+		oldSecrets, nil,
+	).Twice()
+	t.Cleanup(func() {
+		// UpdateWalletSecrets must never be called on a wrong passphrase.
+		store.AssertExpectations(t)
+		store.AssertNotCalled(t, "UpdateWalletSecrets")
+	})
+
+	vault := NewWalletVault(store, walletID, false)
+	require.NoError(t, vault.Unlock(t.Context(), correctPassphrase))
+	t.Cleanup(vault.Lock)
+
+	oldState := vault.unlockedState
+	err := vault.ChangePassphrase(t.Context(), ChangePassphraseParams{
+		ChangePrivate: true,
+		PrivateOld:    wrongPassphrase,
+		PrivateNew:    []byte("new-passphrase"),
+	})
+	require.ErrorIs(t, err, ErrInvalidPassphrase)
+
+	// Runtime state must be untouched.
+	require.Same(t, oldState, vault.unlockedState)
+	require.Equal(
+		t, oldExpected.cryptoKeyPrivate[:], oldState.cryptoKeyPrivate[:],
+	)
+	require.False(t, vault.IsLocked())
 }
 
 // TestWalletVaultChangePassphraseUpdateErrorPreservesState verifies that
@@ -262,12 +388,11 @@ func TestWalletVaultChangePassphraseUpdateErrorPreservesState(t *testing.T) {
 	var capturedUpdate db.UpdateWalletSecretsParams
 
 	store := new(bwmock.Store)
+
+	// Unlock and ChangePassphrase each fetch the persisted secrets once.
 	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
 		oldSecrets, nil,
-	).Once()
-	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
-		oldSecrets, nil,
-	).Once()
+	).Twice()
 	store.On("UpdateWalletSecrets", mock.Anything, mock.MatchedBy(
 		func(params db.UpdateWalletSecretsParams) bool {
 			capturedUpdate = params
@@ -283,7 +408,11 @@ func TestWalletVaultChangePassphraseUpdateErrorPreservesState(t *testing.T) {
 	t.Cleanup(vault.Lock)
 
 	oldState := vault.unlockedState
-	err := vault.ChangePassphrase(t.Context(), newPassphrase)
+	err := vault.ChangePassphrase(t.Context(), ChangePassphraseParams{
+		ChangePrivate: true,
+		PrivateOld:    correctPassphrase,
+		PrivateNew:    newPassphrase,
+	})
 	require.Error(t, err)
 	require.ErrorIs(t, err, errStoreUnavailable)
 
@@ -315,12 +444,11 @@ func TestWalletVaultChangePassphraseSuccessPersistsRotation(t *testing.T) {
 	var capturedUpdate db.UpdateWalletSecretsParams
 
 	store := new(bwmock.Store)
+
+	// Unlock and ChangePassphrase each fetch the persisted secrets once.
 	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
 		oldSecrets, nil,
-	).Once()
-	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
-		oldSecrets, nil,
-	).Once()
+	).Twice()
 	store.On("UpdateWalletSecrets", mock.Anything, mock.MatchedBy(
 		func(params db.UpdateWalletSecretsParams) bool {
 			capturedUpdate = params
@@ -337,9 +465,13 @@ func TestWalletVaultChangePassphraseSuccessPersistsRotation(t *testing.T) {
 
 	oldState := vault.unlockedState
 
-	require.NoError(
-		t, vault.ChangePassphrase(t.Context(), newPassphrase),
-	)
+	require.NoError(t, vault.ChangePassphrase(t.Context(),
+		ChangePassphraseParams{
+			ChangePrivate: true,
+			PrivateOld:    correctPassphrase,
+			PrivateNew:    newPassphrase,
+		},
+	))
 	require.Same(t, oldState, vault.unlockedState)
 	require.Equal(
 		t, oldExpected.cryptoKeyPrivate[:],
@@ -394,12 +526,11 @@ func TestWalletVaultChangePassphrasePreservesHDRootCiphertext(t *testing.T) {
 	var capturedUpdate db.UpdateWalletSecretsParams
 
 	store := new(bwmock.Store)
+
+	// Unlock and ChangePassphrase each fetch the persisted secrets once.
 	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
 		oldSecrets, nil,
-	).Once()
-	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
-		oldSecrets, nil,
-	).Once()
+	).Twice()
 	store.On("UpdateWalletSecrets", mock.Anything, mock.MatchedBy(
 		func(params db.UpdateWalletSecretsParams) bool {
 			capturedUpdate = params
@@ -414,7 +545,11 @@ func TestWalletVaultChangePassphrasePreservesHDRootCiphertext(t *testing.T) {
 	require.NoError(t, vault.Unlock(t.Context(), correctPassphrase))
 	t.Cleanup(vault.Lock)
 
-	err := vault.ChangePassphrase(t.Context(), newPassphrase)
+	err := vault.ChangePassphrase(t.Context(), ChangePassphraseParams{
+		ChangePrivate: true,
+		PrivateOld:    correctPassphrase,
+		PrivateNew:    newPassphrase,
+	})
 	require.NoError(t, err)
 	require.Equal(
 		t, oldSecrets.EncryptedMasterHdPrivKey,
@@ -472,12 +607,11 @@ func TestWalletVaultChangePassphraseWatchOnlyRotatesScriptMaterial(
 	var capturedUpdate db.UpdateWalletSecretsParams
 
 	store := new(bwmock.Store)
+
+	// Unlock and ChangePassphrase each fetch the persisted secrets once.
 	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
 		oldSecrets, nil,
-	).Once()
-	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
-		oldSecrets, nil,
-	).Once()
+	).Twice()
 	store.On("UpdateWalletSecrets", mock.Anything, mock.MatchedBy(
 		func(params db.UpdateWalletSecretsParams) bool {
 			capturedUpdate = params
@@ -493,7 +627,13 @@ func TestWalletVaultChangePassphraseWatchOnlyRotatesScriptMaterial(
 	t.Cleanup(vault.Lock)
 
 	oldState := vault.unlockedState
-	require.NoError(t, vault.ChangePassphrase(t.Context(), newPassphrase))
+	require.NoError(t, vault.ChangePassphrase(t.Context(),
+		ChangePassphraseParams{
+			ChangePrivate: true,
+			PrivateOld:    correctPassphrase,
+			PrivateNew:    newPassphrase,
+		},
+	))
 	require.Same(t, oldState, vault.unlockedState)
 	require.Equal(
 		t, expected.cryptoKeyScript[:], vault.unlockedState.cryptoKeyScript[:],
