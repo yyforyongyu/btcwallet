@@ -460,6 +460,17 @@ type Wallet struct {
 	// Callers read it through IsWatchOnly(); the read-side joins against
 	// account_secrets are obsolete now that the value is wallet-level.
 	isWatchOnly bool
+
+	// lastSyncedTip caches the last synced-to tip that was successfully
+	// read from the runtime Store on a SQL backend. SyncedTo cannot return
+	// an error, and a SQL wallet has no legacy addrStore to fall back to,
+	// so a transient store read or block-decode failure must not be
+	// reported to callers as the -1 (never-synced / zero-confirmation)
+	// sentinel. On such a failure SyncedTo logs the error and returns this
+	// last known-good tip instead, keeping a spurious reorg-to-genesis from
+	// being observed. It is guarded by lastSyncedTipMu.
+	lastSyncedTip   *waddrmgr.BlockStamp
+	lastSyncedTipMu sync.Mutex
 }
 
 // IsWatchOnly reports whether this wallet was created without private-key
@@ -479,12 +490,45 @@ func (w *Wallet) ID() uint32 {
 }
 
 // SyncedTo returns the wallet's current synced-to block.
+//
+// On a SQL backend the tip is read from the runtime Store. Because this method
+// cannot return an error and a SQL wallet has no legacy addrStore to consult,
+// a failed store read or block-decode is not silently reported as the -1
+// (never-synced) sentinel: the error is logged and the last successfully read
+// tip is returned instead, so a transient failure is not observed by callers
+// as a reorg back to genesis. Only a genuinely never-synced wallet (no cached
+// tip yet) reports height -1.
 func (w *Wallet) SyncedTo() waddrmgr.BlockStamp {
-	stamp, ok := w.storeSyncedTo()
-	if ok {
+	stamp, ok, err := w.storeSyncedTo()
+	switch {
+	// The runtime Store returned a usable tip; cache it as the last
+	// known-good value and return it.
+	case ok:
+		w.setLastSyncedTip(stamp)
+
 		return stamp
+
+	// The store read failed on a SQL backend. Surface the failure through
+	// a log and preserve the last known-good tip rather than fabricating a
+	// -1 tip that callers would treat as zero confirmations.
+	case err != nil:
+		if last, hasLast := w.getLastSyncedTip(); hasLast {
+			log.Errorf("SyncedTo: runtime store read failed, "+
+				"returning last known tip %d: %v", last.Height,
+				err)
+
+			return last
+		}
+
+		log.Errorf("SyncedTo: runtime store read failed and no prior "+
+			"tip is known, reporting unsynced: %v", err)
+
+		return waddrmgr.BlockStamp{Height: -1}
 	}
 
+	// Not a store-backed read (kvdb backend): fall back to the legacy
+	// manager. A SQL wallet has no legacy addrStore, but storeSyncedTo only
+	// returns (_, false, nil) for kvdb, so addrStore is non-nil here.
 	if w.addrStore == nil {
 		return waddrmgr.BlockStamp{Height: -1}
 	}
@@ -493,28 +537,61 @@ func (w *Wallet) SyncedTo() waddrmgr.BlockStamp {
 }
 
 // storeSyncedTo returns the synced tip read from the runtime Store on non-kvdb
-// backends. The bool is false when the kvdb backend is selected or the Store
-// has no usable synced tip, so the caller falls back to the legacy manager.
-func (w *Wallet) storeSyncedTo() (waddrmgr.BlockStamp, bool) {
+// backends.
+//
+//   - ok is true when the Store returned a usable tip (including a genuinely
+//     never-synced wallet, reported as height -1); the caller returns it.
+//   - ok is false with a nil error only on the kvdb backend (or no store), so
+//     the caller falls back to the legacy manager.
+//   - a non-nil error means the store read or block-decode failed on a SQL
+//     backend; the caller must not treat this as a valid tip.
+func (w *Wallet) storeSyncedTo() (waddrmgr.BlockStamp, bool, error) {
 	if w.store == nil || w.cfg.DB.withDefaults().Backend == DBBackendKVDB {
-		return waddrmgr.BlockStamp{}, false
+		return waddrmgr.BlockStamp{}, false, nil
 	}
 
 	info, err := w.store.GetWallet(context.Background(), w.cfg.Name)
 	if err != nil {
-		return waddrmgr.BlockStamp{}, false
+		return waddrmgr.BlockStamp{}, false, fmt.Errorf(
+			"read wallet %q: %w", w.cfg.Name, err,
+		)
 	}
 
 	if info.SyncedTo == nil {
-		return waddrmgr.BlockStamp{Height: -1}, true
+		return waddrmgr.BlockStamp{Height: -1}, true, nil
 	}
 
 	stamp, err := db.BlockStampFromBlock(info.SyncedTo)
 	if err != nil {
+		return waddrmgr.BlockStamp{}, false, fmt.Errorf(
+			"decode synced-to block: %w", err,
+		)
+	}
+
+	return stamp, true, nil
+}
+
+// setLastSyncedTip records the last synced tip successfully read from the
+// runtime Store so a later failed read can preserve it.
+func (w *Wallet) setLastSyncedTip(stamp waddrmgr.BlockStamp) {
+	w.lastSyncedTipMu.Lock()
+	defer w.lastSyncedTipMu.Unlock()
+
+	tip := stamp
+	w.lastSyncedTip = &tip
+}
+
+// getLastSyncedTip returns the last synced tip successfully read from the
+// runtime Store, and whether one has been recorded yet.
+func (w *Wallet) getLastSyncedTip() (waddrmgr.BlockStamp, bool) {
+	w.lastSyncedTipMu.Lock()
+	defer w.lastSyncedTipMu.Unlock()
+
+	if w.lastSyncedTip == nil {
 		return waddrmgr.BlockStamp{}, false
 	}
 
-	return stamp, true
+	return *w.lastSyncedTip, true
 }
 
 // hasMinConfs checks whether a transaction at height txHeight has met minconf

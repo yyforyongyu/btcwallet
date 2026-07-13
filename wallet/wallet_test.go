@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -11,7 +12,10 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
+	walletmock "github.com/btcsuite/btcwallet/wallet/internal/bwtest/mock"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -284,4 +288,105 @@ func TestLocateBirthdayBlock(t *testing.T) {
 			break
 		}
 	}
+}
+
+// newSyncedToTestWallet builds a minimal SQL-backed wallet whose synced tip is
+// read from the provided mock store, so SyncedTo exercises the store path
+// rather than the legacy addrStore fallback.
+func newSyncedToTestWallet(store *walletmock.Store) *Wallet {
+	return &Wallet{
+		store: store,
+		cfg: Config{
+			Name: "tip-wallet",
+			DB: DBConfig{
+				Backend: DBBackendSQLite,
+			},
+			ChainParams: &chainParams,
+		},
+	}
+}
+
+// TestSyncedToStoreErrorNotMaskedAsMinusOne verifies that on a SQL backend a
+// failed runtime-store read or an undecodable block is not silently reported
+// as the -1 (never-synced) tip. Once a valid tip has been observed it is
+// preserved across a later failure; with no prior tip the failure reports -1.
+func TestSyncedToStoreErrorNotMaskedAsMinusOne(t *testing.T) {
+	t.Parallel()
+
+	goodTip := &db.Block{Height: 250, Hash: chainhash.Hash{0x01}}
+
+	t.Run("successful read caches and returns tip", func(t *testing.T) {
+		t.Parallel()
+
+		store := &walletmock.Store{}
+		store.On("GetWallet", mock.Anything, "tip-wallet").
+			Return(&db.WalletInfo{SyncedTo: goodTip}, nil).Once()
+
+		w := newSyncedToTestWallet(store)
+
+		got := w.SyncedTo()
+		require.Equal(t, int32(250), got.Height)
+
+		// The tip was cached, so a later failing read returns it rather
+		// than -1.
+		store.On("GetWallet", mock.Anything, "tip-wallet").
+			Return(nil, errDBMock).Once()
+
+		got = w.SyncedTo()
+		require.Equal(t, int32(250), got.Height)
+
+		store.AssertExpectations(t)
+	})
+
+	t.Run("store error with no prior tip reports unsynced", func(t *testing.T) {
+		t.Parallel()
+
+		store := &walletmock.Store{}
+		store.On("GetWallet", mock.Anything, "tip-wallet").
+			Return(nil, errDBMock).Once()
+
+		w := newSyncedToTestWallet(store)
+
+		got := w.SyncedTo()
+		require.Equal(t, int32(-1), got.Height)
+		store.AssertExpectations(t)
+	})
+
+	t.Run("undecodable block is not returned as tip", func(t *testing.T) {
+		t.Parallel()
+
+		store := &walletmock.Store{}
+
+		// First a valid read to establish a known-good tip.
+		store.On("GetWallet", mock.Anything, "tip-wallet").
+			Return(&db.WalletInfo{SyncedTo: goodTip}, nil).Once()
+
+		// Then a row whose height overflows int32, which
+		// BlockStampFromBlock rejects.
+		badTip := &db.Block{Height: math.MaxInt32 + 1}
+		store.On("GetWallet", mock.Anything, "tip-wallet").
+			Return(&db.WalletInfo{SyncedTo: badTip}, nil).Once()
+
+		w := newSyncedToTestWallet(store)
+
+		require.Equal(t, int32(250), w.SyncedTo().Height)
+
+		// The decode failure preserves the last known-good tip instead
+		// of surfacing a fake -1.
+		require.Equal(t, int32(250), w.SyncedTo().Height)
+		store.AssertExpectations(t)
+	})
+
+	t.Run("never-synced wallet reports minus one", func(t *testing.T) {
+		t.Parallel()
+
+		store := &walletmock.Store{}
+		store.On("GetWallet", mock.Anything, "tip-wallet").
+			Return(&db.WalletInfo{SyncedTo: nil}, nil).Once()
+
+		w := newSyncedToTestWallet(store)
+
+		require.Equal(t, int32(-1), w.SyncedTo().Height)
+		store.AssertExpectations(t)
+	})
 }
