@@ -903,13 +903,37 @@ func (s *syncer) unminedTxns(ctx context.Context) ([]*wire.MsgTx, error) {
 	return wtxmgr.DependencySort(txSet), nil
 }
 
-// updateSyncTip records the latest synced block through the store.
+// updateSyncTip records the latest synced block through the store. It is the
+// forward-only sink for BlockConnected notifications and must never move the
+// persisted tip backwards: a stale or replayed BlockConnected (for example one
+// queued by an earlier Rescan and dispatched later via processChainUpdate)
+// carries an old height, and writing it would rewind the tip and make the
+// wallet re-scan or miss blocks. Genuine reorgs never reach here; they arrive
+// as BlockDisconnected and are handled by checkRollback/rewindToBlock, the only
+// paths permitted to lower the tip. This guard therefore skips any update whose
+// height is not strictly greater than the current persisted height.
 func (s *syncer) updateSyncTip(ctx context.Context,
 	block wtxmgr.BlockMeta) error {
 
 	storeBlock, err := storeBlockFromBlockMeta(block)
 	if err != nil {
 		return err
+	}
+
+	// Read the current persisted tip and drop the update if it does not
+	// advance it. syncedTo returns height -1 when the wallet has no tip yet,
+	// so the first BlockConnected always applies.
+	current, err := s.syncedTo(ctx)
+	if err != nil {
+		return err
+	}
+
+	if block.Height <= current.Height {
+		log.Debugf("Ignoring stale sync tip update for block %v "+
+			"(height %d) at or below current tip height %d",
+			block.Hash, block.Height, current.Height)
+
+		return nil
 	}
 
 	err = s.store.UpdateWallet(

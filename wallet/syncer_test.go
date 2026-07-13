@@ -828,8 +828,11 @@ func TestHandleChainUpdate(t *testing.T) {
 	)
 
 	// Case 1: Test handling of a BlockConnected notification, which
-	// advances the synced tip through the store.
+	// advances the synced tip through the store. updateSyncTip reads the
+	// current tip first, so a lower current tip lets height 100 advance it.
 	meta := wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 100}}
+
+	expectSyncedTip(store, waddrmgr.BlockStamp{Height: 99})
 
 	store.On("UpdateWallet", mock.Anything, mock.Anything).Return(
 		nil).Once()
@@ -3272,6 +3275,11 @@ func TestWaitForEvent(t *testing.T) {
 	notificationChan := make(chan any, 1)
 	mockChain.On("Notifications").Return((<-chan any)(notificationChan))
 
+	// The wallet has no persisted tip yet (height -1), so the connected
+	// block below advances it and the rewind in Case 2 is a no-op. A single
+	// unsynced tip covers both cases.
+	expectSyncedTip(store, waddrmgr.BlockStamp{Height: -1})
+
 	// Case 1: Test event handling when a chain notification arrives, which
 	// advances the synced tip through the store.
 	notificationChan <- chain.BlockConnected{}
@@ -3288,8 +3296,6 @@ func TestWaitForEvent(t *testing.T) {
 	// requested rewind start is at or beyond the current synced tip, so the
 	// rewind is a no-op.
 	s.scanReqChan <- &scanReq{typ: scanTypeRewind}
-
-	expectSyncedTip(store, waddrmgr.BlockStamp{})
 
 	// Act & Assert: Call waitForEvent and verify it correctly processes
 	// the arriving scan request.
@@ -4827,6 +4833,10 @@ func TestProcessChainUpdate(t *testing.T) {
 				Block: wtxmgr.Block{Height: 100},
 			},
 			setup: func(store *walletmock.Store, c *bwmock.Chain) {
+				// A lower current tip lets height 100 advance it.
+				expectSyncedTip(
+					store, waddrmgr.BlockStamp{Height: 99},
+				)
 				store.On("UpdateWallet", mock.Anything, mock.MatchedBy(
 					func(params db.UpdateWalletParams) bool {
 						return params.SyncedTo != nil &&
@@ -4922,6 +4932,11 @@ func TestProcessChainUpdateRoutesSyncTip(t *testing.T) {
 		},
 		Time: time.Unix(1710003800, 0),
 	}
+
+	// updateSyncTip reads the current persisted tip first; a lower current
+	// tip lets this connected block advance it.
+	expectSyncedTip(store, waddrmgr.BlockStamp{Height: 143})
+
 	store.On("UpdateWallet", mock.Anything, mock.MatchedBy(
 		func(params db.UpdateWalletParams) bool {
 			return params.WalletID == s.walletID &&
@@ -4935,6 +4950,94 @@ func TestProcessChainUpdateRoutesSyncTip(t *testing.T) {
 	err := s.processChainUpdate(t.Context(), chain.BlockConnected(block))
 	require.NoError(t, err)
 	store.AssertExpectations(t)
+}
+
+// TestUpdateSyncTipMonotonic verifies that updateSyncTip never moves the
+// persisted tip backwards. A stale or replayed BlockConnected notification
+// carrying a height at or below the current persisted tip is dropped without a
+// write, so a late-dispatched notification (for example one queued by an
+// earlier Rescan) cannot rewind the wallet's synced tip. Genuine reorgs arrive
+// as BlockDisconnected and are handled by checkRollback, not here.
+func TestUpdateSyncTipMonotonic(t *testing.T) {
+	t.Parallel()
+
+	const walletID uint32 = 91
+
+	tests := []struct {
+		name         string
+		currentTip   waddrmgr.BlockStamp
+		updateHeight int32
+		wantWrite    bool
+	}{
+		{
+			name:         "advance applies",
+			currentTip:   waddrmgr.BlockStamp{Height: 100},
+			updateHeight: 101,
+			wantWrite:    true,
+		},
+		{
+			name:         "equal height ignored",
+			currentTip:   waddrmgr.BlockStamp{Height: 100},
+			updateHeight: 100,
+			wantWrite:    false,
+		},
+		{
+			name:         "stale lower height ignored",
+			currentTip:   waddrmgr.BlockStamp{Height: 100},
+			updateHeight: 40,
+			wantWrite:    false,
+		},
+		{
+			name:         "first tip applies from unsynced",
+			currentTip:   waddrmgr.BlockStamp{Height: -1},
+			updateHeight: 0,
+			wantWrite:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: a store-backed syncer whose current persisted
+			// tip is tc.currentTip.
+			store := &walletmock.Store{}
+			s := newSyncer(
+				Config{}, nil, nil, nil, store, walletID,
+			)
+			expectSyncedTip(store, tc.currentTip)
+
+			block := wtxmgr.BlockMeta{
+				Block: wtxmgr.Block{
+					Hash:   chainhash.Hash{0xab},
+					Height: tc.updateHeight,
+				},
+				Time: time.Unix(1710004000, 0),
+			}
+
+			// Only an advancing update is permitted to write; a stale
+			// or equal-height update must not call UpdateWallet.
+			if tc.wantWrite {
+				store.On("UpdateWallet", mock.Anything,
+					mock.MatchedBy(
+						func(p db.UpdateWalletParams) bool {
+							return p.SyncedTo != nil &&
+								p.SyncedTo.Height ==
+									uint32(tc.updateHeight)
+						},
+					)).Return(nil).Once()
+			}
+
+			// Act.
+			err := s.updateSyncTip(t.Context(), block)
+
+			// Assert: no error either way, and UpdateWallet was
+			// invoked exactly when an advance was expected. The
+			// strict mock fails the test if a skipped update wrote.
+			require.NoError(t, err)
+			store.AssertExpectations(t)
+		})
+	}
 }
 
 // TestAdvanceChainSyncUsesStoreSyncedTo verifies Store-backed synchronization
