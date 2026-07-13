@@ -2265,6 +2265,80 @@ func keylessImportedAccount(info db.AccountInfo) bool {
 	return info.IsImported && len(info.PublicKey) == 0
 }
 
+// scanTargetKey identifies an account owned by a targeted rescan. It pairs the
+// key scope with the durable, scope-unique account name so an account's
+// addresses and UTXOs can be matched to a resolved scan target regardless of
+// its maskable BIP44 number.
+type scanTargetKey struct {
+	scope db.KeyScope
+	name  string
+}
+
+// scanTargetSet is the membership set of accounts a targeted rescan seeds. It
+// is nil for a full (untargeted) scan, in which case matches reports true for
+// every account so the seeding stays wallet-wide.
+type scanTargetSet map[scanTargetKey]struct{}
+
+// newScanTargetSet builds the account membership set for the resolved rescan
+// targets. It returns nil when there are no targets so callers seed every
+// account (the untargeted path). The keyless raw-import bucket carries a nil
+// info, so it is matched by the reserved imported alias name under its target
+// scope.
+func newScanTargetSet(targets []scanTarget) scanTargetSet {
+	if len(targets) == 0 {
+		return nil
+	}
+
+	set := make(scanTargetSet, len(targets))
+	for _, target := range targets {
+		key := scanTargetKey{
+			scope: db.KeyScope(target.Scope),
+			name:  target.AccountName,
+		}
+
+		// The keyless imported bucket is carried through unresolved
+		// (nil info, empty name); key it on the reserved imported alias
+		// so its addresses and UTXOs match.
+		if target.info == nil {
+			key.name = db.DefaultImportedAccountName
+		}
+
+		set[key] = struct{}{}
+	}
+
+	return set
+}
+
+// matches reports whether the account identified by scope and name is in the
+// target set. A nil set (untargeted scan) matches every account so the full
+// wallet is seeded.
+func (s scanTargetSet) matches(scope db.KeyScope, name string) bool {
+	if s == nil {
+		return true
+	}
+
+	_, ok := s[scanTargetKey{scope: scope, name: name}]
+
+	return ok
+}
+
+// includesImported reports whether the target set includes the reserved
+// raw-import alias, so its materialized addresses should be seeded. A nil set
+// (untargeted scan) always includes it.
+func (s scanTargetSet) includesImported() bool {
+	if s == nil {
+		return true
+	}
+
+	for key := range s {
+		if key.name == db.DefaultImportedAccountName {
+			return true
+		}
+	}
+
+	return false
+}
+
 // storeScanAddresses loads active scan addresses through the store, paging per
 // (key scope, account) pair because ListAddresses is scoped to a single pair.
 //
@@ -2274,8 +2348,14 @@ func keylessImportedAccount(info db.AccountInfo) bool {
 // addresses are watched. The non-default external branches are intentionally
 // skipped because they only ever existed due to a since-fixed bug, and
 // watching them would diverge from the legacy recovery set.
-func (s *syncer) storeScanAddresses(
-	ctx context.Context) ([]address.Address, error) {
+//
+// targets bounds the seeding to a targeted rescan's accounts: a non-nil set
+// loads only addresses owned by the target accounts (and the raw-import bucket
+// only when it is itself a target), so a targeted rescan does not watch and
+// persist activity for unrelated accounts. A nil set loads every account (the
+// untargeted path).
+func (s *syncer) storeScanAddresses(ctx context.Context,
+	targets scanTargetSet) ([]address.Address, error) {
 
 	accounts, err := s.store.ListAccounts(ctx, db.ListAccountsQuery{
 		WalletID:    s.walletID,
@@ -2291,6 +2371,14 @@ func (s *syncer) storeScanAddresses(
 			continue
 		}
 
+		// Skip accounts a targeted rescan does not target.
+		if !targets.matches(
+			accounts[i].KeyScope, accounts[i].AccountName,
+		) {
+
+			continue
+		}
+
 		accountAddrs, err := s.storeAccountScanAddresses(
 			ctx, accounts[i],
 		)
@@ -2301,12 +2389,16 @@ func (s *syncer) storeScanAddresses(
 		addrs = append(addrs, accountAddrs...)
 	}
 
-	importedAddrs, err := s.storeImportedScanAddresses(ctx)
-	if err != nil {
-		return nil, err
-	}
+	// The raw-import bucket is a separate pseudo-account; seed it only when
+	// the scan is untargeted or explicitly targets it.
+	if targets.includesImported() {
+		importedAddrs, err := s.storeImportedScanAddresses(ctx)
+		if err != nil {
+			return nil, err
+		}
 
-	addrs = append(addrs, importedAddrs...)
+		addrs = append(addrs, importedAddrs...)
+	}
 
 	return addrs, nil
 }
@@ -2409,8 +2501,14 @@ func (s *syncer) storeAccountScanAddresses(ctx context.Context,
 
 // storeScanUnspent loads UTXOs that recovery scans should watch through the
 // store.
-func (s *syncer) storeScanUnspent(ctx context.Context) (
-	[]wtxmgr.Credit, error) {
+//
+// targets bounds the seeding to a targeted rescan's accounts: a non-nil set
+// keeps only UTXOs owned by the target accounts (matched on the row's key
+// scope and account name), so a targeted rescan does not watch and persist a
+// spend of an unrelated account's UTXO. A nil set keeps every UTXO (the
+// untargeted path).
+func (s *syncer) storeScanUnspent(ctx context.Context,
+	targets scanTargetSet) ([]wtxmgr.Credit, error) {
 
 	utxos, err := s.store.ListOutputsToWatch(ctx, s.walletID)
 	if err != nil {
@@ -2419,6 +2517,11 @@ func (s *syncer) storeScanUnspent(ctx context.Context) (
 
 	credits := make([]wtxmgr.Credit, 0, len(utxos))
 	for i := range utxos {
+		// Skip UTXOs a targeted rescan does not target.
+		if !targets.matches(utxos[i].KeyScope, utxos[i].AccountName) {
+			continue
+		}
+
 		credit, err := storeScanCredit(utxos[i])
 		if err != nil {
 			return nil, err
@@ -2467,12 +2570,18 @@ func (s *syncer) loadStoreScanData(ctx context.Context,
 		return nil, nil, nil, err
 	}
 
-	addrs, err := s.storeScanAddresses(ctx)
+	// Scope the address and UTXO seeds to the same targets as the horizons.
+	// A nil set (empty targets) seeds every account, matching the horizon
+	// loader's untargeted path; a non-nil set keeps a targeted rescan from
+	// watching and persisting activity for unrelated accounts.
+	targetSet := newScanTargetSet(targets)
+
+	addrs, err := s.storeScanAddresses(ctx, targetSet)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	unspent, err := s.storeScanUnspent(ctx)
+	unspent, err := s.storeScanUnspent(ctx, targetSet)
 	if err != nil {
 		return nil, nil, nil, err
 	}

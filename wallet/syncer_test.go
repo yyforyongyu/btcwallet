@@ -2706,7 +2706,7 @@ func TestStoreScanAddresses(t *testing.T) {
 	)
 
 	// Act: Load scan addresses from the store.
-	addrs, err := s.storeScanAddresses(t.Context())
+	addrs, err := s.storeScanAddresses(t.Context(), nil)
 
 	// Assert: The stored script was converted into a scan address.
 	require.NoError(t, err)
@@ -2765,7 +2765,7 @@ func TestStoreScanAddressesIncludesImportedAlias(t *testing.T) {
 	)
 
 	// Act: Load scan addresses from the store.
-	addrs, err := s.storeScanAddresses(t.Context())
+	addrs, err := s.storeScanAddresses(t.Context(), nil)
 
 	// Assert: The raw imported address was included in the scan set.
 	require.NoError(t, err)
@@ -2810,7 +2810,7 @@ func TestStoreScanAddressesIncludesRawImportOnlyScope(t *testing.T) {
 	)
 
 	// Act: Load scan addresses from the store.
-	addrs, err := s.storeScanAddresses(t.Context())
+	addrs, err := s.storeScanAddresses(t.Context(), nil)
 
 	// Assert: The raw imported-only scope was probed and included.
 	require.NoError(t, err)
@@ -2887,7 +2887,7 @@ func TestStoreScanAddressesNonDefaultScope(t *testing.T) {
 	)
 
 	// Act: load scan addresses from the store.
-	addrs, err := s.storeScanAddresses(t.Context())
+	addrs, err := s.storeScanAddresses(t.Context(), nil)
 
 	// Assert: only the internal-branch address survived the filter.
 	require.NoError(t, err)
@@ -2925,7 +2925,7 @@ func TestStoreScanUnspent(t *testing.T) {
 	).Return(utxos, nil).Once()
 
 	// Act: Load scan UTXOs from the store.
-	credits, err := s.storeScanUnspent(t.Context())
+	credits, err := s.storeScanUnspent(t.Context(), nil)
 
 	// Assert: The store UTXO row was converted into a recovery credit.
 	require.NoError(t, err)
@@ -2937,6 +2937,172 @@ func TestStoreScanUnspent(t *testing.T) {
 	require.Equal(t, int32(42), credits[0].Height)
 	require.True(t, credits[0].FromCoinBase)
 	store.AssertExpectations(t)
+}
+
+// targetAccountName is the account name used across the targeted-rescan
+// scoping tests.
+const targetAccountName = "target"
+
+// resolvedTestTarget builds a resolved scanTarget for a materialized account so
+// tests can construct a targeted-rescan target set.
+func resolvedTestTarget(scope waddrmgr.KeyScope, account uint32,
+	name string) scanTarget {
+
+	accountID := account
+	dbScope := db.KeyScope(scope)
+
+	return scanTarget{
+		Scope:       scope,
+		Account:     account,
+		AccountName: name,
+		info: &db.AccountInfo{
+			AccountID:   &accountID,
+			AccountName: name,
+			KeyScope:    dbScope,
+		},
+	}
+}
+
+// TestStoreScanAddressesTargetedScoped verifies that a targeted rescan seeds
+// only the target account's addresses. Without scoping, storeScanAddresses
+// would load every account's addresses (and the raw-import bucket), letting a
+// targeted rescan match and persist unrelated-account activity.
+func TestStoreScanAddressesTargetedScoped(t *testing.T) {
+	t.Parallel()
+
+	const walletID uint32 = 40
+
+	store := &walletmock.Store{}
+	s := newSyncer(
+		Config{ChainParams: &chainParams}, nil, nil, &mockTxPublisher{},
+		store, walletID,
+	)
+
+	targetAddr, err := address.NewAddressPubKeyHash(
+		make([]byte, 20), &chainParams,
+	)
+	require.NoError(t, err)
+	targetScript, err := txscript.PayToAddrScript(targetAddr)
+	require.NoError(t, err)
+
+	// Two accounts exist, but only "target" is a scan target.
+	accounts := []db.AccountInfo{
+		{AccountName: targetAccountName, KeyScope: db.KeyScopeBIP0084},
+		{AccountName: "other", KeyScope: db.KeyScopeBIP0084},
+	}
+	store.On("ListAccounts", mock.Anything, mock.MatchedBy(
+		func(query db.ListAccountsQuery) bool {
+			return query.WalletID == walletID && query.SkipBalance
+		},
+	)).Return(accounts, nil).Once()
+
+	// Only the target account's addresses must be queried. A query for the
+	// off-target account or the imported bucket would be an unexpected call
+	// and trip the strict mock.
+	store.On("ListAddresses", mock.Anything, mock.MatchedBy(
+		func(query db.ListAddressesQuery) bool {
+			return query.WalletID == walletID &&
+				query.AccountName != nil &&
+				*query.AccountName == targetAccountName
+		},
+	)).Return(page.Result[db.AddressInfo, uint32]{
+		Items: []db.AddressInfo{{ScriptPubKey: targetScript}},
+	}, nil).Once()
+
+	targets := newScanTargetSet([]scanTarget{
+		resolvedTestTarget(waddrmgr.KeyScopeBIP0084, 0, targetAccountName),
+	})
+
+	addrs, err := s.storeScanAddresses(t.Context(), targets)
+	require.NoError(t, err)
+	require.Len(t, addrs, 1)
+	require.Equal(
+		t, targetAddr.EncodeAddress(), addrs[0].EncodeAddress(),
+	)
+	store.AssertExpectations(t)
+}
+
+// TestStoreScanUnspentTargetedScoped verifies that a targeted rescan seeds only
+// the target account's UTXOs. Without scoping, storeScanUnspent would return
+// every wallet UTXO, letting a targeted rescan watch and persist a spend of an
+// unrelated account's output.
+func TestStoreScanUnspentTargetedScoped(t *testing.T) {
+	t.Parallel()
+
+	const walletID uint32 = 41
+
+	store := &walletmock.Store{}
+	s := newSyncer(
+		Config{}, nil, nil, &mockTxPublisher{}, store, walletID,
+	)
+
+	targetOut := wire.OutPoint{Hash: chainhash.Hash{0x01}, Index: 0}
+	offOut := wire.OutPoint{Hash: chainhash.Hash{0x02}, Index: 1}
+	utxos := []db.UtxoInfo{
+		{
+			OutPoint:    targetOut,
+			Amount:      btcutil.Amount(1000),
+			PkScript:    []byte{0x51},
+			AccountName: targetAccountName,
+			KeyScope:    db.KeyScopeBIP0084,
+		},
+		{
+			OutPoint:    offOut,
+			Amount:      btcutil.Amount(2000),
+			PkScript:    []byte{0x52},
+			AccountName: "other",
+			KeyScope:    db.KeyScopeBIP0084,
+		},
+	}
+	store.On(
+		"ListOutputsToWatch", mock.Anything, walletID,
+	).Return(utxos, nil).Once()
+
+	targets := newScanTargetSet([]scanTarget{
+		resolvedTestTarget(waddrmgr.KeyScopeBIP0084, 0, targetAccountName),
+	})
+
+	credits, err := s.storeScanUnspent(t.Context(), targets)
+	require.NoError(t, err)
+	require.Len(t, credits, 1)
+	require.Equal(t, targetOut, credits[0].OutPoint)
+	store.AssertExpectations(t)
+}
+
+// TestNewScanTargetSet verifies target-set membership, including the nil
+// (untargeted) set matching everything and the raw-import bucket being matched
+// only when it is itself a target.
+func TestNewScanTargetSet(t *testing.T) {
+	t.Parallel()
+
+	// A nil (untargeted) set matches every account and includes the
+	// raw-import bucket.
+	full := newScanTargetSet(nil)
+	require.Nil(t, full)
+	require.True(t, full.matches(db.KeyScopeBIP0084, "anything"))
+	require.True(t, full.includesImported())
+
+	// A targeted set matches only its members.
+	targeted := newScanTargetSet([]scanTarget{
+		resolvedTestTarget(waddrmgr.KeyScopeBIP0084, 0, targetAccountName),
+	})
+	require.True(t, targeted.matches(db.KeyScopeBIP0084, targetAccountName))
+	require.False(t, targeted.matches(db.KeyScopeBIP0084, "other"))
+	require.False(
+		t, targeted.matches(db.KeyScopeBIP0049Plus, targetAccountName),
+	)
+	require.False(t, targeted.includesImported())
+
+	// The keyless imported bucket (nil info) is keyed on the reserved
+	// imported alias, so it matches raw-import addresses and UTXOs.
+	importedTarget := newScanTargetSet([]scanTarget{{
+		Scope:   waddrmgr.KeyScopeBIP0084,
+		Account: waddrmgr.ImportedAddrAccount,
+	}})
+	require.True(t, importedTarget.includesImported())
+	require.True(t, importedTarget.matches(
+		db.KeyScopeBIP0084, db.DefaultImportedAccountName,
+	))
 }
 
 // TestInitChainSyncWatchesUnspentForSpends verifies that initChainSync seeds
