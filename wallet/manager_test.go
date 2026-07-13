@@ -14,6 +14,9 @@ import (
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
+	"github.com/btcsuite/btcwallet/walletdb"
+	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -1299,4 +1302,89 @@ func TestManagerCreateReleasesGuardOnFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("retry blocked: create guard was not released")
 	}
+}
+
+// TestCreateLegacyWallet verifies that the wallet database is correctly
+// initialized with the address and transaction manager buckets.
+func TestCreateLegacyWallet(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Create a fresh database with empty top-level buckets.
+	dbConn, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+
+	params := CreateWalletParams{
+		PubPassphrase:     []byte("public"),
+		PrivatePassphrase: []byte("private"),
+		Birthday:          time.Now(),
+	}
+
+	// Act: Initialize the wallet database.
+	err := kvdb.CreateLegacyWallet(dbConn, kvdb.CreateLegacyWalletParams{
+		PubPassphrase:     params.PubPassphrase,
+		PrivatePassphrase: params.PrivatePassphrase,
+		ChainParams:       &chainParams,
+		Birthday:          params.Birthday,
+	})
+
+	// Assert: Verify initialization success.
+	require.NoError(t, err)
+
+	// Verify that the address manager and transaction manager can be
+	// opened, indicating successful initialization.
+	err = walletdb.View(dbConn, func(tx walletdb.ReadTx) error {
+		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
+		require.NotNil(t, addrmgrNs)
+
+		_, err := waddrmgr.Open(
+			addrmgrNs, params.PubPassphrase, &chainParams,
+		)
+		if err != nil {
+			return err
+		}
+
+		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
+		require.NotNil(t, txmgrNs)
+
+		_, err = wtxmgr.Open(txmgrNs, &chainParams)
+
+		return err
+	})
+	require.NoError(t, err)
+}
+
+// TestLoadLegacyWallet verifies that the wallet database can be successfully
+// loaded and the address and transaction managers retrieved.
+func TestLoadLegacyWallet(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Create a test database and initialize it.
+	dbConn, cleanup := setupTestDB(t)
+	t.Cleanup(cleanup)
+
+	pubPass := []byte("public")
+
+	params := CreateWalletParams{
+		PubPassphrase:     pubPass,
+		PrivatePassphrase: []byte("private"),
+		Birthday:          time.Now(),
+	}
+
+	err := kvdb.CreateLegacyWallet(dbConn, kvdb.CreateLegacyWalletParams{
+		PubPassphrase:     params.PubPassphrase,
+		PrivatePassphrase: params.PrivatePassphrase,
+		ChainParams:       &chainParams,
+		Birthday:          params.Birthday,
+	})
+	require.NoError(t, err)
+
+	// Act: Load the wallet database.
+	addrMgr, txMgr, err := kvdb.LoadLegacyWallet(
+		dbConn, pubPass, &chainParams,
+	)
+
+	// Assert: Verify that both managers were loaded successfully.
+	require.NoError(t, err)
+	require.NotNil(t, addrMgr)
+	require.NotNil(t, txMgr)
 }

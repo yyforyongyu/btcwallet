@@ -18,7 +18,6 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
-	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/require"
@@ -299,10 +298,9 @@ func setupBenchmarkWallet(tb testing.TB,
 	w := testWallet(setupT)
 	require.False(tb, setupT.Failed(), "testWallet setup failed")
 
-	// Backfill Config and State for benchmarks comparing new APIs.
-	// Legacy testWallet does not populate these.
-	if w.legacyStore == nil {
-		w.legacyStore = kvdb.NewStore(w.db, w.txStore, w.addrStore)
+	// Backfill Config for benchmarks comparing new APIs. Legacy testWallet
+	// leaves ChainParams and Chain unset on the config.
+	if w.cfg.ChainParams == nil {
 		w.cfg = Config{
 			DB:          testDBConfig(w.db),
 			ChainParams: w.chainParams,

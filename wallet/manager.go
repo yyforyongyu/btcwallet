@@ -1038,15 +1038,13 @@ func (m *Manager) buildWallet(cfg Config) (*Wallet, error) {
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
 
 	var (
-		addrStore     waddrmgr.AddrStore
-		legacyDBStore *kvdb.Store
-		txStore       wtxmgr.TxStore
-		vault         keyvault.Vault
+		addrStore waddrmgr.AddrStore
+		txStore   wtxmgr.TxStore
+		vault     keyvault.Vault
 	)
 
 	if isKVDB {
 		addrStore = legacyStore.AddrStore
-		legacyDBStore = legacyStore.Store
 		txStore = legacyStore.TxStore
 		vault = kvdb.NewLegacyManagerVault(
 			legacyStore.DB, legacyStore.AddrStore,
@@ -1059,7 +1057,6 @@ func (m *Manager) buildWallet(cfg Config) (*Wallet, error) {
 		cfg:               cfg,
 		id:                walletID,
 		addrStore:         addrStore,
-		legacyStore:       legacyDBStore,
 		store:             store,
 		runtimeStoreClose: runtimeStoreClose,
 		cache:             newStoreRuntimeCache(store),

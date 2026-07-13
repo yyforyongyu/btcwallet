@@ -58,7 +58,10 @@ type OpenStoreParams struct {
 	ChainParams *chaincfg.Params
 }
 
-// StoreHandle is an opened kvdb wallet store and its legacy manager state.
+// StoreHandle is an opened kvdb wallet store together with the legacy manager
+// state that backs it. It bundles the walletdb database, the db.Store adapter,
+// and the legacy address/transaction managers, and owns their lifetime via
+// Close. It is returned by CreateStore and OpenStore.
 type StoreHandle struct {
 	// DB is the opened walletdb database backing the store.
 	DB walletdb.DB
@@ -72,6 +75,8 @@ type StoreHandle struct {
 	// TxStore is the opened legacy transaction manager.
 	TxStore *wtxmgr.Store
 
+	// closeFn releases the resources owned by this handle, closing the
+	// underlying walletdb database. It is nil once Close has run.
 	closeFn func() error
 }
 
@@ -149,7 +154,7 @@ func CreateStore(cfg Config, createParams CreateLegacyWalletParams) (
 		return nil, err
 	}
 
-	return LoadStore(dbConn, closeFn, OpenStoreParams{
+	return loadStore(dbConn, closeFn, OpenStoreParams{
 		PubPassphrase: createParams.PubPassphrase,
 		ChainParams:   createParams.ChainParams,
 	})
@@ -168,11 +173,11 @@ func OpenStore(cfg Config, params OpenStoreParams) (*StoreHandle, error) {
 		return nil, fmt.Errorf("open kvdb: %w", err)
 	}
 
-	return LoadStore(dbConn, dbConn.Close, params)
+	return loadStore(dbConn, dbConn.Close, params)
 }
 
-// LoadStore loads a kvdb-backed wallet store from an already-open walletdb.
-func LoadStore(dbConn walletdb.DB, closeFn func() error,
+// loadStore loads a kvdb-backed wallet store from an already-open walletdb.
+func loadStore(dbConn walletdb.DB, closeFn func() error,
 	params OpenStoreParams) (*StoreHandle, error) {
 
 	addrStore, txStore, err := LoadLegacyWallet(

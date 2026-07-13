@@ -24,7 +24,6 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
-	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/wallet/internal/keyvault"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 )
@@ -350,11 +349,6 @@ type Wallet struct {
 	// txStore is the transaction manager responsible for storing and
 	// querying the wallet's transaction history and unspent outputs.
 	txStore wtxmgr.TxStore
-
-	// legacyStore is the kvdb compatibility adapter for legacy manager paths.
-	// New wallet code must not open walletdb transactions directly; use
-	// db.Store, keyvault, or kvdb adapter methods instead.
-	legacyStore *kvdb.Store
 
 	// keyVault provides encryption and decryption for wallet key material.
 	keyVault keyvault.Vault

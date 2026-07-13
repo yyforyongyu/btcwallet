@@ -290,7 +290,6 @@ func TestManagerCreateLoadSQLiteNoLegacySidecar(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, w)
 	require.Nil(t, w.addrStore)
-	require.Nil(t, w.legacyStore)
 	require.Nil(t, w.txStore)
 	requireNoLegacyWalletFile(t, cfg)
 	require.NoError(t, w.closeRuntimeStore())
@@ -303,7 +302,6 @@ func TestManagerCreateLoadSQLiteNoLegacySidecar(t *testing.T) {
 		require.NoError(t, loaded.closeRuntimeStore())
 	})
 	require.Nil(t, loaded.addrStore)
-	require.Nil(t, loaded.legacyStore)
 	require.Nil(t, loaded.txStore)
 	requireNoLegacyWalletFile(t, cfg)
 

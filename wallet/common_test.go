@@ -14,7 +14,6 @@ import (
 	"github.com/btcsuite/btcwallet/wallet/internal/bwtest/keyvaultmock"
 	walletmock "github.com/btcsuite/btcwallet/wallet/internal/bwtest/mock"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
-	kvdb "github.com/btcsuite/btcwallet/wallet/internal/db/kvdb"
 	"github.com/btcsuite/btcwallet/walletdb"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 	"github.com/stretchr/testify/mock"
@@ -167,7 +166,6 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 		addrStore:   mockAddrStore,
 		store:       mockStore,
 		txStore:     mockTxStore,
-		legacyStore: kvdb.NewStore(db, mockTxStore, mockAddrStore),
 		keyVault:    mockVault,
 		sync:        mockSyncer,
 		state:       newWalletState(mockSyncer),
