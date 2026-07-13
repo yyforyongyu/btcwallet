@@ -406,3 +406,46 @@ func txDetailInfoFromLegacy(details *wtxmgr.TxDetails) *db.TxDetailInfo {
 		OwnedOutputs: ownedOutputs,
 	}
 }
+
+// TestTxStatusReExport verifies the wallet-level TxStatus type alias and its
+// re-exported constants are usable by external callers and stay numerically
+// equal to the internal store values, and that TxDetail.Status accepts them.
+func TestTxStatusReExport(t *testing.T) {
+	t.Parallel()
+
+	// The wallet-level constants must equal the internal store values so a
+	// caller that switches on wallet.TxStatus* observes the same states the
+	// store persisted.
+	tests := []struct {
+		name   string
+		wallet TxStatus
+		store  db.TxStatus
+	}{
+		{"pending", TxStatusPending, db.TxStatusPending},
+		{"published", TxStatusPublished, db.TxStatusPublished},
+		{"replaced", TxStatusReplaced, db.TxStatusReplaced},
+		{"failed", TxStatusFailed, db.TxStatusFailed},
+		{"orphaned", TxStatusOrphaned, db.TxStatusOrphaned},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tc.store, tc.wallet)
+		})
+	}
+
+	// The alias must be nameable by external callers: a function typed on
+	// wallet.TxStatus accepts a wallet-level constant and its result is
+	// assignable to TxDetail.Status and back to the internal type.
+	status := echoTxStatus(TxStatusReplaced)
+	detail := TxDetail{Status: status}
+	require.Equal(t, db.TxStatusReplaced, detail.Status)
+	require.Equal(t, "replaced", detail.Status.String())
+}
+
+// echoTxStatus names the wallet-level TxStatus type in a signature, mirroring
+// how an external caller would hold the value returned by TxDetail.Status.
+func echoTxStatus(s TxStatus) TxStatus {
+	return s
+}

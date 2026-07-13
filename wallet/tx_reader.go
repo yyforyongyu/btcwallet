@@ -31,6 +31,34 @@ var (
 	errNilTxDetailMsgTx = errors.New("tx detail MsgTx is nil")
 )
 
+// TxStatus is the wallet-relative validity state of a transaction, exposed on
+// TxDetail.Status. It aliases the internal store type so external callers
+// (which cannot name the internal package) can hold, compare, and switch on
+// the value using the wallet-level TxStatus* constants below.
+type TxStatus = db.TxStatus
+
+const (
+	// TxStatusPending indicates a locally-created transaction that has not
+	// yet been broadcast.
+	TxStatusPending = db.TxStatusPending
+
+	// TxStatusPublished indicates a transaction the wallet still treats as
+	// valid: unconfirmed in the mempool or confirmed in the best chain.
+	TxStatusPublished = db.TxStatusPublished
+
+	// TxStatusReplaced indicates a transaction invalidated by a competing
+	// transaction that spent the same inputs via RBF.
+	TxStatusReplaced = db.TxStatusReplaced
+
+	// TxStatusFailed indicates a transaction invalidated by a competing
+	// transaction that spent the same inputs (double-spend).
+	TxStatusFailed = db.TxStatusFailed
+
+	// TxStatusOrphaned indicates a coinbase transaction that was reorged
+	// out of the best chain.
+	TxStatusOrphaned = db.TxStatusOrphaned
+)
+
 // TxReader provides an interface for querying tx history.
 type TxReader interface {
 	// GetTx returns a detailed description of a tx given its tx hash.
@@ -143,8 +171,10 @@ type TxDetail struct {
 	// Status is the wallet-relative validity state of the transaction
 	// (published, pending, failed, replaced, or orphaned). Retained
 	// invalid transactions surface their state here so callers can
-	// distinguish them from ordinary unconfirmed transactions.
-	Status db.TxStatus
+	// distinguish them from ordinary unconfirmed transactions. Its type
+	// and the TxStatus* constants are re-exported at the wallet level so
+	// external callers can name them.
+	Status TxStatus
 }
 
 // GetTx returns a detailed description of a tx given its tx hash.
