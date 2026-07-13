@@ -42,6 +42,10 @@ var (
 	}
 )
 
+// errMsgSQLiteDBPath is the missing-SQLite-path validation error substring
+// asserted by the config validation tests.
+const errMsgSQLiteDBPath = "DB.SQLite.DBPath"
+
 // TestConfigValidate ensures that the Config.validate method correctly
 // identifies missing required parameters.
 func TestConfigValidate(t *testing.T) {
@@ -77,8 +81,24 @@ func TestConfigValidate(t *testing.T) {
 			expectedErr: "RecoveryWindow",
 		},
 		{
+			// With no backend set, the config defaults to SQLite
+			// and has no kvdb path to derive the SQLite path from,
+			// so validation fails on the missing SQLite path.
+			name: "missing default SQLite path",
+			config: Config{
+				Chain:          &bwmock.Chain{},
+				ChainParams:    &chainParams,
+				Name:           "test-wallet",
+				RecoveryWindow: MinRecoveryWindow,
+			},
+			expectedErr: errMsgSQLiteDBPath,
+		},
+		{
 			name: "missing KVDB DBPath",
 			config: Config{
+				DB: DBConfig{
+					Backend: DBBackendKVDB,
+				},
 				Chain:          &bwmock.Chain{},
 				ChainParams:    &chainParams,
 				Name:           "test-wallet",

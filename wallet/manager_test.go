@@ -916,10 +916,13 @@ func TestManager_genRootKey(t *testing.T) {
 	t.Parallel()
 
 	m := NewManager()
-	cfg := Config{ChainParams: &chainParams}
+	cfg := Config{
+		ChainParams: &chainParams,
+		DB:          DBConfig{Backend: DBBackendKVDB},
+	}
 
-	// With no configured kvdb path there is no legacy wallet to recover, so
-	// genRootKey takes the fresh-generation branch.
+	// With explicit kvdb and no configured path there is no legacy wallet to
+	// recover, so genRootKey takes the fresh-generation branch.
 	key, err := m.genRootKey(cfg, CreateWalletParams{Mode: ModeGenSeed})
 
 	// Verify we got a valid private extended key.
@@ -935,7 +938,10 @@ func TestManager_deriveRootKey(t *testing.T) {
 	t.Parallel()
 
 	m := NewManager()
-	cfg := Config{ChainParams: &chainParams}
+	cfg := Config{
+		ChainParams: &chainParams,
+		DB:          DBConfig{Backend: DBBackendKVDB},
+	}
 
 	// 1. ModeShell: Should return nil/nil (no root key for shell).
 	t.Run("ModeShell", func(t *testing.T) {
