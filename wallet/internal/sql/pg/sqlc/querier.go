@@ -159,6 +159,10 @@ type Querier interface {
 	// even when no account_secrets row exists so callers can distinguish a
 	// watch-only account from an absent account.
 	GetAccountSecret(ctx context.Context, arg GetAccountSecretParams) (GetAccountSecretRow, error)
+	// Returns account-level key material for signing, selected by account id. The
+	// account row is returned even when no account_secrets row exists so callers
+	// can distinguish a watch-only account from an absent account.
+	GetAccountSecretById(ctx context.Context, arg GetAccountSecretByIdParams) (GetAccountSecretByIdRow, error)
 	// Returns the lock ID for the current active lease on a UTXO ID.
 	//
 	// How:
@@ -174,6 +178,12 @@ type Querier interface {
 	// - Address exists without secret row: returns row with NULL secret fields
 	// - Address does not exist: returns no rows (sql.ErrNoRows)
 	GetAddressSecret(ctx context.Context, arg GetAddressSecretParams) (GetAddressSecretRow, error)
+	// Retrieves secret information for an address by its script pubkey. Uses
+	// LEFT JOIN to distinguish:
+	// - Address exists with secret: returns full row
+	// - Address exists without secret row: returns row with NULL secret fields
+	// - Address does not exist: returns no rows (sql.ErrNoRows)
+	GetAddressSecretByScriptPubKey(ctx context.Context, arg GetAddressSecretByScriptPubKeyParams) (GetAddressSecretByScriptPubKeyRow, error)
 	// Returns a single address type by its ID.
 	GetAddressTypeByID(ctx context.Context, id int16) (AddressType, error)
 	// Atomically gets the next derived account number for a key scope and

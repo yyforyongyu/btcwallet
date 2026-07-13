@@ -262,6 +262,39 @@ func (q *Queries) GetAddressSecret(ctx context.Context, arg GetAddressSecretPara
 	return i, err
 }
 
+const GetAddressSecretByScriptPubKey = `-- name: GetAddressSecretByScriptPubKey :one
+SELECT
+    a.id AS address_id,
+    s.encrypted_priv_key,
+    s.encrypted_script
+FROM addresses AS a
+LEFT JOIN address_secrets AS s ON a.id = s.address_id
+WHERE a.wallet_id = $1 AND a.script_pub_key = $2
+`
+
+type GetAddressSecretByScriptPubKeyParams struct {
+	WalletID     int64
+	ScriptPubKey []byte
+}
+
+type GetAddressSecretByScriptPubKeyRow struct {
+	AddressID        int64
+	EncryptedPrivKey []byte
+	EncryptedScript  []byte
+}
+
+// Retrieves secret information for an address by its script pubkey. Uses
+// LEFT JOIN to distinguish:
+// - Address exists with secret: returns full row
+// - Address exists without secret row: returns row with NULL secret fields
+// - Address does not exist: returns no rows (sql.ErrNoRows)
+func (q *Queries) GetAddressSecretByScriptPubKey(ctx context.Context, arg GetAddressSecretByScriptPubKeyParams) (GetAddressSecretByScriptPubKeyRow, error) {
+	row := q.queryRow(ctx, q.getAddressSecretByScriptPubKeyStmt, GetAddressSecretByScriptPubKey, arg.WalletID, arg.ScriptPubKey)
+	var i GetAddressSecretByScriptPubKeyRow
+	err := row.Scan(&i.AddressID, &i.EncryptedPrivKey, &i.EncryptedScript)
+	return i, err
+}
+
 const InsertAddressSecret = `-- name: InsertAddressSecret :exec
 INSERT INTO address_secrets (
     address_id,

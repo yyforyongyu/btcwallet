@@ -111,6 +111,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getAccountSecretStmt, err = db.PrepareContext(ctx, GetAccountSecret); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAccountSecret: %w", err)
 	}
+	if q.getAccountSecretByIdStmt, err = db.PrepareContext(ctx, GetAccountSecretById); err != nil {
+		return nil, fmt.Errorf("error preparing query GetAccountSecretById: %w", err)
+	}
 	if q.getActiveUtxoLeaseLockIDStmt, err = db.PrepareContext(ctx, GetActiveUtxoLeaseLockID); err != nil {
 		return nil, fmt.Errorf("error preparing query GetActiveUtxoLeaseLockID: %w", err)
 	}
@@ -119,6 +122,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.getAddressSecretStmt, err = db.PrepareContext(ctx, GetAddressSecret); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAddressSecret: %w", err)
+	}
+	if q.getAddressSecretByScriptPubKeyStmt, err = db.PrepareContext(ctx, GetAddressSecretByScriptPubKey); err != nil {
+		return nil, fmt.Errorf("error preparing query GetAddressSecretByScriptPubKey: %w", err)
 	}
 	if q.getAddressTypeByIDStmt, err = db.PrepareContext(ctx, GetAddressTypeByID); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAddressTypeByID: %w", err)
@@ -456,6 +462,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getAccountSecretStmt: %w", cerr)
 		}
 	}
+	if q.getAccountSecretByIdStmt != nil {
+		if cerr := q.getAccountSecretByIdStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getAccountSecretByIdStmt: %w", cerr)
+		}
+	}
 	if q.getActiveUtxoLeaseLockIDStmt != nil {
 		if cerr := q.getActiveUtxoLeaseLockIDStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getActiveUtxoLeaseLockIDStmt: %w", cerr)
@@ -469,6 +480,11 @@ func (q *Queries) Close() error {
 	if q.getAddressSecretStmt != nil {
 		if cerr := q.getAddressSecretStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getAddressSecretStmt: %w", cerr)
+		}
+	}
+	if q.getAddressSecretByScriptPubKeyStmt != nil {
+		if cerr := q.getAddressSecretByScriptPubKeyStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getAddressSecretByScriptPubKeyStmt: %w", cerr)
 		}
 	}
 	if q.getAddressTypeByIDStmt != nil {
@@ -849,9 +865,11 @@ type Queries struct {
 	getAccountPropsByIdStmt                     *sql.Stmt
 	getAccountPropsByWalletAndIdStmt            *sql.Stmt
 	getAccountSecretStmt                        *sql.Stmt
+	getAccountSecretByIdStmt                    *sql.Stmt
 	getActiveUtxoLeaseLockIDStmt                *sql.Stmt
 	getAddressByScriptPubKeyStmt                *sql.Stmt
 	getAddressSecretStmt                        *sql.Stmt
+	getAddressSecretByScriptPubKeyStmt          *sql.Stmt
 	getAddressTypeByIDStmt                      *sql.Stmt
 	getAndIncrementNextAccountNumberStmt        *sql.Stmt
 	getAndIncrementNextExternalIndexStmt        *sql.Stmt
@@ -949,9 +967,11 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getAccountPropsByIdStmt:                     q.getAccountPropsByIdStmt,
 		getAccountPropsByWalletAndIdStmt:            q.getAccountPropsByWalletAndIdStmt,
 		getAccountSecretStmt:                        q.getAccountSecretStmt,
+		getAccountSecretByIdStmt:                    q.getAccountSecretByIdStmt,
 		getActiveUtxoLeaseLockIDStmt:                q.getActiveUtxoLeaseLockIDStmt,
 		getAddressByScriptPubKeyStmt:                q.getAddressByScriptPubKeyStmt,
 		getAddressSecretStmt:                        q.getAddressSecretStmt,
+		getAddressSecretByScriptPubKeyStmt:          q.getAddressSecretByScriptPubKeyStmt,
 		getAddressTypeByIDStmt:                      q.getAddressTypeByIDStmt,
 		getAndIncrementNextAccountNumberStmt:        q.getAndIncrementNextAccountNumberStmt,
 		getAndIncrementNextExternalIndexStmt:        q.getAndIncrementNextExternalIndexStmt,

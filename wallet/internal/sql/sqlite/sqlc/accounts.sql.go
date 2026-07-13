@@ -823,6 +823,57 @@ func (q *Queries) GetAccountSecret(ctx context.Context, arg GetAccountSecretPara
 	return i, err
 }
 
+const GetAccountSecretById = `-- name: GetAccountSecretById :one
+SELECT
+    a.wallet_id,
+    ks.purpose,
+    ks.coin_type,
+    a.account_number,
+    a.account_name,
+    a.public_key,
+    acs.encrypted_private_key,
+    a.master_fingerprint
+FROM accounts AS a
+INNER JOIN key_scopes AS ks ON a.scope_id = ks.id
+LEFT JOIN account_secrets AS acs ON a.id = acs.account_id
+WHERE a.wallet_id = ?1 AND a.id = ?2
+`
+
+type GetAccountSecretByIdParams struct {
+	WalletID int64
+	ID       int64
+}
+
+type GetAccountSecretByIdRow struct {
+	WalletID            int64
+	Purpose             int64
+	CoinType            int64
+	AccountNumber       sql.NullInt64
+	AccountName         string
+	PublicKey           []byte
+	EncryptedPrivateKey []byte
+	MasterFingerprint   sql.NullInt64
+}
+
+// Returns account-level key material for signing, selected by account id. The
+// account row is returned even when no account_secrets row exists so callers
+// can distinguish a watch-only account from an absent account.
+func (q *Queries) GetAccountSecretById(ctx context.Context, arg GetAccountSecretByIdParams) (GetAccountSecretByIdRow, error) {
+	row := q.queryRow(ctx, q.getAccountSecretByIdStmt, GetAccountSecretById, arg.WalletID, arg.ID)
+	var i GetAccountSecretByIdRow
+	err := row.Scan(
+		&i.WalletID,
+		&i.Purpose,
+		&i.CoinType,
+		&i.AccountNumber,
+		&i.AccountName,
+		&i.PublicKey,
+		&i.EncryptedPrivateKey,
+		&i.MasterFingerprint,
+	)
+	return i, err
+}
+
 const GetAndIncrementNextExternalIndex = `-- name: GetAndIncrementNextExternalIndex :one
 UPDATE accounts
 SET next_external_index = next_external_index + 1
