@@ -162,7 +162,7 @@ itest-db-race:
 	env CGO_ENABLED=1 GORACE="history_size=7 halt_on_errors=1" $(ITEST_DB_RACE)
 
 #? itest: Run integration tests
-#? itest (vars): chain=btcd|bitcoind|neutrino backend=btcd|bitcoind|neutrino db=kvdb|sqlite|postgres
+#? itest (vars): chain=btcd|bitcoind|neutrino backend=btcd|bitcoind|neutrino db=sqlite|kvdb
 #? itest (vars): icase=<regex> (filter itest cases)
 #? itest (vars): timeout=<duration> verbose=1 nocache=1
 #? itest (ex): make itest icase=manager
@@ -175,7 +175,7 @@ itest:
 		$(filter-out -test.run=%,$(TEST_FLAGS)) \
 		-args \
 		-chain="$(if $(backend),$(backend),$(if $(chain),$(chain),btcd))" \
-		-db="$(if $(db),$(db),kvdb)"
+		-db="$(if $(db),$(db),sqlite)"
 
 # =========
 # UTILITIES

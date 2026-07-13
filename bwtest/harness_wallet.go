@@ -38,10 +38,33 @@ func (h *HarnessTest) CreateEmptyWallet() *wallet.Wallet {
 
 	name := "itest-" + strings.ReplaceAll(h.Name(), "/", "_")
 
+	// Resolve the configured backend, rejecting any db value the harness
+	// cannot wire. kvdb runs directly off the subtest DB path; sqlite derives
+	// its path from that same kvdb path via the wallet's config defaults.
+	// postgres needs a DSN the harness does not provision, so reject it here
+	// with a clear message rather than failing deep inside Manager.Create.
+	backend := wallet.DBBackend(h.dbType)
+	switch backend {
+	// kvdb and sqlite are both wireable from the subtest DB path.
+	case wallet.DBBackendKVDB, wallet.DBBackendSQLite:
+
+	case wallet.DBBackendPostgres:
+		h.Fatalf("db=%s is not supported by the itest harness: no "+
+			"Postgres DSN is provisioned", h.dbType)
+
+	default:
+		h.Fatalf("unknown db backend %q: use kvdb or sqlite", h.dbType)
+	}
+
 	cfg := wallet.Config{
 		// Use the subtest-scoped DB path and chain client prepared by the
 		// harness.
 		DB: wallet.DBConfig{
+			// Honor the harness-configured backend so db=kvdb parity
+			// runs exercise kvdb rather than silently defaulting to
+			// SQLite. When sqlite is selected the SQLite path is
+			// derived from the kvdb path below.
+			Backend: backend,
 			KVDB: wallet.KVDBConfig{
 				DBPath: h.WalletDBPath,
 			},

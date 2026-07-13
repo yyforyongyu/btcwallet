@@ -26,13 +26,14 @@ var (
 
 	// dbBackend defines the database backend to be used for the wallet
 	// storage.
-	// Options: "kvdb" (default), "sqlite", "postgres".
+	// Options: "sqlite" (default), "kvdb".
 	//
-	// This flag allows verifying that the wallet functions correctly across all
-	// supported database drivers.
+	// This flag allows verifying that the wallet functions correctly across the
+	// supported database drivers. It defaults to sqlite to match the wallet's
+	// default backend; pass -db=kvdb to run the legacy walletdb parity suite.
 	dbBackend = flag.String(
-		"db", "kvdb",
-		"database backend to use (kvdb, sqlite, postgres)",
+		"db", "sqlite",
+		"database backend to use (sqlite, kvdb)",
 	)
 
 	// shuffleSeedFlag is the source of randomness used to shuffle the test
