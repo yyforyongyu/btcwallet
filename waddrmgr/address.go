@@ -728,6 +728,12 @@ type baseScriptAddress struct {
 	scriptMutex     sync.Mutex
 }
 
+// encryptedScript returns the stored, still-encrypted script material for the
+// address. It is nil for watch-only script addresses that persist no script.
+func (a *baseScriptAddress) encryptedScript() []byte {
+	return a.scriptEncrypted
+}
+
 var _ clearTextScriptSetter = (*baseScriptAddress)(nil)
 
 // unlock decrypts and stores the associated script.  It will fail if the key is

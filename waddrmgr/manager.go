@@ -7,6 +7,7 @@ package waddrmgr
 import (
 	"crypto/rand"
 	"crypto/sha512"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -84,6 +85,10 @@ const (
 	// saltSize is the number of bytes of the salt used when hashing
 	// private passphrases.
 	saltSize = 32
+
+	// errReadRandSalt is the error description used when reading random
+	// bytes for a new passphrase salt fails.
+	errReadRandSalt = "failed to read random source for passphrase salt"
 )
 
 // isReservedAccountName returns true if the account name is reserved.
@@ -1146,6 +1151,437 @@ func (m *Manager) ChangePassphrase(ns walletdb.ReadWriteBucket, oldPassphrase,
 	}
 
 	return nil
+}
+
+// ChangePassphrasesParams describes an atomic change of the public and/or
+// private passphrases guarding the address manager.
+type ChangePassphrasesParams struct {
+	// ChangePublic indicates the public passphrase should be changed from
+	// PublicOld to PublicNew.
+	ChangePublic bool
+
+	// PublicOld is the current public passphrase. It is only consulted when
+	// ChangePublic is true.
+	PublicOld []byte
+
+	// PublicNew is the desired public passphrase. It is only used when
+	// ChangePublic is true.
+	PublicNew []byte
+
+	// ChangePrivate indicates the private passphrase should be changed from
+	// PrivateOld to PrivateNew.
+	ChangePrivate bool
+
+	// PrivateOld is the current private passphrase. It is only consulted
+	// when ChangePrivate is true.
+	PrivateOld []byte
+
+	// PrivateNew is the desired private passphrase. It is only used when
+	// ChangePrivate is true.
+	PrivateNew []byte
+
+	// Config holds the scrypt parameters used to derive the new master
+	// keys. A nil value selects DefaultScryptOptions.
+	Config *ScryptOptions
+}
+
+// changePassphrasesStaged holds the fully derived and re-encrypted key material
+// produced while staging a passphrase change. Nothing in here is applied to the
+// in-memory Manager state until the surrounding database transaction commits.
+type changePassphrasesStaged struct {
+	// newMasterKeyPub is the freshly derived public master key. It is nil
+	// when the public passphrase is not being changed.
+	newMasterKeyPub *snacl.SecretKey
+
+	// pubParams is the marshalled parameters of newMasterKeyPub.
+	pubParams []byte
+
+	// encryptedPub is the crypto public key re-encrypted under
+	// newMasterKeyPub.
+	encryptedPub []byte
+
+	// newMasterKeyPriv is the freshly derived private master key. It is nil
+	// when the private passphrase is not being changed.
+	newMasterKeyPriv *snacl.SecretKey
+
+	// privParams is the marshalled parameters of newMasterKeyPriv.
+	privParams []byte
+
+	// encPriv and encScript are the crypto private and script keys
+	// re-encrypted under newMasterKeyPriv.
+	encPriv   []byte
+	encScript []byte
+
+	// passphraseSalt is the new salt used to hash the private passphrase on
+	// each unlock.
+	passphraseSalt [saltSize]byte
+
+	// hashedPassphrase is the hash of the new private passphrase with the
+	// new salt. It is only meaningful while the manager is unlocked.
+	hashedPassphrase [sha512.Size]byte
+}
+
+// ChangePassphrases atomically changes the public and/or private passphrases in
+// a single database transaction. Unlike calling ChangePassphrase twice, every
+// requested old passphrase is validated up front, all new key material is
+// staged into local variables and written through ns, and the in-memory state
+// is only swapped in once the transaction commits. If any step fails, no
+// database rows are written by this method beyond those already rolled back
+// with the transaction and no in-memory secret is mutated.
+//
+// In order to change the private passphrase, the address manager must not be
+// watching-only.
+func (m *Manager) ChangePassphrases(ns walletdb.ReadWriteBucket,
+	params ChangePassphrasesParams) error {
+
+	// Nothing to do if neither passphrase is being changed.
+	if !params.ChangePublic && !params.ChangePrivate {
+		return nil
+	}
+
+	config := params.Config
+	if config == nil {
+		config = &DefaultScryptOptions
+	}
+
+	// No private passphrase to change for a watching-only address manager.
+	if params.ChangePrivate && m.WatchOnly() {
+		return managerError(ErrWatchingOnly, errWatchingOnly, nil)
+	}
+
+	// Stage all new key material while holding the lock so that the current
+	// state used for validation and re-encryption cannot change underneath
+	// us. The lock is released before the database writes below, mirroring
+	// the OnCommit discipline used elsewhere in this package where the
+	// in-memory swap re-acquires the lock at commit time.
+	stage := func() (*changePassphrasesStaged, error) {
+		m.mtx.Lock()
+		defer m.mtx.Unlock()
+
+		return m.stageChangePassphrases(params, config)
+	}
+
+	staged, err := stage()
+	if err != nil {
+		return err
+	}
+
+	// Persist all staged rows through ns. If the caller's transaction is
+	// later rolled back these writes are discarded, and because the swap
+	// below is deferred to OnCommit the in-memory state remains untouched.
+	err = staged.write(ns)
+	if err != nil {
+		return err
+	}
+
+	// Register a closure that swaps the staged material into the in-memory
+	// Manager state. It runs only when the transaction commits, so a failed
+	// commit leaves the old keys in place.
+	ns.Tx().OnCommit(func() {
+		staged.commit(m)
+	})
+
+	return nil
+}
+
+// write persists the staged master-key parameters and re-encrypted crypto-key
+// blobs through ns using the same put helpers as ChangePassphrase.
+func (s *changePassphrasesStaged) write(ns walletdb.ReadWriteBucket) error {
+	if s.newMasterKeyPub != nil {
+		err := putCryptoKeys(ns, s.encryptedPub, nil, nil)
+		if err != nil {
+			return maybeConvertDbError(err)
+		}
+
+		err = putMasterKeyParams(ns, s.pubParams, nil)
+		if err != nil {
+			return maybeConvertDbError(err)
+		}
+	}
+
+	if s.newMasterKeyPriv != nil {
+		err := putCryptoKeys(ns, nil, s.encPriv, s.encScript)
+		if err != nil {
+			return maybeConvertDbError(err)
+		}
+
+		err = putMasterKeyParams(ns, nil, s.privParams)
+		if err != nil {
+			return maybeConvertDbError(err)
+		}
+	}
+
+	return nil
+}
+
+// commit swaps the staged key material into the in-memory Manager state,
+// zeroing the replaced secret keys. It is invoked from the transaction's
+// OnCommit hook and re-acquires the manager lock since the transaction lock is
+// no longer held at commit time.
+func (s *changePassphrasesStaged) commit(m *Manager) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	if s.newMasterKeyPub != nil {
+		m.masterKeyPub.Zero()
+		m.masterKeyPub = s.newMasterKeyPub
+	}
+
+	if s.newMasterKeyPriv != nil {
+		copy(m.cryptoKeyPrivEncrypted, s.encPriv)
+		copy(m.cryptoKeyScriptEncrypted, s.encScript)
+		m.masterKeyPriv.Zero()
+		m.masterKeyPriv = s.newMasterKeyPriv
+		m.privPassphraseSalt = s.passphraseSalt
+		m.hashedPrivPassphrase = s.hashedPassphrase
+	}
+}
+
+// stageChangePassphrases validates the requested old passphrases against copies
+// of the current master keys and derives all new key material into a
+// changePassphrasesStaged value without mutating any Manager state. It must be
+// called with m.mtx held.
+func (m *Manager) stageChangePassphrases(params ChangePassphrasesParams,
+	config *ScryptOptions) (*changePassphrasesStaged, error) {
+
+	staged := &changePassphrasesStaged{}
+
+	// Validate and stage the public passphrase change first so that a wrong
+	// public passphrase is rejected before any private key material is
+	// touched.
+	if params.ChangePublic {
+		err := m.stagePublicPassphrase(staged, params, config)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Validate and stage the private passphrase change.
+	if params.ChangePrivate {
+		err := m.stagePrivatePassphrase(staged, params, config)
+		if err != nil {
+			// Zero any already-staged public master key so a
+			// private-side failure does not leak it.
+			staged.zeroSecrets()
+
+			return nil, err
+		}
+	}
+
+	return staged, nil
+}
+
+// validateOldMasterKey derives a copy of the given master key's parameters from
+// the supplied old passphrase to confirm the passphrase is correct without
+// mutating any Manager state. The temporary key is zeroed before returning to
+// avoid leaving a copy in memory. keyName is used purely for error messages.
+func validateOldMasterKey(params snacl.Parameters, oldPassphrase []byte,
+	keyName string) error {
+
+	secretKey := snacl.SecretKey{Key: &snacl.CryptoKey{}}
+	secretKey.Parameters = params
+
+	defer secretKey.Zero()
+
+	err := secretKey.DeriveKey(&oldPassphrase)
+	if err != nil {
+		if errors.Is(err, snacl.ErrInvalidPassword) {
+			str := fmt.Sprintf("invalid passphrase for %s master "+
+				"key", keyName)
+
+			return managerError(ErrWrongPassphrase, str, nil)
+		}
+
+		str := fmt.Sprintf("failed to derive %s master key", keyName)
+
+		return managerError(ErrCrypto, str, err)
+	}
+
+	return nil
+}
+
+// stagePublicPassphrase validates the old public passphrase and derives the new
+// public master key and re-encrypted crypto public key into staged. It must be
+// called with m.mtx held.
+func (m *Manager) stagePublicPassphrase(staged *changePassphrasesStaged,
+	params ChangePassphrasesParams, config *ScryptOptions) error {
+
+	// Ensure the provided old passphrase is correct against a copy of the
+	// public master key.
+	err := validateOldMasterKey(
+		m.masterKeyPub.Parameters, params.PublicOld, "public",
+	)
+	if err != nil {
+		return err
+	}
+
+	// Generate a new public master key from the new passphrase.
+	newMasterKeyPub, err := newSecretKey(&params.PublicNew, config)
+	if err != nil {
+		str := "failed to create new public master key"
+
+		return managerError(ErrCrypto, str, err)
+	}
+
+	// Re-encrypt the crypto public key using the new public master key. The
+	// clear-text crypto public key is always resident in memory.
+	encryptedPub, err := newMasterKeyPub.Encrypt(m.cryptoKeyPub.Bytes())
+	if err != nil {
+		newMasterKeyPub.Zero()
+
+		str := "failed to encrypt crypto public key"
+
+		return managerError(ErrCrypto, str, err)
+	}
+
+	staged.newMasterKeyPub = newMasterKeyPub
+	staged.pubParams = newMasterKeyPub.Marshal()
+	staged.encryptedPub = encryptedPub
+
+	return nil
+}
+
+// stagePrivatePassphrase validates the old private passphrase and derives the
+// new private master key, re-encrypted crypto private and script keys, new
+// salt, and (when unlocked) the new passphrase hash into staged. It must be
+// called with m.mtx held.
+func (m *Manager) stagePrivatePassphrase(staged *changePassphrasesStaged,
+	params ChangePassphrasesParams, config *ScryptOptions) error {
+
+	// Ensure the provided old passphrase is correct against a copy of the
+	// private master key. We also need a working copy of this derived key
+	// below to decrypt the current crypto private/script keys, so derive it
+	// here rather than through the shared helper.
+	oldMasterKey := snacl.SecretKey{Key: &snacl.CryptoKey{}}
+	oldMasterKey.Parameters = m.masterKeyPriv.Parameters
+
+	defer oldMasterKey.Zero()
+
+	err := oldMasterKey.DeriveKey(&params.PrivateOld)
+	if err != nil {
+		if errors.Is(err, snacl.ErrInvalidPassword) {
+			str := "invalid passphrase for private master key"
+
+			return managerError(ErrWrongPassphrase, str, nil)
+		}
+
+		str := "failed to derive private master key"
+
+		return managerError(ErrCrypto, str, err)
+	}
+
+	// Generate a new private master key from the new passphrase.
+	newMasterKeyPriv, err := newSecretKey(&params.PrivateNew, config)
+	if err != nil {
+		str := "failed to create new private master key"
+
+		return managerError(ErrCrypto, str, err)
+	}
+
+	// Re-encrypt the crypto private and script keys under the new master
+	// key, decrypting the current blobs with the old master key validated
+	// above so this works whether or not the manager is currently unlocked.
+	encPriv, encScript, err := reEncryptCryptoKeys(
+		&oldMasterKey, newMasterKeyPriv, m.cryptoKeyPrivEncrypted,
+		m.cryptoKeyScriptEncrypted,
+	)
+	if err != nil {
+		newMasterKeyPriv.Zero()
+
+		return err
+	}
+
+	// Create a new salt used to hash the new passphrase on each unlock.
+	var passphraseSalt [saltSize]byte
+
+	_, err = rand.Read(passphraseSalt[:])
+	if err != nil {
+		newMasterKeyPriv.Zero()
+
+		return managerError(ErrCrypto, errReadRandSalt, err)
+	}
+
+	// When the manager is locked, the new clear-text master key isn't
+	// needed yet, so drop it from memory now. If unlocked, pre-compute the
+	// passphrase hash with the new passphrase and salt so unlock checks
+	// keep working.
+	var hashedPassphrase [sha512.Size]byte
+	if m.IsLocked() {
+		newMasterKeyPriv.Zero()
+	} else {
+		saltedPassphrase := append(
+			passphraseSalt[:], params.PrivateNew...,
+		)
+		hashedPassphrase = sha512.Sum512(saltedPassphrase)
+		zero.Bytes(saltedPassphrase)
+	}
+
+	staged.newMasterKeyPriv = newMasterKeyPriv
+	staged.privParams = newMasterKeyPriv.Marshal()
+	staged.encPriv = encPriv
+	staged.encScript = encScript
+	staged.passphraseSalt = passphraseSalt
+	staged.hashedPassphrase = hashedPassphrase
+
+	return nil
+}
+
+// reEncryptCryptoKeys decrypts the current crypto private and script key blobs
+// with oldMasterKey and re-encrypts them under newMasterKey, returning the new
+// private and script ciphertexts in that order. The decrypted clear-text
+// material is zeroed before returning.
+func reEncryptCryptoKeys(oldMasterKey, newMasterKey *snacl.SecretKey,
+	cryptoKeyPrivEnc, cryptoKeyScriptEnc []byte) ([]byte, []byte, error) {
+
+	// Re-encrypt the crypto private key.
+	decPriv, err := oldMasterKey.Decrypt(cryptoKeyPrivEnc)
+	if err != nil {
+		str := "failed to decrypt crypto private key"
+
+		return nil, nil, managerError(ErrCrypto, str, err)
+	}
+
+	encPriv, err := newMasterKey.Encrypt(decPriv)
+	zero.Bytes(decPriv)
+
+	if err != nil {
+		str := "failed to encrypt crypto private key"
+
+		return nil, nil, managerError(ErrCrypto, str, err)
+	}
+
+	// Re-encrypt the crypto script key.
+	decScript, err := oldMasterKey.Decrypt(cryptoKeyScriptEnc)
+	if err != nil {
+		str := "failed to decrypt crypto script key"
+
+		return nil, nil, managerError(ErrCrypto, str, err)
+	}
+
+	encScript, err := newMasterKey.Encrypt(decScript)
+	zero.Bytes(decScript)
+
+	if err != nil {
+		str := "failed to encrypt crypto script key"
+
+		return nil, nil, managerError(ErrCrypto, str, err)
+	}
+
+	return encPriv, encScript, nil
+}
+
+// zeroSecrets zeroes any staged master keys so that a partial staging failure
+// does not leak already-derived key material.
+func (s *changePassphrasesStaged) zeroSecrets() {
+	if s.newMasterKeyPub != nil {
+		s.newMasterKeyPub.Zero()
+		s.newMasterKeyPub = nil
+	}
+
+	if s.newMasterKeyPriv != nil {
+		s.newMasterKeyPriv.Zero()
+		s.newMasterKeyPriv = nil
+	}
 }
 
 // ConvertToWatchingOnly converts the current address manager to a locked

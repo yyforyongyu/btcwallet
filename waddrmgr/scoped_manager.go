@@ -718,6 +718,144 @@ func (s *ScopedKeyManager) AccountProperties(ns walletdb.ReadBucket,
 	return props, nil
 }
 
+// AccountSecret reads the persisted account row and returns the material needed
+// to relocate an account's secret to another store without decrypting or
+// re-deriving it. It returns the account-level extended public key (decrypted
+// to plaintext from the stored blob), the stored encrypted account extended
+// private key ciphertext exactly as persisted, the master-key fingerprint, the
+// account name, and whether the account is imported.
+//
+// The encrypted private key is returned verbatim and is never decrypted here.
+// Watch-only, imported-xpub, or otherwise private-less accounts return a nil
+// encryptedPrivKey (not an error). An absent account returns the
+// ErrAccountNotFound error.
+func (s *ScopedKeyManager) AccountSecret(ns walletdb.ReadBucket,
+	account uint32) (*hdkeychain.ExtendedKey, []byte, uint32, string, bool,
+	error) {
+
+	// Read the raw account row directly rather than going through
+	// loadAccountInfo, which would decrypt and cache the private key and
+	// require the manager to be unlocked. We only need the persisted
+	// material here.
+	rowInterface, err := fetchAccountInfo(ns, &s.scope, account)
+	if err != nil {
+		return nil, nil, 0, "", false, maybeConvertDbError(err)
+	}
+
+	// The public crypto key is always available regardless of lock state,
+	// so decrypting the stored account public key never requires an unlock.
+	s.mtx.RLock()
+	cryptoKeyPub := s.rootManager.cryptoKeyPub
+	s.mtx.RUnlock()
+
+	switch row := rowInterface.(type) {
+	case *dbDefaultAccountRow:
+		pubKey, err := decryptAccountPubKey(
+			cryptoKeyPub, row.pubKeyEncrypted, account,
+		)
+		if err != nil {
+			return nil, nil, 0, "", false, err
+		}
+
+		// A default account row that carries no encrypted private key
+		// (e.g. an imported xpub persisted as a default row) reports a
+		// nil ciphertext rather than an empty slice.
+		encryptedPrivKey := row.privKeyEncrypted
+		if len(encryptedPrivKey) == 0 {
+			encryptedPrivKey = nil
+		}
+
+		// Default account rows do not persist a master-key fingerprint.
+		return pubKey, encryptedPrivKey, 0, row.name, false, nil
+
+	case *dbWatchOnlyAccountRow:
+		pubKey, err := decryptAccountPubKey(
+			cryptoKeyPub, row.pubKeyEncrypted, account,
+		)
+		if err != nil {
+			return nil, nil, 0, "", false, err
+		}
+
+		// Watch-only accounts never hold a private key.
+		return pubKey, nil, row.masterKeyFingerprint, row.name, true,
+			nil
+
+	default:
+		str := fmt.Sprintf("unsupported account type %T", row)
+
+		return nil, nil, 0, "", false, managerError(
+			ErrDatabase, str, nil,
+		)
+	}
+}
+
+// decryptAccountPubKey decrypts a stored account public-key blob with the given
+// public crypto key and parses it into an extended key. account is used only
+// for error messages.
+func decryptAccountPubKey(cryptoKeyPub EncryptorDecryptor, enc []byte,
+	account uint32) (*hdkeychain.ExtendedKey, error) {
+
+	serialized, err := cryptoKeyPub.Decrypt(enc)
+	if err != nil {
+		str := fmt.Sprintf("failed to decrypt public key for account "+
+			"%d", account)
+
+		return nil, managerError(ErrCrypto, str, err)
+	}
+
+	return hdkeychain.NewKeyFromString(string(serialized))
+}
+
+// ManagedAddressSecret resolves the given address and returns its persisted
+// secret material without decrypting it. For a public-key address it returns
+// the stored encrypted private key (nil when the address is watch-only or has
+// no private key); for a script address it returns the stored encrypted script.
+// An address that exists but carries neither returns (nil, nil, nil), while an
+// address that cannot be resolved returns the ErrAddressNotFound error, keeping
+// "found but has no secret" distinguishable from "not found".
+func (s *ScopedKeyManager) ManagedAddressSecret(ns walletdb.ReadBucket,
+	addr address.Address) ([]byte, []byte, error) {
+
+	// Reuse the standard address resolution path so caching and PK->PKH
+	// normalization behave identically to other reads.
+	managedAddr, err := s.Address(ns, addr)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Read the encrypted material straight from the concrete address types'
+	// unexported fields; we deliberately avoid the decrypting accessors.
+	switch a := managedAddr.(type) {
+	case *managedAddress:
+		if len(a.privKeyEncrypted) == 0 {
+			return nil, nil, nil
+		}
+
+		return a.privKeyEncrypted, nil, nil
+
+	case encryptedScriptGetter:
+		// All script address types embed baseScriptAddress and thus
+		// expose the stored ciphertext through this accessor.
+		script := a.encryptedScript()
+		if len(script) == 0 {
+			return nil, nil, nil
+		}
+
+		return nil, script, nil
+
+	default:
+		// The address resolved but is of a type that holds no secret
+		// material we can export.
+		return nil, nil, nil
+	}
+}
+
+// encryptedScriptGetter is implemented by the script-based managed address
+// types so ManagedAddressSecret can read their stored ciphertext uniformly.
+type encryptedScriptGetter interface {
+	encryptedScript() []byte
+}
+
 // cachedKey is an entry within the LRU map that stores private keys that are
 // to be used frequently. We use this wrapper struct to be able too report the
 // size of a given element to the cache.
