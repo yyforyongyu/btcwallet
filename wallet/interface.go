@@ -30,6 +30,26 @@ import (
 //
 //nolint:interfacebloat
 type Interface interface {
+	// The role-based manager interfaces expose the wallet's modern,
+	// context-aware API surface (account, address, UTXO, PSBT and signing
+	// operations) alongside the lifecycle Controller. They are embedded
+	// here so that existing holders of Interface can reach the new role
+	// methods directly, without a separate accessor. Embedding is
+	// conflict-free: every legacy method that overlaps a role method
+	// carries a *Deprecated suffix, so there are no duplicate method names.
+	//
+	// UnsafeSigner (rather than Signer) is embedded because it additionally
+	// exposes the bucket-free DerivePrivKey/GetPrivKeyForAddress needed by
+	// private-key consumers such as lnd's keychain; this matches the
+	// private-key exposure the interface already grants via PrivKeyForAddress
+	// and DeriveFromKeyPath.
+	AccountManager
+	AddressManager
+	UtxoManager
+	PsbtManager
+	UnsafeSigner
+	Controller
+
 	// StartDeprecated starts the goroutines necessary to manage a wallet.
 	//
 	// Deprecated: Use WalletController.Start instead.
