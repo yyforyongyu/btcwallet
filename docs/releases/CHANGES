@@ -343,7 +343,7 @@ Changes in 0.4.0 (Sun May 25 2014)
       transactions
 
   - Rewrite the transaction store to handle several issues regarding
-    transation malleability and performance issues
+    transaction malleability and performance issues
     - The new transaction store is written to disk in a different format
       then before, and upgrades will require a rescan to rebuild the
       transaction history
