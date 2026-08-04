@@ -111,7 +111,7 @@ func putMinedBalance(ns walletdb.ReadWriteBucket, amt btcutil.Amount) error {
 //
 // The canonical outpoint serialization format is:
 //
-//   [0:32]  Trasaction hash (32 bytes)
+//   [0:32]  Transaction hash (32 bytes)
 //   [32:36] Output index (4 bytes)
 //
 // The canonical transaction hash serialization is simply the hash.
