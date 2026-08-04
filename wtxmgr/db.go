@@ -111,7 +111,7 @@ func putMinedBalance(ns walletdb.ReadWriteBucket, amt btcutil.Amount) error {
 //
 // The canonical outpoint serialization format is:
 //
-//   [0:32]  Trasaction hash (32 bytes)
+//   [0:32]  Transaction hash (32 bytes)
 //   [32:36] Output index (4 bytes)
 //
 // The canonical transaction hash serialization is simply the hash.
@@ -889,7 +889,7 @@ func extractRawDebitCreditKey(v []byte) []byte {
 	return v[8:80]
 }
 
-// existsDebit checks for the existance of a debit.  If found, the debit and
+// existsDebit checks for the existence of a debit.  If found, the debit and
 // previous credit keys are returned.  If the debit does not exist, both keys
 // are nil.
 func existsDebit(ns walletdb.ReadBucket, txHash *chainhash.Hash, index uint32, block *Block) (k, credKey []byte, err error) {

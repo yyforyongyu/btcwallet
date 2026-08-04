@@ -1081,7 +1081,7 @@ func (m *Manager) ConvertToWatchingOnly(ns walletdb.ReadWriteBucket) error {
 	// is being converted to watching-only, the encrypted private key
 	// material is no longer needed.
 
-	// Clear and remove all of the encrypted acount private keys.
+	// Clear and remove all of the encrypted account private keys.
 	for _, manager := range m.scopedManagers {
 		for _, acctInfo := range manager.acctInfo {
 			zero.Bytes(acctInfo.acctKeyEncrypted)

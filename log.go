@@ -88,9 +88,9 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"BTCN": btcnLog,
 }
 
-// initLogRotator initializes the logging rotater to write logs to logFile and
+// initLogRotator initializes the logging rotator to write logs to logFile and
 // create roll files in the same directory.  It must be called before the
-// package-global log rotater variables are used.
+// package-global log rotator variables are used.
 func initLogRotator(logFile string) {
 	logDir, _ := filepath.Split(logFile)
 	err := os.MkdirAll(logDir, 0700)
