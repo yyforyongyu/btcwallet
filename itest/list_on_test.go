@@ -36,6 +36,14 @@ var allTestCases = []*testCase{
 		TestFunc: testManagerCreateWatchOnly,
 	},
 	{
+		Name:     "account manager new account",
+		TestFunc: testAccountManagerNewAccount,
+	},
+	{
+		Name:     "account manager new account watchonly",
+		TestFunc: testAccountManagerNewAccountWatchOnly,
+	},
+	{
 		Name:     "controller start stop",
 		TestFunc: testControllerStartStop,
 	},
