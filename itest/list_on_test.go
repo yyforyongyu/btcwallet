@@ -48,6 +48,10 @@ var allTestCases = []*testCase{
 		TestFunc: testAccountManagerRenameAccount,
 	},
 	{
+		Name:     "account manager import account",
+		TestFunc: testAccountManagerImportAccount,
+	},
+	{
 		Name:     "controller start stop",
 		TestFunc: testControllerStartStop,
 	},
