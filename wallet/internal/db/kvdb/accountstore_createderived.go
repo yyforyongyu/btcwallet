@@ -189,6 +189,7 @@ func (o *createDerivedAccountOps) CreateDerivedAccount(_ context.Context,
 	}
 
 	return db.CreateDerivedAccountRow{
+		AccountID: accountNumber,
 		AccountNumber: sql.NullInt64{
 			Int64: accountNumber,
 			Valid: true,

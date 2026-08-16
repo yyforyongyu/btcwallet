@@ -37,6 +37,7 @@ func testAccountManagerNewAccount(h *bwtest.HarnessTest) {
 	require.NotNil(
 		h, account.AccountNumber, "derived account number is missing",
 	)
+	require.NotNil(h, account.AccountID, "derived account ID is missing")
 	require.NotEmpty(
 		h, account.PublicKey, "derived account public key is missing",
 	)
@@ -66,6 +67,10 @@ func testAccountManagerNewAccount(h *bwtest.HarnessTest) {
 	require.Equal(
 		h, account.AccountNumber, duplicatePostcondition.AccountNumber,
 	)
+	require.NotNil(
+		h, duplicatePostcondition.AccountID, "queried account ID is missing",
+	)
+	require.Equal(h, account.AccountID, duplicatePostcondition.AccountID)
 	require.Equal(
 		h, wantKey, canonicalAccountKey(h, duplicatePostcondition.PublicKey),
 	)
@@ -108,6 +113,8 @@ func testAccountManagerNewAccount(h *bwtest.HarnessTest) {
 	reloaded := managed.Wallet
 	durable, err := reloaded.GetAccount(ctx, scope, accountName)
 	require.NoError(h, err, "failed to load durable account")
+	require.NotNil(h, durable.AccountID, "reloaded account ID is missing")
+	require.Equal(h, account.AccountID, durable.AccountID)
 	require.Equal(
 		h, duplicatePostcondition, durable, "reload changed the account view",
 	)
