@@ -109,8 +109,9 @@ func (w *Wallet) buildAccountDeriveFn(
 // KeyScope*. The wallet initializes two special, reserved accounts:
 //   - "default": The first user-created account (account number 0). This
 //     account is created for each of the default key scopes and CAN be renamed.
-//   - "imported": A special account that holds all individually imported keys.
-//     This account is global and CANNOT be renamed.
+//   - "imported": A special raw-import pseudo-account that holds individually
+//     imported keys. This account is global and CANNOT be renamed. Imported
+//     xpub accounts are distinct scoped accounts and CAN be renamed.
 type AccountManager interface {
 	// NewAccount creates a new account for a given key scope and name. The
 	// provided name must be unique within that key scope.
@@ -138,8 +139,10 @@ type AccountManager interface {
 
 	// RenameAccount renames an existing account. To uniquely identify the
 	// account, the key scope must be provided. The new name must be unique
-	// within that same key scope. The reserved "imported" account cannot
-	// be renamed.
+	// within that same key scope. Imported xpub accounts can be renamed. The
+	// reserved "imported" raw-import pseudo-account cannot be renamed.
+	// RenameAccount returns ErrAccountNotFound when oldName is absent from
+	// the scope or names the reserved raw-import pseudo-account.
 	RenameAccount(ctx context.Context, scope waddrmgr.KeyScope,
 		oldName string, newName string) error
 
@@ -379,7 +382,10 @@ func (w *Wallet) GetAccount(ctx context.Context, scope waddrmgr.KeyScope,
 }
 
 // RenameAccount renames an existing account. The new name must be unique within
-// the same key scope. The reserved "imported" account cannot be renamed.
+// the same key scope. Imported xpub accounts can be renamed. The reserved
+// "imported" raw-import pseudo-account cannot be renamed. RenameAccount returns
+// ErrAccountNotFound when oldName is absent from the scope or names the
+// reserved raw-import pseudo-account.
 func (w *Wallet) RenameAccount(ctx context.Context,
 	scope waddrmgr.KeyScope, oldName, newName string) error {
 
@@ -400,6 +406,10 @@ func (w *Wallet) RenameAccount(ctx context.Context,
 		NewName:  newName,
 	})
 	if err != nil {
+		if errors.Is(err, db.ErrAccountNotFound) {
+			return fmt.Errorf("%w: %s", ErrAccountNotFound, oldName)
+		}
+
 		// Preserve waddrmgr.ManagerError semantics so callers using
 		// waddrmgr.IsError(err, ...) keep working when kvdb wraps the
 		// underlying manager error via fmt.Errorf.

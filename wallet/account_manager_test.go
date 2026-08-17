@@ -535,9 +535,8 @@ func TestNewAccountMissingHDSeedDefersToStore(t *testing.T) {
 	require.Equal(t, uint32(1), *account.AccountNumber)
 }
 
-// TestRenameAccount verifies RenameAccount routes through
-// w.store.RenameAccount with the correct params and preserves
-// db.ErrAccountNotFound passthrough.
+// TestRenameAccount verifies RenameAccount routes through w.store.RenameAccount
+// with the correct params and maps a missing account to the public error.
 func TestRenameAccount(t *testing.T) {
 	t.Parallel()
 
@@ -569,7 +568,7 @@ func TestRenameAccount(t *testing.T) {
 	).Once()
 
 	err = w.RenameAccount(t.Context(), scope, "missing", "x")
-	require.ErrorIs(t, err, db.ErrAccountNotFound)
+	require.ErrorIs(t, err, ErrAccountNotFound)
 }
 
 // TestImportAccount verifies the normal import path routes through
