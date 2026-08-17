@@ -42,9 +42,13 @@ func (s *Store) RenameAccount(_ context.Context,
 			return err
 		}
 
-		err = assertRenameableAccount(ns, scopedMgr, acctNum)
-		if err != nil {
-			return err
+		if params.AccountNumber != nil {
+			err = assertRenameableAccount(ns, scopedMgr, acctNum)
+			if err != nil {
+				return err
+			}
+		} else if acctNum == waddrmgr.ImportedAddrAccount {
+			return db.ErrAccountNotFound
 		}
 
 		err = scopedMgr.RenameAccount(ns, acctNum, params.NewName)
@@ -74,9 +78,8 @@ func resolveRenameAccountNumber(ns walletdb.ReadBucket,
 	return acctNum, nil
 }
 
-// assertRenameableAccount rejects imported accounts before calling
-// waddrmgr.RenameAccount, which only knows about the legacy imported-address
-// pseudo-account slot.
+// assertRenameableAccount rejects account rows without a public BIP44 account
+// number.
 func assertRenameableAccount(ns walletdb.ReadBucket,
 	scopedMgr waddrmgr.AccountStore, acctNum uint32) error {
 

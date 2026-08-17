@@ -279,9 +279,9 @@ func TestRenameAccountNotFound(t *testing.T) {
 	require.ErrorIs(t, err, db.ErrAccountNotFound)
 }
 
-// TestRenameAccountRejectsImported verifies that kvdb rejects imported account
-// renames both by name and by waddrmgr's internal account number.
-func TestRenameAccountRejectsImported(t *testing.T) {
+// TestRenameAccountImported verifies imported xpubs can be renamed by name,
+// while internal-number selection and the raw-import pseudo-account reject.
+func TestRenameAccountImported(t *testing.T) {
 	t.Parallel()
 
 	store, _, cleanup := newAccountStoreFixture(t)
@@ -314,7 +314,23 @@ func TestRenameAccountRejectsImported(t *testing.T) {
 		OldName: name,
 		NewName: "renamed-imported",
 	})
+	require.NoError(t, err)
+
+	_, err = store.GetAccount(t.Context(), db.GetAccountQuery{
+		Scope: scope,
+		Name:  &name,
+	})
 	require.ErrorIs(t, err, db.ErrAccountNotFound)
+
+	renamedName := "renamed-imported"
+	info, err := store.GetAccount(t.Context(), db.GetAccountQuery{
+		Scope: scope,
+		Name:  &renamedName,
+	})
+	require.NoError(t, err)
+	require.Equal(t, renamedName, info.AccountName)
+	require.True(t, info.IsImported)
+	require.Nil(t, info.AccountNumber)
 
 	mgrScope := waddrmgr.KeyScope(scope)
 	scopedMgr, err := store.addrStore.FetchScopedKeyManager(mgrScope)
@@ -327,7 +343,7 @@ func TestRenameAccountRejectsImported(t *testing.T) {
 
 		var err error
 
-		internalNumber, err = scopedMgr.LookupAccount(ns, name)
+		internalNumber, err = scopedMgr.LookupAccount(ns, renamedName)
 
 		return err
 	})
@@ -336,18 +352,23 @@ func TestRenameAccountRejectsImported(t *testing.T) {
 	err = store.RenameAccount(t.Context(), db.RenameAccountParams{
 		Scope:         scope,
 		AccountNumber: &internalNumber,
-		NewName:       "renamed-imported",
+		NewName:       "renamed-imported-number",
 	})
 	require.ErrorIs(t, err, db.ErrAccountNotFound)
 
-	info, err := store.GetAccount(
-		t.Context(), db.GetAccountQuery{
-			Scope: scope,
-			Name:  &name,
-		},
-	)
+	err = store.RenameAccount(t.Context(), db.RenameAccountParams{
+		Scope:   scope,
+		OldName: waddrmgr.ImportedAddrAccountName,
+		NewName: "renamed-raw-import",
+	})
+	require.ErrorIs(t, err, db.ErrAccountNotFound)
+
+	info, err = store.GetAccount(t.Context(), db.GetAccountQuery{
+		Scope: scope,
+		Name:  &renamedName,
+	})
 	require.NoError(t, err)
-	require.Equal(t, name, info.AccountName)
+	require.Equal(t, renamedName, info.AccountName)
 }
 
 // kvdbDeriveFnFixture returns an AccountDerivationFunc that derives an
