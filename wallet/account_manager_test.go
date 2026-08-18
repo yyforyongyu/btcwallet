@@ -7,6 +7,7 @@ package wallet
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -472,17 +473,25 @@ func TestNewAccount(t *testing.T) {
 
 	// Duplicate-name path.
 	expectAccountDeriveSetup(t, deps, stub)
-	deps.store.On("CreateDerivedAccount", mock.Anything, mock.Anything,
-		mock.Anything).Return((*db.AccountInfo)(nil),
-		waddrmgr.ManagerError{
-			ErrorCode: waddrmgr.ErrDuplicateAccount,
-		}).Once()
+
+	storeErr := fmt.Errorf("create derived account: %w", db.ErrDuplicateAccount)
+	deps.store.On(
+		"CreateDerivedAccount", mock.Anything, mock.Anything, mock.Anything,
+	).Return((*db.AccountInfo)(nil), storeErr).Once()
 
 	_, err = w.NewAccount(t.Context(), scope, testAccountName)
 	require.Error(t, err)
-	require.True(t,
-		waddrmgr.IsError(err, waddrmgr.ErrDuplicateAccount),
+	require.True(
+		t, waddrmgr.IsError(err, waddrmgr.ErrDuplicateAccount),
 	)
+	require.ErrorIs(t, err, db.ErrDuplicateAccount)
+
+	var managerErr waddrmgr.ManagerError
+	require.ErrorAs(t, err, &managerErr)
+	require.Equal(
+		t, "account with the same name already exists", managerErr.Description,
+	)
+	require.ErrorIs(t, managerErr.Err, db.ErrDuplicateAccount)
 }
 
 // TestNewAccountMissingHDSeedDefersToStore verifies that neutered-root kvdb

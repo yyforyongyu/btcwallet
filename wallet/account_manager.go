@@ -186,6 +186,14 @@ func (w *Wallet) NewAccount(ctx context.Context, scope waddrmgr.KeyScope,
 		}, deriveFn,
 	)
 	if err != nil {
+		if errors.Is(err, db.ErrDuplicateAccount) {
+			return nil, waddrmgr.ManagerError{
+				ErrorCode:   waddrmgr.ErrDuplicateAccount,
+				Description: "account with the same name already exists",
+				Err:         err,
+			}
+		}
+
 		// Preserve the legacy waddrmgr.ManagerError contract so that
 		// callers using waddrmgr.IsError(err, ...) keep working after
 		// kvdb wraps the underlying manager error via fmt.Errorf.
