@@ -35,9 +35,9 @@ The `bitcoind` backend uses ZMQ for block/tx notifications.
 ## Wallet Helpers
 
 `bwtest` owns wallet creation, funding and lock policy so component tests do
-not each define their own. `(*HarnessTest).NewWallet` is the single
-parameterized entry point; it takes a `WalletFixture` describing what the case
-needs and returns the wallet with the outpoints funding produced:
+not each define their own. `(*HarnessTest).NewWallet` and
+`(*HarnessTest).NewManagedWallet` take a `WalletFixture` describing what the
+case needs. `NewWallet` returns the wallet with the outpoints funding produced:
 
 ```go
 func testFoo(t *bwtest.HarnessTest) {
@@ -51,10 +51,26 @@ func testFoo(t *bwtest.HarnessTest) {
 }
 ```
 
-`WalletFixture` carries the funding address type, the funding amounts, whether
-to unlock, and whether to leave the wallet unstarted. A case that selects the
-funded coins derives its key scope from the same `AddrType` with `KeyScope()`,
-so the funded scope has one authority.
+`WalletFixture` carries the funding address type, funding amounts, whether to
+unlock, and whether to leave the wallet unstarted. Its zero value returns a
+started, locked wallet. `WatchOnly` creates a rootless `ModeShell` watch-only
+wallet.
+`InitialAccounts` seeds a watch-only shell wallet; a non-empty slice implies
+watch-only even when `WatchOnly` is false, and nil and empty slices are
+equivalent. A case that selects funded coins derives its key scope from the
+same `AddrType` with `KeyScope()`, so the funded scope has one authority.
+
+`NewManagedWallet` returns the same prepared wallet and funding with a
+`ManagedWallet` bundle containing its `Config`, `Manager`, and `Wallet`. Use it
+when a component test needs the reload handle, then pass the bundle to
+`(*HarnessTest).ReloadWallet`. A successful reload consumes the old generation
+and returns a fresh, registered, started, but locked replacement bundle from
+the same persistent store.
+
+Tests with custom `CreateWalletParams` may create through the Manager API and
+then construct a `ManagedWallet` from that generation's exact `Config`,
+`Manager`, and `Wallet`. The Manager and Wallet remain registered with the
+harness until `ReloadWallet` transfers ownership to the replacement.
 
 Two convenience wrappers remain for cases that need nothing else:
 
@@ -65,8 +81,9 @@ Funding is also available on its own through `(*HarnessTest).FundWallet` and
 `(*HarnessTest).FundWalletOfType`, and addresses through
 `(*HarnessTest).NewWalletAddress` and `(*HarnessTest).NewWalletAddressOfType`.
 
-Manager-focused tests should continue to create wallets through the manager API
-directly.
+Manager-focused tests should continue to create wallets through the Manager API
+directly. Component tests using the standard fixture that need reload handles
+should use `NewManagedWallet` instead.
 
 ## Fast Scrypt
 

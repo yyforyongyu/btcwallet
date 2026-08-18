@@ -83,12 +83,33 @@ type WalletFixture struct {
 	// combined with Unstarted.
 	Amounts []btcutil.Amount
 
+	// WatchOnly creates a rootless watch-only shell wallet when InitialAccounts
+	// is empty.
+	WatchOnly bool
+
+	// InitialAccounts seeds a watch-only shell wallet with the provided
+	// accounts. A nil or empty slice creates no accounts, and a non-empty slice
+	// implies WatchOnly.
+	InitialAccounts []wallet.WatchOnlyAccount
+
 	// Unlocked unlocks the wallet once it has started.
 	Unlocked bool
 
 	// Unstarted returns the wallet before Start, for cases asserting
 	// behavior that is only observable while the wallet is not running.
 	Unstarted bool
+}
+
+// ManagedWallet bundles a wallet with the Config and Manager needed to replace
+// its current lifecycle generation from the same persistent store.
+//
+// Tests with custom CreateWalletParams may construct a ManagedWallet directly.
+// Its Config, Manager, and Wallet must describe the same generation, and the
+// Manager and Wallet must remain registered with the harness until reload.
+type ManagedWallet struct {
+	Config  wallet.Config
+	Manager *wallet.Manager
+	Wallet  *wallet.Wallet
 }
 
 // NewWallet creates, registers and prepares a wallet as the fixture describes,
@@ -103,7 +124,26 @@ func (h *HarnessTest) NewWallet(fixture WalletFixture) (*wallet.Wallet,
 
 	h.Helper()
 
+	managed, funding := h.NewManagedWallet(fixture)
+
+	return managed.Wallet, funding
+}
+
+// NewManagedWallet creates, registers and prepares a managed wallet as the
+// fixture describes, returning it with the funding transaction's outputs.
+//
+// The returned bundle retains the Config and Manager needed to reload this
+// wallet generation from its persistent store.
+func (h *HarnessTest) NewManagedWallet(fixture WalletFixture) (ManagedWallet,
+	WalletFunding) {
+
+	h.Helper()
+
 	cfg, params := h.TestWalletConfig()
+	if fixture.WatchOnly || len(fixture.InitialAccounts) != 0 {
+		params.Mode, params.WatchOnly = wallet.ModeShell, true
+		params.InitialAccounts = fixture.InitialAccounts
+	}
 
 	manager := h.NewWalletManager()
 	w, err := manager.Create(cfg, params)
@@ -114,13 +154,18 @@ func (h *HarnessTest) NewWallet(fixture WalletFixture) (*wallet.Wallet,
 	// failed unregistered, and a second direct Stop callback here would stop a
 	// successful one twice, out of order with the Manager close.
 	h.RegisterWallet(w)
+	managed := ManagedWallet{
+		Config:  cfg,
+		Manager: manager,
+		Wallet:  w,
+	}
 
 	if fixture.Unstarted {
 		require.Empty(
 			h, fixture.Amounts, "funding needs a started wallet",
 		)
 
-		return w, WalletFunding{}
+		return managed, WalletFunding{}
 	}
 
 	err = w.Start(h.Context())
@@ -131,10 +176,46 @@ func (h *HarnessTest) NewWallet(fixture WalletFixture) (*wallet.Wallet,
 	}
 
 	if len(fixture.Amounts) == 0 {
-		return w, WalletFunding{}
+		return managed, WalletFunding{}
 	}
 
-	return w, h.FundWalletOfType(w, fixture.AddrType, fixture.Amounts...)
+	return managed, h.FundWalletOfType(w, fixture.AddrType, fixture.Amounts...)
+}
+
+// ReloadWallet consumes current after shutting it down and returns a fresh
+// registered, started, and locked replacement loaded from the same store.
+// Callers must use the returned bundle for any later reload.
+func (h *HarnessTest) ReloadWallet(current ManagedWallet) ManagedWallet {
+	h.Helper()
+
+	ctx := h.Context()
+	require.NoError(
+		h, current.Wallet.Stop(ctx), "failed to stop wallet before reload",
+	)
+	require.True(
+		h, h.DeregisterWallet(current.Wallet), "failed to deregister wallet",
+	)
+	require.NoError(
+		h, current.Manager.Close(), "failed to close wallet manager",
+	)
+	require.True(
+		h, h.ReleaseManager(current.Manager),
+		"failed to release wallet manager",
+	)
+
+	manager := h.NewWalletManager()
+	w, err := manager.Load(current.Config)
+	require.NoError(h, err, "failed to reload wallet")
+	require.NotSame(h, current.Wallet, w, "reload returned the original wallet")
+
+	h.RegisterWallet(w)
+	require.NoError(h, w.Start(ctx), "failed to start reloaded wallet")
+
+	return ManagedWallet{
+		Config:  current.Config,
+		Manager: manager,
+		Wallet:  w,
+	}
 }
 
 // CreateEmptyWallet creates, starts, and registers a new wallet instance.
