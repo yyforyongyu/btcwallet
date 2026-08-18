@@ -19,6 +19,7 @@ SELECT
     sqlc.arg('master_fingerprint') AS master_fingerprint
 FROM key_scopes AS ks
 WHERE ks.id = sqlc.arg('scope_id')
+ON CONFLICT (wallet_id, scope_id, account_name) DO NOTHING
 RETURNING id, account_number, created_at;
 
 -- name: CreateImportedAccount :one

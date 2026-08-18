@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
@@ -94,6 +95,11 @@ func (o createDerivedAccountOps) CreateDerivedAccount(ctx context.Context,
 		},
 	)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return db.CreateDerivedAccountRow{},
+				fmt.Errorf("create derived account: %w", db.ErrDuplicateAccount)
+		}
+
 		return db.CreateDerivedAccountRow{}, err
 	}
 
