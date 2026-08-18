@@ -141,6 +141,12 @@ func (o *createDerivedAccountOps) CreateDerivedAccount(_ context.Context,
 		derived.PublicKey, derived.EncryptedPrivateKey,
 	)
 	if err != nil {
+		if waddrmgr.IsError(err, waddrmgr.ErrDuplicateAccount) {
+			return db.CreateDerivedAccountRow{},
+				fmt.Errorf("put derived account: %w",
+					errors.Join(db.ErrDuplicateAccount, err))
+		}
+
 		return db.CreateDerivedAccountRow{}, fmt.Errorf(
 			"put derived account: %w", err,
 		)

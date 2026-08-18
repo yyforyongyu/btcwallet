@@ -450,6 +450,35 @@ func TestCreateDerivedAccount(t *testing.T) {
 	require.Equal(t, savingsAccountName, read.AccountName)
 }
 
+// TestCreateDerivedAccountDuplicateName verifies that the kvdb adapter
+// normalizes a duplicate derived-account name while preserving the underlying
+// waddrmgr error.
+func TestCreateDerivedAccountDuplicateName(t *testing.T) {
+	t.Parallel()
+
+	store, mgr, cleanup := newAccountStoreFixture(t)
+	t.Cleanup(cleanup)
+
+	params := db.CreateDerivedAccountParams{
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Name: savingsAccountName,
+	}
+	deriveFn := kvdbDeriveFnFixture(t, mgr)
+
+	_, err := store.CreateDerivedAccount(t.Context(), params, deriveFn)
+	require.NoError(t, err)
+
+	_, err = store.CreateDerivedAccount(t.Context(), params, deriveFn)
+	require.ErrorIs(t, err, db.ErrDuplicateAccount)
+
+	var managerErr waddrmgr.ManagerError
+	require.ErrorAs(t, err, &managerErr)
+	require.Equal(t, waddrmgr.ErrDuplicateAccount, managerErr.ErrorCode)
+}
+
 // TestCreateDerivedAccountRollsBackOnDeriveError verifies that when the
 // derivation callback fails after the account number has been allocated,
 // the underlying walletdb transaction rolls back so the lastAccount counter
