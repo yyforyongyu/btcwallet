@@ -53,6 +53,10 @@ var (
 	// database.
 	ErrAccountNotFound = errors.New("account not found")
 
+	// ErrDuplicateAccount is returned when a derived account name already
+	// exists within the same wallet and key scope.
+	ErrDuplicateAccount = errors.New("duplicate account")
+
 	// ErrAddressNotFound is returned when an address is not found in the
 	// database.
 	ErrAddressNotFound = errors.New("address not found")
