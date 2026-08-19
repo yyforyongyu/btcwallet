@@ -36,20 +36,80 @@ var allTestCases = []*testCase{
 		TestFunc: testManagerCreateWatchOnly,
 	},
 	{
-		Name:     "account manager new account",
-		TestFunc: testAccountManagerNewAccount,
+		Name:     "account manager create account",
+		TestFunc: testAccountManagerCreateAccount,
 	},
 	{
-		Name:     "account manager new account watchonly",
-		TestFunc: testAccountManagerNewAccountWatchOnly,
+		Name:     "account manager reject duplicate creation",
+		TestFunc: testAccountManagerRejectDuplicateAccountCreation,
 	},
 	{
-		Name:     "account manager rename account",
-		TestFunc: testAccountManagerRenameAccount,
+		Name:     "account manager reject invalid creation",
+		TestFunc: testAccountManagerRejectInvalidAccountCreation,
+	},
+	{
+		Name:     "account manager reject locked creation",
+		TestFunc: testAccountManagerRejectLockedAccountCreation,
+	},
+	{
+		Name:     "account manager reject watchonly creation",
+		TestFunc: testAccountManagerRejectWatchOnlyAccountCreation,
+	},
+	{
+		Name:     "account manager reject stopped creation",
+		TestFunc: testAccountManagerRejectStoppedAccountCreation,
+	},
+	{
+		Name:     "account manager rename derived account",
+		TestFunc: testAccountManagerRenameDerivedAccount,
+	},
+	{
+		Name:     "account manager rename imported account",
+		TestFunc: testAccountManagerRenameImportedAccount,
+	},
+	{
+		Name:     "account manager reject duplicate rename",
+		TestFunc: testAccountManagerRejectDuplicateAccountRename,
+	},
+	{
+		Name:     "account manager reject invalid rename",
+		TestFunc: testAccountManagerRejectInvalidAccountRename,
+	},
+	{
+		Name:     "account manager reject unknown rename",
+		TestFunc: testAccountManagerRejectUnknownAccountRename,
+	},
+	{
+		Name:     "account manager rename locked account",
+		TestFunc: testAccountManagerRenameLockedAccount,
+	},
+	{
+		Name:     "account manager reject stopped rename",
+		TestFunc: testAccountManagerRejectStoppedAccountRename,
 	},
 	{
 		Name:     "account manager import account",
 		TestFunc: testAccountManagerImportAccount,
+	},
+	{
+		Name:     "account manager preview import",
+		TestFunc: testAccountManagerPreviewAccountImport,
+	},
+	{
+		Name:     "account manager reject duplicate import name",
+		TestFunc: testAccountManagerRejectDuplicateImportName,
+	},
+	{
+		Name:     "account manager reject invalid import name",
+		TestFunc: testAccountManagerRejectInvalidImportName,
+	},
+	{
+		Name:     "account manager reject invalid import key",
+		TestFunc: testAccountManagerRejectInvalidImportKey,
+	},
+	{
+		Name:     "account manager reject stopped import",
+		TestFunc: testAccountManagerRejectStoppedAccountImport,
 	},
 	{
 		Name:     "controller start stop",

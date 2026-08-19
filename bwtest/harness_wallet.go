@@ -100,18 +100,6 @@ type WalletFixture struct {
 	Unstarted bool
 }
 
-// ManagedWallet bundles a wallet with the Config and Manager needed to replace
-// its current lifecycle generation from the same persistent store.
-//
-// Tests with custom CreateWalletParams may construct a ManagedWallet directly.
-// Its Config, Manager, and Wallet must describe the same generation, and the
-// Manager and Wallet must remain registered with the harness until reload.
-type ManagedWallet struct {
-	Config  wallet.Config
-	Manager *wallet.Manager
-	Wallet  *wallet.Wallet
-}
-
 // NewWallet creates, registers and prepares a wallet as the fixture describes,
 // returning it alongside what its funding transaction created.
 //
@@ -120,21 +108,6 @@ type ManagedWallet struct {
 // without a further check; deriving an address afterwards does not need one
 // either. An unfunded fixture mines nothing and so provides no such boundary.
 func (h *HarnessTest) NewWallet(fixture WalletFixture) (*wallet.Wallet,
-	WalletFunding) {
-
-	h.Helper()
-
-	managed, funding := h.NewManagedWallet(fixture)
-
-	return managed.Wallet, funding
-}
-
-// NewManagedWallet creates, registers and prepares a managed wallet as the
-// fixture describes, returning it with the funding transaction's outputs.
-//
-// The returned bundle retains the Config and Manager needed to reload this
-// wallet generation from its persistent store.
-func (h *HarnessTest) NewManagedWallet(fixture WalletFixture) (ManagedWallet,
 	WalletFunding) {
 
 	h.Helper()
@@ -153,19 +126,16 @@ func (h *HarnessTest) NewManagedWallet(fixture WalletFixture) (ManagedWallet,
 	// cleanup owner. Registering after Start would leave a wallet whose Start
 	// failed unregistered, and a second direct Stop callback here would stop a
 	// successful one twice, out of order with the Manager close.
-	h.RegisterWallet(w)
-	managed := ManagedWallet{
-		Config:  cfg,
-		Manager: manager,
-		Wallet:  w,
-	}
+	reloadConfig := cfg
+	reloadConfig.PubPassphrase = bytes.Clone(cfg.PubPassphrase)
+	h.registerWallet(manager, w, &reloadConfig)
 
 	if fixture.Unstarted {
 		require.Empty(
 			h, fixture.Amounts, "funding needs a started wallet",
 		)
 
-		return managed, WalletFunding{}
+		return w, WalletFunding{}
 	}
 
 	err = w.Start(h.Context())
@@ -176,46 +146,65 @@ func (h *HarnessTest) NewManagedWallet(fixture WalletFixture) (ManagedWallet,
 	}
 
 	if len(fixture.Amounts) == 0 {
-		return managed, WalletFunding{}
+		return w, WalletFunding{}
 	}
 
-	return managed, h.FundWalletOfType(w, fixture.AddrType, fixture.Amounts...)
+	return w, h.FundWalletOfType(w, fixture.AddrType, fixture.Amounts...)
 }
 
-// ReloadWallet consumes current after shutting it down and returns a fresh
-// registered, started, and locked replacement loaded from the same store.
-// Callers must use the returned bundle for any later reload.
-func (h *HarnessTest) ReloadWallet(current ManagedWallet) ManagedWallet {
+// ReloadWallet replaces current with a fresh registered, started, and locked
+// Wallet loaded from the same store.
+func (h *HarnessTest) ReloadWallet(current *wallet.Wallet) *wallet.Wallet {
 	h.Helper()
+
+	h.mu.Lock()
+	var (
+		currentManager *wallet.Manager
+		cfg            wallet.Config
+		found          bool
+	)
+	for manager, registration := range h.wallets {
+		if registration.instance != current ||
+			registration.reloadConfig == nil {
+
+			continue
+		}
+
+		currentManager = manager
+		cfg = *registration.reloadConfig
+		cfg.PubPassphrase = bytes.Clone(
+			registration.reloadConfig.PubPassphrase,
+		)
+		found = true
+		break
+	}
+	h.mu.Unlock()
+	require.True(h, found, "wallet is not registered for reload")
 
 	ctx := h.Context()
 	require.NoError(
-		h, current.Wallet.Stop(ctx), "failed to stop wallet before reload",
+		h, current.Stop(ctx), "failed to stop wallet before reload",
 	)
 	require.True(
-		h, h.DeregisterWallet(current.Wallet), "failed to deregister wallet",
+		h, h.DeregisterWallet(current), "failed to deregister wallet",
 	)
 	require.NoError(
-		h, current.Manager.Close(), "failed to close wallet manager",
+		h, currentManager.Close(), "failed to close wallet manager",
 	)
 	require.True(
-		h, h.ReleaseManager(current.Manager),
+		h, h.ReleaseManager(currentManager),
 		"failed to release wallet manager",
 	)
 
 	manager := h.NewWalletManager()
-	w, err := manager.Load(current.Config)
+	w, err := manager.Load(cfg)
 	require.NoError(h, err, "failed to reload wallet")
-	require.NotSame(h, current.Wallet, w, "reload returned the original wallet")
+	require.NotSame(h, current, w, "reload returned the original wallet")
 
-	h.RegisterWallet(w)
+	h.registerWallet(manager, w, &cfg)
 	require.NoError(h, w.Start(ctx), "failed to start reloaded wallet")
 
-	return ManagedWallet{
-		Config:  current.Config,
-		Manager: manager,
-		Wallet:  w,
-	}
+	return w
 }
 
 // CreateEmptyWallet creates, starts, and registers a new wallet instance.
