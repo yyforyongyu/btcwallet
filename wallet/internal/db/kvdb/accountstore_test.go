@@ -279,9 +279,9 @@ func TestRenameAccountNotFound(t *testing.T) {
 	require.ErrorIs(t, err, db.ErrAccountNotFound)
 }
 
-// TestRenameAccountRejectsImported verifies that kvdb rejects imported account
-// renames both by name and by waddrmgr's internal account number.
-func TestRenameAccountRejectsImported(t *testing.T) {
+// TestRenameAccountImported verifies imported xpubs can be renamed by name,
+// while internal-number selection and the raw-import pseudo-account reject.
+func TestRenameAccountImported(t *testing.T) {
 	t.Parallel()
 
 	store, _, cleanup := newAccountStoreFixture(t)
@@ -314,7 +314,23 @@ func TestRenameAccountRejectsImported(t *testing.T) {
 		OldName: name,
 		NewName: "renamed-imported",
 	})
+	require.NoError(t, err)
+
+	_, err = store.GetAccount(t.Context(), db.GetAccountQuery{
+		Scope: scope,
+		Name:  &name,
+	})
 	require.ErrorIs(t, err, db.ErrAccountNotFound)
+
+	renamedName := "renamed-imported"
+	info, err := store.GetAccount(t.Context(), db.GetAccountQuery{
+		Scope: scope,
+		Name:  &renamedName,
+	})
+	require.NoError(t, err)
+	require.Equal(t, renamedName, info.AccountName)
+	require.True(t, info.IsImported)
+	require.Nil(t, info.AccountNumber)
 
 	mgrScope := waddrmgr.KeyScope(scope)
 	scopedMgr, err := store.addrStore.FetchScopedKeyManager(mgrScope)
@@ -327,7 +343,7 @@ func TestRenameAccountRejectsImported(t *testing.T) {
 
 		var err error
 
-		internalNumber, err = scopedMgr.LookupAccount(ns, name)
+		internalNumber, err = scopedMgr.LookupAccount(ns, renamedName)
 
 		return err
 	})
@@ -336,18 +352,23 @@ func TestRenameAccountRejectsImported(t *testing.T) {
 	err = store.RenameAccount(t.Context(), db.RenameAccountParams{
 		Scope:         scope,
 		AccountNumber: &internalNumber,
-		NewName:       "renamed-imported",
+		NewName:       "renamed-imported-number",
 	})
 	require.ErrorIs(t, err, db.ErrAccountNotFound)
 
-	info, err := store.GetAccount(
-		t.Context(), db.GetAccountQuery{
-			Scope: scope,
-			Name:  &name,
-		},
-	)
+	err = store.RenameAccount(t.Context(), db.RenameAccountParams{
+		Scope:   scope,
+		OldName: waddrmgr.ImportedAddrAccountName,
+		NewName: "renamed-raw-import",
+	})
+	require.ErrorIs(t, err, db.ErrAccountNotFound)
+
+	info, err = store.GetAccount(t.Context(), db.GetAccountQuery{
+		Scope: scope,
+		Name:  &renamedName,
+	})
 	require.NoError(t, err)
-	require.Equal(t, name, info.AccountName)
+	require.Equal(t, renamedName, info.AccountName)
 }
 
 // kvdbDeriveFnFixture returns an AccountDerivationFunc that derives an
@@ -433,7 +454,10 @@ func TestCreateDerivedAccount(t *testing.T) {
 	require.Equal(t, savingsAccountName, info.AccountName)
 	require.False(t, info.IsImported)
 	require.NotEmpty(t, info.PublicKey)
-	require.Equal(t, uint32(0xC0DEC0DE), info.MasterKeyFingerprint)
+	require.NotNil(t, info.MasterKeyFingerprint)
+	require.NotZero(t, *info.MasterKeyFingerprint)
+	require.NotNil(t, info.MasterKeyFingerprint)
+	require.Equal(t, uint32(0xC0DEC0DE), *info.MasterKeyFingerprint)
 
 	// A subsequent GetAccount must observe the new row.
 	name := savingsAccountName
@@ -448,6 +472,35 @@ func TestCreateDerivedAccount(t *testing.T) {
 	require.NotNil(t, read)
 	require.Equal(t, info.AccountNumber, read.AccountNumber)
 	require.Equal(t, savingsAccountName, read.AccountName)
+}
+
+// TestCreateDerivedAccountDuplicateName verifies that the kvdb adapter
+// normalizes a duplicate derived-account name while preserving the underlying
+// waddrmgr error.
+func TestCreateDerivedAccountDuplicateName(t *testing.T) {
+	t.Parallel()
+
+	store, mgr, cleanup := newAccountStoreFixture(t)
+	t.Cleanup(cleanup)
+
+	params := db.CreateDerivedAccountParams{
+		Scope: db.KeyScope{
+			Purpose: waddrmgr.KeyScopeBIP0084.Purpose,
+			Coin:    waddrmgr.KeyScopeBIP0084.Coin,
+		},
+		Name: savingsAccountName,
+	}
+	deriveFn := kvdbDeriveFnFixture(t, mgr)
+
+	_, err := store.CreateDerivedAccount(t.Context(), params, deriveFn)
+	require.NoError(t, err)
+
+	_, err = store.CreateDerivedAccount(t.Context(), params, deriveFn)
+	require.ErrorIs(t, err, db.ErrDuplicateAccount)
+
+	var managerErr waddrmgr.ManagerError
+	require.ErrorAs(t, err, &managerErr)
+	require.Equal(t, waddrmgr.ErrDuplicateAccount, managerErr.ErrorCode)
 }
 
 // TestCreateDerivedAccountRollsBackOnDeriveError verifies that when the
@@ -561,6 +614,7 @@ func TestCreateDerivedAccountFallsBackToScopedKey(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, info.AccountNumber, read.AccountNumber)
+	require.Equal(t, info.MasterKeyFingerprint, read.MasterKeyFingerprint)
 }
 
 var errTestBoom = errors.New("kvdb test boom")
@@ -597,7 +651,8 @@ func TestCreateImportedAccount(t *testing.T) {
 	require.Equal(t, "imported-xpub", info.AccountName)
 	require.True(t, info.IsImported)
 	require.True(t, info.IsWatchOnly)
-	require.Equal(t, uint32(0xDEADBEEF), info.MasterKeyFingerprint)
+	require.NotNil(t, info.MasterKeyFingerprint)
+	require.Equal(t, uint32(0xDEADBEEF), *info.MasterKeyFingerprint)
 
 	// The imported xpub has no BIP44 number, but kvdb still populates the
 	// durable store AccountID from its internal waddrmgr account number, which
@@ -789,6 +844,66 @@ func TestCreateImportedAccountUsesAddrSchema(t *testing.T) {
 		require.NotNil(t, props.AddrSchema)
 		require.Equal(t, waddrmgr.KeyScopeBIP0049AddrSchema,
 			*props.AddrSchema)
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	// BIP44 uses db.PubKeyHash=1 while waddrmgr.PubKeyHash=0. This case
+	// guards against the old raw cast by asserting the persisted legacy schema
+	// for both the external and internal branches.
+	bip44Scope := db.KeyScope{
+		Purpose: waddrmgr.KeyScopeBIP0044.Purpose,
+		Coin:    waddrmgr.KeyScopeBIP0044.Coin,
+	}
+	bip44Schema := db.ScopeAddrSchema{
+		ExternalAddrType: db.PubKeyHash,
+		InternalAddrType: db.PubKeyHash,
+	}
+	bip44Name := "imported-bip44-schema"
+
+	info, err = store.CreateImportedAccount(t.Context(),
+		db.CreateImportedAccountParams{
+			Scope:             bip44Scope,
+			Name:              bip44Name,
+			MasterFingerprint: 0xDEADBEEF,
+			PublicKey:         []byte(masterPub.String()),
+			AddrSchema:        &bip44Schema,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, bip44Schema, info.AddrSchema)
+
+	info, err = store.GetAccount(t.Context(), db.GetAccountQuery{
+		Scope: bip44Scope,
+		Name:  &bip44Name,
+	})
+	require.NoError(t, err)
+	require.Equal(t, bip44Schema, info.AddrSchema)
+
+	bip44ScopedMgr, err := store.addrStore.FetchScopedKeyManager(
+		waddrmgr.KeyScope(bip44Scope),
+	)
+	require.NoError(t, err)
+
+	err = walletdb.View(store.db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgr.NamespaceKey)
+
+		accountNumber, err := bip44ScopedMgr.LookupAccount(ns, bip44Name)
+		if err != nil {
+			return err
+		}
+
+		props, err := bip44ScopedMgr.AccountProperties(ns, accountNumber)
+		if err != nil {
+			return err
+		}
+
+		require.NotNil(t, props.AddrSchema)
+		require.Equal(t, waddrmgr.ScopeAddrSchema{
+			ExternalAddrType: waddrmgr.PubKeyHash,
+			InternalAddrType: waddrmgr.PubKeyHash,
+		}, *props.AddrSchema)
 
 		return nil
 	})
@@ -1330,5 +1445,6 @@ func TestCreateImportedAccountAllowsMultipleInScope(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, "bob-import", got.AccountName)
-	require.Equal(t, uint32(0xFEEDFACE), got.MasterKeyFingerprint)
+	require.NotNil(t, got.MasterKeyFingerprint)
+	require.Equal(t, uint32(0xFEEDFACE), *got.MasterKeyFingerprint)
 }

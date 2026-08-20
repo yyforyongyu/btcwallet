@@ -68,22 +68,28 @@ type HarnessTest struct {
 	// parent harness and its subtests.
 	postgresServer *postgresTestServer
 
-	// managers holds the wallet managers created for this subtest. They are
-	// closed after every registered wallet has stopped.
-	managers []*wallet.Manager
-
 	// mu protects harness state that can be accessed across the main test and
 	// subtests. This includes the wallet registry and idempotent shutdown.
 	mu sync.Mutex
 
-	// wallets is the set of wallets created by a test case.
-	wallets []*wallet.Wallet
+	// wallets is the single ownership registry for Managers and their optional
+	// Wallet instances. A Manager is inserted before Create or Load so cleanup
+	// still owns it when wallet construction fails.
+	wallets map[*wallet.Manager]*walletRegistration
 
 	// stopped prevents stopping shared infrastructure more than once.
 	stopped bool
 
 	// cleaned indicates the subtest cleanup has already run.
 	cleaned bool
+}
+
+// walletRegistration holds the optional Wallet owned by a registered Manager.
+// reloadConfig is set only for wallets created by the standard fixture and is
+// kept private so tests can reload without carrying lifecycle state.
+type walletRegistration struct {
+	instance     *wallet.Wallet
+	reloadConfig *wallet.Config
 }
 
 // SetupHarness creates a new HarnessTest.
@@ -239,7 +245,12 @@ func (h *HarnessTest) NewWalletManager() *wallet.Manager {
 	})
 	require.NoError(h, err, "failed to create wallet manager")
 
-	h.managers = append(h.managers, manager)
+	h.mu.Lock()
+	if h.wallets == nil {
+		h.wallets = make(map[*wallet.Manager]*walletRegistration)
+	}
+	h.wallets[manager] = &walletRegistration{}
+	h.mu.Unlock()
 
 	// Verify the Manager opened the backend requested by the -db flag without
 	// adding a production accessor solely for the test.
@@ -252,11 +263,20 @@ func (h *HarnessTest) NewWalletManager() *wallet.Manager {
 func (h *HarnessTest) teardownWallets(ctx context.Context) error {
 	err := h.stopActiveWallets(ctx)
 
-	for _, manager := range h.managers {
+	h.mu.Lock()
+	managers := make([]*wallet.Manager, 0, len(h.wallets))
+	for manager := range h.wallets {
+		managers = append(managers, manager)
+	}
+	h.mu.Unlock()
+
+	for _, manager := range managers {
 		err = errors.Join(err, manager.Close())
 	}
 
-	h.managers = nil
+	h.mu.Lock()
+	h.wallets = nil
+	h.mu.Unlock()
 
 	return err
 }
@@ -330,26 +350,50 @@ func validateFileBackendArtifact(dbType, dbPath string) error {
 	return nil
 }
 
-// RegisterWallet registers a wallet with the harness.
+// RegisterWallet attaches a wallet to its registered Manager.
 //
 // Registered wallets are automatically included in harness-level assertions,
 // such as MineBlocks.
-func (h *HarnessTest) RegisterWallet(w *wallet.Wallet) {
+func (h *HarnessTest) RegisterWallet(manager *wallet.Manager,
+	w *wallet.Wallet) {
+
+	h.Helper()
+	h.registerWallet(manager, w, nil)
+}
+
+// registerWallet attaches a wallet and optional reload configuration to its
+// registered Manager.
+func (h *HarnessTest) registerWallet(manager *wallet.Manager,
+	w *wallet.Wallet, reloadConfig *wallet.Config) {
+
 	h.Helper()
 
+	if manager == nil {
+		h.Fatalf("cannot register wallet without a manager")
+	}
 	if w == nil {
 		h.Fatalf("cannot register nil wallet")
 	}
 
 	h.mu.Lock()
-	h.wallets = append(h.wallets, w)
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+
+	registration, ok := h.wallets[manager]
+	if !ok {
+		h.Fatalf("cannot attach wallet to an unregistered manager")
+	}
+	if registration.instance != nil {
+		h.Fatalf("manager already has a registered wallet")
+	}
+
+	registration.instance = w
+	registration.reloadConfig = reloadConfig
 }
 
 // DeregisterWallet releases a wallet from harness ownership.
 //
-// It returns false when the wallet is nil or was not registered. The remaining
-// registrations retain their original order.
+// It returns false when the wallet is nil or was not registered. The Manager
+// remains registered until ReleaseManager transfers or releases its ownership.
 func (h *HarnessTest) DeregisterWallet(w *wallet.Wallet) bool {
 	h.Helper()
 
@@ -360,12 +404,13 @@ func (h *HarnessTest) DeregisterWallet(w *wallet.Wallet) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	for i, registered := range h.wallets {
-		if registered != w {
+	for _, registration := range h.wallets {
+		if registration.instance != w {
 			continue
 		}
 
-		h.wallets = append(h.wallets[:i], h.wallets[i+1:]...)
+		registration.instance = nil
+		registration.reloadConfig = nil
 
 		return true
 	}
@@ -375,8 +420,8 @@ func (h *HarnessTest) DeregisterWallet(w *wallet.Wallet) bool {
 
 // ReleaseManager releases a Manager from harness teardown ownership.
 //
-// It returns false when the Manager is nil or was not registered. The remaining
-// registrations retain their original order.
+// It returns false when the Manager is nil, was not registered, or still owns
+// a registered wallet.
 func (h *HarnessTest) ReleaseManager(manager *wallet.Manager) bool {
 	h.Helper()
 
@@ -384,17 +429,17 @@ func (h *HarnessTest) ReleaseManager(manager *wallet.Manager) bool {
 		return false
 	}
 
-	for i, registered := range h.managers {
-		if registered != manager {
-			continue
-		}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
-		h.managers = append(h.managers[:i], h.managers[i+1:]...)
-
-		return true
+	registration, ok := h.wallets[manager]
+	if !ok || registration.instance != nil {
+		return false
 	}
 
-	return false
+	delete(h.wallets, manager)
+
+	return true
 }
 
 // ActiveWallets returns a snapshot of wallets registered with this harness.
@@ -402,7 +447,12 @@ func (h *HarnessTest) ActiveWallets() []*wallet.Wallet {
 	h.Helper()
 
 	h.mu.Lock()
-	wallets := append([]*wallet.Wallet(nil), h.wallets...)
+	wallets := make([]*wallet.Wallet, 0, len(h.wallets))
+	for _, registration := range h.wallets {
+		if registration.instance != nil {
+			wallets = append(wallets, registration.instance)
+		}
+	}
 	h.mu.Unlock()
 
 	return wallets

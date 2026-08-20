@@ -124,6 +124,24 @@ func optionalAccountNumber(accountNumber sql.NullInt64) (*uint32, error) {
 	return result, nil
 }
 
+// optionalMasterFingerprint converts a nullable SQL master fingerprint to a
+// pointer without collapsing an absent value into a present zero.
+func optionalMasterFingerprint(
+	masterFingerprint sql.NullInt64) (*uint32, error) {
+
+	var result *uint32
+	if masterFingerprint.Valid {
+		converted, err := Int64ToUint32(masterFingerprint.Int64)
+		if err != nil {
+			return nil, fmt.Errorf("master fingerprint: %w", err)
+		}
+
+		result = &converted
+	}
+
+	return result, nil
+}
+
 // getKeyCounts converts external, internal, and imported key counts from
 // int64 to uint32 and handles errors.
 func getKeyCounts(external, internal, imported int64) (uint32, uint32,
@@ -230,12 +248,9 @@ func AccountPropsRowToInfo[AddrTypeId ~int16 | ~int64](
 		return nil, fmt.Errorf("coin type: %w", err)
 	}
 
-	var fingerprint uint32
-	if row.MasterFingerprint.Valid {
-		fingerprint, err = Int64ToUint32(row.MasterFingerprint.Int64)
-		if err != nil {
-			return nil, fmt.Errorf("master fingerprint: %w", err)
-		}
+	fingerprint, err := optionalMasterFingerprint(row.MasterFingerprint)
+	if err != nil {
+		return nil, err
 	}
 
 	// Normalized SQL account rows track HD branch counters only. Individually
@@ -272,6 +287,42 @@ func AccountPropsRowToInfo[AddrTypeId ~int16 | ~int64](
 		IsWatchOnly: row.IsWatchOnly,
 		CreatedAt:   row.CreatedAt,
 	}, nil
+}
+
+// addrTypeToWaddrmgr maps a database AddressType to its legacy waddrmgr
+// representation. The two enums share names but not ordinal values, so a
+// direct cast would corrupt the schema.
+func addrTypeToWaddrmgr(t AddressType) (waddrmgr.AddressType, error) {
+	switch t {
+	case RawPubKey:
+		return waddrmgr.RawPubKey, nil
+
+	case PubKeyHash:
+		return waddrmgr.PubKeyHash, nil
+
+	case ScriptHash:
+		return waddrmgr.Script, nil
+
+	case NestedWitnessPubKey:
+		return waddrmgr.NestedWitnessPubKey, nil
+
+	case WitnessPubKey:
+		return waddrmgr.WitnessPubKey, nil
+
+	case WitnessScript:
+		return waddrmgr.WitnessScript, nil
+
+	case TaprootPubKey:
+		return waddrmgr.TaprootPubKey, nil
+
+	case Anchor:
+		return 0, fmt.Errorf("%w: database address type %d",
+			ErrInvalidParam, t)
+
+	default:
+		return 0, fmt.Errorf("%w: database address type %d",
+			ErrInvalidParam, t)
+	}
 }
 
 // addrTypeFromWaddrmgr maps a legacy waddrmgr.AddressType to the database
@@ -336,6 +387,28 @@ func ScopeAddrSchemaFromWaddrmgr(
 	}, nil
 }
 
+// ScopeAddrSchemaToWaddrmgr converts a database account schema into the
+// legacy address-manager schema shape. An unrepresentable address type is
+// surfaced as ErrInvalidParam rather than coerced to a different enum value.
+func ScopeAddrSchemaToWaddrmgr(
+	schema ScopeAddrSchema) (waddrmgr.ScopeAddrSchema, error) {
+
+	external, err := addrTypeToWaddrmgr(schema.ExternalAddrType)
+	if err != nil {
+		return waddrmgr.ScopeAddrSchema{}, fmt.Errorf("external: %w", err)
+	}
+
+	internal, err := addrTypeToWaddrmgr(schema.InternalAddrType)
+	if err != nil {
+		return waddrmgr.ScopeAddrSchema{}, fmt.Errorf("internal: %w", err)
+	}
+
+	return waddrmgr.ScopeAddrSchema{
+		ExternalAddrType: external,
+		InternalAddrType: internal,
+	}, nil
+}
+
 // BuildAccountInfo creates an AccountInfo with the provided values.
 // confirmedBalance and unconfirmedBalance are populated verbatim from
 // the caller; create paths pass zero (a fresh account has no UTXOs)
@@ -346,7 +419,7 @@ func BuildAccountInfo(accountID *uint32, accountNum *uint32,
 	isImported bool, externalKeyCount, internalKeyCount,
 	importedKeyCount uint32, isWatchOnly bool, createdAt time.Time,
 	scope KeyScope, addrSchema ScopeAddrSchema, publicKey []byte,
-	masterKeyFingerprint uint32,
+	masterKeyFingerprint *uint32,
 	confirmedBalance, unconfirmedBalance btcutil.Amount) *AccountInfo {
 
 	return &AccountInfo{
@@ -459,12 +532,9 @@ func AccountRowToInfo[AccOriginId ~int16 | ~int64](
 		return nil, err
 	}
 
-	var fingerprint uint32
-	if row.MasterFingerprint.Valid {
-		fingerprint, err = Int64ToUint32(row.MasterFingerprint.Int64)
-		if err != nil {
-			return nil, fmt.Errorf("master fingerprint: %w", err)
-		}
+	fingerprint, err := optionalMasterFingerprint(row.MasterFingerprint)
+	if err != nil {
+		return nil, err
 	}
 
 	addrSchema, err := DerivedAddressAccountSchema(

@@ -247,6 +247,7 @@ SELECT
     $4 AS master_fingerprint
 FROM key_scopes AS ks
 WHERE ks.id = $5
+ON CONFLICT (wallet_id, scope_id, account_name) DO NOTHING
 RETURNING id, account_number, created_at
 `
 

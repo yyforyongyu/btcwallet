@@ -246,7 +246,7 @@ func TestCreateDerivedAccountDuplicateName(t *testing.T) {
 		t.Context(), params, SpendableDeriveFn(),
 	)
 	require.Error(t, err)
-	requireConstraintSQLError(t, err)
+	require.ErrorIs(t, err, db.ErrDuplicateAccount)
 
 	after := store.StatsSnapshot()
 	require.Equal(t, before.Unhealthy, after.Unhealthy)
@@ -255,13 +255,9 @@ func TestCreateDerivedAccountDuplicateName(t *testing.T) {
 	require.Equal(t, before.RetryExhausted, after.RetryExhausted)
 	require.Equal(t, before.AmbiguousTxCommits, after.AmbiguousTxCommits)
 	require.Equal(t, before.Errors.Backend, after.Errors.Backend)
-	require.Equal(t, before.Errors.TotalErrs+1, after.Errors.TotalErrs)
-	require.Equal(
-		t,
-		before.Errors.PermanentErrs+1,
-		after.Errors.PermanentErrs,
-	)
-	require.Equal(t, before.Errors.Constraint+1, after.Errors.Constraint)
+	require.Equal(t, before.Errors.TotalErrs, after.Errors.TotalErrs)
+	require.Equal(t, before.Errors.PermanentErrs, after.Errors.PermanentErrs)
+	require.Equal(t, before.Errors.Constraint, after.Errors.Constraint)
 	require.Equal(t, before.Errors.TransientErrs, after.Errors.TransientErrs)
 	require.Equal(t, before.Errors.FatalErrs, after.Errors.FatalErrs)
 }

@@ -7,8 +7,10 @@ package wallet
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -20,6 +22,214 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+// TestAccountInfoFromStore verifies SQL and modern kvdb snapshots map every
+// public semantic field without exposing Store identity. The fixtures cover
+// absent, present-zero, and present-nonzero optional values, including a stale
+// derived fingerprint that must be replaced by the Wallet-cached value.
+func TestAccountInfoFromStore(t *testing.T) {
+	t.Parallel()
+
+	var (
+		storeAccountID        = uint32(91)
+		storeAccountZero      = uint32(0)
+		storeAccountSeven     = uint32(7)
+		storeFingerprintZero  = uint32(0)
+		storeFingerprintStale = uint32(0xfedcba98)
+		publicAccountZero     = AccountNumber(0)
+		publicAccountSeven    = AccountNumber(7)
+		publicFingerprintZero = MasterFingerprint(0)
+		publicFingerprintSet  = MasterFingerprint(0x01020304)
+	)
+
+	createdAt := time.Date(
+		2026, time.August, 15, 9, 30, 0, 0, time.UTC,
+	)
+	tests := []struct {
+		name              string
+		walletFingerprint uint32
+		store             db.AccountInfo
+		want              AccountInfo
+	}{
+		{
+			name: "sql present zero optionals",
+			store: db.AccountInfo{
+				AccountID:          &storeAccountID,
+				AccountNumber:      &storeAccountZero,
+				AccountName:        "sql derived",
+				ExternalKeyCount:   2,
+				InternalKeyCount:   3,
+				ImportedKeyCount:   4,
+				ConfirmedBalance:   btcutil.Amount(5),
+				UnconfirmedBalance: btcutil.Amount(6),
+				IsWatchOnly:        true,
+				CreatedAt:          createdAt,
+				KeyScope:           db.KeyScope{Purpose: 49, Coin: 0},
+				AddrSchema: db.ScopeAddrSchema{
+					ExternalAddrType: db.NestedWitnessPubKey,
+					InternalAddrType: db.WitnessPubKey,
+				},
+				PublicKey:            []byte{7, 8, 9},
+				MasterKeyFingerprint: &storeFingerprintZero,
+			},
+			want: AccountInfo{
+				AccountNumber:      &publicAccountZero,
+				AccountName:        "sql derived",
+				ExternalKeyCount:   2,
+				InternalKeyCount:   3,
+				ImportedKeyCount:   4,
+				ConfirmedBalance:   btcutil.Amount(5),
+				UnconfirmedBalance: btcutil.Amount(6),
+				IsWatchOnly:        true,
+				CreatedAt:          createdAt,
+				KeyScope:           waddrmgr.KeyScope{Purpose: 49, Coin: 0},
+				AddrSchema: waddrmgr.ScopeAddrSchema{
+					ExternalAddrType: waddrmgr.NestedWitnessPubKey,
+					InternalAddrType: waddrmgr.WitnessPubKey,
+				},
+				PublicKey:            []byte{7, 8, 9},
+				MasterKeyFingerprint: &publicFingerprintZero,
+			},
+		},
+		{
+			name: "modern kvdb absent optionals",
+			store: db.AccountInfo{
+				AccountID:          &storeAccountID,
+				AccountName:        "imported",
+				IsImported:         true,
+				ExternalKeyCount:   10,
+				InternalKeyCount:   11,
+				ImportedKeyCount:   12,
+				ConfirmedBalance:   btcutil.Amount(13),
+				UnconfirmedBalance: btcutil.Amount(14),
+				CreatedAt:          createdAt.Add(time.Hour),
+				KeyScope:           db.KeyScope{Purpose: 84, Coin: 1},
+				AddrSchema: db.ScopeAddrSchema{
+					ExternalAddrType: db.WitnessPubKey,
+					InternalAddrType: db.WitnessPubKey,
+				},
+			},
+			want: AccountInfo{
+				AccountName:        "imported",
+				IsImported:         true,
+				ExternalKeyCount:   10,
+				InternalKeyCount:   11,
+				ImportedKeyCount:   12,
+				ConfirmedBalance:   btcutil.Amount(13),
+				UnconfirmedBalance: btcutil.Amount(14),
+				CreatedAt:          createdAt.Add(time.Hour),
+				KeyScope:           waddrmgr.KeyScope{Purpose: 84, Coin: 1},
+				AddrSchema: waddrmgr.ScopeAddrSchema{
+					ExternalAddrType: waddrmgr.WitnessPubKey,
+					InternalAddrType: waddrmgr.WitnessPubKey,
+				},
+			},
+		},
+		{
+			name:              "modern kvdb ignores stale fingerprint",
+			walletFingerprint: uint32(publicFingerprintSet),
+			store: db.AccountInfo{
+				AccountID:          &storeAccountID,
+				AccountNumber:      &storeAccountSeven,
+				AccountName:        "kvdb derived",
+				ExternalKeyCount:   15,
+				InternalKeyCount:   16,
+				ImportedKeyCount:   17,
+				ConfirmedBalance:   btcutil.Amount(18),
+				UnconfirmedBalance: btcutil.Amount(19),
+				IsWatchOnly:        true,
+				CreatedAt:          createdAt.Add(2 * time.Hour),
+				KeyScope:           db.KeyScope{Purpose: 86, Coin: 1},
+				AddrSchema: db.ScopeAddrSchema{
+					ExternalAddrType: db.TaprootPubKey,
+					InternalAddrType: db.TaprootPubKey,
+				},
+				PublicKey:            []byte{20, 21, 22},
+				MasterKeyFingerprint: &storeFingerprintStale,
+			},
+			want: AccountInfo{
+				AccountNumber:      &publicAccountSeven,
+				AccountName:        "kvdb derived",
+				ExternalKeyCount:   15,
+				InternalKeyCount:   16,
+				ImportedKeyCount:   17,
+				ConfirmedBalance:   btcutil.Amount(18),
+				UnconfirmedBalance: btcutil.Amount(19),
+				IsWatchOnly:        true,
+				CreatedAt:          createdAt.Add(2 * time.Hour),
+				KeyScope:           waddrmgr.KeyScope{Purpose: 86, Coin: 1},
+				AddrSchema: waddrmgr.ScopeAddrSchema{
+					ExternalAddrType: waddrmgr.TaprootPubKey,
+					InternalAddrType: waddrmgr.TaprootPubKey,
+				},
+				PublicKey:            []byte{20, 21, 22},
+				MasterKeyFingerprint: &publicFingerprintSet,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			w := &Wallet{masterFingerprint: test.walletFingerprint}
+			got, err := w.accountInfoFromStore(&test.store)
+			require.NoError(t, err)
+			require.Equal(t, test.want, *got)
+		})
+	}
+}
+
+// TestAccountInfoFromStoreCopiesMutableFields verifies independently converted
+// results do not alias Store-owned optionals or public-key bytes.
+func TestAccountInfoFromStoreCopiesMutableFields(t *testing.T) {
+	t.Parallel()
+
+	accountNumber := uint32(2)
+	fingerprint := uint32(3)
+	store := db.AccountInfo{
+		AccountNumber: &accountNumber,
+		IsImported:    true,
+		AddrSchema: db.ScopeAddrSchema{
+			ExternalAddrType: db.WitnessPubKey,
+			InternalAddrType: db.WitnessPubKey,
+		},
+		PublicKey:            []byte{4, 5, 6},
+		MasterKeyFingerprint: &fingerprint,
+	}
+	w := &Wallet{}
+
+	first, err := w.accountInfoFromStore(&store)
+	require.NoError(t, err)
+	second, err := w.accountInfoFromStore(&store)
+	require.NoError(t, err)
+
+	*first.AccountNumber = AccountNumber(20)
+	*first.MasterKeyFingerprint = MasterFingerprint(30)
+	first.PublicKey[0] = 40
+
+	require.Equal(t, uint32(2), *store.AccountNumber)
+	require.Equal(t, uint32(3), *store.MasterKeyFingerprint)
+	require.Equal(t, []byte{4, 5, 6}, store.PublicKey)
+	require.Equal(t, AccountNumber(2), *second.AccountNumber)
+	require.Equal(t, MasterFingerprint(3), *second.MasterKeyFingerprint)
+	require.Equal(t, []byte{4, 5, 6}, second.PublicKey)
+}
+
+// TestAccountInfoFromStoreRejectsInvalidSchema verifies a malformed Store
+// schema fails conversion instead of producing a partial public result.
+func TestAccountInfoFromStoreRejectsInvalidSchema(t *testing.T) {
+	t.Parallel()
+
+	store := db.AccountInfo{AddrSchema: db.ScopeAddrSchema{
+		ExternalAddrType: db.Anchor,
+		InternalAddrType: db.WitnessPubKey,
+	}}
+
+	got, err := (&Wallet{}).accountInfoFromStore(&store)
+	require.ErrorContains(t, err, "external account address schema")
+	require.Nil(t, got)
+}
 
 // stubAccountDeriveFn holds the master-key material the test wallet's
 // buildAccountDeriveFn path consumes.
@@ -147,7 +357,8 @@ func TestPropertiesToAccountInfoLockedDerivedNotMisclassified(t *testing.T) {
 	require.Equal(t, uint32(7), *info.AccountNumber)
 	require.False(t, info.IsImported)
 	require.False(t, info.IsWatchOnly)
-	require.Equal(t, masterFingerprint, info.MasterKeyFingerprint)
+	require.NotNil(t, info.MasterKeyFingerprint)
+	require.Equal(t, masterFingerprint, *info.MasterKeyFingerprint)
 }
 
 // TestValidateExtendedPubKeyNil verifies that a nil account key is rejected
@@ -176,7 +387,7 @@ func TestPropertiesToAccountInfoImportedClassifiedAndMasked(t *testing.T) {
 	require.Nil(t, info.AccountNumber)
 	require.True(t, info.IsImported)
 	require.True(t, info.IsWatchOnly)
-	require.Equal(t, importedFingerprint, info.MasterKeyFingerprint)
+	require.Nil(t, info.MasterKeyFingerprint)
 }
 
 // TestListAccounts verifies ListAccounts returns account snapshots with the
@@ -203,10 +414,9 @@ func TestListAccounts(t *testing.T) {
 		WalletID: 0,
 	}).Return([]db.AccountInfo{
 		{
-			AccountNumber:        &accountNumber,
-			AccountName:          "default",
-			KeyScope:             bip84,
-			MasterKeyFingerprint: 0,
+			AccountNumber: &accountNumber,
+			AccountName:   "default",
+			KeyScope:      bip84,
 		},
 	}, nil).Once()
 
@@ -215,7 +425,9 @@ func TestListAccounts(t *testing.T) {
 
 	require.Len(t, accounts, 1)
 	require.Equal(t, "default", accounts[0].AccountName)
-	require.Equal(t, masterFP, accounts[0].MasterKeyFingerprint)
+	require.NotNil(t, accounts[0].MasterKeyFingerprint)
+	require.Equal(t, MasterFingerprint(masterFP),
+		*accounts[0].MasterKeyFingerprint)
 }
 
 // TestListAccountsByScope verifies the scope filter narrows the query.
@@ -358,10 +570,9 @@ func TestGetAccount(t *testing.T) {
 
 	// Seed a non-zero cached master fingerprint so the
 	// derived-account override path produces an observable value.
-	// The mocked store deliberately returns MasterKeyFingerprint: 0
-	// (matching what waddrmgr's default-account row carries for
-	// legacy derived rows) so the wallet-level override is what
-	// surfaces the value to the caller.
+	// The mocked store deliberately returns an absent fingerprint,
+	// matching a legacy derived row with no kvdb side-bucket entry,
+	// so the wallet-level fallback surfaces the value to the caller.
 	const masterFP uint32 = 0xDEADBEEF
 
 	w.masterFingerprint = masterFP
@@ -379,22 +590,23 @@ func TestGetAccount(t *testing.T) {
 		Scope:    dbScope,
 		Name:     &name,
 	}).Return(&db.AccountInfo{
-		AccountNumber:        &accountNumber,
-		AccountName:          name,
-		KeyScope:             dbScope,
-		ConfirmedBalance:     100,
-		UnconfirmedBalance:   23,
-		MasterKeyFingerprint: 0,
+		AccountNumber:      &accountNumber,
+		AccountName:        name,
+		KeyScope:           dbScope,
+		ConfirmedBalance:   100,
+		UnconfirmedBalance: 23,
 	}, nil).Once()
 
 	info, err := w.GetAccount(t.Context(), scope, name)
 	require.NoError(t, err)
 	require.NotNil(t, info.AccountNumber)
-	require.Equal(t, uint32(1), *info.AccountNumber)
+	require.Equal(t, AccountNumber(1), *info.AccountNumber)
 	require.Equal(t, name, info.AccountName)
 	require.Equal(t, btcutil.Amount(100), info.ConfirmedBalance)
 	require.Equal(t, btcutil.Amount(23), info.UnconfirmedBalance)
-	require.Equal(t, masterFP, info.MasterKeyFingerprint)
+	require.NotNil(t, info.MasterKeyFingerprint)
+	require.Equal(t, MasterFingerprint(masterFP),
+		*info.MasterKeyFingerprint)
 }
 
 // TestGetAccountIncludesImportedPseudoAccount verifies that the AccountInfo
@@ -467,22 +679,32 @@ func TestNewAccount(t *testing.T) {
 	account, err := w.NewAccount(t.Context(), scope, testAccountName)
 	require.NoError(t, err)
 	require.NotNil(t, account.AccountNumber)
-	require.Equal(t, uint32(1), *account.AccountNumber)
-	require.Equal(t, stub.masterKeyFingerprint, account.MasterKeyFingerprint)
+	require.Equal(t, AccountNumber(1), *account.AccountNumber)
+	require.NotNil(t, account.MasterKeyFingerprint)
+	require.Equal(t, MasterFingerprint(stub.masterKeyFingerprint),
+		*account.MasterKeyFingerprint)
 
 	// Duplicate-name path.
 	expectAccountDeriveSetup(t, deps, stub)
-	deps.store.On("CreateDerivedAccount", mock.Anything, mock.Anything,
-		mock.Anything).Return((*db.AccountInfo)(nil),
-		waddrmgr.ManagerError{
-			ErrorCode: waddrmgr.ErrDuplicateAccount,
-		}).Once()
+
+	storeErr := fmt.Errorf("create derived account: %w", db.ErrDuplicateAccount)
+	deps.store.On(
+		"CreateDerivedAccount", mock.Anything, mock.Anything, mock.Anything,
+	).Return((*db.AccountInfo)(nil), storeErr).Once()
 
 	_, err = w.NewAccount(t.Context(), scope, testAccountName)
 	require.Error(t, err)
-	require.True(t,
-		waddrmgr.IsError(err, waddrmgr.ErrDuplicateAccount),
+	require.True(
+		t, waddrmgr.IsError(err, waddrmgr.ErrDuplicateAccount),
 	)
+	require.ErrorIs(t, err, db.ErrDuplicateAccount)
+
+	var managerErr waddrmgr.ManagerError
+	require.ErrorAs(t, err, &managerErr)
+	require.Equal(
+		t, "account with the same name already exists", managerErr.Description,
+	)
+	require.ErrorIs(t, managerErr.Err, db.ErrDuplicateAccount)
 }
 
 // TestNewAccountMissingHDSeedDefersToStore verifies that neutered-root kvdb
@@ -523,12 +745,11 @@ func TestNewAccountMissingHDSeedDefersToStore(t *testing.T) {
 	account, err := w.NewAccount(t.Context(), scope, testAccountName)
 	require.NoError(t, err)
 	require.NotNil(t, account.AccountNumber)
-	require.Equal(t, uint32(1), *account.AccountNumber)
+	require.Equal(t, AccountNumber(1), *account.AccountNumber)
 }
 
-// TestRenameAccount verifies RenameAccount routes through
-// w.store.RenameAccount with the correct params and preserves
-// db.ErrAccountNotFound passthrough.
+// TestRenameAccount verifies RenameAccount routes through w.store.RenameAccount
+// with the correct params and maps a missing account to the public error.
 func TestRenameAccount(t *testing.T) {
 	t.Parallel()
 
@@ -560,7 +781,7 @@ func TestRenameAccount(t *testing.T) {
 	).Once()
 
 	err = w.RenameAccount(t.Context(), scope, "missing", "x")
-	require.ErrorIs(t, err, db.ErrAccountNotFound)
+	require.ErrorIs(t, err, ErrAccountNotFound)
 }
 
 // TestImportAccount verifies the normal import path routes through

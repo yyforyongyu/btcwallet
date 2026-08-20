@@ -83,6 +83,15 @@ type WalletFixture struct {
 	// combined with Unstarted.
 	Amounts []btcutil.Amount
 
+	// WatchOnly creates a rootless watch-only shell wallet when InitialAccounts
+	// is empty.
+	WatchOnly bool
+
+	// InitialAccounts seeds a watch-only shell wallet with the provided
+	// accounts. A nil or empty slice creates no accounts, and a non-empty slice
+	// implies WatchOnly.
+	InitialAccounts []wallet.WatchOnlyAccount
+
 	// Unlocked unlocks the wallet once it has started.
 	Unlocked bool
 
@@ -104,6 +113,10 @@ func (h *HarnessTest) NewWallet(fixture WalletFixture) (*wallet.Wallet,
 	h.Helper()
 
 	cfg, params := h.TestWalletConfig()
+	if fixture.WatchOnly || len(fixture.InitialAccounts) != 0 {
+		params.Mode, params.WatchOnly = wallet.ModeShell, true
+		params.InitialAccounts = fixture.InitialAccounts
+	}
 
 	manager := h.NewWalletManager()
 	w, err := manager.Create(cfg, params)
@@ -113,7 +126,9 @@ func (h *HarnessTest) NewWallet(fixture WalletFixture) (*wallet.Wallet,
 	// cleanup owner. Registering after Start would leave a wallet whose Start
 	// failed unregistered, and a second direct Stop callback here would stop a
 	// successful one twice, out of order with the Manager close.
-	h.RegisterWallet(w)
+	reloadConfig := cfg
+	reloadConfig.PubPassphrase = bytes.Clone(cfg.PubPassphrase)
+	h.registerWallet(manager, w, &reloadConfig)
 
 	if fixture.Unstarted {
 		require.Empty(
@@ -135,6 +150,61 @@ func (h *HarnessTest) NewWallet(fixture WalletFixture) (*wallet.Wallet,
 	}
 
 	return w, h.FundWalletOfType(w, fixture.AddrType, fixture.Amounts...)
+}
+
+// ReloadWallet replaces current with a fresh registered, started, and locked
+// Wallet loaded from the same store.
+func (h *HarnessTest) ReloadWallet(current *wallet.Wallet) *wallet.Wallet {
+	h.Helper()
+
+	h.mu.Lock()
+	var (
+		currentManager *wallet.Manager
+		cfg            wallet.Config
+		found          bool
+	)
+	for manager, registration := range h.wallets {
+		if registration.instance != current ||
+			registration.reloadConfig == nil {
+
+			continue
+		}
+
+		currentManager = manager
+		cfg = *registration.reloadConfig
+		cfg.PubPassphrase = bytes.Clone(
+			registration.reloadConfig.PubPassphrase,
+		)
+		found = true
+		break
+	}
+	h.mu.Unlock()
+	require.True(h, found, "wallet is not registered for reload")
+
+	ctx := h.Context()
+	require.NoError(
+		h, current.Stop(ctx), "failed to stop wallet before reload",
+	)
+	require.True(
+		h, h.DeregisterWallet(current), "failed to deregister wallet",
+	)
+	require.NoError(
+		h, currentManager.Close(), "failed to close wallet manager",
+	)
+	require.True(
+		h, h.ReleaseManager(currentManager),
+		"failed to release wallet manager",
+	)
+
+	manager := h.NewWalletManager()
+	w, err := manager.Load(cfg)
+	require.NoError(h, err, "failed to reload wallet")
+	require.NotSame(h, current, w, "reload returned the original wallet")
+
+	h.registerWallet(manager, w, &cfg)
+	require.NoError(h, w.Start(ctx), "failed to start reloaded wallet")
+
+	return w
 }
 
 // CreateEmptyWallet creates, starts, and registers a new wallet instance.
