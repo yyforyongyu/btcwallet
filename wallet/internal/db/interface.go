@@ -53,6 +53,10 @@ var (
 	// database.
 	ErrAccountNotFound = errors.New("account not found")
 
+	// ErrAccountNameConflict is returned when an account name is already in use
+	// within a wallet and key scope.
+	ErrAccountNameConflict = errors.New("account name conflict")
+
 	// ErrAddressNotFound is returned when an address is not found in the
 	// database.
 	ErrAddressNotFound = errors.New("address not found")
