@@ -2008,3 +2008,195 @@ func TestNewBulkAddressesReplaysCommittedBatch(t *testing.T) {
 		})
 	}
 }
+
+// TestAllocateNextKeyReturnsLocator verifies both branches and semantic
+// selectors retain the committed key's full custom-scope derivation metadata.
+func TestAllocateNextKeyReturnsLocator(t *testing.T) {
+	t.Parallel()
+
+	scope := waddrmgr.KeyScope{Purpose: 1017, Coin: 1}
+	account := uint32(7)
+
+	for _, tc := range []struct {
+		name          string
+		selector      AccountSelector
+		accountName   string
+		accountNumber *uint32
+		branch        uint32
+	}{
+		{
+			name:        "external by name",
+			selector:    NewAccountSelectorByName(scope, "key-family"),
+			accountName: "key-family",
+		},
+		{
+			name: "internal by number",
+			selector: NewAccountSelectorByNumber(
+				scope, AccountNumber(account),
+			),
+			accountNumber: &account,
+			branch:        1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Only the single Store allocation is expected. Strict
+			// chain, recovery, and other Store mocks reject any extra work.
+			w, deps := createTestWalletWithMocks(t)
+			w.addrStore = nil
+			startLoadedWalletForTest(t, w)
+			_, script, pubKey := expectedStoreAddress(
+				t, storeDerivationAccountPubKey(t), db.WitnessPubKey,
+				tc.branch, 19,
+			)
+			stored := db.AddressInfo{
+				AccountNumber:        &account,
+				KeyScope:             db.KeyScope(scope),
+				MasterKeyFingerprint: 0x12345678,
+				AddrType:             db.WitnessPubKey,
+				HasDerivationPath:    true,
+				Branch:               tc.branch,
+				Index:                19,
+				ScriptPubKey:         script,
+				PubKey:               pubKey,
+			}
+			deps.store.On("NewDerivedAddresses", t.Context(),
+				db.NewDerivedAddressParams{
+					WalletID:           w.id,
+					Scope:              db.KeyScope(scope),
+					AccountName:        tc.accountName,
+					AccountNumber:      tc.accountNumber,
+					Change:             tc.branch == 1,
+					RequireNoChainSync: true,
+				}, uint32(1),
+			).Return([]db.AddressInfo{stored}, nil).Once()
+
+			// Act: Allocate through the public request loop, using the custom
+			// scope directly rather than a receiving-address type's scope.
+			key, path, err := w.AllocateNextKey(
+				t.Context(), tc.selector, tc.branch == 1,
+			)
+
+			// Assert: Every public locator component comes from the committed
+			// row. Shared cleanup verifies one allocation and no watch calls.
+			require.NoError(t, err)
+			require.NotNil(t, key)
+			require.Equal(t, pubKey, key.SerializeCompressed())
+			require.Equal(t, &AddressDerivation{
+				KeyScope:             scope,
+				Account:              account,
+				Branch:               tc.branch,
+				Index:                stored.Index,
+				MasterKeyFingerprint: stored.MasterKeyFingerprint,
+			}, path)
+		})
+	}
+}
+
+// TestAllocateNextKeyRejectsAdmission verifies invalid selectors and modern
+// kvdb are refused without touching allocation or chain dependencies.
+func TestAllocateNextKeyRejectsAdmission(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		selector AccountSelector
+		kvdb     bool
+		wantErr  error
+	}{
+		{
+			name:    "invalid selector",
+			wantErr: ErrInvalidParam,
+		},
+		{
+			name: "unsupported kvdb",
+			selector: NewAccountSelectorByName(
+				waddrmgr.KeyScopeBIP0084, "key-family",
+			),
+			kvdb:    true,
+			wantErr: ErrAccountOperationUnsupported,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Leave all dependency mocks without expectations so
+			// even a read before the admission refusal fails the test.
+			w, _ := createTestWalletWithMocks(t)
+			if !tc.kvdb {
+				w.addrStore = nil
+			}
+
+			startLoadedWalletForTest(t, w)
+
+			// Act: Submit the unsupported backend or malformed selector at
+			// the public boundary, with the Wallet otherwise ready for work.
+			key, path, err := w.AllocateNextKey(t.Context(), tc.selector, false)
+
+			// Assert: No usable key or locator escapes. Shared cleanup checks
+			// every strict dependency mock without duplicate assertions here.
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Nil(t, key)
+			require.Nil(t, path)
+		})
+	}
+}
+
+// TestAllocateNextKeyMapsStoreFailure preserves public failure identities and
+// never retries or returns a key after an uncertain durable allocation.
+func TestAllocateNextKeyMapsStoreFailure(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		storeErr error
+		wantErr  error
+	}{
+		{
+			name:     "ordinary account",
+			storeErr: db.ErrAccountOperationUnsupported,
+			wantErr:  ErrAccountOperationUnsupported,
+		},
+		{
+			name:     "exhausted branch",
+			storeErr: db.ErrMaxAddressIndexReached,
+			wantErr:  ErrAddressDerivationExhausted,
+		},
+		{
+			name: "ambiguous canceled commit",
+			storeErr: errors.Join(
+				dbruntime.ErrAmbiguousTxCommit, context.Canceled,
+			),
+			wantErr: ErrIndeterminateCommit,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Permit exactly one failed allocation and no chain or
+			// recovery calls. A retry violates the Store's Once expectation.
+			w, deps := createTestWalletWithMocks(t)
+			w.addrStore = nil
+			startLoadedWalletForTest(t, w)
+			deps.store.On("NewDerivedAddresses", t.Context(),
+				mock.Anything, uint32(1)).Return(nil, tc.storeErr).Once()
+
+			// Act: Exercise mapping through admitted public work so a joined
+			// cancellation cannot replace the indeterminate-commit identity.
+			key, path, err := w.AllocateNextKey(t.Context(),
+				NewAccountSelectorByName(
+					waddrmgr.KeyScopeBIP0084, "key-family",
+				),
+				false,
+			)
+
+			// Assert: Only the wallet-owned identity is exposed, and no key or
+			// path escapes. Shared cleanup verifies the single allocation.
+			require.ErrorIs(t, err, tc.wantErr)
+			require.NotErrorIs(t, err, dbruntime.ErrAmbiguousTxCommit)
+			require.Nil(t, key)
+			require.Nil(t, path)
+		})
+	}
+}

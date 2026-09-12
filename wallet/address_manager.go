@@ -175,6 +175,13 @@ type OutputScriptInfo struct {
 // AddressManager provides an interface for generating and inspecting wallet
 // addresses and scripts.
 type AddressManager interface {
+	// AllocateNextKey commits a fresh child for a root-derived NoChainSync
+	// account without automatic chain tracking. It returns its public key and
+	// complete locator; ordinary accounts and kvdb are unsupported. Errors
+	// may retain consumed children, so callers must not assume index reuse.
+	AllocateNextKey(ctx context.Context, selector AccountSelector,
+		internal bool) (*btcec.PublicKey, *AddressDerivation, error)
+
 	// NewBulkAddresses force-allocates 1..MaxBulkAddressCount fresh addresses
 	// for the selected account and branch (internal when true). SQL wallets
 	// register the complete committed batch before returning it. Errors return
@@ -498,6 +505,15 @@ func (w *Wallet) addrBalances(ctx context.Context) (map[string]btcutil.Amount,
 	return balances, nil
 }
 
+// allocateNextKeyReq keeps key allocation inside existing Wallet admission
+// and reuses the address metadata response without creating a receiving path.
+type allocateNextKeyReq struct {
+	reqCtx
+
+	params   db.NewDerivedAddressParams
+	respChan chan addressInfoResp
+}
+
 // newBulkAddressesReq joins allocation and registration to Wallet shutdown.
 type newBulkAddressesReq struct {
 	reqCtx
@@ -697,6 +713,96 @@ func (w *Wallet) NewAddress(ctx context.Context, accountName string,
 	result := <-r.respChan
 
 	return result.addr, result.err
+}
+
+// AllocateNextKey commits one fresh external or internal child of an existing
+// root-derived NoChainSync account. It uses the account's stored scope/schema
+// and returns the public key and full derivation metadata without registering
+// a watch or starting recovery. Ordinary accounts and modern kvdb return
+// ErrAccountOperationUnsupported before mutation. Invalid and colliding
+// children stay consumed; terminal exhaustion is ErrAddressDerivationExhausted.
+// Errors return no key or path. ErrIndeterminateCommit means allocation may
+// have committed: the operation never retries it or assumes an index is free.
+func (w *Wallet) AllocateNextKey(ctx context.Context, selector AccountSelector,
+	internal bool) (*btcec.PublicKey, *AddressDerivation, error) {
+
+	// Validate public admission before accessing dependencies. Kvdb cannot
+	// represent the persisted policy this operation requires.
+	err := selector.validate()
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidParam, err)
+	}
+
+	if w.addrStore != nil {
+		return nil, nil, ErrAccountOperationUnsupported
+	}
+
+	err = w.state.validateStarted()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Resolve the semantic selector and policy together in the allocation
+	// transaction, avoiding a separate lookup of a mutable account name.
+	params := db.NewDerivedAddressParams{
+		WalletID:           w.id,
+		Scope:              db.KeyScope(selector.keyScope),
+		AccountNumber:      (*uint32)(selector.accountNumber),
+		Change:             internal,
+		RequireNoChainSync: true,
+	}
+	if selector.accountName != nil {
+		params.AccountName = *selector.accountName
+	}
+
+	r := allocateNextKeyReq{
+		reqCtx:   reqCtx{ctx: ctx},
+		params:   params,
+		respChan: make(chan addressInfoResp, 1),
+	}
+
+	err = w.sendReq(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Join admitted work even after cancellation so shutdown cannot close
+	// the Store before allocation finishes and its outcome is returned.
+	result := <-r.respChan
+
+	return result.info.PubKey, result.info.Derivation, result.err
+}
+
+// handleAllocateNextKey returns a committed child's existing metadata without
+// entering the receiving handler's chain-registration path.
+func (w *Wallet) handleAllocateNextKey(r allocateNextKeyReq) {
+	// Count one reuses collision skipping, exhaustion, and commit handling;
+	// the Store guarantees one result on success and no partial allocation.
+	stored, err := w.store.NewDerivedAddresses(r.ctx, r.params, 1)
+	if err != nil {
+		// Ambiguity takes precedence over cancellation, but its private
+		// runtime identity must not become a second public error contract.
+		if errors.Is(err, dbruntime.ErrAmbiguousTxCommit) {
+			err = fmt.Errorf("%w: %s", ErrIndeterminateCommit, err.Error())
+		} else {
+			err = bulkAddressErr(err)
+		}
+
+		r.respChan <- addressInfoResp{err: err}
+
+		return
+	}
+
+	// The existing conversion preserves the public key and root locator of
+	// the same managed row used by ordinary lookup and signing.
+	info, err := addressInfoFromStoreAddress(&stored[0], w.cfg.ChainParams)
+	if err != nil {
+		r.respChan <- addressInfoResp{err: err}
+
+		return
+	}
+
+	r.respChan <- addressInfoResp{info: info}
 }
 
 // NewBulkAddresses force-allocates fresh addresses instead of reusing unused
