@@ -3417,9 +3417,10 @@ func TestNewDerivedAddressesDurableBatches(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name   string
-		count  uint32
-		change bool
+		name        string
+		count       uint32
+		change      bool
+		noChainSync bool
 	}{
 		{
 			name:  "single external",
@@ -3430,6 +3431,17 @@ func TestNewDerivedAddressesDurableBatches(t *testing.T) {
 			count:  100,
 			change: true,
 		},
+		{
+			name:        "key-only external",
+			count:       1,
+			noChainSync: true,
+		},
+		{
+			name:        "key-only internal",
+			count:       1,
+			change:      true,
+			noChainSync: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -3438,15 +3450,25 @@ func TestNewDerivedAddressesDurableBatches(t *testing.T) {
 			// Retain the configuration for a fresh pool to read durable facts.
 			store, reopen := newReopenableTestStore(t, mockDeriveFunc())
 			id := newWallet(t, store, "bulk")
-			createDerivedAccount(
-				t, store, id, db.KeyScopeBIP0084, derivedAccountName,
+			// Persist policy in the fixture so both receiving and key-only
+			// calls exercise the same transaction and reopen assertions.
+			_, err := store.CreateDerivedAccount(
+				t.Context(), db.CreateDerivedAccountParams{
+					WalletID:    id,
+					Scope:       db.KeyScopeBIP0084,
+					Name:        derivedAccountName,
+					NoChainSync: tc.noChainSync,
+				}, SpendableDeriveFn(),
 			)
+			require.NoError(t, err)
+
 			params := db.NewDerivedAddressParams{
-				WalletID:         id,
-				Scope:            db.KeyScopeBIP0084,
-				AccountName:      derivedAccountName,
-				Change:           tc.change,
-				RequireChainSync: true,
+				WalletID:           id,
+				Scope:              db.KeyScopeBIP0084,
+				AccountName:        derivedAccountName,
+				Change:             tc.change,
+				RequireChainSync:   !tc.noChainSync,
+				RequireNoChainSync: tc.noChainSync,
 			}
 
 			const workers = 3
@@ -3865,6 +3887,147 @@ func TestNewDerivedAddressesRejectsNoChainSync(t *testing.T) {
 	require.Nil(t, batch)
 	require.Zero(t, calls)
 	require.Zero(t, account.ExternalKeyCount)
+	require.NoError(t, rowsErr)
+	require.Empty(t, rows.Items)
+}
+
+// TestNewDerivedAddressesKeyOnlyPolicy checks stored policy before derivation
+// and keeps accepted children discoverable through ordinary address lookup.
+func TestNewDerivedAddressesKeyOnlyPolicy(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		noChainSync bool
+		wantErr     error
+		wantCount   uint32
+	}{
+		{
+			name:        "key-only account",
+			noChainSync: true,
+			wantCount:   1,
+		},
+		{
+			name:    "ordinary account",
+			wantErr: db.ErrAccountOperationUnsupported,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange: Count derivations as well as durable rows so rollback
+			// cannot hide a policy check performed after consuming a child.
+			var calls uint32
+
+			derive := mockDeriveFunc()
+			store := NewTestStoreWithDerive(t, func(ctx context.Context,
+				p db.AddressDerivationParams) (*db.DerivedAddressData, error) {
+
+				calls++
+
+				return derive(ctx, p)
+			})
+			id := newWallet(t, store, "key-policy")
+			_, err := store.CreateDerivedAccount(
+				t.Context(), db.CreateDerivedAccountParams{
+					WalletID:    id,
+					Scope:       db.KeyScopeBIP0084,
+					Name:        derivedAccountName,
+					NoChainSync: tc.noChainSync,
+				}, SpendableDeriveFn(),
+			)
+			require.NoError(t, err)
+
+			// Act: Require key-only admission and read the resulting durable
+			// counters and addresses through the ordinary Store interfaces.
+			batch, err := store.NewDerivedAddresses(t.Context(),
+				db.NewDerivedAddressParams{
+					WalletID:           id,
+					Scope:              db.KeyScopeBIP0084,
+					AccountName:        derivedAccountName,
+					RequireNoChainSync: true,
+				}, 1,
+			)
+			account := getAccountByName(
+				t, store, id, db.KeyScopeBIP0084, derivedAccountName,
+			)
+			rows, rowsErr := store.ListAddresses(t.Context(),
+				listAccountAddressesQuery(
+					t, id, db.KeyScopeBIP0084, derivedAccountName, 10,
+				))
+
+			// Assert: Refusal precedes derivation and mutation; acceptance
+			// preserves the same path and owner on ordinary script lookup.
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Equal(t, tc.wantCount, calls)
+			require.Equal(t, tc.wantCount, account.ExternalKeyCount)
+			require.NoError(t, rowsErr)
+			require.Len(t, rows.Items, int(tc.wantCount))
+			require.Len(t, batch, int(tc.wantCount))
+
+			for _, child := range batch {
+				read, err := store.GetAddress(t.Context(), db.GetAddressQuery{
+					WalletID:     id,
+					ScriptPubKey: child.ScriptPubKey,
+				})
+				require.NoError(t, err)
+				require.Equal(t, child.AccountID, read.AccountID)
+				require.Equal(t, child.AccountNumber, read.AccountNumber)
+				require.Equal(t, child.KeyScope, read.KeyScope)
+				require.Equal(t, child.Branch, read.Branch)
+				require.Equal(t, child.Index, read.Index)
+			}
+		})
+	}
+}
+
+// TestNewDerivedAddressesRejectsUnnumberedAccount prevents key allocation from
+// publishing a successful child without a truthful account locator.
+func TestNewDerivedAddressesRejectsUnnumberedAccount(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: A public-only imported account has no account number. Any
+	// derivation callback invocation would violate pre-mutation admission.
+	store := NewTestStoreWithDerive(t, func(context.Context,
+		db.AddressDerivationParams) (*db.DerivedAddressData, error) {
+
+		t.Error("unnumbered account reached derivation")
+
+		return nil, errors.New("unexpected derivation")
+	})
+	id := newWatchOnlyWallet(t, store, "unnumbered-key")
+	_, err := store.CreateImportedAccount(t.Context(),
+		db.CreateImportedAccountParams{
+			WalletID:    id,
+			Name:        derivedAccountName,
+			Scope:       db.KeyScopeBIP0084,
+			PublicKey:   RandomBytes(32),
+			NoChainSync: true,
+		})
+	require.NoError(t, err)
+
+	// Act: Request a key-only child from the otherwise derivable account,
+	// then inspect its counters and rows to detect accidental allocation.
+	batch, err := store.NewDerivedAddresses(t.Context(),
+		db.NewDerivedAddressParams{
+			WalletID:           id,
+			Scope:              db.KeyScopeBIP0084,
+			AccountName:        derivedAccountName,
+			RequireNoChainSync: true,
+		}, 1,
+	)
+	account := getAccountByName(
+		t, store, id, db.KeyScopeBIP0084, derivedAccountName,
+	)
+	rows, rowsErr := store.ListAddresses(t.Context(),
+		listAccountAddressesQuery(
+			t, id, db.KeyScopeBIP0084, derivedAccountName, 10,
+		))
+
+	// Assert: Refusal returns no child, consumes no index, and inserts no
+	// address; the callback above also catches an allocation rolled back later.
+	require.ErrorIs(t, err, db.ErrAccountOperationUnsupported)
+	require.Nil(t, batch)
+	require.Zero(t, account.ExternalKeyCount)
+	require.Zero(t, account.InternalKeyCount)
 	require.NoError(t, rowsErr)
 	require.Empty(t, rows.Items)
 }

@@ -337,7 +337,8 @@ type AddressStore interface {
 	// NewDerivedAddresses atomically allocates count fresh children in order.
 	// Errors return no addresses; exhaustion may commit consumed invalid
 	// indexes, and an ambiguous commit must never be retried automatically.
-	// RequireChainSync applies before mutation. Kvdb is unsupported.
+	// RequireChainSync and RequireNoChainSync check persisted policy before
+	// mutation; neither overrides it. Kvdb is unsupported.
 	NewDerivedAddresses(ctx context.Context, params NewDerivedAddressParams,
 		count uint32) ([]AddressInfo, error)
 

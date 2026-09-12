@@ -856,6 +856,11 @@ type NewDerivedAddressParams struct {
 	// receiving address. The false default preserves internal key and change
 	// allocation; this requirement never changes the stored account policy.
 	RequireChainSync bool
+
+	// RequireNoChainSync admits only key-only accounts with a wallet-root
+	// locator. It checks persisted policy without changing it or enabling
+	// receiving behavior for callers that allocate keys.
+	RequireNoChainSync bool
 }
 
 // NewImportedAddressParams defines the input required to import a single

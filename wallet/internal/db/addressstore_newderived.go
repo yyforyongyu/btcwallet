@@ -186,6 +186,18 @@ func derivedAddressAccount(ctx context.Context, params NewDerivedAddressParams,
 		)
 	}
 
+	// Key-only callers need both an opted-out account and a truthful root
+	// locator. Check the account resolved in this transaction before consuming
+	// a child; imported accounts currently have no account-number metadata.
+	if params.RequireNoChainSync &&
+		(!account.NoChainSync || !account.IsDerived) {
+
+		return account, nil, fmt.Errorf(
+			"%w: account %q does not support key-only allocation",
+			ErrAccountOperationUnsupported, key.AccountName,
+		)
+	}
+
 	// Non-derived accounts have a NULL account_number; their derivation uses
 	// AccountPubKey directly so a BIP44 number is not available.
 	accountNumValue, errAccount := DerivedAddressAccountNumber(
