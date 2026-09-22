@@ -230,6 +230,11 @@ func (w *Wallet) handleBroadcast(r broadcastReq) {
 	// to prevent subsequent attempts with stale transaction data.
 	err = w.publishTx(r.tx, ourAddrs)
 	if err == nil {
+		// A locally published wallet transaction needs the same live
+		// notification as a transaction observed from the chain.
+		if recorded {
+			w.publishTxEvents(r.ctx, []db.CreateTxParams{{Tx: r.tx}})
+		}
 		r.respErrChan <- nil
 
 		return

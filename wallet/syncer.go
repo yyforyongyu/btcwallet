@@ -261,6 +261,10 @@ type syncer struct {
 	// request does not unnecessarily block the calling goroutine.
 	scanReqChan chan *scanReq
 
+	// PoC callback publishes details only after the Store accepts a batch.
+	txCommitted func(context.Context, []db.CreateTxParams)
+	pendingTxns []db.CreateTxParams
+
 	// publisher is the component responsible for broadcasting transactions
 	// to the network. It is primarily used during the maintenance phase to
 	// ensure unmined transactions remain in the mempool.
@@ -933,6 +937,13 @@ func (s *syncer) applyStoreTxBatch(ctx context.Context,
 	if err != nil {
 		return fmt.Errorf("apply tx batch: %w", err)
 	}
+	if s.txCommitted != nil {
+		if block == nil {
+			s.txCommitted(ctx, transactions)
+		} else if syncedTo != nil {
+			s.pendingTxns = append(s.pendingTxns, transactions...)
+		}
+	}
 
 	return nil
 }
@@ -996,6 +1007,9 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 	if err != nil {
 		return fmt.Errorf("apply sync scan batch: %w", err)
 	}
+	if s.txCommitted != nil {
+		s.pendingTxns = append(s.pendingTxns, params.Transactions...)
+	}
 
 	// A committed horizon or credit can introduce watches after startup;
 	// finish registration before catch-up reports this batch complete.
@@ -1029,6 +1043,10 @@ func (s *syncer) putTargetedBatch(ctx context.Context,
 		}
 
 		return fmt.Errorf("apply targeted scan batch: %w", err)
+	}
+
+	if s.txCommitted != nil {
+		s.pendingTxns = append(s.pendingTxns, params.Transactions...)
 	}
 
 	// Targeted scans can also store new addresses and outputs. Register
@@ -1747,6 +1765,7 @@ func (s *syncer) advanceChainSync(ctx context.Context) (bool, error) {
 	// return.
 	if syncedTo.Height >= bestHeight {
 		s.state.Store(uint32(syncStateSynced))
+		s.flushTxCommitted(ctx)
 		log.Infof("Wallet is synced to chain tip: height=%d",
 			syncedTo.Height)
 
@@ -2682,4 +2701,15 @@ func (s *syncer) loadWalletScanData(ctx context.Context) ([]storeScanAccount,
 	[]address.Address, []wtxmgr.Credit, error) {
 
 	return s.loadStoreScanData(ctx, nil)
+}
+
+// flushTxCommitted delays confirmed delivery until the wallet is ready at the
+// observed tip; the PoC does not yet deduplicate replayed transactions.
+func (s *syncer) flushTxCommitted(ctx context.Context) {
+	if s.txCommitted == nil || len(s.pendingTxns) == 0 {
+		return
+	}
+	pending := s.pendingTxns
+	s.pendingTxns = nil
+	s.txCommitted(ctx, pending)
 }

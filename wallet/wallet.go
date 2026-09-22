@@ -357,6 +357,10 @@ type Wallet struct {
 	// TODO(yy): Deprecate.
 	NtfnServer *NotificationServer
 
+	// PoC subscribers observe committed transaction details.
+	txEventsMu sync.Mutex
+	txEvents   map[chan *TxDetail]struct{}
+
 	// wg is a wait group used to track and wait for all long-running
 	// background goroutines to finish during a graceful shutdown.
 	wg sync.WaitGroup

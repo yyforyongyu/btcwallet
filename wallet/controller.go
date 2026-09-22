@@ -373,6 +373,7 @@ func (w *Wallet) stop() error {
 	// here ensures no accepted request or Wallet worker can retain Store or
 	// key material after stop returns.
 	w.wg.Wait()
+	w.closeTxSubscriptions()
 
 	// Lock the key vault so no decrypted signing keys outlive the shutdown.
 	// The background goroutines have exited, so no signer is running.

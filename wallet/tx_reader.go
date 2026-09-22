@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
@@ -599,4 +600,82 @@ func safeUint32ToInt32(u uint32) (int32, bool) {
 	}
 
 	return int32(u), true
+}
+
+// TxSubscriber exposes live committed transactions for the diagnostic port.
+type TxSubscriber interface {
+	SubscribeTxns() (*TxSubscription, error)
+}
+
+// TxSubscription carries wallet transaction details until Done is called.
+type TxSubscription struct {
+	C    <-chan *TxDetail
+	done func()
+	once sync.Once
+}
+
+// Done removes the subscription and closes its channel.
+func (s *TxSubscription) Done() {
+	s.once.Do(s.done)
+}
+
+// SubscribeTxns registers a wallet-scoped event stream.
+func (w *Wallet) SubscribeTxns() (*TxSubscription, error) {
+	if err := w.state.validateStarted(); err != nil {
+		return nil, err
+	}
+	ch := make(chan *TxDetail, 64)
+	w.txEventsMu.Lock()
+	if w.txEvents == nil {
+		w.txEvents = make(map[chan *TxDetail]struct{})
+	}
+	w.txEvents[ch] = struct{}{}
+	w.txEventsMu.Unlock()
+	return &TxSubscription{
+		C: ch,
+		done: func() {
+			w.txEventsMu.Lock()
+			if _, ok := w.txEvents[ch]; ok {
+				delete(w.txEvents, ch)
+				close(ch)
+			}
+			w.txEventsMu.Unlock()
+		},
+	}, nil
+}
+
+// publishTxEvents reads committed facts before sending them to subscribers.
+func (w *Wallet) publishTxEvents(ctx context.Context, txns []db.CreateTxParams) {
+	w.txEventsMu.Lock()
+	active := len(w.txEvents) > 0
+	w.txEventsMu.Unlock()
+	if !active {
+		return
+	}
+	for _, tx := range txns {
+		detail, err := w.getTxDetail(ctx, tx.Tx.TxHash(), w.SyncedTo().Height)
+		if err != nil {
+			log.Warnf("PoC transaction event lookup failed: %v", err)
+			continue
+		}
+		w.txEventsMu.Lock()
+		for ch := range w.txEvents {
+			select {
+			case ch <- detail:
+			default:
+				log.Warnf("PoC transaction subscriber overflow")
+			}
+		}
+		w.txEventsMu.Unlock()
+	}
+}
+
+// closeTxSubscriptions wakes clients when the wallet is stopped.
+func (w *Wallet) closeTxSubscriptions() {
+	w.txEventsMu.Lock()
+	defer w.txEventsMu.Unlock()
+	for ch := range w.txEvents {
+		delete(w.txEvents, ch)
+		close(ch)
+	}
 }
