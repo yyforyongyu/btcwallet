@@ -46,8 +46,8 @@ type AccountInfo struct {
 	// transactions.
 	UnconfirmedBalance btcutil.Amount
 
-	// IsWatchOnly reports the wallet-level watch-only state associated with
-	// the account snapshot.
+	// IsWatchOnly reports whether this account has no usable local
+	// signing path, even if another account in the wallet can sign.
 	IsWatchOnly bool
 
 	// NoChainSync is the stored, immutable policy excluding the account from

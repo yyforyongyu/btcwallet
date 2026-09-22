@@ -2429,6 +2429,84 @@ func TestGetUtxoReturnsCurrentWalletOutput(t *testing.T) {
 	require.Equal(t, db.UnminedHeight, utxo.Height)
 }
 
+// TestMixedAccountUtxoSpendability verifies that external-XPub outputs remain
+// wallet-owned without being reported as locally signable beside local funds.
+func TestMixedAccountUtxoSpendability(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: create one signing wallet with a local and an external
+	// account, then credit one output to each address in one transaction.
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "wallet-mixed-account-utxos")
+	scope := db.KeyScopeBIP0084
+	createDerivedAccount(t, store, walletID, scope, "local")
+	_, err := store.CreateImportedAccount(
+		t.Context(), db.CreateImportedAccountParams{
+			WalletID:  walletID,
+			Name:      "external",
+			Scope:     scope,
+			PublicKey: RandomBytes(32),
+		},
+	)
+	require.NoError(t, err)
+
+	local := newDerivedAddress(t, store, walletID, scope, "local", false)
+	external := newDerivedAddress(
+		t, store, walletID, scope, "external", false,
+	)
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{
+			{
+				Value:    15000,
+				PkScript: local.ScriptPubKey,
+			},
+			{
+				Value:    25000,
+				PkScript: external.ScriptPubKey,
+			},
+		},
+	)
+	err = store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID: walletID,
+		Tx:       tx,
+		Received: time.Unix(1710001400, 0),
+		Status:   db.TxStatusPending,
+		Credits: map[uint32]address.Address{
+			0: nil,
+			1: nil,
+		},
+	})
+	require.NoError(t, err)
+
+	// Act: read the same outputs through the list and point lookup paths.
+	list, err := store.ListUTXOs(
+		t.Context(), db.ListUtxosQuery{WalletID: walletID},
+	)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	localOut, err := store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: wire.OutPoint{Hash: tx.TxHash(), Index: 0},
+	})
+	require.NoError(t, err)
+	externalOut, err := store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: walletID,
+		OutPoint: wire.OutPoint{Hash: tx.TxHash(), Index: 1},
+	})
+	require.NoError(t, err)
+
+	// Assert: local outputs retain the wallet default while every external
+	// read overrides it, without losing ownership or the credited amount.
+	require.Nil(t, localOut.Spendable)
+	require.NotNil(t, externalOut.Spendable)
+	require.False(t, *externalOut.Spendable)
+	require.Equal(t, btcutil.Amount(25000), externalOut.Amount)
+	require.Nil(t, list[0].Spendable)
+	require.NotNil(t, list[1].Spendable)
+	require.False(t, *list[1].Spendable)
+}
+
 // TestGetUtxoNotFound verifies that GetUtxo returns ErrUtxoNotFound when the
 // requested outpoint is not part of the current wallet UTXO set.
 func TestGetUtxoNotFound(t *testing.T) {

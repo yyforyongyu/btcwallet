@@ -71,11 +71,10 @@ func TestGetAccountWatchOnlyMapping(t *testing.T) {
 
 	_, err := store.CreateImportedAccount(
 		t.Context(), db.CreateImportedAccountParams{
-			WalletID:            walletID,
-			Name:                "imported-xpub",
-			Scope:               scope,
-			PublicKey:           RandomBytes(32),
-			EncryptedPrivateKey: RandomBytes(32),
+			WalletID:  walletID,
+			Name:      "imported-xpub",
+			Scope:     scope,
+			PublicKey: RandomBytes(32),
 		},
 	)
 	require.NoError(t, err)
@@ -92,9 +91,9 @@ func TestGetAccountWatchOnlyMapping(t *testing.T) {
 		),
 	)
 	require.NoError(t, err)
-	// ADR 0012: imported accounts on a spendable wallet carry private-
-	// key material, so they inherit the wallet's spendable state.
-	require.False(t, imported.IsWatchOnly)
+	// An external XPub cannot use the local signer even when the wallet's
+	// own derived account can.
+	require.True(t, imported.IsWatchOnly)
 }
 
 // TestGetAccountReturnsPublicKeyAndFingerprint verifies that derived and

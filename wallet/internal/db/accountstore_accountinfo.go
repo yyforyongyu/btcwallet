@@ -68,7 +68,7 @@ type AccountPropsRow[AddrTypeId ~int16 | ~int64] struct {
 	// MasterFingerprint is the nullable account master key fingerprint.
 	MasterFingerprint sql.NullInt64
 
-	// IsWatchOnly reports the wallet-level watch-only state.
+	// IsWatchOnly reports the wallet mode before account provenance is applied.
 	IsWatchOnly bool
 
 	// CreatedAt is the account creation timestamp.
@@ -288,7 +288,7 @@ func AccountPropsRowToInfo[AddrTypeId ~int16 | ~int64](
 			Coin:    coinTypeNum,
 		},
 		AddrSchema:  addrSchema,
-		IsWatchOnly: row.IsWatchOnly,
+		IsWatchOnly: row.IsWatchOnly || !row.IsDerived,
 		NoChainSync: row.NoChainSync,
 		CreatedAt:   row.CreatedAt,
 	}, nil
@@ -481,7 +481,7 @@ type AccountInfoRow[AccOriginId ~int16 | ~int64] struct {
 	// MasterFingerprint is the nullable account master key fingerprint.
 	MasterFingerprint sql.NullInt64
 
-	// IsWatchOnly reports the wallet-level watch-only state.
+	// IsWatchOnly reports the wallet mode before account provenance is applied.
 	IsWatchOnly bool
 
 	// CreatedAt is the account creation timestamp.
@@ -557,10 +557,13 @@ func AccountRowToInfo[AccOriginId ~int16 | ~int64](
 		return nil, fmt.Errorf("address schema: %w", err)
 	}
 
+	// Imported XPub children have no wallet signing path. Keep their
+	// account snapshot watch-only even inside a signing wallet.
 	info := BuildAccountInfo(
 		accountID, accountNum, row.AccountName, !row.IsDerived,
 		externalKeyCount,
-		internalKeyCount, importedKeyCount, row.IsWatchOnly,
+		internalKeyCount, importedKeyCount,
+		row.IsWatchOnly || !row.IsDerived,
 		row.NoChainSync,
 		row.CreatedAt,
 		KeyScope{Purpose: purposeNum, Coin: coinTypeNum}, addrSchema,

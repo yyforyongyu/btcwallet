@@ -127,9 +127,8 @@ func TestWatchOnlyAccountSecretTriggers(t *testing.T) {
 		walletID := newWallet(t, store, "spendable-account-secret")
 
 		// CreateImportedAccount with EncryptedPrivateKey inserts the
-		// secret row via the API path (the spendable wallet invariant
-		// from ADR 0012 requires private-key material on imported
-		// accounts), so the test exercises the trigger's UPDATE allow
+		// secret row via the API path, so the test exercises the
+		// trigger's UPDATE allow
 		// path on the already-inserted row. The "insert is rejected"
 		// subtests above cover the watch-only direction of the
 		// trigger; this subtest covers the non-watch-only UPDATE path.
@@ -143,7 +142,7 @@ func TestWatchOnlyAccountSecretTriggers(t *testing.T) {
 			},
 		)
 		require.NoError(t, err)
-		require.False(t, props.IsWatchOnly)
+		require.True(t, props.IsWatchOnly)
 
 		scopeID := GetKeyScopeID(t, queries, walletID, db.KeyScopeBIP0084)
 		accountID := GetAccountID(t, queries, scopeID, "spendable-imported")

@@ -134,7 +134,8 @@ type AddressInfoRow[TypeID any] struct {
 	// address is derived. Raw imported addresses leave this NULL.
 	AccountIsDerived sql.NullBool
 
-	// WalletIsWatchOnly indicates whether the wallet is watch-only.
+	// WalletIsWatchOnly is the parent wallet mode; imported-account
+	// provenance is applied when converting the address row.
 	WalletIsWatchOnly bool
 
 	// HasScript indicates whether the address has an encrypted script.
@@ -422,8 +423,9 @@ func convertAddressPath(hasDerivedPath bool, branch,
 // AddressRowToInfo converts raw database field values into an AddressInfo
 // struct. It handles type conversion and validation for each field.
 //
-// Watch-only state is copied directly from the wallet-level flag. Address
-// secret presence is not used to infer public watch-only state.
+// Imported-XPub children are watch-only even inside a signing wallet.
+// Raw imports still follow the wallet mode because a signing SQL wallet
+// currently requires their private key at import time.
 func AddressRowToInfo[TypeID any](
 	row AddressInfoRow[TypeID]) (*AddressInfo, error) {
 
@@ -492,7 +494,7 @@ func AddressRowToInfo[TypeID any](
 		ScriptPubKey:         row.ScriptPubKey,
 		PubKey:               row.PubKey,
 		HasScript:            row.HasScript,
-		IsWatchOnly:          row.WalletIsWatchOnly,
+		IsWatchOnly:          row.WalletIsWatchOnly || (row.IsDerived && isImported),
 		IsUsed:               row.IsUsed,
 	}, nil
 }

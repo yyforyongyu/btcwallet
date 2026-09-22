@@ -430,12 +430,9 @@ type AccountInfo struct {
 	// unconfirmed transactions.
 	UnconfirmedBalance btcutil.Amount
 
-	// IsWatchOnly is a wallet-level convenience copy of the wallet's
-	// watch-only state. Per ADR 0012 (wallet-level watch-only as a uniform
-	// invariant) every account in the same wallet shares this value;
-	// callers that want the canonical reading use Wallet.IsWatchOnly().
-	// The field is retained as a convenience to minimize caller churn and
-	// may be removed in a future cleanup task.
+	// IsWatchOnly reports whether this account lacks a usable local
+	// signing path. An imported XPub is watch-only even when another
+	// account in the same wallet has private key material.
 	IsWatchOnly bool
 
 	// NoChainSync reports whether automatic chain synchronization excludes
@@ -793,11 +790,9 @@ type AddressInfo struct {
 	// ambiguous, such as P2TR key-path versus P2TR script-path imports.
 	HasScript bool
 
-	// IsWatchOnly is a wallet-level convenience copy of the wallet's
-	// watch-only state. Per ADR 0012 every address in the same wallet
-	// shares this value; callers that want the canonical reading use
-	// Wallet.IsWatchOnly(). The field is retained as a convenience and
-	// may be removed in a future cleanup task.
+	// IsWatchOnly reports whether this address lacks a usable local
+	// signing path. An imported-XPub child is watch-only even when
+	// another account in the same wallet has private key material.
 	IsWatchOnly bool
 
 	// IsUsed reports whether the address has a non-abandoned
@@ -1482,10 +1477,9 @@ type UtxoInfo struct {
 	// secret row report false rather than dropping out of the result.
 	HasScript bool
 
-	// Spendable optionally overrides wallet-level spendability. SQL backends
-	// leave this nil because ADR 0012 makes spendability wallet-level for SQL
-	// wallets. The legacy kvdb backend sets it for rows whose account or
-	// address still carries mixed watch-only state inside a spendable wallet.
+	// Spendable optionally overrides wallet-level spendability. SQL and
+	// legacy kvdb backends use it when an imported account has no local
+	// signing path inside a wallet with private keys.
 	Spendable *bool
 
 	// IsLocked is true when the UTXO has an active (non-expired) lease.

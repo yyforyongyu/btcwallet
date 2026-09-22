@@ -2206,11 +2206,13 @@ func TestNewDerivedAddressDerivesByAccountNumber(t *testing.T) {
 func TestNewDerivedAddressOnImportedAccount(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: keep a locally derived account beside an external XPub
+	// in the same signing wallet.
 	store := NewTestStore(t)
-	// ADR 0012: a public-only xpub import requires a watch-only wallet;
-	// the spendable-wallet invariant rejects the same import.
-	walletID := newWatchOnlyWallet(
-		t, store, "wallet-imported-derive",
+	walletID := newWallet(t, store, "wallet-imported-derive")
+	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "local")
+	local := newDerivedAddress(
+		t, store, walletID, db.KeyScopeBIP0084, "local", false,
 	)
 
 	// Create an imported xpub account: real PublicKey, no encrypted
@@ -2226,6 +2228,8 @@ func TestNewDerivedAddressOnImportedAccount(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	// Act: allocate and read the external account's child through the
+	// same maintained address API used for the local account.
 	info, err := store.NewDerivedAddress(
 		t.Context(), db.NewDerivedAddressParams{
 			WalletID:    walletID,
@@ -2242,6 +2246,8 @@ func TestNewDerivedAddressOnImportedAccount(t *testing.T) {
 	// AccountNumber != nil.
 	require.True(t, info.IsImported)
 	require.Nil(t, info.AccountNumber)
+	require.True(t, info.IsWatchOnly)
+	require.False(t, local.IsWatchOnly)
 
 	read, err := store.GetAddress(
 		t.Context(), db.GetAddressQuery{
@@ -2251,10 +2257,20 @@ func TestNewDerivedAddressOnImportedAccount(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.True(t, read.IsImported)
+	require.True(t, read.IsWatchOnly)
 	require.Nil(t, read.AccountNumber)
 	require.Equal(t, name, read.AccountName)
 	require.Equal(t, info.Branch, read.Branch)
 	require.Equal(t, info.Index, read.Index)
+
+	list, err := store.ListAddresses(
+		t.Context(), listAccountAddressesQuery(
+			t, walletID, db.KeyScopeBIP0084, name, 5,
+		),
+	)
+	require.NoError(t, err)
+	require.Len(t, list.Items, 1)
+	require.True(t, list.Items[0].IsWatchOnly)
 }
 
 // TestGetAddressRejectsDerivedParentWithoutPath verifies that imported-xpub

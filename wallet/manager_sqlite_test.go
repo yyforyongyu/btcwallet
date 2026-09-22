@@ -122,6 +122,57 @@ func TestManagerSQLiteCreatePublishes(t *testing.T) {
 	require.NoError(t, w.Lock(t.Context()))
 }
 
+// TestManagerSQLiteMixedAccounts verifies that a signing wallet can import an
+// external account and allocate its public addresses beside a local account.
+func TestManagerSQLiteMixedAccounts(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: create and unlock a real SQLite wallet, then derive one local
+	// account so the imported account cannot be mistaken for a watch-only
+	// wallet-wide mode. The chain mock accepts the address registration.
+	m := testSQLiteManager(t)
+	chainMock, ok := m.config.ChainSource.(*bwmock.Chain)
+	require.True(t, ok)
+	chainMock.On("NotifyReceived", mock.Anything).Return(nil).Once()
+	params := sqliteCreateParams(t)
+	w, err := m.Create(params)
+	require.NoError(t, err)
+	require.NoError(t, w.Unlock(t.Context(), UnlockRequest{
+		Passphrase: params.PrivatePassphrase,
+		Timeout:    -1,
+	}))
+	local, err := w.NewAccount(t.Context(), NewAccountParams{
+		Scope: waddrmgr.KeyScopeBIP0084,
+		Name:  "local",
+	})
+	require.NoError(t, err)
+	key, fingerprint := importAccountTestKey(t, 84)
+
+	// Act: use only the public wallet methods to import an external XPub,
+	// allocate its first address, and read the persisted account snapshot.
+	imported, err := w.ImportAccount(
+		t.Context(), "external", key, fingerprint,
+		waddrmgr.WitnessPubKey, false,
+	)
+	require.NoError(t, err)
+	addr, err := w.NewAddress(
+		t.Context(), "external", waddrmgr.WitnessPubKey, false,
+	)
+	require.NoError(t, err)
+	read, err := w.GetAccount(
+		t.Context(), waddrmgr.KeyScopeBIP0084, "external",
+	)
+	require.NoError(t, err)
+
+	// Assert: one wallet exposes both account types, and the imported
+	// account remains public-only after address allocation and reload.
+	require.False(t, w.IsWatchOnly())
+	require.False(t, local.IsWatchOnly)
+	require.True(t, imported.IsWatchOnly)
+	require.True(t, read.IsWatchOnly)
+	require.NotNil(t, addr)
+}
+
 // TestNewManagerClassifiesDatabaseIdentityMismatch proves public callers can
 // distinguish a persisted network mismatch without importing internal/db.
 func TestNewManagerClassifiesDatabaseIdentityMismatch(t *testing.T) {

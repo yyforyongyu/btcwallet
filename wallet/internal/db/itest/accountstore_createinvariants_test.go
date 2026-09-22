@@ -357,9 +357,9 @@ func TestWatchOnlyHierarchyAccountRules(t *testing.T) {
 		},
 		{
 			name: "standard wallet imported account with " +
-				"private key is spendable",
+				"private key has no signer path",
 			walletParams:  CreateWalletParamsFixture,
-			wantWatchOnly: false,
+			wantWatchOnly: true,
 			createAccountFn: func(t *testing.T, store db.AccountStore,
 				walletID uint32) (bool, error) {
 
@@ -382,9 +382,9 @@ func TestWatchOnlyHierarchyAccountRules(t *testing.T) {
 		},
 		{
 			name: "standard wallet imported account without " +
-				"private key is rejected",
-			walletParams: CreateWalletParamsFixture,
-			wantErr:      db.ErrSpendableWalletNeedsAccountPrivKey,
+				"private key is watch-only",
+			walletParams:  CreateWalletParamsFixture,
+			wantWatchOnly: true,
 			createAccountFn: func(t *testing.T, store db.AccountStore,
 				walletID uint32) (bool, error) {
 

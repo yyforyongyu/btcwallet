@@ -471,8 +471,8 @@ func (m *mockCreateImportedAccountOps) GetAccountInfoByID(ctx context.Context,
 	return info, args.Error(1)
 }
 
-// TestCreateImportedAccountParamsValidateWatchOnly verifies the symmetric
-// watch-only invariant rejects mismatched mode imports in both directions.
+// TestCreateImportedAccountParamsValidateWatchOnly verifies that a watch-only
+// wallet cannot acquire account private-key material through an import.
 func TestCreateImportedAccountParamsValidateWatchOnly(t *testing.T) {
 	t.Parallel()
 
@@ -498,7 +498,7 @@ func TestCreateImportedAccountParamsValidateWatchOnly(t *testing.T) {
 			walletWatchOnly:  false,
 		},
 		{
-			name:            "spendable wallet accepts no priv key (kvdb path)",
+			name:            "spendable wallet accepts external xpub",
 			walletWatchOnly: false,
 		},
 	}
@@ -523,22 +523,4 @@ func TestCreateImportedAccountParamsValidateWatchOnly(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
-}
-
-// TestRequireAccountPrivKeyOnSpendable verifies the SQL-only symmetric
-// rejection: a spendable wallet must not create an imported account without
-// encrypted private-key material under ADR 0012.
-func TestRequireAccountPrivKeyOnSpendable(t *testing.T) {
-	t.Parallel()
-
-	err := requireAccountPrivKeyOnSpendable(7, "imported", false, nil)
-	require.ErrorIs(t, err, ErrSpendableWalletNeedsAccountPrivKey)
-
-	err = requireAccountPrivKeyOnSpendable(7, "imported", false, []byte{1})
-	require.NoError(t, err)
-
-	// Watch-only wallets bypass this check; the watch-only-direction
-	// rejection happens in ValidateWatchOnly above.
-	err = requireAccountPrivKeyOnSpendable(7, "imported", true, nil)
-	require.NoError(t, err)
 }

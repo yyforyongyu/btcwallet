@@ -189,7 +189,8 @@ func NewDerivedAddressesWithOps(ctx context.Context,
 	addresses := make([]AddressInfo, 0, count)
 	for _, candidate := range candidates {
 		info, err := insertDerivedAddress(
-			ctx, candidate, number, account.WalletWatchOnly, ops,
+			ctx, candidate, number,
+			account.WalletWatchOnly || !account.IsDerived, ops,
 		)
 		if err != nil {
 			return nil, false, err

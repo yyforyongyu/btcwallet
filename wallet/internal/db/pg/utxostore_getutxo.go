@@ -103,6 +103,12 @@ func utxoInfoFromGetRow(row sqlc.GetUtxoByOutpointRow) (*db.UtxoInfo,
 
 	utxo.AddrType = addrType
 	utxo.HasScript = row.HasScript
+	// Imported-XPub children have no wallet derivation path for the
+	// signer, even when their parent wallet holds other private keys.
+	if row.AddressIsDerived && !row.AccountIsDerived.Bool {
+		spendable := false
+		utxo.Spendable = &spendable
+	}
 	utxo.IsLocked = row.IsLocked
 
 	if hasScope {

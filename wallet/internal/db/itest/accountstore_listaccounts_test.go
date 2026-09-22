@@ -443,11 +443,10 @@ func TestListAccountsWatchOnlyMapping(t *testing.T) {
 
 	_, err := store.CreateImportedAccount(
 		t.Context(), db.CreateImportedAccountParams{
-			WalletID:            walletID,
-			Name:                "imported-xpub",
-			Scope:               scope,
-			PublicKey:           RandomBytes(32),
-			EncryptedPrivateKey: RandomBytes(32),
+			WalletID:  walletID,
+			Name:      "imported-xpub",
+			Scope:     scope,
+			PublicKey: RandomBytes(32),
 		},
 	)
 	require.NoError(t, err)
@@ -474,9 +473,8 @@ func TestListAccountsWatchOnlyMapping(t *testing.T) {
 	)
 
 	require.False(t, derived.IsWatchOnly)
-	// ADR 0012: an imported account on a spendable wallet carries
-	// private-key material, so it inherits the wallet's spendable state.
-	require.False(t, imported.IsWatchOnly)
+	// An external XPub remains watch-only beside a derived account.
+	require.True(t, imported.IsWatchOnly)
 }
 
 // TestListAccountsOrdering verifies that ListAccounts returns derived accounts
