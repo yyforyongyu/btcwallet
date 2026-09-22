@@ -681,9 +681,9 @@ func TestDecorateInputErrNotPubKey(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotPubKeyAddress)
 }
 
-// TestDecorateInputErrImported tests that decorateInput returns
-// ErrDerivationPathNotFound when the address is imported.
-func TestDecorateInputErrImported(t *testing.T) {
+// TestDecorateInputImportedWithoutOrigin verifies that an owned imported key
+// supplies truthful UTXO facts without inventing a BIP32 origin.
+func TestDecorateInputImportedWithoutOrigin(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Setup keys and address.
@@ -718,8 +718,11 @@ func TestDecorateInputErrImported(t *testing.T) {
 	// Act: Call decorateInput.
 	err = w.decorateInput(t.Context(), pInput, tx, utxo)
 
-	// Assert: Verify the error.
-	require.ErrorIs(t, err, ErrDerivationPathNotFound)
+	// Assert: The wallet supplies the known coin and leaves unknown origin
+	// fields empty for an external signer to resolve independently.
+	require.NoError(t, err)
+	require.Equal(t, utxo, pInput.WitnessUtxo)
+	require.Empty(t, pInput.Bip32Derivation)
 }
 
 // TestDecorateInputErrDerivationMissing tests that decorateInput returns

@@ -524,13 +524,15 @@ func (w *Wallet) decorateInput(ctx context.Context, pInput *psbt.PInput,
 	// for the address.
 	derivation, err := derivationForAddressInfo(scriptInfo.AddressInfo)
 	if errors.Is(err, ErrDerivationPathNotFound) &&
-		(len(pInput.Bip32Derivation) > 0 ||
-			len(pInput.TaprootBip32Derivation) > 0) {
+		scriptInfo.AddressInfo.Derivation == nil &&
+		scriptInfo.AddressInfo.PubKey != nil {
 
 		// PoC: preserve the origin supplied by the caller for a known coin
 		// when the wallet has no origin. Refuse a key that disagrees with
 		// the wallet's own imported public key.
-		if pub := scriptInfo.AddressInfo.PubKey; pub != nil {
+		if pub := scriptInfo.AddressInfo.PubKey; pub != nil &&
+			(len(pInput.Bip32Derivation) > 0 ||
+				len(pInput.TaprootBip32Derivation) > 0) {
 			known := pub.SerializeCompressed()
 			if txscript.IsPayToTaproot(utxo.PkScript) {
 				known = known[1:]
@@ -909,6 +911,11 @@ func (w *Wallet) addChangeOutputInfo(ctx context.Context, packet *psbt.Packet,
 		authoredTx.Tx.TxOut[authoredTx.ChangeIndex],
 		changeScriptInfo.AddressInfo,
 	)
+	if errors.Is(err, ErrImportedAddrNoDerivation) &&
+		changeScriptInfo.PubKey != nil &&
+		!changeScriptInfo.AddressInfo.Imported {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
