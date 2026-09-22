@@ -523,6 +523,42 @@ func (w *Wallet) decorateInput(ctx context.Context, pInput *psbt.PInput,
 	// With the managed address, we can now get the derivation information
 	// for the address.
 	derivation, err := derivationForAddressInfo(scriptInfo.AddressInfo)
+	if errors.Is(err, ErrDerivationPathNotFound) &&
+		(len(pInput.Bip32Derivation) > 0 ||
+			len(pInput.TaprootBip32Derivation) > 0) {
+
+		// PoC: preserve the origin supplied by the caller for a known coin
+		// when the wallet has no origin. Refuse a key that disagrees with
+		// the wallet's own imported public key.
+		if pub := scriptInfo.AddressInfo.PubKey; pub != nil {
+			known := pub.SerializeCompressed()
+			if txscript.IsPayToTaproot(utxo.PkScript) {
+				known = known[1:]
+				if len(pInput.TaprootBip32Derivation) != 1 ||
+					!bytes.Equal(pInput.TaprootBip32Derivation[0].XOnlyPubKey, known) {
+					return ErrConflictingInputMetadata
+				}
+			} else if len(pInput.Bip32Derivation) != 1 ||
+				!bytes.Equal(pInput.Bip32Derivation[0].PubKey, known) {
+				return ErrConflictingInputMetadata
+			}
+		}
+		// Fill only wallet-verified UTXO facts; the caller's origin stays
+		// available for the subsequent metadata reconciliation.
+		pInput.WitnessUtxo = &wire.TxOut{
+			Value: utxo.Value, PkScript: utxo.PkScript,
+		}
+		if txscript.IsPayToTaproot(utxo.PkScript) {
+			pInput.SighashType = txscript.SigHashDefault
+		} else {
+			pInput.NonWitnessUtxo = tx
+			pInput.SighashType = txscript.SigHashAll
+			if scriptInfo.AddrType.SpendType() == waddrmgr.SpendTypeNestedWitnessKey {
+				pInput.RedeemScript = scriptInfo.RedeemScript
+			}
+		}
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -783,7 +819,7 @@ func (w *Wallet) populatePsbtPacket(ctx context.Context, packet *psbt.Packet,
 	packet.UnsignedTx = tx
 	packet.Inputs = make([]psbt.PInput, len(tx.TxIn))
 
-	for _, txIn := range tx.TxIn {
+	for i, txIn := range tx.TxIn {
 		caller, ok := callerInputs[txIn.PreviousOutPoint]
 		if !ok {
 			// An input the wallet selected itself, which keeps
@@ -792,6 +828,8 @@ func (w *Wallet) populatePsbtPacket(ctx context.Context, packet *psbt.Packet,
 		}
 
 		txIn.Sequence = caller.sequence
+		// PoC: present caller origin to decoration before its wallet lookup.
+		packet.Inputs[i] = caller.pInput
 	}
 
 	// Authoring leaves the caller's outputs in their own order and swaps

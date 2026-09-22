@@ -1166,9 +1166,9 @@ func TestFundPsbtTranslatesAmountError(t *testing.T) {
 	mocks.store.On("GetAccount", mock.Anything, db.GetAccountQuery{
 		WalletID: w.id, Scope: scope, AccountNumber: &defaultAccountNum,
 	}).Return(accountInfo, nil).Once()
-	mocks.chain.On("BlockStamp").Return(
-		&waddrmgr.BlockStamp{Height: 100}, nil,
-	).Once()
+	mocks.addrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
+	).Maybe()
 	mocks.store.On("ListUTXOs", mock.Anything, db.ListUtxosQuery{
 		WalletID: w.id, Scope: &scope, AccountName: &defaultAccountName,
 	}).Return([]db.UtxoInfo{}, nil).Once()
@@ -5506,4 +5506,118 @@ func TestFundPsbtKeepsTaprootParentTx(t *testing.T) {
 	// copy of anything the wallet wrote.
 	require.Len(t, fundedInput.TaprootBip32Derivation, 1)
 	mocks.store.AssertExpectations(t)
+}
+
+// TestPortImportedMetadataProbe checks the public funding boundary with a
+// predecorated numberless input, so an adapter-only workaround can be judged.
+func TestPortImportedMetadataProbe(t *testing.T) {
+	// Arrange: Reuse the existing manual-funding fixture and remove only the
+	// account number, matching an ordinary imported XPub child. Supply the
+	// origin in the caller packet to test whether FundPsbt can preserve it.
+	w, deps := createStartedWalletWithMocks(t)
+	deps.syncer.On("syncState").Return(syncStateSynced).Once()
+	outpoint := wire.OutPoint{Hash: chainhash.Hash{99}}
+	utxo := expectManualFundingSources(t, w, deps, outpoint)
+	var pubKey []byte
+	for _, call := range deps.store.ExpectedCalls {
+		if call.Method != "GetAddress" {
+			continue
+		}
+		info := call.ReturnArguments.Get(0).(*db.AddressInfo)
+		if bytes.Equal(info.ScriptPubKey, utxo.PkScript) {
+			info.AccountNumber = nil
+			pubKey = info.PubKey
+			call.Once()
+		}
+	}
+	require.NotEmpty(t, pubKey)
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(wire.NewTxIn(&outpoint, nil, nil))
+	tx.AddTxOut(&wire.TxOut{
+		Value:    400_000,
+		PkScript: append([]byte{0, 20}, make([]byte, 20)...),
+	})
+	packet, err := psbt.NewFromUnsignedTx(tx)
+	require.NoError(t, err)
+	packet.Inputs[0].WitnessUtxo = utxo
+	packet.Inputs[0].Bip32Derivation = []*psbt.Bip32Derivation{
+		{
+			PubKey:               pubKey,
+			MasterKeyFingerprint: 1,
+			Bip32Path:            []uint32{0x80000054, 0x80000001, 0x80000000, 0, 0},
+		},
+	}
+
+	// Act: Exercise the maintained public funding operation, including its
+	// internal metadata reconstruction rather than calling decoration alone.
+	funded, _, err := w.FundPsbt(t.Context(), &FundIntent{
+		Packet:  packet,
+		FeeRate: defaultFeeRate,
+	})
+
+	// Assert: funding retains the caller's supplied origin for an owned
+	// numberless input while adding the wallet-verified coin information.
+	require.NoError(t, err)
+	require.NotNil(t, funded)
+	require.Equal(t, packet.Inputs[0].Bip32Derivation,
+		funded.Inputs[0].Bip32Derivation)
+	require.Equal(t, utxo, funded.Inputs[0].WitnessUtxo)
+	require.NoError(t, w.stop())
+	deps.store.AssertExpectations(t)
+	deps.chain.AssertExpectations(t)
+	deps.syncer.AssertExpectations(t)
+}
+
+// TestPortImportedMetadataRejectsWrongPubKey checks that the imported-input
+// fallback does not accept a caller origin for a different public key.
+func TestPortImportedMetadataRejectsWrongPubKey(t *testing.T) {
+	// Arrange: Construct an owned numberless input with a valid but unrelated
+	// public key in the caller's PSBT origin record.
+	w, deps := createStartedWalletWithMocks(t)
+	deps.syncer.On("syncState").Return(syncStateSynced).Once()
+	outpoint := wire.OutPoint{Hash: chainhash.Hash{100}}
+	utxo := expectManualFundingSources(t, w, deps, outpoint)
+	for _, call := range deps.store.ExpectedCalls {
+		if call.Method != "GetAddress" {
+			continue
+		}
+		info := call.ReturnArguments.Get(0).(*db.AddressInfo)
+		if bytes.Equal(info.ScriptPubKey, utxo.PkScript) {
+			info.AccountNumber = nil
+			call.Once()
+		}
+	}
+	wrongKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(wire.NewTxIn(&outpoint, nil, nil))
+	tx.AddTxOut(&wire.TxOut{
+		Value:    400_000,
+		PkScript: append([]byte{0, 20}, make([]byte, 20)...),
+	})
+	packet, err := psbt.NewFromUnsignedTx(tx)
+	require.NoError(t, err)
+	packet.Inputs[0].WitnessUtxo = utxo
+	packet.Inputs[0].Bip32Derivation = []*psbt.Bip32Derivation{
+		{
+			PubKey:               wrongKey.PubKey().SerializeCompressed(),
+			MasterKeyFingerprint: 1,
+			Bip32Path:            []uint32{0x80000054, 0x80000001, 0x80000000, 0, 0},
+		},
+	}
+
+	// Act: Fund through the public operation, which verifies the wallet's
+	// stored public key while reconciling the caller's origin record.
+	_, _, err = w.FundPsbt(t.Context(), &FundIntent{
+		Packet:  packet,
+		FeeRate: defaultFeeRate,
+	})
+
+	// Assert: The unrelated key is rejected before a funded packet can be
+	// returned, and the normal wallet lifecycle still closes cleanly.
+	require.ErrorIs(t, err, ErrConflictingInputMetadata)
+	require.NoError(t, w.stop())
+	deps.store.AssertExpectations(t)
+	deps.chain.AssertExpectations(t)
+	deps.syncer.AssertExpectations(t)
 }

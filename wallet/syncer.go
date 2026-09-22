@@ -975,7 +975,7 @@ func (s *syncer) txNotificationState(ctx context.Context,
 func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 	results []scanResult) error {
 
-	params, err := s.storeScanBatchParams(scanState, results, true)
+	params, err := s.storeScanBatchParams(ctx, scanState, results, true)
 	if err != nil {
 		return err
 	}
@@ -1010,7 +1010,7 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 func (s *syncer) putTargetedBatch(ctx context.Context,
 	scanState *RecoveryState, results []scanResult) error {
 
-	params, err := s.storeScanBatchParams(scanState, results, false)
+	params, err := s.storeScanBatchParams(ctx, scanState, results, false)
 	if err != nil {
 		return err
 	}
@@ -1089,8 +1089,8 @@ func scanHorizonParams(scanState *RecoveryState,
 // appendScanTxParams appends store transaction params for every relevant output
 // in the scan result, attaching the resolved store block. It validates that
 // each credit index is within the transaction's output range.
-func (s *syncer) appendScanTxParams(params *db.ScanBatchParams,
-	result scanResult, block *db.Block) error {
+func (s *syncer) appendScanTxParams(ctx context.Context,
+	params *db.ScanBatchParams, result scanResult, block *db.Block) error {
 
 	for _, match := range result.RelevantOutputs {
 		credits := make(map[uint32]address.Address, len(match.Entries))
@@ -1104,6 +1104,22 @@ func (s *syncer) appendScanTxParams(params *db.ScanBatchParams,
 			credits[index] = entry.Address
 		}
 
+		// PoC: a chain scan carries no label. Preserve one already stored
+		// on this exact confirmed transaction before applying the batch.
+		label := ""
+		existing, err := s.store.GetTx(ctx, db.GetTxQuery{
+			WalletID: s.walletID,
+			Txid:     match.Rec.Hash,
+		})
+		if err != nil && !errors.Is(err, db.ErrTxNotFound) {
+			return err
+		}
+		if err == nil && existing.Block != nil && block != nil &&
+			existing.Block.Hash == block.Hash &&
+			existing.Block.Height == block.Height {
+			label = existing.Label
+		}
+
 		params.Transactions = append(
 			params.Transactions, db.CreateTxParams{
 				WalletID: s.walletID,
@@ -1111,6 +1127,7 @@ func (s *syncer) appendScanTxParams(params *db.ScanBatchParams,
 				Received: result.meta.Time,
 				Block:    block,
 				Status:   db.TxStatusPublished,
+				Label:    label,
 				Credits:  credits,
 			},
 		)
@@ -1123,8 +1140,9 @@ func (s *syncer) appendScanTxParams(params *db.ScanBatchParams,
 // scanState is the recovery state that produced the results; it carries the
 // account identity snapshot used to stamp every emitted horizon with the stable
 // AccountID SQL backends require for horizon extension.
-func (s *syncer) storeScanBatchParams(scanState *RecoveryState,
-	results []scanResult, includeSyncedBlocks bool) (db.ScanBatchParams,
+func (s *syncer) storeScanBatchParams(ctx context.Context,
+	scanState *RecoveryState, results []scanResult,
+	includeSyncedBlocks bool) (db.ScanBatchParams,
 	error) {
 
 	params := db.ScanBatchParams{WalletID: s.walletID}
@@ -1158,7 +1176,7 @@ func (s *syncer) storeScanBatchParams(scanState *RecoveryState,
 
 		mergeScanHorizons(horizons, result.FoundHorizons)
 
-		err := s.appendScanTxParams(&params, result, block)
+		err := s.appendScanTxParams(ctx, &params, result, block)
 		if err != nil {
 			return db.ScanBatchParams{}, err
 		}

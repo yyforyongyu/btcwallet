@@ -98,9 +98,12 @@ func expectDefaultAuthoringSources(t *testing.T, w *Wallet,
 	mocks.store.On("GetAccount", mock.Anything, db.GetAccountQuery{
 		WalletID: w.id, Scope: scope, AccountNumber: &defaultAccountNum,
 	}).Return(accountInfo, nil).Once()
+	mocks.addrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
+	).Maybe()
 	mocks.chain.On("BlockStamp").Return(
 		&waddrmgr.BlockStamp{Height: 100}, nil,
-	).Once()
+	).Maybe()
 	utxo := db.UtxoInfo{
 		OutPoint: validUTXO, Amount: inputAmount, PkScript: inputScript,
 		Height: 1,
@@ -1497,8 +1500,8 @@ func TestGetEligibleUTXOsNilSourceResolvesDefaultAccount(t *testing.T) {
 	defaultAccountNum := uint32(waddrmgr.DefaultAccountNum)
 	scope := db.KeyScope(waddrmgr.KeyScopeBIP0086)
 
-	mocks.chain.On("BlockStamp").Return(
-		&waddrmgr.BlockStamp{Height: 100}, nil,
+	mocks.addrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
 	).Once()
 
 	// The default account must be resolved by number 0, never by the
@@ -1556,8 +1559,8 @@ func TestGetEligibleUTXOsScopedAccountValue(t *testing.T) {
 		Height:   100,
 	}}
 
-	mocks.chain.On("BlockStamp").Return(
-		&waddrmgr.BlockStamp{Height: 100}, nil,
+	mocks.addrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
 	).Once()
 	mocks.store.On("GetAccount", mock.Anything, db.GetAccountQuery{
 		WalletID: w.id,
@@ -1626,8 +1629,8 @@ func TestGetEligibleUTXOsImportedAccountBypassesGetAccount(t *testing.T) {
 		AccountName: db.DefaultImportedAccountName,
 	}}
 
-	mocks.chain.On("BlockStamp").Return(
-		&waddrmgr.BlockStamp{Height: 100}, nil,
+	mocks.addrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
 	).Once()
 
 	// The imported alias has no account row, so a real GetAccount returns
@@ -1678,8 +1681,8 @@ func TestGetEligibleUTXOsSourceUTXOsValue(t *testing.T) {
 		Height:   100,
 	}
 
-	mocks.chain.On("BlockStamp").Return(
-		&waddrmgr.BlockStamp{Height: 100}, nil,
+	mocks.addrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
 	).Once()
 	mocks.store.On("GetUtxo", mock.Anything, db.GetUtxoQuery{
 		WalletID: w.id,
@@ -1705,8 +1708,8 @@ func TestGetEligibleUTXOsNilSourceAccountNotFound(t *testing.T) {
 	// Arrange.
 	w, mocks := createTestWalletWithMocks(t)
 
-	mocks.chain.On("BlockStamp").Return(
-		&waddrmgr.BlockStamp{Height: 100}, nil,
+	mocks.addrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
 	).Once()
 
 	// The default-account resolution by number 0 reports not found.
@@ -2022,6 +2025,9 @@ func expectCorruptAmountSources(t *testing.T, w *Wallet,
 	}).Return(accountInfo, nil).Maybe()
 	mocks.chain.On("BlockStamp").Return(
 		&waddrmgr.BlockStamp{Height: 100}, nil,
+	).Maybe()
+	mocks.addrStore.On("SyncedTo").Return(
+		waddrmgr.BlockStamp{Height: 100},
 	).Maybe()
 
 	script := corruptAmountPkScript()

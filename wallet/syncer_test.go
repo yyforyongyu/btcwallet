@@ -1952,6 +1952,10 @@ func TestPutSyncBatchStore(t *testing.T) {
 	fixture := newStoreScanBatchFixture(t)
 	scanState := NewRecoveryState(0, &chainParams, nil)
 	seedScanStateAccountID(scanState, fixture)
+	store.On("GetTx", mock.Anything, db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     fixture.tx.TxHash(),
+	}).Return((*db.TxInfo)(nil), db.ErrTxNotFound).Once()
 
 	store.On(
 		"ApplyScanBatch", mock.Anything,
@@ -1997,6 +2001,10 @@ func TestPutTargetedBatchStore(t *testing.T) {
 	fixture := newStoreScanBatchFixture(t)
 	scanState := NewRecoveryState(0, &chainParams, nil)
 	seedScanStateAccountID(scanState, fixture)
+	store.On("GetTx", mock.Anything, db.GetTxQuery{
+		WalletID: walletID,
+		Txid:     fixture.tx.TxHash(),
+	}).Return((*db.TxInfo)(nil), db.ErrTxNotFound).Once()
 
 	store.On(
 		"ApplyScanBatch", mock.Anything,
@@ -7041,6 +7049,10 @@ func TestLiveWatchSyncBatchCancellation(t *testing.T) {
 	fixture := newStoreScanBatchFixture(t)
 	scanState := NewRecoveryState(0, &chainParams, nil)
 	seedScanStateAccountID(scanState, fixture)
+	store.On("GetTx", mock.Anything, db.GetTxQuery{
+		WalletID: 0,
+		Txid:     fixture.tx.TxHash(),
+	}).Return((*db.TxInfo)(nil), db.ErrTxNotFound).Once()
 
 	store.On("ApplyScanBatch", ctx, mock.Anything).
 		Run(func(mock.Arguments) {
@@ -7108,6 +7120,10 @@ func TestLiveWatchTargetedBatchCancellation(t *testing.T) {
 	fixture := newStoreScanBatchFixture(t)
 	scanState := NewRecoveryState(0, &chainParams, nil)
 	seedScanStateAccountID(scanState, fixture)
+	store.On("GetTx", mock.Anything, db.GetTxQuery{
+		WalletID: w.id,
+		Txid:     fixture.tx.TxHash(),
+	}).Return((*db.TxInfo)(nil), db.ErrTxNotFound).Once()
 
 	var committing *Info
 	store.On("ApplyScanBatch", ctx, mock.Anything).
@@ -7164,6 +7180,10 @@ func TestLiveWatchTargetedCommitUncertainty(t *testing.T) {
 	fixture := newStoreScanBatchFixture(t)
 	scanState := NewRecoveryState(0, &chainParams, nil)
 	seedScanStateAccountID(scanState, fixture)
+	deps.store.On("GetTx", mock.Anything, db.GetTxQuery{
+		WalletID: w.id,
+		Txid:     fixture.tx.TxHash(),
+	}).Return((*db.TxInfo)(nil), db.ErrTxNotFound).Once()
 	deps.store.On("ApplyScanBatch", mock.Anything, mock.Anything).
 		Return(&dbruntime.AmbiguousTxCommitError{
 			Err: errDBMock,
