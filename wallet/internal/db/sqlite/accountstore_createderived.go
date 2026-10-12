@@ -32,8 +32,7 @@ func (s *Store) CreateDerivedAccount(ctx context.Context,
 			return err
 		}
 
-		// Roll back the row, secrets, and allocation on identity refusal.
-		return checkAccountIdentity(ctx, qtx, params.WalletID, info)
+		return nil
 	})
 	if err != nil {
 		return nil, err

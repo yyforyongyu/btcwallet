@@ -183,9 +183,6 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getWalletByNameStmt, err = db.PrepareContext(ctx, GetWalletByName); err != nil {
 		return nil, fmt.Errorf("error preparing query GetWalletByName: %w", err)
 	}
-	if q.getWalletForAccountCreationStmt, err = db.PrepareContext(ctx, GetWalletForAccountCreation); err != nil {
-		return nil, fmt.Errorf("error preparing query GetWalletForAccountCreation: %w", err)
-	}
 	if q.getWalletSecretsStmt, err = db.PrepareContext(ctx, GetWalletSecrets); err != nil {
 		return nil, fmt.Errorf("error preparing query GetWalletSecrets: %w", err)
 	}
@@ -603,11 +600,6 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getWalletByNameStmt: %w", cerr)
 		}
 	}
-	if q.getWalletForAccountCreationStmt != nil {
-		if cerr := q.getWalletForAccountCreationStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing getWalletForAccountCreationStmt: %w", cerr)
-		}
-	}
 	if q.getWalletSecretsStmt != nil {
 		if cerr := q.getWalletSecretsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getWalletSecretsStmt: %w", cerr)
@@ -945,7 +937,6 @@ type Queries struct {
 	getUtxoSpendByOutpointStmt                    *sql.Stmt
 	getWalletByIDStmt                             *sql.Stmt
 	getWalletByNameStmt                           *sql.Stmt
-	getWalletForAccountCreationStmt               *sql.Stmt
 	getWalletSecretsStmt                          *sql.Stmt
 	hasInvalidWalletUtxoByOutpointStmt            *sql.Stmt
 	insertAddressSecretStmt                       *sql.Stmt
@@ -1054,7 +1045,6 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getUtxoSpendByOutpointStmt:                    q.getUtxoSpendByOutpointStmt,
 		getWalletByIDStmt:                             q.getWalletByIDStmt,
 		getWalletByNameStmt:                           q.getWalletByNameStmt,
-		getWalletForAccountCreationStmt:               q.getWalletForAccountCreationStmt,
 		getWalletSecretsStmt:                          q.getWalletSecretsStmt,
 		hasInvalidWalletUtxoByOutpointStmt:            q.hasInvalidWalletUtxoByOutpointStmt,
 		insertAddressSecretStmt:                       q.insertAddressSecretStmt,

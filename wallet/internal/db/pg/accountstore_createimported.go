@@ -30,12 +30,6 @@ func (s *Store) CreateImportedAccount(ctx context.Context,
 			return err
 		}
 
-		// Check after insertion so occupied names retain precedence.
-		err = checkAccountIdentity(ctx, qtx, params.WalletID, info)
-		if err != nil {
-			return err
-		}
-
 		if params.DryRun {
 			return errDryRunRollback
 		}
@@ -66,7 +60,7 @@ var _ db.CreateImportedAccountOps = createImportedAccountOps{}
 func (o createImportedAccountOps) IsWalletWatchOnly(ctx context.Context,
 	walletID uint32) (bool, error) {
 
-	return getWalletForAccountCreation(ctx, o.q, walletID)
+	return getWalletWatchOnly(ctx, o.q, walletID)
 }
 
 // EnsureKeyScope implements db.CreateImportedAccountOps.
