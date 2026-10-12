@@ -37,6 +37,13 @@ CREATE TABLE accounts (
     -- (docs/developer/adr/0009-single-passphrase-encryption.md).
     public_key BYTEA,
 
+    -- Valid account XPubs are indexed by derivation payload and the effective
+    -- branch schema. NULL preserves opaque Store public-key inputs.
+    chain_code BYTEA,
+    compressed_pub_key BYTEA,
+    external_type_id SMALLINT,
+    internal_type_id SMALLINT,
+
     -- Timestamp when the account was created. Automatically set by the database
     -- in UTC.
     created_at TIMESTAMP NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
@@ -56,6 +63,21 @@ CREATE TABLE accounts (
     -- Account numbers must be non-negative when present.
     CHECK (account_number IS NULL OR account_number >= 0),
 
+    -- All identity components must be present together, with exact BIP32
+    -- lengths, so no partially populated row can bypass a branch index.
+    CHECK (
+        (
+            chain_code IS NULL AND compressed_pub_key IS NULL
+            AND external_type_id IS NULL AND internal_type_id IS NULL
+        )
+        OR (
+            chain_code IS NOT NULL AND compressed_pub_key IS NOT NULL
+            AND octet_length(chain_code) = 32
+            AND octet_length(compressed_pub_key) = 33
+            AND external_type_id IS NOT NULL AND internal_type_id IS NOT NULL
+        )
+    ),
+
     -- Derived account shape must match account-number presence.
     CHECK (
         (is_derived AND account_number IS NOT NULL)
@@ -68,7 +90,13 @@ CREATE TABLE accounts (
     -- DELETE RESTRICT to ensure that the wallet/scope cannot be deleted if
     -- accounts still exist.
     FOREIGN KEY (wallet_id, scope_id)
-    REFERENCES key_scopes (wallet_id, id) ON DELETE RESTRICT
+    REFERENCES key_scopes (wallet_id, id) ON DELETE RESTRICT,
+
+    -- The copied schema must remain the schema of this account's scope.
+    FOREIGN KEY (wallet_id, scope_id, external_type_id, internal_type_id)
+    REFERENCES key_scopes (
+        wallet_id, id, external_type_id, internal_type_id
+    ) ON DELETE RESTRICT
 );
 
 -- Index on foreign scope_id for faster lookups and joins.
@@ -82,6 +110,16 @@ ON accounts (wallet_id, scope_id, account_name);
 CREATE UNIQUE INDEX uidx_accounts_scope_account_number
 ON accounts (scope_id, account_number)
 WHERE account_number IS NOT NULL;
+
+-- Corresponding external or internal branches collide across every scope in
+-- one wallet; the branch type excludes only genuinely disjoint schemas.
+CREATE UNIQUE INDEX uidx_accounts_xpub_external
+ON accounts (wallet_id, chain_code, compressed_pub_key, external_type_id)
+WHERE chain_code IS NOT NULL;
+
+CREATE UNIQUE INDEX uidx_accounts_xpub_internal
+ON accounts (wallet_id, chain_code, compressed_pub_key, internal_type_id)
+WHERE chain_code IS NOT NULL;
 
 -- Unique indexes to support composite child-table foreign keys.
 CREATE UNIQUE INDEX uidx_accounts_id_wallet_scope

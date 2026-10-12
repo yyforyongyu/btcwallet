@@ -309,6 +309,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.rewindWalletSyncStateHeightsForRollbackStmt, err = db.PrepareContext(ctx, RewindWalletSyncStateHeightsForRollback); err != nil {
 		return nil, fmt.Errorf("error preparing query RewindWalletSyncStateHeightsForRollback: %w", err)
 	}
+	if q.setAccountNormalizedIdentityStmt, err = db.PrepareContext(ctx, SetAccountNormalizedIdentity); err != nil {
+		return nil, fmt.Errorf("error preparing query SetAccountNormalizedIdentity: %w", err)
+	}
 	if q.updateAccountNameByWalletScopeAndNameStmt, err = db.PrepareContext(ctx, UpdateAccountNameByWalletScopeAndName); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateAccountNameByWalletScopeAndName: %w", err)
 	}
@@ -810,6 +813,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing rewindWalletSyncStateHeightsForRollbackStmt: %w", cerr)
 		}
 	}
+	if q.setAccountNormalizedIdentityStmt != nil {
+		if cerr := q.setAccountNormalizedIdentityStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setAccountNormalizedIdentityStmt: %w", cerr)
+		}
+	}
 	if q.updateAccountNameByWalletScopeAndNameStmt != nil {
 		if cerr := q.updateAccountNameByWalletScopeAndNameStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing updateAccountNameByWalletScopeAndNameStmt: %w", cerr)
@@ -979,6 +987,7 @@ type Queries struct {
 	markUtxoSpentStmt                             *sql.Stmt
 	releaseUtxoLeaseStmt                          *sql.Stmt
 	rewindWalletSyncStateHeightsForRollbackStmt   *sql.Stmt
+	setAccountNormalizedIdentityStmt              *sql.Stmt
 	updateAccountNameByWalletScopeAndNameStmt     *sql.Stmt
 	updateAccountNameByWalletScopeAndNumberStmt   *sql.Stmt
 	updateTransactionLabelByHashStmt              *sql.Stmt
@@ -1087,6 +1096,7 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		markUtxoSpentStmt:                             q.markUtxoSpentStmt,
 		releaseUtxoLeaseStmt:                          q.releaseUtxoLeaseStmt,
 		rewindWalletSyncStateHeightsForRollbackStmt:   q.rewindWalletSyncStateHeightsForRollbackStmt,
+		setAccountNormalizedIdentityStmt:              q.setAccountNormalizedIdentityStmt,
 		updateAccountNameByWalletScopeAndNameStmt:     q.updateAccountNameByWalletScopeAndNameStmt,
 		updateAccountNameByWalletScopeAndNumberStmt:   q.updateAccountNameByWalletScopeAndNumberStmt,
 		updateTransactionLabelByHashStmt:              q.updateTransactionLabelByHashStmt,

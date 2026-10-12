@@ -614,6 +614,9 @@ type Querier interface {
 	// - Touches only wallet_sync_states rows whose heights are at or above the
 	//   rollback boundary.
 	RewindWalletSyncStateHeightsForRollback(ctx context.Context, rollbackHeight int64) (int64, error)
+	// Fill the newly inserted row after name and number constraints have passed.
+	// Read branch types from its persisted scope rather than trusting a caller.
+	SetAccountNormalizedIdentity(ctx context.Context, arg SetAccountNormalizedIdentityParams) error
 	// Renames an account identified by wallet id, scope tuple, and current name.
 	UpdateAccountNameByWalletScopeAndName(ctx context.Context, arg UpdateAccountNameByWalletScopeAndNameParams) (int64, error)
 	// Renames a derived account identified by wallet id, scope tuple, and number.

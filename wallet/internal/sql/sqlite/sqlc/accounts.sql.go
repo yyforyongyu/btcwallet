@@ -1215,6 +1215,35 @@ func (q *Queries) ListAccountsByWalletScope(ctx context.Context, arg ListAccount
 	return items, nil
 }
 
+const SetAccountNormalizedIdentity = `-- name: SetAccountNormalizedIdentity :exec
+UPDATE accounts
+SET
+    chain_code = ?1,
+    compressed_pub_key = ?2,
+    external_type_id = (
+        SELECT ks.external_type_id FROM key_scopes AS ks
+        WHERE ks.id = accounts.scope_id
+    ),
+    internal_type_id = (
+        SELECT ks.internal_type_id FROM key_scopes AS ks
+        WHERE ks.id = accounts.scope_id
+    )
+WHERE accounts.id = ?3
+`
+
+type SetAccountNormalizedIdentityParams struct {
+	ChainCode        []byte
+	CompressedPubKey []byte
+	AccountID        int64
+}
+
+// Fill the newly inserted row after name and number constraints have passed.
+// Read branch types from its persisted scope rather than trusting a caller.
+func (q *Queries) SetAccountNormalizedIdentity(ctx context.Context, arg SetAccountNormalizedIdentityParams) error {
+	_, err := q.exec(ctx, q.setAccountNormalizedIdentityStmt, SetAccountNormalizedIdentity, arg.ChainCode, arg.CompressedPubKey, arg.AccountID)
+	return err
+}
+
 const UpdateAccountNameByWalletScopeAndName = `-- name: UpdateAccountNameByWalletScopeAndName :execrows
 UPDATE accounts
 SET account_name = ?1

@@ -50,6 +50,11 @@ ON key_scopes (wallet_id, purpose, coin_type);
 -- Unique index to support composite foreign keys scoped by wallet ownership.
 CREATE UNIQUE INDEX uidx_key_scopes_wallet_id_id ON key_scopes (wallet_id, id);
 
+-- Account identity copies both branch types from its persisted scope. This
+-- referenced key lets a composite foreign key reject later schema drift.
+CREATE UNIQUE INDEX uidx_key_scopes_account_schema
+ON key_scopes (wallet_id, id, external_type_id, internal_type_id);
+
 -- Enforce that wallet ownership chosen at key-scope creation time remains
 -- immutable. This closes the database-boundary hole where a raw update could
 -- reparent an existing scope into another wallet after insert.

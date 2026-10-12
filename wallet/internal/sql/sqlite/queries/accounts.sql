@@ -51,6 +51,23 @@ FROM key_scopes AS ks
 WHERE ks.id = sqlc.arg('scope_id')
 RETURNING id, created_at;
 
+-- name: SetAccountNormalizedIdentity :exec
+-- Fill the newly inserted row after name and number constraints have passed.
+-- Read branch types from its persisted scope rather than trusting a caller.
+UPDATE accounts
+SET
+    chain_code = sqlc.arg('chain_code'),
+    compressed_pub_key = sqlc.arg('compressed_pub_key'),
+    external_type_id = (
+        SELECT ks.external_type_id FROM key_scopes AS ks
+        WHERE ks.id = accounts.scope_id
+    ),
+    internal_type_id = (
+        SELECT ks.internal_type_id FROM key_scopes AS ks
+        WHERE ks.id = accounts.scope_id
+    )
+WHERE accounts.id = sqlc.arg('account_id');
+
 -- name: CreateAccountSecret :exec
 -- Inserts the encrypted private key material for an account.
 INSERT INTO account_secrets (
