@@ -74,15 +74,27 @@ func CheckAccountIdentity(candidate AccountInfo, accounts []AccountInfo) error {
 // SQL Store's existing opaque-byte input contract. Removing serialization
 // metadata leaves exactly the chain code and compressed public key.
 func accountXPubPayload(serialized []byte) []byte {
+	chainCode, pubKey := AccountXPubParts(serialized)
+	if chainCode == nil {
+		return nil
+	}
+
+	return append(chainCode, pubKey...)
+}
+
+// AccountXPubParts returns the two derivation-bearing fields of a serialized
+// public extended key. Invalid or opaque Store bytes return nil parts so SQL
+// adapters preserve their existing input contract while indexing valid XPubs.
+func AccountXPubParts(serialized []byte) ([]byte, []byte) {
 	key, err := hdkeychain.NewKeyFromString(string(serialized))
 	if err != nil || key.IsPrivate() {
-		return nil
+		return nil, nil
 	}
 
 	pubKey, err := key.ECPubKey()
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 
-	return append(key.ChainCode(), pubKey.SerializeCompressed()...)
+	return key.ChainCode(), pubKey.SerializeCompressed()
 }

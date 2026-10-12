@@ -80,6 +80,21 @@ func mapErr(err error) *dberr.SQLError {
 		err = fmt.Errorf("%w: %w", db.ErrAccountNumberConflict, err)
 	}
 
+	// SQLite names the indexed columns instead of its index. Match either
+	// corresponding branch tuple without reclassifying unrelated failures.
+	if code == sqlite3.SQLITE_CONSTRAINT_UNIQUE &&
+		(strings.Contains(sqliteErr.Error(),
+			"UNIQUE constraint failed: accounts.wallet_id, "+
+				"accounts.chain_code, accounts.compressed_pub_key, "+
+				"accounts.external_type_id") ||
+			strings.Contains(sqliteErr.Error(),
+				"UNIQUE constraint failed: accounts.wallet_id, "+
+					"accounts.chain_code, accounts.compressed_pub_key, "+
+					"accounts.internal_type_id")) {
+
+		err = fmt.Errorf("%w: %w", db.ErrAccountIdentityCollision, err)
+	}
+
 	return dberr.NewSQLError(dberr.BackendSQLite, reason, codeString, err)
 }
 

@@ -101,6 +101,19 @@ func (o createImportedAccountOps) CreateImportedAccount(ctx context.Context,
 		return 0, err
 	}
 
+	// Index after insertion so occupied names win before XPub admission.
+	chainCode, pubKey := db.AccountXPubParts(req.PublicKey)
+	if chainCode != nil {
+		err = o.q.SetAccountNormalizedIdentity(ctx,
+			sqlc.SetAccountNormalizedIdentityParams{
+				ChainCode: chainCode, CompressedPubKey: pubKey,
+				AccountID: row.ID,
+			})
+		if err != nil {
+			return 0, fmt.Errorf("set account identity: %w", err)
+		}
+	}
+
 	return row.ID, nil
 }
 

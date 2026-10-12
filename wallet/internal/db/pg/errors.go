@@ -17,6 +17,12 @@ const accountNameConstraint = "uidx_accounts_wallet_scope_account_name"
 // accountNumberConstraint identifies the derived-number index within a scope.
 const accountNumberConstraint = "uidx_accounts_scope_account_number"
 
+// These indexes own corresponding-branch XPub admission across a wallet.
+const (
+	accountXPubExternalConstraint = "uidx_accounts_xpub_external"
+	accountXPubInternalConstraint = "uidx_accounts_xpub_internal"
+)
+
 // SQLSTATE helper constants support PostgreSQL error classification.
 const (
 	// connectionExceptionClass identifies PostgreSQL SQLSTATE class 08,
@@ -92,20 +98,18 @@ func mapErr(err error) *dberr.SQLError {
 	// transport fallback.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		// Only the account-name index identifies a caller name conflict;
-		// preserve the driver cause for SQL classification and diagnostics.
-		if pgErr.Code == codeUniqueViolation &&
-			pgErr.ConstraintName == accountNameConstraint {
-
-			err = fmt.Errorf("%w: %w", db.ErrAccountNameConflict, err)
-		}
-
-		// Exact allocation needs the occupied-number identity while the
-		// original driver cause retains normal SQL classification.
-		if pgErr.Code == codeUniqueViolation &&
-			pgErr.ConstraintName == accountNumberConstraint {
-
-			err = fmt.Errorf("%w: %w", db.ErrAccountNumberConflict, err)
+		// Only account admission indexes get caller-facing conflict
+		// sentinels; every case retains the original driver cause.
+		if pgErr.Code == codeUniqueViolation {
+			switch pgErr.ConstraintName {
+			case accountNameConstraint:
+				err = fmt.Errorf("%w: %w", db.ErrAccountNameConflict, err)
+			case accountNumberConstraint:
+				err = fmt.Errorf("%w: %w", db.ErrAccountNumberConflict, err)
+			case accountXPubExternalConstraint,
+				accountXPubInternalConstraint:
+				err = fmt.Errorf("%w: %w", db.ErrAccountIdentityCollision, err)
+			}
 		}
 
 		return mapCode(pgErr.Code, err)

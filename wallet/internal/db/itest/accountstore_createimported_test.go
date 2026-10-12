@@ -5,12 +5,14 @@ package itest
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	dberr "github.com/btcsuite/btcwallet/wallet/internal/db/err"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,6 +42,93 @@ func TestCreateImportedAccountRejectsWalletScopeMismatch(t *testing.T) {
 	)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "constraint")
+}
+
+// TestCreateImportedAccountIdentityIndex verifies that the database itself
+// rejects a matching branch identity while admitting a disjoint scope schema.
+func TestCreateImportedAccountIdentityIndex(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: create three account rows through the Store with opaque keys,
+	// leaving their normalized fields empty for direct database writes.
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "identity-index")
+	strict := db.ScopeAddrSchema{
+		ExternalAddrType: db.NestedWitnessPubKey,
+		InternalAddrType: db.NestedWitnessPubKey,
+	}
+	requests := []db.CreateImportedAccountParams{
+		{
+			WalletID:            walletID,
+			Name:                "owner",
+			Scope:               db.KeyScopeBIP0084,
+			PublicKey:           RandomBytes(32),
+			EncryptedPrivateKey: RandomBytes(32),
+		},
+		{
+			WalletID:            walletID,
+			Name:                "overlap",
+			Scope:               db.KeyScopeBIP0049Plus,
+			PublicKey:           RandomBytes(32),
+			EncryptedPrivateKey: RandomBytes(32),
+		},
+		{
+			WalletID:            walletID,
+			Name:                "disjoint",
+			Scope:               db.KeyScope{Purpose: 100, Coin: 0},
+			AddrSchema:          &strict,
+			PublicKey:           RandomBytes(32),
+			EncryptedPrivateKey: RandomBytes(32),
+		},
+	}
+	ids := make([]int64, 0, len(requests))
+
+	for _, request := range requests {
+		info, err := store.CreateImportedAccount(t.Context(), request)
+		require.NoError(t, err)
+		require.NotNil(t, info.AccountID)
+		ids = append(ids, int64(*info.AccountID))
+	}
+
+	// Bind the same raw normalized payload to each persisted scope schema.
+	// PostgreSQL and SQLite differ only in parameter placeholder syntax.
+	bind := [3]string{"?", "?", "?"}
+	if testBackend() == dberr.BackendPostgres {
+		bind = [3]string{"$1", "$2", "$3"}
+	}
+
+	statement := fmt.Sprintf(`
+		UPDATE accounts SET
+			chain_code = %s, compressed_pub_key = %s,
+			external_type_id = (
+				SELECT external_type_id FROM key_scopes
+				WHERE id = accounts.scope_id
+			),
+			internal_type_id = (
+				SELECT internal_type_id FROM key_scopes
+				WHERE id = accounts.scope_id
+			)
+		WHERE id = %s`, bind[0], bind[1], bind[2])
+	chainCode := bytes.Repeat([]byte{0x11}, 32)
+	pubKey := bytes.Repeat([]byte{0x22}, 33)
+
+	// Act: populate the owner first, then try matching keys in an overlapping
+	// scope and in a scope whose corresponding branches are both disjoint.
+	_, ownerErr := store.DB().ExecContext(
+		t.Context(), statement, chainCode, pubKey, ids[0],
+	)
+	_, overlapErr := store.DB().ExecContext(
+		t.Context(), statement, chainCode, pubKey, ids[1],
+	)
+	_, disjointErr := store.DB().ExecContext(
+		t.Context(), statement, chainCode, pubKey, ids[2],
+	)
+
+	// Assert: the unique branch index refuses only the overlapping identity;
+	// the disjoint row remains writable with the very same key payload.
+	require.NoError(t, ownerErr)
+	require.Error(t, overlapErr)
+	require.NoError(t, disjointErr)
 }
 
 // TestCreateImportedAccountErrors verifies that CreateImportedAccount returns

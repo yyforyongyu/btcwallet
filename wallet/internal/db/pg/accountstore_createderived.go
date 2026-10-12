@@ -118,6 +118,20 @@ func (o createDerivedAccountOps) CreateDerivedAccount(ctx context.Context,
 		return db.CreateDerivedAccountRow{}, err
 	}
 
+	// Index before secrets so collisions roll back allocated accounts.
+	chainCode, pubKey := db.AccountXPubParts(derived.PublicKey)
+	if chainCode != nil {
+		err = o.q.SetAccountNormalizedIdentity(ctx,
+			sqlc.SetAccountNormalizedIdentityParams{
+				ChainCode: chainCode, CompressedPubKey: pubKey,
+				AccountID: row.ID,
+			})
+		if err != nil {
+			return db.CreateDerivedAccountRow{},
+				fmt.Errorf("set account identity: %w", err)
+		}
+	}
+
 	if len(derived.EncryptedPrivateKey) > 0 {
 		err = o.q.CreateAccountSecret(
 			ctx, sqlc.CreateAccountSecretParams{
