@@ -219,6 +219,9 @@ type scanResult struct {
 
 	// meta contains block metadata (hash, height, time).
 	meta *wtxmgr.BlockMeta
+
+	// parentHash preserves fetched ancestry until the live commit boundary.
+	parentHash chainhash.Hash
 }
 
 // chainSyncer is a private interface that abstracts the chain synchronization
@@ -1230,7 +1233,8 @@ func (s *syncer) scanBatchHeadersOnly(_ context.Context,
 		}
 
 		results = append(results, scanResult{
-			meta: meta,
+			meta:       meta,
+			parentHash: header.PrevBlock,
 			// We provide an empty BlockProcessResult to avoid nil
 			// pointer dereferences when accessing embedded fields
 			// (like RelevantTxs) in commitSyncBatch. This
@@ -1343,6 +1347,7 @@ func (s *syncer) scanBatchWithFullBlocks(_ context.Context,
 
 		results = append(results, scanResult{
 			meta:               meta,
+			parentHash:         block.Header.PrevBlock,
 			BlockProcessResult: res,
 		})
 	}
@@ -1364,6 +1369,7 @@ func (s *syncer) initResultsForCFilterScan(_ context.Context,
 	results := make([]scanResult, len(hashes))
 	for i := range hashes {
 		results[i] = scanResult{
+			parentHash: headers[i].PrevBlock,
 			meta: &wtxmgr.BlockMeta{
 				Block: wtxmgr.Block{
 					Hash: hashes[i],
@@ -1799,6 +1805,14 @@ func (s *syncer) scanBatch(ctx context.Context, syncedTo waddrmgr.BlockStamp,
 	if len(results) == 0 {
 		return fmt.Errorf("%w: scan batch empty", ErrScanBatchEmpty)
 	}
+
+	// A reorg can overtake the queued disconnect notification. Preserve the
+	// old tip until rollback finds the fork, rather than overwriting its only
+	// evidence with a batch whose first block cannot extend it.
+	if results[0].parentHash != syncedTo.Hash {
+		return s.checkRollback(ctx)
+	}
+
 	// Process Batch (Update). We do this in a single DB transaction.
 	return s.putSyncBatch(ctx, scanState, results)
 }
