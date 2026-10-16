@@ -7464,3 +7464,90 @@ func TestLiveWatchTargetedScanFailure(t *testing.T) {
 	_, err = w.CreateTransaction(t.Context(), &TxIntent{})
 	require.ErrorIs(t, err, ErrStateForbidden)
 }
+
+// TestScanBatchAncestry reproduces a replacement-tip scan overtaking
+// its disconnect notification, preserving the evidence needed for rollback.
+func TestScanBatchAncestry(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Confirm a real transaction on the old branch, then expose a
+	// higher backend tip whose next block extends a replacement height one.
+	// The existing worker stays behind its mocked backend-readiness gate.
+	_, client, w := newLiveWatchManager(t)
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	recv, err := w.NewAddress(t.Context(), NewAccountSelectorByName(
+		waddrmgr.KeyScopeBIP0084, waddrmgr.DefaultAccountName,
+	), false)
+	require.NoError(t, err)
+	script, err := txscript.PayToAddrScript(recv.Addr)
+	require.NoError(t, err)
+
+	s, ok := w.sync.(*syncer)
+	require.True(t, ok)
+
+	s.cfg.SyncMethod = SyncMethodFullBlocks
+
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+		Hash:  chainhash.Hash{1},
+		Index: 460,
+	}, nil, nil))
+	tx.AddTxOut(&wire.TxOut{
+		Value:    1000,
+		PkScript: script,
+	})
+	record, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+	require.NoError(t, err)
+
+	matches := TxEntries{
+		{
+			Rec: record,
+		},
+	}
+	oldBlock := &db.Block{
+		Hash:      chainhash.Hash{47},
+		Height:    1,
+		Timestamp: time.Now().Truncate(time.Second),
+	}
+	require.NoError(t, s.applyStoreTxBatch(
+		t.Context(), matches, oldBlock, oldBlock,
+	))
+
+	newHash := chainhash.Hash{48}
+	next := wire.NewMsgBlock(&wire.BlockHeader{
+		PrevBlock: newHash,
+		Timestamp: oldBlock.Timestamp,
+	})
+	nextHash := next.BlockHash()
+
+	client.On("GetBestBlock").Unset()
+	client.On("GetBestBlock").Return(&nextHash, int32(2), nil).Twice()
+	client.On("GetBlockHashes", int64(2), int64(2)).
+		Return([]chainhash.Hash{nextHash}, nil).Once()
+	client.On("GetBlocks", []chainhash.Hash{nextHash}).
+		Return([]*wire.MsgBlock{next}, nil).Once()
+	client.On("GetBlockHashes", int64(0), int64(1)).Return(
+		[]chainhash.Hash{*chainParams.GenesisHash, newHash}, nil,
+	).Once()
+	client.On("GetBlockHeader", chainParams.GenesisHash).Unset()
+	client.On("GetBlockHeader", chainParams.GenesisHash).
+		Return(&chainParams.GenesisBlock.Header, nil).Once()
+
+	// Act: Advance before delivering any disconnect notification. The first
+	// fetched parent must trigger the existing rollback instead of committing
+	// a replacement tip that hides the old transaction's detached block.
+	finished, err := s.advanceChainSync(t.Context())
+
+	// Assert: Public Wallet state still exposes the fork point and a detached
+	// transaction before any new branch can overwrite the fork evidence.
+	require.NoError(t, err)
+	require.False(t, finished)
+	info, err := w.Info(t.Context())
+	require.NoError(t, err)
+	require.EqualValues(t, 0, info.SyncedTo.Height)
+	detail, err := w.GetTx(t.Context(), tx.TxHash())
+	require.NoError(t, err)
+	require.Nil(t, detail.Block)
+}
