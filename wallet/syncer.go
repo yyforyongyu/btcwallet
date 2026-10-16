@@ -237,6 +237,16 @@ type chainSyncer interface {
 	syncState() syncState
 }
 
+// txManager combines the Wallet capabilities used by the syncer for
+// publication and notification after successful commits.
+type txManager interface {
+	TxPublisher
+	txNotifier
+}
+
+// Wallet supplies both capabilities through the same private dependency.
+var _ txManager = (*Wallet)(nil)
+
 // syncer is a stateless blocking worker responsible for synchronizing the
 // wallet with the blockchain. It operates within the lifecycle provided by the
 // caller via context and manages the chain loop, scanning, and reorg handling.
@@ -264,10 +274,9 @@ type syncer struct {
 	// request does not unnecessarily block the calling goroutine.
 	scanReqChan chan *scanReq
 
-	// publisher is the component responsible for broadcasting transactions
-	// to the network. It is primarily used during the maintenance phase to
-	// ensure unmined transactions remain in the mempool.
-	publisher TxPublisher
+	// txManager rebroadcasts unmined transactions and announces committed
+	// observations while Wallet retains subscriber state and lifecycle.
+	txManager txManager
 }
 
 // A compile-time assertion to ensure that syncer implements chainSyncer.
@@ -308,9 +317,10 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 
 // newSyncer creates a new syncer instance. The Store and its wallet ID are
 // mandatory: every migrated runtime path reads and writes through the Store,
-// so there is no nil-store fallback.
+// so there is no nil-store fallback. The notifier observes successful commits
+// without owning persistence or scan lifecycle.
 func newSyncer(cfg Config, addrStore waddrmgr.AddrStore,
-	txStore wtxmgr.TxStore, publisher TxPublisher, store db.Store,
+	txStore wtxmgr.TxStore, txManager txManager, store db.Store,
 	walletID uint32) *syncer {
 
 	return &syncer{
@@ -318,7 +328,7 @@ func newSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 		addrStore:   addrStore,
 		txStore:     txStore,
 		scanReqChan: make(chan *scanReq, 1),
-		publisher:   publisher,
+		txManager:   txManager,
 		store:       store,
 		walletID:    walletID,
 	}
@@ -793,7 +803,7 @@ func (s *syncer) broadcastUnminedTxns(ctx context.Context) error {
 	}
 
 	for _, tx := range txs {
-		err := s.publisher.Broadcast(ctx, tx, "")
+		err := s.txManager.Broadcast(ctx, tx, "")
 		if err != nil {
 			log.Warnf("Unable to rebroadcast tx %v: %v",
 				tx.TxHash(), err)
@@ -937,6 +947,12 @@ func (s *syncer) applyStoreTxBatch(ctx context.Context,
 		return fmt.Errorf("apply tx batch: %w", err)
 	}
 
+	// Announce only successful commits; delivery cannot replace a write error
+	// or make this batch depend on subscribers consuming their queues.
+	for _, tx := range transactions {
+		s.txManager.notifyTx(ctx, tx.Tx.TxHash())
+	}
+
 	return nil
 }
 
@@ -1000,6 +1016,12 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 		return fmt.Errorf("apply sync scan batch: %w", err)
 	}
 
+	// The existing Store commit owns persistence and tip advancement. The
+	// Wallet notifier only reads the result and offers best-effort delivery.
+	for _, tx := range params.Transactions {
+		s.txManager.notifyTx(ctx, tx.Tx.TxHash())
+	}
+
 	// A committed horizon or credit can introduce watches after startup;
 	// finish registration before catch-up reports this batch complete.
 	if refreshWatches {
@@ -1032,6 +1054,12 @@ func (s *syncer) putTargetedBatch(ctx context.Context,
 		}
 
 		return fmt.Errorf("apply targeted scan batch: %w", err)
+	}
+
+	// Historical observations use the same Wallet payload and queue policy,
+	// without adding notification state to scan readiness or rollback.
+	for _, tx := range params.Transactions {
+		s.txManager.notifyTx(ctx, tx.Tx.TxHash())
 	}
 
 	// Targeted scans can also store new addresses and outputs. Register
