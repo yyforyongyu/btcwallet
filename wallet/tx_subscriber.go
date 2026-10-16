@@ -8,6 +8,9 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 )
 
 // TxSubscriptionQueueLimit bounds each stream's retained notifications. A full
@@ -54,6 +57,13 @@ type TxEvent struct {
 // txSubscriptions owns registration, sends, and closure under one mutex so
 // concurrent producer and lifetime handlers cannot send to a closed channel.
 type txSubscriptions struct {
+	// Read dependencies are immutable after Wallet construction; Store reads
+	// stay outside mu so persistence never holds the channel-lifetime lock.
+	store       db.Store
+	walletID    uint32
+	walletName  string
+	chainParams *chaincfg.Params
+
 	mu          sync.Mutex
 	subscribers map[*txSubscription]struct{}
 }

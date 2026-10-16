@@ -29,6 +29,13 @@ func newManagedWallet(cfg Config, data *walletData) *Wallet {
 		lockTimer:         lockTimer,
 		masterFingerprint: data.masterFingerprint,
 		isWatchOnly:       data.isWatchOnly,
+		// Notifications share committed reads without retaining the Wallet.
+		txSubscriptions: txSubscriptions{
+			store:       data.store,
+			walletID:    data.id,
+			walletName:  cfg.Name,
+			chainParams: cfg.ChainParams,
+		},
 	}
 
 	w.sync = newSyncer(

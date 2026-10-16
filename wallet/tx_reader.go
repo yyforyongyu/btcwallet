@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
@@ -610,4 +611,25 @@ func safeUint32ToInt32(u uint32) (int32, bool) {
 	}
 
 	return int32(u), true
+}
+
+// clone isolates mutable data before consumers can read concurrently
+// with fan-out. Address objects remain read-only under the stream's contract.
+func (detail *TxDetail) clone() *TxDetail {
+	owned := *detail
+	owned.RawTx = slices.Clone(detail.RawTx)
+	owned.PrevOuts = slices.Clone(detail.PrevOuts)
+	owned.Outputs = slices.Clone(detail.Outputs)
+
+	for i := range owned.Outputs {
+		owned.Outputs[i].PkScript = slices.Clone(detail.Outputs[i].PkScript)
+		owned.Outputs[i].Addresses = slices.Clone(detail.Outputs[i].Addresses)
+	}
+
+	if detail.Block != nil {
+		block := *detail.Block
+		owned.Block = &block
+	}
+
+	return &owned
 }
