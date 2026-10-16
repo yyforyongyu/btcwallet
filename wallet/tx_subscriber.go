@@ -6,6 +6,7 @@ package wallet
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -34,6 +35,10 @@ type TxSubscriber interface {
 	SubscribeTxns(ctx context.Context) (<-chan *TxEvent, func(), error)
 }
 
+// A compile-time assertion to ensure that Wallet implements the TxSubscriber
+// interface.
+var _ TxSubscriber = (*Wallet)(nil)
+
 // TxEvent describes one Wallet observation, separate from stored
 // transaction history. Repeated observations need not arrive in time order.
 type TxEvent struct {
@@ -44,4 +49,163 @@ type TxEvent struct {
 	// Timestamp records when notification preparation began, not when the
 	// transaction or its block was received. It does not establish ordering.
 	Timestamp time.Time
+}
+
+// txSubscriptions owns registration, sends, and closure under one mutex so
+// concurrent producer and lifetime handlers cannot send to a closed channel.
+type txSubscriptions struct {
+	mu          sync.Mutex
+	subscribers map[*txSubscription]struct{}
+}
+
+// txSubscription retains only the event queue and cleanup acknowledgement.
+// Closing done also releases the Wallet handler that owns this lifetime.
+type txSubscription struct {
+	events chan *TxEvent
+	done   chan struct{}
+}
+
+// subscribe registers before exposing the stream, so cancellation always finds
+// its record. Allocate the map lazily for Wallets that never have subscribers.
+func (s *txSubscriptions) subscribe() *txSubscription {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sub := &txSubscription{
+		events: make(chan *TxEvent, TxSubscriptionQueueLimit),
+		done:   make(chan struct{}),
+	}
+	if s.subscribers == nil {
+		s.subscribers = make(map[*txSubscription]struct{})
+	}
+
+	s.subscribers[sub] = struct{}{}
+
+	return sub
+}
+
+// cancel removes membership before closure, making every termination path
+// idempotent. The producer mutex excludes refill while queued data is drained.
+func (s *txSubscriptions) cancel(sub *txSubscription) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, active := s.subscribers[sub]; !active {
+		return
+	}
+
+	delete(s.subscribers, sub)
+
+	// Consumers can race the drain; never wait for them to release payloads.
+	for {
+		select {
+		case <-sub.events:
+		default:
+			close(sub.events)
+			close(sub.done)
+
+			return
+		}
+	}
+}
+
+// subscribeTxnsReq retains caller cancellation in the existing joined handler,
+// keeping registration and stream teardown within Wallet's shutdown boundary.
+type subscribeTxnsReq struct {
+	reqCtx
+
+	respChan chan subscribeTxnsResp
+}
+
+// subscribeTxnsResp transfers an admitted record or its registration error.
+type subscribeTxnsResp struct {
+	sub *txSubscription
+	err error
+}
+
+// cancelTxSubscriptionReq asks mainLoop to remove a stream; sub.done
+// acknowledges
+// cleanup without another response channel or a reference back to Wallet.
+type cancelTxSubscriptionReq struct {
+	sub *txSubscription
+}
+
+// SubscribeTxns implements TxSubscriber using Wallet's request admission and
+// joined lifetime handlers so registration and cleanup participate in shutdown.
+func (w *Wallet) SubscribeTxns(ctx context.Context) (<-chan *TxEvent, func(),
+	error) {
+
+	err := w.state.validateStarted()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Admission joins registration and its lifetime handler through Stop.
+	r := subscribeTxnsReq{
+		reqCtx:   reqCtx{ctx: ctx},
+		respChan: make(chan subscribeTxnsResp, 1),
+	}
+
+	err = w.sendReq(ctx, r)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	result := <-r.respChan
+	if result.err != nil {
+		return nil, nil, result.err
+	}
+
+	// Capture channels, not the owning Wallet. A request transfers cleanup to
+	// mainLoop; if shutdown wins, the admitted lifetime handler finishes it.
+	sub := result.sub
+	requests, quit := w.requestChan, w.lifetimeCtx.Done()
+	cancel := func() {
+		select {
+		case requests <- cancelTxSubscriptionReq{sub: sub}:
+		case <-sub.done:
+			return
+		case <-quit:
+		}
+
+		<-sub.done
+	}
+
+	return sub.events, cancel, nil
+}
+
+// handleSubscribeTxns registers and watches a stream using the existing joined
+// request handler. It exits when any cancellation path acknowledges cleanup.
+func (w *Wallet) handleSubscribeTxns(r subscribeTxnsReq) {
+	err := r.ctx.Err()
+	if err != nil {
+		r.respChan <- subscribeTxnsResp{err: err}
+
+		return
+	}
+
+	if w.lifetimeCtx.Err() != nil {
+		r.respChan <- subscribeTxnsResp{err: ErrWalletStopped}
+
+		return
+	}
+
+	sub := w.txSubscriptions.subscribe()
+	r.respChan <- subscribeTxnsResp{sub: sub}
+
+	// Context and shutdown cleanup bypass request admission, which may already
+	// be stopped. All paths share the same send/close synchronization.
+	select {
+	case <-r.ctx.Done():
+		w.txSubscriptions.cancel(sub)
+	case <-w.lifetimeCtx.Done():
+		w.txSubscriptions.cancel(sub)
+	case <-sub.done:
+	}
+}
+
+// handleCancelTxSubscription completes cleanup inline in mainLoop, avoiding a
+// new goroutine when sub.done already acknowledges this control request.
+func (w *Wallet) handleCancelTxSubscription(r cancelTxSubscriptionReq) {
+	w.txSubscriptions.cancel(r.sub)
 }
