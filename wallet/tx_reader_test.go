@@ -117,16 +117,20 @@ func TestBuildTxDetailFromStore(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			// Arrange: Create a test wallet with mocks.
+			// Arrange: Reuse the wallet fixture network and a fixed tip
+			// so mined and unmined rows have deterministic public details.
 			w, _ := createStartedWalletWithMocks(t)
 			currentHeight := int32(1)
 
-			// Act: Build the TxDetail.
-			result, err := w.buildTxDetailFromStore(
+			// Act: Convert the store row using the explicit network and
+			// tip, without another database read.
+			result, err := buildTxDetailFromStore(
 				txDetailInfoFromLegacy(tc.details), currentHeight,
+				w.cfg.ChainParams,
 			)
 
-			// Assert: Check that the correct details are returned.
+			// Assert: Compare the complete public result to the independent
+			// expected detail, including ownership, fees, and confirmations.
 			require.NoError(t, err)
 			require.Equal(t, tc.expectedTxDetail, result)
 		})
@@ -145,7 +149,7 @@ func TestBuildTxDetailFromStoreRequiresMsgTx(t *testing.T) {
 	w, _ := createStartedWalletWithMocks(t)
 
 	// Act: Build the TxDetail from the malformed store row.
-	_, err := w.buildTxDetailFromStore(txDetails, 1)
+	_, err := buildTxDetailFromStore(txDetails, 1, w.cfg.ChainParams)
 
 	// Assert: Check that the contract violation is reported.
 	require.ErrorIs(t, err, ErrNilTxDetailMsgTx)
@@ -163,7 +167,7 @@ func TestBuildTxDetailFromStoreRequiresValidStatus(t *testing.T) {
 	w, _ := createStartedWalletWithMocks(t)
 
 	// Act: Build the public detail from the malformed store row.
-	_, err := w.buildTxDetailFromStore(txDetails, 1)
+	_, err := buildTxDetailFromStore(txDetails, 1, w.cfg.ChainParams)
 
 	// Assert: Check that the unsupported status fails closed.
 	require.ErrorIs(t, err, ErrInvalidTxStatus)
