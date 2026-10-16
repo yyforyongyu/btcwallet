@@ -268,6 +268,10 @@ type syncer struct {
 	// to the network. It is primarily used during the maintenance phase to
 	// ensure unmined transactions remain in the mempool.
 	publisher TxPublisher
+
+	// txNotifier announces committed observations without owning subscriber
+	// lifecycle or changing the result of a Store operation.
+	txNotifier txNotifier
 }
 
 // A compile-time assertion to ensure that syncer implements chainSyncer.
@@ -308,10 +312,11 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 
 // newSyncer creates a new syncer instance. The Store and its wallet ID are
 // mandatory: every migrated runtime path reads and writes through the Store,
-// so there is no nil-store fallback.
+// so there is no nil-store fallback. The notifier observes successful commits
+// without owning persistence or scan lifecycle.
 func newSyncer(cfg Config, addrStore waddrmgr.AddrStore,
-	txStore wtxmgr.TxStore, publisher TxPublisher, store db.Store,
-	walletID uint32) *syncer {
+	txStore wtxmgr.TxStore, publisher TxPublisher, notifier txNotifier,
+	store db.Store, walletID uint32) *syncer {
 
 	return &syncer{
 		cfg:         cfg,
@@ -319,6 +324,7 @@ func newSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 		txStore:     txStore,
 		scanReqChan: make(chan *scanReq, 1),
 		publisher:   publisher,
+		txNotifier:  notifier,
 		store:       store,
 		walletID:    walletID,
 	}
@@ -937,6 +943,12 @@ func (s *syncer) applyStoreTxBatch(ctx context.Context,
 		return fmt.Errorf("apply tx batch: %w", err)
 	}
 
+	// Announce only successful commits; delivery cannot replace a write error
+	// or make this batch depend on subscribers consuming their queues.
+	for _, tx := range transactions {
+		s.txNotifier.notifyTx(ctx, tx.Tx.TxHash())
+	}
+
 	return nil
 }
 
@@ -1000,6 +1012,12 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 		return fmt.Errorf("apply sync scan batch: %w", err)
 	}
 
+	// The existing Store commit owns persistence and tip advancement. The
+	// Wallet notifier only reads the result and offers best-effort delivery.
+	for _, tx := range params.Transactions {
+		s.txNotifier.notifyTx(ctx, tx.Tx.TxHash())
+	}
+
 	// A committed horizon or credit can introduce watches after startup;
 	// finish registration before catch-up reports this batch complete.
 	if refreshWatches {
@@ -1032,6 +1050,12 @@ func (s *syncer) putTargetedBatch(ctx context.Context,
 		}
 
 		return fmt.Errorf("apply targeted scan batch: %w", err)
+	}
+
+	// Historical observations use the same Wallet payload and queue policy,
+	// without adding notification state to scan readiness or rollback.
+	for _, tx := range params.Transactions {
+		s.txNotifier.notifyTx(ctx, tx.Tx.TxHash())
 	}
 
 	// Targeted scans can also store new addresses and outputs. Register
