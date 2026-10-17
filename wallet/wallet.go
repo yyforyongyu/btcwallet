@@ -401,6 +401,10 @@ type Wallet struct {
 	// lifecycle and authentication requests.
 	requestChan chan any
 
+	// txSubscriptions owns this Wallet's stream state; its mutex also
+	// coordinates producers running outside the request loop.
+	txSubscriptions txSubscriptions
+
 	// lockTimer is the timer used to automatically lock the wallet after a
 	// timeout.
 	lockTimer *time.Timer

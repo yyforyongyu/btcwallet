@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
@@ -309,17 +311,21 @@ func (w *Wallet) handleGetTx(r getTxReq) {
 	// The legacy tip accessor is joined by this accepted outer read.
 	currentHeight := w.SyncedTo().Height
 
-	detail, err := w.getTxDetail(r.ctx, r.txHash, currentHeight)
+	detail, err := getTxDetail(
+		r.ctx, w.store, w.id, r.txHash, currentHeight, w.cfg.ChainParams,
+	)
 	r.respChan <- txDetailResp{detail: detail, err: err}
 }
 
 // getTxDetail loads one transaction through the detailed store path and builds
-// the full wallet response.
-func (w *Wallet) getTxDetail(ctx context.Context, txHash chainhash.Hash,
-	currentHeight int32) (*TxDetail, error) {
+// the wallet-relative response. Explicit dependencies let readers and event
+// preparation share conversion without retaining the owning Wallet.
+func getTxDetail(ctx context.Context, store db.Store, walletID uint32,
+	txHash chainhash.Hash, currentHeight int32,
+	chainParams *chaincfg.Params) (*TxDetail, error) {
 
-	txDetails, err := w.store.GetTxDetail(ctx, db.GetTxDetailQuery{
-		WalletID: w.id,
+	txDetails, err := store.GetTxDetail(ctx, db.GetTxDetailQuery{
+		WalletID: walletID,
 		Txid:     txHash,
 	})
 	if err != nil {
@@ -330,7 +336,7 @@ func (w *Wallet) getTxDetail(ctx context.Context, txHash chainhash.Hash,
 		return nil, fmt.Errorf("get tx detail: %w", err)
 	}
 
-	return w.buildTxDetailFromStore(txDetails, currentHeight)
+	return buildTxDetailFromStore(txDetails, currentHeight, chainParams)
 }
 
 // handleListTxns delivers the result of an accepted component request.
@@ -361,7 +367,9 @@ func (w *Wallet) listTxDetails(ctx context.Context, startHeight,
 
 	details := make([]*TxDetail, 0, len(records))
 	for i := range records {
-		txDetail, err := w.buildTxDetailFromStore(&records[i], currentHeight)
+		txDetail, err := buildTxDetailFromStore(
+			&records[i], currentHeight, w.cfg.ChainParams,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -373,9 +381,10 @@ func (w *Wallet) listTxDetails(ctx context.Context, startHeight,
 }
 
 // buildTxDetailFromStore builds a wallet tx response from the db-native detail
-// shape returned by db.Store.
-func (w *Wallet) buildTxDetailFromStore(txDetails *db.TxDetailInfo,
-	currentHeight int32) (*TxDetail, error) {
+// shape returned by db.Store. The supplied tip and network determine the
+// confirmation count and output addresses without additional Store reads.
+func buildTxDetailFromStore(txDetails *db.TxDetailInfo, currentHeight int32,
+	chainParams *chaincfg.Params) (*TxDetail, error) {
 
 	if txDetails.MsgTx == nil {
 		return nil, ErrNilTxDetailMsgTx
@@ -394,10 +403,10 @@ func (w *Wallet) buildTxDetailFromStore(txDetails *db.TxDetailInfo,
 	)
 	details.Status = status
 
-	w.populateBlockDetails(details, txDetails.Block, currentHeight)
-	w.calculateValueAndFeeFromStore(details, txDetails, msgTx)
-	w.populateOutputs(details, msgTx, txDetails.OwnedOutputs)
-	w.populatePrevOuts(details, msgTx, txDetails.OwnedInputs)
+	populateBlockDetails(details, txDetails.Block, currentHeight)
+	calculateValueAndFeeFromStore(details, txDetails, msgTx)
+	populateOutputs(details, msgTx, txDetails.OwnedOutputs, chainParams)
+	populatePrevOuts(details, msgTx, txDetails.OwnedInputs)
 
 	return details, nil
 }
@@ -447,8 +456,9 @@ func buildBasicTxDetail(hash chainhash.Hash, rawTx []byte, label string,
 	}
 }
 
-// populateBlockDetails populates the block details for the given TxDetail.
-func (w *Wallet) populateBlockDetails(details *TxDetail, block *db.Block,
+// populateBlockDetails derives confirmations from the supplied tip while
+// retaining nil block data for an unconfirmed transaction.
+func populateBlockDetails(details *TxDetail, block *db.Block,
 	currentHeight int32) {
 
 	if block == nil {
@@ -471,9 +481,9 @@ func (w *Wallet) populateBlockDetails(details *TxDetail, block *db.Block,
 	details.Confirmations = calcConf(height, currentHeight)
 }
 
-// calculateValueAndFeeFromStore calculates the value and fee for the given
-// store-backed TxDetail.
-func (w *Wallet) calculateValueAndFeeFromStore(details *TxDetail,
+// calculateValueAndFeeFromStore derives wallet value from owned inputs and
+// outputs; fees are known only when every input belongs to the wallet.
+func calculateValueAndFeeFromStore(details *TxDetail,
 	txDetails *db.TxDetailInfo, msgTx *wire.MsgTx) {
 
 	var balanceDelta btcutil.Amount
@@ -509,9 +519,10 @@ func (w *Wallet) calculateValueAndFeeFromStore(details *TxDetail,
 	)
 }
 
-// populateOutputs populates outputs for a store-backed TxDetail.
-func (w *Wallet) populateOutputs(details *TxDetail, msgTx *wire.MsgTx,
-	ownedOutputs []db.TxOwnedOutput) {
+// populateOutputs combines stored ownership with network-specific script
+// addresses so the result includes both wallet and external outputs.
+func populateOutputs(details *TxDetail, msgTx *wire.MsgTx,
+	ownedOutputs []db.TxOwnedOutput, chainParams *chaincfg.Params) {
 
 	isOurAddress := make(map[uint32]bool)
 	for _, credit := range ownedOutputs {
@@ -520,7 +531,7 @@ func (w *Wallet) populateOutputs(details *TxDetail, msgTx *wire.MsgTx,
 
 	for i, txOut := range msgTx.TxOut {
 		sc, outAddresses, _, err := txscript.ExtractPkScriptAddrs(
-			txOut.PkScript, w.cfg.ChainParams,
+			txOut.PkScript, chainParams,
 		)
 
 		var addresses []address.Address
@@ -548,8 +559,9 @@ func (w *Wallet) populateOutputs(details *TxDetail, msgTx *wire.MsgTx,
 	}
 }
 
-// populatePrevOuts populates prevouts for a store-backed TxDetail.
-func (w *Wallet) populatePrevOuts(details *TxDetail, msgTx *wire.MsgTx,
+// populatePrevOuts annotates transaction inputs with stored wallet ownership
+// so consumers can distinguish wallet debits from external inputs.
+func populatePrevOuts(details *TxDetail, msgTx *wire.MsgTx,
 	ownedInputs []db.TxOwnedInput) {
 
 	isOurOutput := make(map[uint32]bool)
@@ -599,4 +611,25 @@ func safeUint32ToInt32(u uint32) (int32, bool) {
 	}
 
 	return int32(u), true
+}
+
+// clone isolates mutable data before consumers can read concurrently
+// with fan-out. Address objects remain read-only under the stream's contract.
+func (detail *TxDetail) clone() *TxDetail {
+	owned := *detail
+	owned.RawTx = slices.Clone(detail.RawTx)
+	owned.PrevOuts = slices.Clone(detail.PrevOuts)
+	owned.Outputs = slices.Clone(detail.Outputs)
+
+	for i := range owned.Outputs {
+		owned.Outputs[i].PkScript = slices.Clone(detail.Outputs[i].PkScript)
+		owned.Outputs[i].Addresses = slices.Clone(detail.Outputs[i].Addresses)
+	}
+
+	if detail.Block != nil {
+		block := *detail.Block
+		owned.Block = &block
+	}
+
+	return &owned
 }

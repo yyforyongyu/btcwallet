@@ -299,8 +299,15 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 	ctx, cancel := context.WithCancel(t.Context())
 
 	w := &Wallet{
-		addrStore:   mockAddrStore,
-		store:       mockStore,
+		addrStore: mockAddrStore,
+		store:     mockStore,
+
+		// The fixture supplies the same immutable notification dependencies
+		// as managed construction; existing cleanup owns Store expectations.
+		txSubscriptions: txSubscriptions{
+			store:       mockStore,
+			chainParams: &chainParams,
+		},
 		txStore:     mockTxStore,
 		keyVault:    mockVault,
 		sync:        mockSyncer,

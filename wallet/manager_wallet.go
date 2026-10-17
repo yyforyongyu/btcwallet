@@ -29,10 +29,18 @@ func newManagedWallet(cfg Config, data *walletData) *Wallet {
 		lockTimer:         lockTimer,
 		masterFingerprint: data.masterFingerprint,
 		isWatchOnly:       data.isWatchOnly,
+		// Notifications share committed reads without retaining the Wallet.
+		txSubscriptions: txSubscriptions{
+			store:       data.store,
+			walletID:    data.id,
+			walletName:  cfg.Name,
+			chainParams: cfg.ChainParams,
+		},
 	}
 
+	// The syncer retains publication and notification capabilities separately.
 	w.sync = newSyncer(
-		cfg, w.addrStore, w.txStore, w, w.store, w.id,
+		cfg, w.addrStore, w.txStore, w, &w.txSubscriptions, w.store, w.id,
 	)
 	w.state = newWalletState(w.sync)
 
