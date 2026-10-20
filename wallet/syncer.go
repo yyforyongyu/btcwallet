@@ -231,6 +231,12 @@ type chainEventReq struct {
 	result chan error
 }
 
+// chainPauseReq holds the existing worker across one Manager-owned rollback.
+// Only Manager can resume it; the control carries no disconnect or Store work.
+type chainPauseReq struct {
+	resume <-chan struct{}
+}
+
 // chainSyncer is a private interface that abstracts the chain synchronization
 // logic, allowing it to be mocked for testing the wallet and controller.
 type chainSyncer interface {
@@ -1061,6 +1067,19 @@ func (s *syncer) txNotificationState(ctx context.Context,
 func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 	results []scanResult) error {
 
+	// A rollback invalidates already fetched results. Ordinary delivery must
+	// follow this batch, even when a conversion, commit, or registration fails.
+	pending, err := s.chainWriteBoundary(ctx)
+	if err != nil {
+		return err
+	}
+
+	if pending.result != nil {
+		defer func() {
+			pending.result <- s.handlePreparedChainUpdate(ctx, pending.event)
+		}()
+	}
+
 	params, err := s.storeScanBatchParams(scanState, results, true)
 	if err != nil {
 		return err
@@ -1101,6 +1120,19 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 // putTargetedBatch records targeted recovery scan results through the store.
 func (s *syncer) putTargetedBatch(ctx context.Context,
 	scanState *RecoveryState, results []scanResult) error {
+
+	// Targeted results can also contain old-branch facts. Retained ordinary
+	// delivery is acknowledged on every exit rather than stranded in backoff.
+	pending, err := s.chainWriteBoundary(ctx)
+	if err != nil {
+		return err
+	}
+
+	if pending.result != nil {
+		defer func() {
+			pending.result <- s.handlePreparedChainUpdate(ctx, pending.event)
+		}()
+	}
 
 	params, err := s.storeScanBatchParams(scanState, results, false)
 	if err != nil {
@@ -2125,6 +2157,54 @@ func (s *syncer) handleScanReq(ctx context.Context,
 	return s.scanWithRewind(ctx, req)
 }
 
+// handleChainRequest acknowledges prepared work on the sole syncer worker.
+// Pauses acknowledge quiescence first, then fence writes until continuation.
+func (s *syncer) handleChainRequest(ctx context.Context,
+	req chainEventReq) error {
+
+	if pause, ok := req.event.(chainPauseReq); ok {
+		req.result <- nil
+
+		select {
+		case <-pause.resume:
+			return nil
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// Manager owns terminal processing errors; the worker reports the exact
+	// prepared result without entering its historical retry path.
+	req.result <- s.handlePreparedChainUpdate(ctx, req.event)
+
+	return nil
+}
+
+// chainWriteBoundary services a waiting pause before a historical commit.
+// Ordinary work stays local until the caller's batch exits, preserving order.
+func (s *syncer) chainWriteBoundary(
+	ctx context.Context) (chainEventReq, error) {
+
+	select {
+	case req := <-s.chainReqChan:
+		if _, ok := req.event.(chainPauseReq); !ok {
+			return req, nil
+		}
+
+		err := s.handleChainRequest(ctx, req)
+		if err != nil {
+			return chainEventReq{}, err
+		}
+
+		// The rollback may have replaced the branch underlying this batch.
+		return chainEventReq{}, ErrStateChanged
+
+	default:
+		return chainEventReq{}, nil
+	}
+}
+
 // waitForEvent blocks until a notification, rescan job, or context
 // cancellation occurs, processing the event accordingly.
 func (s *syncer) waitForEvent(ctx context.Context) error {
@@ -2132,9 +2212,7 @@ func (s *syncer) waitForEvent(ctx context.Context) error {
 	// Prepared updates share the historical worker. Manager owns terminal
 	// failure handling, so acknowledge the exact result without retrying it.
 	case req := <-s.chainReqChan:
-		req.result <- s.handlePreparedChainUpdate(ctx, req.event)
-
-		return nil
+		return s.handleChainRequest(ctx, req)
 
 	// Process asynchronous notifications from the chain backend, such as
 	// new blocks or transactions.
@@ -2264,6 +2342,23 @@ func (s *syncer) scanWithTargets(ctx context.Context, req *scanReq) error {
 
 		// Persist the scan while rescanning still blocks transaction creation.
 		err = s.putTargetedBatch(ctx, scanState, results)
+		if errors.Is(err, ErrStateChanged) {
+			// Restart this Wallet's original request with fresh horizons
+			// and branch data; a discarded batch must not lose the rescan.
+			scanState, err = s.loadTargetedScanState(ctx, req.targets)
+			if err != nil {
+				return err
+			}
+
+			_, bestHeight, err = s.cfg.Chain.GetBestBlock()
+			if err != nil {
+				return fmt.Errorf("get best block: %w", err)
+			}
+
+			startHeight = req.startBlock.Height
+
+			continue
+		}
 		if err != nil {
 			return err
 		}

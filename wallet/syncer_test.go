@@ -226,6 +226,200 @@ func TestSyncerChainEventWaitsForRewind(t *testing.T) {
 	})
 }
 
+// TestSyncerRollbackPausesScanBatch rejects old-branch facts fetched before
+// the historical sync commit path acknowledges a database-wide rollback.
+func TestSyncerRollbackPausesScanBatch(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		t.Helper()
+
+		// Arrange: Keep an already fetched credit outside Store, then block
+		// a pause sender at the actual worker mailbox before the sync write.
+		store := &walletmock.Store{}
+		s := newTestSyncer(Config{}, nil, nil, nil, store, 7)
+		fixture := newStoreScanBatchFixture(t)
+		state := NewRecoveryState(0, &chainParams, nil)
+		resume := make(chan struct{})
+
+		paused := make(chan error, 1)
+		go func() {
+			paused <- s.requestChainEvent(t.Context(),
+				chainPauseReq{resume: resume}, nil, nil)
+		}()
+
+		synctest.Wait()
+		store.On("RollbackToBlock", mock.Anything, uint32(100)).
+			Return(nil).Once()
+		t.Cleanup(func() { store.AssertExpectations(t) })
+
+		// Act: The batch receives the pause before conversion or
+		// persistence. Roll back only after that receipt, then resume.
+		batch := make(chan error, 1)
+		go func() {
+			batch <- s.putSyncBatch(t.Context(), state,
+				[]scanResult{fixture.result})
+		}()
+
+		require.NoError(t, <-paused)
+		require.Empty(t, batch)
+		require.NoError(t, store.RollbackToBlock(t.Context(), 100))
+		close(resume)
+
+		// Assert: No ApplyScanBatch call is permitted by the mock;
+		// neither old credit nor its old checkpoint can reappear.
+		require.ErrorIs(t, <-batch, ErrStateChanged)
+	})
+}
+
+// TestSyncerRollbackTargetedBatch keeps an accepted targeted request alive
+// across rollback by reloading state and refetching its original range.
+func TestSyncerRollbackTargetedBatch(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		t.Helper()
+
+		// Arrange: Hold the old header read inside a real targeted scan.
+		// Empty horizons isolate request continuation from address derivation.
+		store := &walletmock.Store{}
+		backend := &bwmock.Chain{}
+		s := newTestSyncer(Config{
+			Chain: backend, ChainParams: &chainParams,
+		}, nil, nil, nil, store, 7)
+		store.On("ListAccounts", mock.Anything, mock.Anything).
+			Return([]db.AccountInfo(nil), nil).Times(4)
+
+		for range 2 {
+			expectImportedScanAddressPage(store, 7,
+				page.Result[db.AddressInfo, uint32]{})
+		}
+
+		store.On("ListOutputsToWatch", mock.Anything, uint32(7)).
+			Return([]db.UtxoInfo(nil), nil).Twice()
+		backend.On("GetBestBlock").
+			Return(&chainhash.Hash{2}, int32(1), nil).Twice()
+
+		read, release := make(chan struct{}), make(chan struct{})
+		for _, hash := range []chainhash.Hash{{1}, {2}} {
+			hashes := []chainhash.Hash{hash}
+			backend.On("GetBlockHashes", int64(1), int64(1)).
+				Return(hashes, nil).Once()
+
+			call := backend.On("GetBlockHeaders", hashes).Return(
+				[]*wire.BlockHeader{{Timestamp: time.Unix(1, 0)}}, nil,
+			).Once()
+			if hash[0] == 1 {
+				call.Run(func(mock.Arguments) {
+					close(read)
+					<-release
+				})
+			}
+		}
+
+		store.On("RollbackToBlock", mock.Anything, uint32(1)).
+			Return(nil).Once()
+		store.On("ApplyScanBatch", mock.Anything, mock.MatchedBy(
+			func(params db.ScanBatchParams) bool {
+				return params.WalletID == 7 &&
+					len(params.Transactions) == 0 &&
+					len(params.SyncedBlocks) == 0
+			},
+		)).Return(nil).Once()
+		t.Cleanup(func() {
+			store.AssertExpectations(t)
+			backend.AssertExpectations(t)
+		})
+
+		result := make(chan error, 1)
+		go func() {
+			result <- s.scanWithTargets(t.Context(), &scanReq{
+				startBlock: waddrmgr.BlockStamp{Height: 1},
+			})
+		}()
+
+		<-read
+
+		// Act: Admit the pause while the old branch is already read, then
+		// let the worker reach its commit boundary before rolling back.
+		resume, paused := make(chan struct{}), make(chan error, 1)
+		go func() {
+			paused <- s.requestChainEvent(t.Context(),
+				chainPauseReq{resume: resume}, nil, nil)
+		}()
+
+		synctest.Wait()
+		close(release)
+		require.NoError(t, <-paused)
+		require.NoError(t, store.RollbackToBlock(t.Context(), 1))
+		close(resume)
+
+		// Assert: A fresh state and replacement header precede the sole
+		// targeted commit; the request completes instead of being dropped.
+		require.NoError(t, <-result)
+		require.Equal(t, syncStateSynced, s.syncState())
+	})
+}
+
+// TestSyncerRollbackRetainedRequestFailure proves ordinary delivery follows
+// the historical attempt and always settles, including a failed Store write.
+func TestSyncerRollbackRetainedRequestFailure(t *testing.T) {
+	t.Parallel()
+
+	for _, commitErr := range []error{nil, errDBMock} {
+		t.Run(fmt.Sprintf("commit=%v", commitErr), func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				t.Helper()
+
+				// Arrange: Queue the next connected event while a fetched
+				// historical batch still owns the current write attempt.
+				store := &walletmock.Store{}
+				s := newTestSyncer(Config{}, nil, nil, nil, store, 7)
+				state := NewRecoveryState(0, &chainParams, nil)
+
+				var height int32
+				if commitErr == nil {
+					height = 1
+				}
+
+				batchCall := store.On("ApplyScanBatch", mock.Anything,
+					mock.Anything).Return(commitErr).Once()
+				tipCall := store.On("GetWallet", mock.Anything, "").
+					Return(&db.WalletInfo{SyncedTo: &db.Block{
+						Height: uint32(height),
+					}}, nil).Once().NotBefore(batchCall)
+				store.On("ApplyTxBatch", mock.Anything, mock.Anything).
+					Return(nil).Once().NotBefore(tipCall)
+				t.Cleanup(func() { store.AssertExpectations(t) })
+
+				delivered := make(chan error, 1)
+				go func() {
+					delivered <- s.requestChainEvent(t.Context(),
+						chain.FilteredBlockConnected{
+							Block: &wtxmgr.BlockMeta{
+								Block: wtxmgr.Block{Height: height + 1},
+							},
+						}, nil, nil)
+				}()
+
+				synctest.Wait()
+
+				// Act: Consume the waiting envelope at the batch boundary;
+				// the deferred processing must run on success and failure.
+				err := s.putSyncBatch(t.Context(), state, []scanResult{{
+					meta: &wtxmgr.BlockMeta{
+						Block: wtxmgr.Block{Height: 1},
+					},
+				}})
+
+				// Assert: The historical result remains its own outcome,
+				// while the next event commits and acknowledges separately.
+				require.ErrorIs(t, err, commitErr)
+				require.NoError(t, <-delivered)
+			})
+		})
+	}
+}
+
 // TestSyncerInitialization verifies that a new syncer is created with the
 // correct default state.
 func TestSyncerInitialization(t *testing.T) {
