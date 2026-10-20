@@ -1,19 +1,26 @@
 package wallet
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"iter"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	walletmock "github.com/btcsuite/btcwallet/wallet/internal/bwtest/mock"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
@@ -163,6 +170,612 @@ func TestManagerChainEventFailureStopsManager(t *testing.T) {
 	require.Empty(t, manager.wallets)
 	require.ErrorIs(t, first.state.validateStarted(), ErrWalletStopped)
 	require.ErrorIs(t, second.state.validateStarted(), ErrWalletStopped)
+}
+
+// chainEventWalletData supplies real private startup and sync-worker reads at
+// height zero. Expected maintenance counts make readiness deterministic rather
+// than leaving an unsynced fixture unable to receive prepared delivery.
+func chainEventWalletData(t *testing.T, name string, id uint32,
+	events int) (*walletData, *mockWalletDeps) {
+
+	t.Helper()
+
+	_, deps := createTestWalletWithMocks(t)
+	deps.store.On("GetWallet", mock.Anything, name).Return(
+		&db.WalletInfo{
+			BirthdayBlock: &db.Block{},
+			SyncedTo:      &db.Block{},
+		}, nil,
+	).Times(3 + events)
+	deps.store.On("ListAccounts", mock.Anything, db.ListAccountsQuery{
+		WalletID: id,
+	}).Return([]db.AccountInfo(nil), nil).Once()
+	deps.store.On("DeleteExpiredLeases", mock.Anything, id).Return(nil).Once()
+	deps.store.On("ListAccounts", mock.Anything, db.ListAccountsQuery{
+		WalletID:      id,
+		SkipBalance:   true,
+		ChainSyncOnly: true,
+	}).Return([]db.AccountInfo(nil), nil).Once()
+	expectImportedScanAddressPage(
+		deps.store, id, page.Result[db.AddressInfo, uint32]{},
+	)
+	deps.store.On("ListOutputsToWatch", mock.Anything, id).
+		Return([]db.UtxoInfo(nil), nil).Once()
+	deps.store.On("ListTxns", mock.Anything, mock.Anything).
+		Return([]db.TxInfo(nil), nil).Times(1 + events)
+	deps.vault.On("Lock").Return().Once()
+
+	return &walletData{
+		id:          id,
+		name:        name,
+		store:       deps.store,
+		vault:       deps.vault,
+		isWatchOnly: true,
+	}, deps
+}
+
+// expectChainEventSource supplies only existing worker initialization and
+// maintenance calls. A readiness token marks every actual notification wait;
+// the caller's existing fixture remains the sole mock-verification owner.
+func expectChainEventSource(backend *bwmock.Chain, wallets, waits int,
+	ready chan<- struct{}, source <-chan any) {
+
+	for range wallets {
+		backend.On("IsCurrent").Return(true).Once()
+		backend.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
+			Return(nil).Once()
+		backend.On("NotifyBlocks").Return(nil).Once()
+	}
+
+	for range waits {
+		backend.On("GetBestBlock").Return(
+			&chainhash.Hash{}, int32(0), nil,
+		).Once()
+		backend.On("Notifications").Run(func(mock.Arguments) {
+			ready <- struct{}{}
+		}).Return(source).Once()
+	}
+}
+
+// TestManagerChainEventRegistration fixes startup and Create membership at the
+// same admission boundary without replaying an older event to the new Wallet.
+func TestManagerChainEventRegistration(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Start the complete durable pair on real workers, then
+	// prepare a third Wallet for Create. Each worker reaches receipt.
+	first, firstDeps := chainEventWalletData(t, "first", 1, 2)
+	second, secondDeps := chainEventWalletData(t, "second", 2, 2)
+	third, thirdDeps := chainEventWalletData(t, "third", 3, 1)
+	backend := &managerBackendMock{}
+	backend.On("listWallets", mock.Anything).
+		Return([]*walletData{first, second}, nil).Once()
+
+	params := managerLifecycleCreateParams("third")
+	backend.On("create", mock.Anything, params, mock.Anything).
+		Return(third, nil).Once()
+	backend.On("close").Return(nil).Once()
+	manager := newManagerLifecycleTest(t, backend)
+	manager.chainDone = make(chan struct{})
+	source, ok := manager.config.ChainSource.(*bwmock.Chain)
+	require.True(t, ok)
+
+	ready := make(chan struct{}, 8)
+	expectChainEventSource(source, 3, 8, ready, nil)
+
+	event := chain.RelevantTx{TxRecord: &wtxmgr.TxRecord{}}
+
+	processors := []struct {
+		store  *walletmock.Store
+		id     uint32
+		events int
+	}{
+		{
+			store:  firstDeps.store,
+			id:     1,
+			events: 2,
+		},
+		{
+			store:  secondDeps.store,
+			id:     2,
+			events: 2,
+		},
+		{
+			store:  thirdDeps.store,
+			id:     3,
+			events: 1,
+		},
+	}
+	for _, processor := range processors {
+		for range processor.events {
+			// This registration-only record has no owned effects; each
+			// receipt still reaches the prepared batch boundary below.
+			processor.store.On(
+				"ResolveOwnedAddresses", mock.Anything,
+				matchResolveOwnedAddressesQuery(processor.id),
+			).Return(map[string]*db.AddressInfo{}, nil).Once()
+		}
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDeps.store.On("ApplyTxBatch", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) {
+			close(entered)
+			<-release
+		}).Return(nil).Once()
+	firstDeps.store.On("ApplyTxBatch", mock.Anything, mock.Anything).
+		Return(nil).Once()
+	secondDeps.store.On("ApplyTxBatch", mock.Anything, mock.Anything).
+		Return(nil).Twice()
+	thirdDeps.store.On("ApplyTxBatch", mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	loaded, err := manager.Start(t.Context())
+	require.NoError(t, err)
+	require.Len(t, loaded, 2)
+	<-ready
+	<-ready
+
+	// Act: Hold an admitted event before Create can publish. After
+	// it settles, publish the third processor and deliver again.
+	delivered := make(chan error, 1)
+	go func() {
+		delivered <- manager.dispatchChainEvent(t.Context(), event)
+	}()
+
+	<-entered
+
+	type createResult struct {
+		wallet *Wallet
+		err    error
+	}
+
+	created := make(chan createResult, 1)
+	go func() {
+		w, createErr := manager.Create(params)
+		created <- createResult{
+			wallet: w,
+			err:    createErr,
+		}
+	}()
+
+	close(release)
+	require.NoError(t, <-delivered)
+
+	result := <-created
+
+	for range 3 {
+		<-ready
+	}
+
+	err = manager.dispatchChainEvent(t.Context(), event)
+
+	for range 3 {
+		<-ready
+	}
+
+	// Assert: Startup contributes both durable Wallets, Create
+	// contributes only to the later fanout, and exact Store calls
+	// prove that no old delivery reached the new processor.
+	require.NoError(t, result.err)
+	require.Equal(t, uint32(3), result.wallet.ID())
+	require.NoError(t, err)
+}
+
+// TestManagerChainEventWorkerExit prevents partial fanout from waiting forever
+// when the actual sync worker ends without canceling Wallet lifetime.
+func TestManagerChainEventWorkerExit(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Start a real second worker on an open source, while the first
+	// target's strict processor closes that source after accepting the event.
+	first, firstDeps := newChainEventTestWallet(t, "first", 1)
+	data, deps := chainEventWalletData(t, "second", 2, 0)
+	ready := make(chan struct{}, 1)
+	source := make(chan any)
+	expectChainEventSource(deps.chain, 1, 1, ready, source)
+	second := newManagedWallet(Config{
+		Name:        "second",
+		Chain:       deps.chain,
+		ChainParams: &chainParams,
+	}, data)
+	require.NoError(t, second.start(t.Context()))
+	<-ready
+
+	manager := testSQLManager(t, &walletmock.Store{})
+	manager.wallets[first.cfg.Name] = first
+	manager.wallets[second.cfg.Name] = second
+	event := chain.RelevantTx{TxRecord: &wtxmgr.TxRecord{}}
+	firstDeps.syncer.On("requestChainEvent", mock.Anything, event,
+		(<-chan struct{})(manager.chainDone), first.syncDone,
+	).Run(func(mock.Arguments) {
+		close(source)
+		<-second.syncDone
+	}).Return(nil).Once()
+
+	// Act: The real second processor has permanently exited by the time its
+	// prepared handoff begins; no external Stop is used to release the send.
+	err := manager.dispatchChainEvent(t.Context(), event)
+
+	// Assert: A dead processor makes partial fanout fail and closes Store
+	// only through joined aggregate teardown, rather than reporting success.
+	require.ErrorIs(t, err, ErrWalletStopped)
+	require.Nil(t, manager.backend)
+	require.Empty(t, manager.wallets)
+	require.ErrorIs(t, second.state.validateStarted(), ErrWalletStopped)
+}
+
+// TestManagerChainEventBlockPayload verifies atomic no-match progress and
+// matching isolation when real processors consume the same block payload.
+func TestManagerChainEventBlockPayload(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Share immutable source records between real processors. Each
+	// Store receives its own Wallet batch; neither matching pass may edit the
+	// source transaction, script, order, or block metadata.
+	addr, err := address.NewAddressPubKeyHash(make([]byte, 20), &chainParams)
+	require.NoError(t, err)
+	script, err := txscript.PayToAddrScript(addr)
+	require.NoError(t, err)
+
+	tx := wire.NewMsgTx(1)
+	tx.AddTxOut(&wire.TxOut{Value: 1000, PkScript: script})
+
+	received := time.Unix(1, 0)
+	record, err := wtxmgr.NewTxRecordFromMsgTx(tx, received)
+	require.NoError(t, err)
+
+	original := *record
+	original.MsgTx = *record.MsgTx.Copy()
+	original.SerializedTx = bytes.Clone(record.SerializedTx)
+	empty := wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Hash: chainhash.Hash{1}, Height: 1},
+		Time:  time.Unix(1, 0),
+	}
+	block := wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Hash: chainhash.Hash{2}, Height: 2},
+		Time:  time.Unix(2, 0),
+	}
+	originalBlock := block
+	event := chain.FilteredBlockConnected{
+		Block:       &block,
+		RelevantTxs: []*wtxmgr.TxRecord{record},
+	}
+	storedEmptyBlock, err := storeBlockFromBlockMeta(empty)
+	require.NoError(t, err)
+
+	ready := make(chan struct{}, 6)
+
+	wallets := make([]*Wallet, 0, 2)
+	for i, name := range []string{"first", "second"} {
+		w, deps := createTestWalletWithMocks(t)
+		w.id = uint32(i + 1)
+		w.cfg.Name = name
+		s := newSyncer(w.cfg, nil, nil, w, w.store, w.id)
+		w.sync = s
+		w.state = newWalletState(s)
+
+		deps.vault.On("Lock").Return().Once()
+		deps.chain.On("Notifications").Run(func(mock.Arguments) {
+			ready <- struct{}{}
+		}).Return((<-chan any)(nil)).Times(3)
+		deps.store.On("GetWallet", mock.Anything, name).Return(
+			&db.WalletInfo{SyncedTo: &db.Block{}}, nil,
+		).Once()
+		deps.store.On("GetWallet", mock.Anything, name).Return(
+			&db.WalletInfo{SyncedTo: &db.Block{Height: 1}}, nil,
+		).Once()
+		deps.store.On("ApplyTxBatch", mock.Anything, db.TxBatchParams{
+			WalletID:     w.id,
+			Transactions: []db.CreateTxParams{},
+			SyncedTo:     storedEmptyBlock,
+		}).Return(nil).Once()
+		// Both processors match the shared record independently, so the
+		// second matching pass must receive the original transaction data.
+		deps.store.On("ResolveOwnedAddresses", mock.Anything,
+			matchResolveOwnedAddressesQuery(w.id, script),
+		).Return(ownedAddrsResult(script), nil).Once()
+		deps.store.On("ApplyTxBatch", mock.Anything,
+			matchBlockTxBatch(w.id, tx, addr, received, &block),
+		).Return(nil).Once()
+		startLoadedWalletForTest(t, w)
+
+		// Pump the existing processor loop under Wallet's joined lifecycle;
+		// maintenance/source initialization belongs to the other regressions.
+		w.wg.Go(func() {
+			for {
+				err := s.waitForEvent(w.lifetimeCtx)
+				if err != nil {
+					return
+				}
+			}
+		})
+		wallets = append(wallets, w)
+	}
+
+	manager := testSQLManager(t, &walletmock.Store{})
+	for _, w := range wallets {
+		manager.wallets[w.cfg.Name] = w
+
+		<-ready
+	}
+
+	// Act: Advance an empty block for every Wallet, then deliver the shared
+	// filtered payload. Tokens ensure both workers are parked before cleanup.
+	noMatchErr := manager.dispatchChainEvent(
+		t.Context(), chain.BlockConnected(empty),
+	)
+
+	for range 2 {
+		<-ready
+	}
+
+	payloadErr := manager.dispatchChainEvent(t.Context(), event)
+
+	for range 2 {
+		<-ready
+	}
+
+	// Assert: Batches include each Wallet's tip with its effects, even for
+	// zero transactions, and the second processor sees the original payload.
+	require.NoError(t, noMatchErr)
+	require.NoError(t, payloadErr)
+	require.Equal(t, original, *record)
+	require.Equal(t, originalBlock, block)
+	require.Equal(t, []*wtxmgr.TxRecord{record}, event.RelevantTxs)
+}
+
+// TestManagerChainEventWalletRelevance prevents shared prepared records from
+// leaking into another Wallet's persisted history or transaction subscription.
+func TestManagerChainEventWalletRelevance(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Run two real SQLite Wallets against a genesis-only backend.
+	// Explicit notification-wait tokens keep delivery on the existing workers;
+	// the first Wallet alone derives the receiving script used by this block.
+	manager, source, recipient := newLiveWatchManager(t)
+	ready := make(chan struct{}, 6)
+
+	source.On("IsCurrent").Unset()
+	source.On("IsCurrent").Return(true).Twice()
+	source.On("NotifyBlocks").Return(nil).Twice()
+	source.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
+		Return(nil).Times(3)
+	source.On("Notifications").Run(func(mock.Arguments) {
+		ready <- struct{}{}
+	}).Return((<-chan any)(nil)).Times(6)
+
+	params := sqliteCreateParams(t)
+	params.Name = "unrelated"
+	unrelated, err := manager.Create(params)
+	require.NoError(t, err)
+
+	wallets := []*Wallet{recipient, unrelated}
+	recv, err := recipient.NewAddress(t.Context(), NewAccountSelectorByName(
+		waddrmgr.KeyScopeBIP0084, waddrmgr.DefaultAccountName,
+	), false)
+	require.NoError(t, err)
+	script, err := txscript.PayToAddrScript(recv.Addr)
+	require.NoError(t, err)
+
+	funding := subscriptionTx(script, 87)
+	funding.AddTxOut(&wire.TxOut{Value: 1000, PkScript: script})
+
+	child := subscriptionTx([]byte{txscript.OP_TRUE}, 88)
+	child.TxIn[0].PreviousOutPoint = wire.OutPoint{Hash: funding.TxHash()}
+	spend := subscriptionTx([]byte{txscript.OP_TRUE}, 89)
+	spend.TxIn[0].PreviousOutPoint = wire.OutPoint{
+		Hash: funding.TxHash(), Index: 1,
+	}
+
+	// The existing post-event maintenance rebroadcasts only the relevant
+	// unmined spend. Report it already known so this adds no publication write
+	// or extra observation to the prepared-event regression.
+	source.On("TestMempoolAccept", mock.MatchedBy(
+		func(txns []*wire.MsgTx) bool {
+			return len(txns) == 1 && txns[0].TxHash() == spend.TxHash()
+		},
+	), float64(0)).Return(nil, chain.ErrTxAlreadyInMempool).Once()
+
+	records := make([]*wtxmgr.TxRecord, 0, 3)
+	for _, tx := range []*wire.MsgTx{funding, child, spend} {
+		record, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Unix(1, 0))
+		require.NoError(t, err)
+
+		records = append(records, record)
+	}
+
+	block := wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Hash: chainhash.Hash{87}, Height: 1},
+		Time:  time.Unix(1, 0),
+	}
+	events, cancel, err := wallets[0].SubscribeTxns(t.Context())
+	require.NoError(t, err)
+
+	defer cancel()
+
+	unrelatedEvents, cancelUnrelated, err := wallets[1].SubscribeTxns(
+		t.Context(),
+	)
+	require.NoError(t, err)
+
+	defer cancelUnrelated()
+
+	<-ready
+	<-ready
+
+	// Act: Commit a payment with its debit-only same-block child in one
+	// prepared block, then submit an unmined spend of its other owned output.
+	// Wait tokens also settle ordinary worker maintenance before assertions.
+	blockErr := manager.dispatchChainEvent(t.Context(),
+		chain.FilteredBlockConnected{
+			Block:       &block,
+			RelevantTxs: records[:2],
+		},
+	)
+
+	<-ready
+	<-ready
+
+	spendErr := manager.dispatchChainEvent(t.Context(), chain.RelevantTx{
+		TxRecord: records[2],
+	})
+
+	<-ready
+	<-ready
+
+	// Assert: Public history and observations contain all three relevant
+	// transactions only in the recipient. The unmatched Wallet advances its
+	// atomic checkpoint without a transaction row or a notification.
+	require.NoError(t, blockErr)
+	require.NoError(t, spendErr)
+
+	for _, record := range records {
+		_, err := wallets[0].GetTx(t.Context(), record.Hash)
+		require.NoError(t, err)
+		_, err = wallets[1].GetTx(t.Context(), record.Hash)
+		require.ErrorIs(t, err, ErrTxNotFound)
+
+		select {
+		case event := <-events:
+			require.Equal(t, record.Hash, event.Detail.Hash)
+		default:
+			t.Fatal("recipient lost a committed transaction observation")
+		}
+	}
+
+	history, err := wallets[0].ListTxns(t.Context(), 0, -1)
+	require.NoError(t, err)
+	require.Len(t, history, 3)
+	history, err = wallets[1].ListTxns(t.Context(), 0, -1)
+	require.NoError(t, err)
+	require.Empty(t, history)
+
+	for _, w := range wallets {
+		info, err := w.Info(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, block.Height, info.SyncedTo.Height)
+		require.Equal(t, block.Hash, info.SyncedTo.Hash)
+	}
+
+	select {
+	case event := <-unrelatedEvents:
+		t.Fatalf("unrelated Wallet received transaction observation: %v", event)
+	default:
+	}
+}
+
+// TestManagerChainEventBlockedStop proves a backpressured handoff, failed
+// partial delivery, and later admission settle before shared Store closure.
+func TestManagerChainEventBlockedStop(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Hold the second existing worker in an accepted rewind. The
+	// first target completes, leaving the prepared send blocked on that busy
+	// worker; cancellation is observed before allowing its Store call to end.
+	first, firstDeps := newChainEventTestWallet(t, "first", 1)
+	second, deps := createTestWalletWithMocks(t)
+	second.cfg.Name = "second"
+	second.id = 2
+	s := newSyncer(second.cfg, nil, nil, second, second.store, second.id)
+	second.sync = s
+	second.state = newWalletState(s)
+	s.state.Store(uint32(syncStateSynced))
+	deps.vault.On("Lock").Return().Once()
+	deps.chain.On("Notifications").Return((<-chan any)(nil)).Once()
+	deps.store.On("GetWallet", mock.Anything, "second").Return(
+		&db.WalletInfo{SyncedTo: &db.Block{Height: 10}}, nil,
+	).Once()
+	fork := waddrmgr.BlockStamp{
+		Hash:      chainhash.Hash{5},
+		Height:    5,
+		Timestamp: time.Unix(5, 0),
+	}
+	entered := make(chan struct{})
+	draining := make(chan struct{})
+	release := make(chan struct{})
+	deps.store.On("RewindWallet", mock.Anything,
+		matchRewindWalletParams(second.id, fork),
+	).Run(func(args mock.Arguments) {
+		close(entered)
+		ctx, ok := args.Get(0).(context.Context)
+		if !ok {
+			panic("rewind has no context")
+		}
+		<-ctx.Done()
+		close(draining)
+		<-release
+	}).Return(context.Canceled).Once()
+	startLoadedWalletForTest(t, second)
+	require.NoError(t, s.requestScan(t.Context(), &scanReq{
+		typ:        scanTypeRewind,
+		startBlock: fork,
+	}))
+
+	workerResult := make(chan error, 1)
+	second.wg.Go(func() {
+		workerResult <- s.waitForEvent(second.lifetimeCtx)
+	})
+	<-entered
+
+	manager := testSQLManager(t, &walletmock.Store{})
+	manager.wallets[first.cfg.Name] = first
+	manager.wallets[second.cfg.Name] = second
+	storeClosed := make(chan struct{})
+	backend, ok := manager.backend.(*sqlManagerBackend)
+	require.True(t, ok)
+
+	backend.closeFn = func() error {
+		close(storeClosed)
+		return nil
+	}
+	// Even an aborted assertion must release owned Store work before the
+	// existing fixture attempts its Manager/Wallet joins.
+	releaseWork := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseWork)
+
+	applied := make(chan struct{})
+	event := chain.RelevantTx{TxRecord: &wtxmgr.TxRecord{}}
+	firstDeps.syncer.On("requestChainEvent", mock.Anything, event,
+		(<-chan struct{})(manager.chainDone), first.syncDone,
+	).Run(func(mock.Arguments) {
+		close(applied)
+	}).Return(nil).Once()
+
+	// Act: Stop while one target has applied and another cannot receive.
+	// A concurrent later admission must also reject without Store access.
+	delivered := make(chan error, 1)
+	later := make(chan error, 1)
+	stopped := make(chan error, 1)
+
+	go func() {
+		delivered <- manager.dispatchChainEvent(t.Context(), event)
+	}()
+
+	<-applied
+
+	go func() { later <- manager.dispatchChainEvent(t.Context(), event) }()
+	go func() { stopped <- manager.Stop() }()
+
+	<-draining
+
+	// Assert: Cancellation can release delivery waits, but neither caller
+	// nor storage may outlive the still-held processor. Release then join all.
+	select {
+	case <-storeClosed:
+		t.Fatal("Store closes before accepted worker joins")
+	default:
+	}
+
+	require.Empty(t, delivered)
+	require.Empty(t, stopped)
+	releaseWork()
+	require.ErrorIs(t, <-delivered, ErrManagerStopped)
+	require.ErrorIs(t, <-later, ErrManagerStopped)
+	require.NoError(t, <-stopped)
+	require.ErrorIs(t, <-workerResult, context.Canceled)
+	<-storeClosed
 }
 
 // TestWalletID verifies that Wallet.ID returns the cached runtime ID.
