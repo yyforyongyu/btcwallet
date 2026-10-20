@@ -186,6 +186,8 @@ func testSQLManager(tb testing.TB, store *walletmock.Store) *Manager {
 
 	m := &Manager{
 		wallets: make(map[string]*Wallet),
+		// Match SQL construction so prepared Stop can interrupt delivery.
+		chainDone: make(chan struct{}),
 		backend: &sqlManagerBackend{
 			store:   store,
 			closeFn: func() error { return nil },

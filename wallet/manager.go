@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 )
 
 var (
@@ -147,6 +149,15 @@ type Manager struct {
 
 	// config is the immutable shared policy retained at construction.
 	config ManagerConfig
+
+	// chainDone closes before Stop waits on the registry lock, releasing
+	// blocked prepared delivery so it can join workers and close storage.
+	// Nil leaves modern kvdb on its isolated notification path.
+	chainDone chan struct{}
+
+	// chainStopOnce lets Stop and processor failure close admission together
+	// without racing channel closure. The channel is immutable after assembly.
+	chainStopOnce sync.Once
 }
 
 // NewManager opens the one database described by cfg and returns a Manager that
@@ -210,11 +221,18 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	// another reference in the Manager's otherwise immutable configuration.
 	cfg.KVDBPubPassphrase = nil
 
-	return &Manager{
+	manager := &Manager{
 		wallets: make(map[string]*Wallet),
 		backend: backend,
 		config:  cfg,
-	}, nil
+	}
+
+	// Only SQL Managers participate in the prepared shared delivery path.
+	if cfg.Backend != DBBackendKVDB {
+		manager.chainDone = make(chan struct{})
+	}
+
+	return manager, nil
 }
 
 // startWallets assembles and starts durable Wallets in stable identifier order.
@@ -259,6 +277,9 @@ func (m *Manager) startWallets(ctx context.Context) ([]*Wallet, error) {
 // from failed Start/Create calls that are not in m.wallets.
 // The caller holds the write lock and must have a non-nil backend.
 func (m *Manager) stopWallets(wallets []*Wallet) error {
+	// Start/Create failure must close the same prepared admission as Stop.
+	m.closeChainAdmission()
+
 	for _, wallet := range m.wallets {
 		wallets = append(wallets, wallet)
 	}
@@ -373,6 +394,10 @@ func (m *Manager) Start(ctx context.Context) ([]*Wallet, error) {
 // It waits for startup, accepted creation, and any other Stop to finish.
 // After shutdown, Stop is a no-op.
 func (m *Manager) Stop() error {
+	// Delivery may hold the registry lock while waiting on a busy processor.
+	// Release that wait before joining it through the existing lock.
+	m.closeChainAdmission()
+
 	m.Lock()
 	defer m.Unlock()
 
@@ -386,6 +411,100 @@ func (m *Manager) Stop() error {
 	m.started.Store(true)
 
 	return m.stopWallets(nil)
+}
+
+// closeChainAdmission releases prepared send/result waits without acquiring
+// the registry lock. Existing Wallet teardown still owns every worker join.
+func (m *Manager) closeChainAdmission() {
+	if m.chainDone != nil {
+		m.chainStopOnce.Do(func() {
+			close(m.chainDone)
+		})
+	}
+}
+
+// normalizeConnectedChainEvent limits the prepared path to connected work.
+// A normalized header-only block must also advance Wallets without matches;
+// raw equal-block notification coalescing remains the source cutover's job.
+func normalizeConnectedChainEvent(event any) (any, error) {
+	switch update := event.(type) {
+	case chain.BlockConnected:
+		block := wtxmgr.BlockMeta(update)
+		return chain.FilteredBlockConnected{Block: &block}, nil
+
+	case chain.FilteredBlockConnected, chain.RelevantTx:
+		return event, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported prepared chain event %T: %w",
+			event, db.ErrInvalidParam)
+	}
+}
+
+// dispatchChainEvent synchronously delivers one normalized connected event to
+// every published SQL Wallet in source admission order. Registry publication
+// shares this lock, so Create joins only later events. Caller cancellation is
+// checked before admission; accepted work belongs to the Wallet lifetimes.
+func (m *Manager) dispatchChainEvent(ctx context.Context, event any) error {
+	update, err := normalizeConnectedChainEvent(event)
+	if err != nil {
+		return err
+	}
+
+	m.Lock()
+	defer m.Unlock()
+
+	// Reject before taking a Wallet snapshot or reaching any Store method.
+	switch {
+	case m.backend == nil:
+		return ErrManagerStopped
+
+	case !m.started.Load(), m.chainDone == nil:
+		return ErrStateForbidden
+	}
+
+	err = ctx.Err()
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-m.chainDone:
+		return ErrManagerStopped
+
+	default:
+	}
+
+	// Reuse the published set rather than retaining another registry. Stable
+	// target order also makes a failed partial fanout reproducible.
+	wallets := make([]*Wallet, 0, len(m.wallets))
+	for _, wallet := range m.wallets {
+		wallets = append(wallets, wallet)
+	}
+
+	sort.Slice(wallets, func(i, j int) bool {
+		return wallets[i].id < wallets[j].id
+	})
+
+	// Keep caller values without letting one waiter abandon accepted fanout.
+	// The existing worker still uses Wallet lifetime for all persistence;
+	// Manager shutdown and worker completion release the handoff waits.
+	ctx = context.WithoutCancel(ctx)
+	for _, wallet := range wallets {
+		err := wallet.sync.requestChainEvent(
+			ctx, update, m.chainDone, wallet.syncDone,
+		)
+		if err != nil {
+			// Partial delivery is terminal. Join even an unacknowledged
+			// handler before the caller can reuse its event or Store closes.
+			return errors.Join(fmt.Errorf(
+				"deliver chain event to wallet %q: %w",
+				wallet.cfg.Name, err,
+			), m.stopWallets(nil))
+		}
+	}
+
+	return nil
 }
 
 // String returns a summary of the active wallets managed by the Manager.

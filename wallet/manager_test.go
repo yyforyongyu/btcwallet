@@ -10,13 +10,160 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
+	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	walletmock "github.com/btcsuite/btcwallet/wallet/internal/bwtest/mock"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+// newChainEventTestWallet reuses the joined request-loop fixture for dispatcher
+// contract tests whose processor outcomes are supplied by mockChainSyncer.
+func newChainEventTestWallet(t *testing.T, name string,
+	id uint32) (*Wallet, *mockWalletDeps) {
+
+	t.Helper()
+
+	w, deps := createTestWalletWithMocks(t)
+	w.cfg.Name = name
+	w.id = id
+	startLoadedWalletForTest(t, w)
+	deps.vault.On("Lock").Return().Once()
+
+	return w, deps
+}
+
+// TestManagerChainEventOrder verifies complete, identically ordered fanout
+// including normalized header-only progress, filtered blocks, and mempool txs.
+func TestManagerChainEventOrder(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Publish two strict processors in reverse map insertion order;
+	// expectations require Wallet-ID order and the same mixed event sequence.
+	first, firstDeps := newChainEventTestWallet(t, "first", 1)
+	second, secondDeps := newChainEventTestWallet(t, "second", 2)
+	manager := testSQLManager(t, &walletmock.Store{})
+	manager.wallets[second.cfg.Name] = second
+	manager.wallets[first.cfg.Name] = first
+	block := &wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Height: 1},
+	}
+	tx := chain.RelevantTx{TxRecord: &wtxmgr.TxRecord{}}
+	filtered := chain.FilteredBlockConnected{
+		Block: &wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 2}},
+	}
+	events := []struct {
+		input any
+		want  any
+	}{
+		{
+			input: chain.BlockConnected(*block),
+			want:  chain.FilteredBlockConnected{Block: block},
+		},
+		{
+			input: filtered,
+			want:  filtered,
+		},
+		{
+			input: tx,
+			want:  tx,
+		},
+	}
+
+	calls := make([]*mock.Call, 0, 2*len(events))
+	for _, event := range events {
+		calls = append(calls, firstDeps.syncer.On(
+			"requestChainEvent", mock.Anything, event.want,
+			(<-chan struct{})(manager.chainDone), first.syncDone,
+		).Return(nil).Once())
+		calls = append(calls, secondDeps.syncer.On(
+			"requestChainEvent", mock.Anything, event.want,
+			(<-chan struct{})(manager.chainDone), second.syncDone,
+		).Return(nil).Once())
+	}
+
+	mock.InOrder(calls...)
+
+	// Act: Submit normalized source events synchronously through Manager;
+	// no consumer reads the maintained notification source in this test.
+	results := make([]error, 0, len(events))
+	for _, event := range events {
+		results = append(results, manager.dispatchChainEvent(
+			t.Context(), event.input,
+		))
+	}
+
+	// Assert: Each complete fanout succeeds; fixture-owned mock verification
+	// checks every exact target, payload, order, and single delivery.
+	for _, err := range results {
+		require.NoError(t, err)
+	}
+}
+
+// TestManagerChainEventRejectsDisconnect prevents prepared connected fanout
+// from reaching the legacy per-Wallet rollback handler.
+func TestManagerChainEventRejectsDisconnect(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: A strict registered processor and Store permit no event or
+	// rollback call; only normal fixture shutdown may touch the Vault.
+	w, _ := newChainEventTestWallet(t, "first", 1)
+	manager := testSQLManager(t, &walletmock.Store{})
+	manager.wallets[w.cfg.Name] = w
+
+	// Act: Submit a disconnect to the prepared connected-event entry point.
+	err := manager.dispatchChainEvent(
+		t.Context(), chain.BlockDisconnected{},
+	)
+
+	// Assert: Rejection is local validation and does not stop the Manager or
+	// transfer ownership of the disconnect to any processor.
+	require.ErrorIs(t, err, db.ErrInvalidParam)
+	require.True(t, manager.started.Load())
+}
+
+// TestManagerChainEventFailureStopsManager prevents a processor error after
+// partial delivery from leaving an incomplete active set running.
+func TestManagerChainEventFailureStopsManager(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: The first target accepts an event; the second rejects it.
+	// Existing aggregate teardown must join both before returning the cause.
+	first, firstDeps := newChainEventTestWallet(t, "first", 1)
+	second, secondDeps := newChainEventTestWallet(t, "second", 2)
+	manager := testSQLManager(t, &walletmock.Store{})
+	manager.wallets[first.cfg.Name] = first
+	manager.wallets[second.cfg.Name] = second
+	event := chain.RelevantTx{TxRecord: &wtxmgr.TxRecord{}}
+	failure := errors.New("processor failed")
+	mock.InOrder(
+		firstDeps.syncer.On(
+			"requestChainEvent", mock.Anything, event,
+			(<-chan struct{})(manager.chainDone), first.syncDone,
+		).Return(nil).Once(),
+		secondDeps.syncer.On(
+			"requestChainEvent", mock.Anything, event,
+			(<-chan struct{})(manager.chainDone), second.syncDone,
+		).Return(failure).Once(),
+	)
+
+	// Act: Fail the accepted fanout, then attempt later delivery through the
+	// same Manager after its terminal cleanup has completed.
+	err := manager.dispatchChainEvent(t.Context(), event)
+	later := manager.dispatchChainEvent(t.Context(), event)
+
+	// Assert: The primary processor error survives cleanup, both Wallets
+	// are inert, and no later event can reach the already closed Store.
+	require.ErrorIs(t, err, failure)
+	require.ErrorIs(t, later, ErrManagerStopped)
+	require.Nil(t, manager.backend)
+	require.Empty(t, manager.wallets)
+	require.ErrorIs(t, first.state.validateStarted(), ErrWalletStopped)
+	require.ErrorIs(t, second.state.validateStarted(), ErrWalletStopped)
+}
 
 // TestWalletID verifies that Wallet.ID returns the cached runtime ID.
 func TestWalletID(t *testing.T) {
