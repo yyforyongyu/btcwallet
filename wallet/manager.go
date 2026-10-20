@@ -441,14 +441,19 @@ func normalizeConnectedChainEvent(event any) (any, error) {
 	}
 }
 
-// dispatchChainEvent synchronously delivers one normalized connected event to
-// every published SQL Wallet in source admission order. Registry publication
-// shares this lock, so Create joins only later events. Caller cancellation is
-// checked before admission; accepted work belongs to the Wallet lifetimes.
+// dispatchChainEvent serializes prepared SQL delivery and rollback against
+// registry publication, so Create joins only later events. Caller cancellation
+// is checked before admission; accepted work belongs to the owned runtime.
 func (m *Manager) dispatchChainEvent(ctx context.Context, event any) error {
-	update, err := normalizeConnectedChainEvent(event)
-	if err != nil {
-		return err
+	// Disconnects have one database-wide owner and never enter Wallet fanout.
+	update := event
+	if _, disconnected := event.(chain.BlockDisconnected); !disconnected {
+		var err error
+
+		update, err = normalizeConnectedChainEvent(event)
+		if err != nil {
+			return err
+		}
 	}
 
 	m.Lock()
@@ -463,7 +468,7 @@ func (m *Manager) dispatchChainEvent(ctx context.Context, event any) error {
 		return ErrStateForbidden
 	}
 
-	err = ctx.Err()
+	err := ctx.Err()
 	if err != nil {
 		return err
 	}
@@ -490,6 +495,10 @@ func (m *Manager) dispatchChainEvent(ctx context.Context, event any) error {
 	// The existing worker still uses Wallet lifetime for all persistence;
 	// Manager shutdown and worker completion release the handoff waits.
 	ctx = context.WithoutCancel(ctx)
+	if disconnected, ok := update.(chain.BlockDisconnected); ok {
+		return m.rollbackChainEvent(ctx, disconnected, wallets)
+	}
+
 	for _, wallet := range wallets {
 		err := wallet.sync.requestChainEvent(
 			ctx, update, m.chainDone, wallet.syncDone,
@@ -502,6 +511,49 @@ func (m *Manager) dispatchChainEvent(ctx context.Context, event any) error {
 				wallet.cfg.Name, err,
 			), m.stopWallets(nil))
 		}
+	}
+
+	return nil
+}
+
+// rollbackChainEvent fences every published worker around one atomic SQL
+// rollback. The caller holds admission; failure joins workers before resuming
+// controls, so an uncertain commit cannot trigger automatic historical retry.
+func (m *Manager) rollbackChainEvent(ctx context.Context,
+	event chain.BlockDisconnected, wallets []*Wallet) error {
+
+	height, err := db.Int64ToUint32(int64(event.Height))
+	if err != nil {
+		return fmt.Errorf("disconnect height: %w", err)
+	}
+
+	backend, ok := m.backend.(*sqlManagerBackend)
+	if !ok {
+		return ErrStateForbidden
+	}
+
+	// The operation alone owns continuation. Deferred closure happens after
+	// terminal joins on errors and after the Store call on success.
+	resume := make(chan struct{})
+	defer close(resume)
+
+	for _, wallet := range wallets {
+		err = wallet.sync.requestChainEvent(
+			ctx, chainPauseReq{resume: resume}, m.chainDone, wallet.syncDone,
+		)
+		if err != nil {
+			return errors.Join(fmt.Errorf(
+				"pause wallet %q for rollback: %w", wallet.cfg.Name, err,
+			), m.stopWallets(nil))
+		}
+	}
+
+	// Store expects the first removed height, exactly the disconnected block,
+	// and selects affected Wallets itself, preserving tips below the fork.
+	err = backend.store.RollbackToBlock(ctx, height)
+	if err != nil {
+		return errors.Join(fmt.Errorf("rollback chain: %w", err),
+			m.stopWallets(nil))
 	}
 
 	return nil
