@@ -375,6 +375,10 @@ type Wallet struct {
 	// chain loop, scanning, and reorganization handling.
 	sync chainSyncer
 
+	// syncDone reports permanent worker exit, including a closed source
+	// channel that ends synchronization without canceling Wallet lifetime.
+	syncDone <-chan struct{}
+
 	// state maintains the wallet's atomic, three-dimensional status:
 	// Lifecycle (System), Synchronization (Chain), and Authentication
 	// (Security).

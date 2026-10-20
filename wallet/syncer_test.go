@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
@@ -65,6 +66,164 @@ func newTestSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 	return newSyncer(
 		cfg, addrStore, txStore, manager, store, walletID,
 	)
+}
+
+// TestSyncerChainEventReportsResult prevents prepared receipt from being
+// mistaken for successful processing when the Store rejects the event.
+func TestSyncerChainEventReportsResult(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "commits transaction",
+		},
+		{
+			name: "reports processor failure",
+			err:  errDBMockSync,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Use the real worker and one transaction write;
+			// identical expectations vary only the commit outcome.
+			store := &walletmock.Store{}
+			backend := &bwmock.Chain{}
+			s := newTestSyncer(
+				Config{Chain: backend, ChainParams: &chainParams},
+				nil, nil, nil, store, 0,
+			)
+			addr := mustNewPubKeyAddr(t, &Wallet{cfg: s.cfg})
+			script := mustPayToAddrScript(addr)
+			tx := wire.NewMsgTx(1)
+			tx.AddTxOut(&wire.TxOut{Value: 1000, PkScript: script})
+			record, err := wtxmgr.NewTxRecordFromMsgTx(
+				tx, time.Unix(1, 0),
+			)
+			require.NoError(t, err)
+			backend.On("Notifications").Return(
+				(<-chan any)(nil),
+			).Once()
+			store.On("ResolveOwnedAddresses", mock.Anything,
+				matchResolveOwnedAddressesQuery(0, script),
+			).Return(ownedAddrsResult(script), nil).Once()
+			store.On("GetTx", mock.Anything, db.GetTxQuery{
+				Txid: record.Hash,
+			}).Return(nil, db.ErrTxNotFound).Once()
+			store.On("ApplyTxBatch", mock.Anything, mock.Anything).
+				Return(test.err).Once()
+			t.Cleanup(func() {
+				store.AssertExpectations(t)
+				backend.AssertExpectations(t)
+			})
+
+			// Act: Transfer through the prepared mailbox while the
+			// existing worker consumes exactly one event.
+			workerResult := make(chan error, 1)
+			go func() {
+				workerResult <- s.waitForEvent(t.Context())
+			}()
+
+			err = s.requestChainEvent(t.Context(), chain.RelevantTx{
+				TxRecord: record,
+			}, nil, nil)
+
+			// Assert: The caller receives the commit outcome; the
+			// worker acknowledges it without entering a retry path.
+			require.ErrorIs(t, err, test.err)
+			require.NoError(t, <-workerResult)
+		})
+	}
+}
+
+// TestSyncerChainEventWaitsForRewind prevents a connected event from reading
+// the old tip and then restoring it over an accepted historical rewind.
+func TestSyncerChainEventWaitsForRewind(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		t.Helper()
+
+		// Arrange: Hold an accepted rewind on the actual syncer worker.
+		// Its next tip read must observe the rewind, not the old height.
+		store := &walletmock.Store{}
+		backend := &bwmock.Chain{}
+		s := newTestSyncer(
+			Config{Chain: backend}, nil, nil, nil, store, 0,
+		)
+		s.state.Store(uint32(syncStateSynced))
+
+		fork := waddrmgr.BlockStamp{
+			Height:    5,
+			Hash:      chainhash.Hash{5},
+			Timestamp: time.Unix(5, 0),
+		}
+		store.On("GetWallet", mock.Anything, "").Return(
+			&db.WalletInfo{SyncedTo: &db.Block{Height: 10}}, nil,
+		).Once()
+		store.On("GetWallet", mock.Anything, "").Return(
+			&db.WalletInfo{SyncedTo: &db.Block{
+				Height:    5,
+				Hash:      fork.Hash,
+				Timestamp: fork.Timestamp,
+			}}, nil,
+		).Once()
+
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		store.On("RewindWallet", mock.Anything,
+			matchRewindWalletParams(0, fork),
+		).Run(func(mock.Arguments) {
+			close(entered)
+			<-release
+		}).Return(nil).Once()
+		backend.On("Notifications").Return((<-chan any)(nil)).Twice()
+		t.Cleanup(func() {
+			store.AssertExpectations(t)
+			backend.AssertExpectations(t)
+		})
+		require.NoError(t, s.requestScan(t.Context(), &scanReq{
+			typ:        scanTypeRewind,
+			startBlock: fork,
+		}))
+
+		workerResult := make(chan error, 2)
+		go func() {
+			workerResult <- s.waitForEvent(t.Context())
+
+			workerResult <- s.waitForEvent(t.Context())
+		}()
+
+		<-entered
+
+		// Act: Queue the old tip's next block while the rewind owns
+		// processing, then allow that historical mutation to finish.
+		eventResult := make(chan error, 1)
+		go func() {
+			eventResult <- s.requestChainEvent(
+				t.Context(), chain.FilteredBlockConnected{
+					Block: &wtxmgr.BlockMeta{
+						Block: wtxmgr.Block{Height: 11},
+					},
+				}, nil, nil,
+			)
+		}()
+
+		synctest.Wait()
+		require.Empty(t, eventResult)
+		close(release)
+
+		// Assert: Both operations settle, and no ApplyTxBatch is
+		// expected: height 11 cannot advance the rewound height 5.
+		require.NoError(t, <-eventResult)
+		require.NoError(t, <-workerResult)
+		require.NoError(t, <-workerResult)
+	})
 }
 
 // TestSyncerInitialization verifies that a new syncer is created with the

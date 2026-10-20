@@ -204,8 +204,14 @@ func (w *Wallet) start(startCtx context.Context) error {
 
 	w.wg.Add(1)
 
+	// Publish completion before launching the existing worker so prepared
+	// delivery cannot wait on a processor that has already exited.
+	syncDone := make(chan struct{})
+	w.syncDone = syncDone
+
 	go func() {
 		defer w.wg.Done()
+		defer close(syncDone)
 
 		w.runSyncLoop()
 	}()

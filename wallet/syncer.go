@@ -224,6 +224,13 @@ type scanResult struct {
 	parentHash chainhash.Hash
 }
 
+// chainEventReq keeps prepared delivery on the existing worker, serialized
+// with historical writes. Buffered completion never depends on a live waiter.
+type chainEventReq struct {
+	event  any
+	result chan error
+}
+
 // chainSyncer is a private interface that abstracts the chain synchronization
 // logic, allowing it to be mocked for testing the wallet and controller.
 type chainSyncer interface {
@@ -232,6 +239,10 @@ type chainSyncer interface {
 
 	// requestScan submits a rescan job to the syncer.
 	requestScan(ctx context.Context, req *scanReq) error
+
+	// requestChainEvent waits for prepared delivery or terminal shutdown.
+	requestChainEvent(ctx context.Context, event any,
+		stopping, workerDone <-chan struct{}) error
 
 	// syncState returns the current synchronization state.
 	syncState() syncState
@@ -283,6 +294,10 @@ type syncer struct {
 	// request does not unnecessarily block the calling goroutine.
 	scanReqChan chan *scanReq
 
+	// chainReqChan applies synchronous backpressure without creating another
+	// worker or allowing prepared updates to race historical tip changes.
+	chainReqChan chan chainEventReq
+
 	// txManager rebroadcasts unmined transactions and announces committed
 	// observations while Wallet retains subscriber state and lifecycle.
 	txManager txManager
@@ -333,13 +348,14 @@ func newSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 	walletID uint32) *syncer {
 
 	return &syncer{
-		cfg:         cfg,
-		addrStore:   addrStore,
-		txStore:     txStore,
-		scanReqChan: make(chan *scanReq, 1),
-		txManager:   txManager,
-		store:       store,
-		walletID:    walletID,
+		cfg:          cfg,
+		addrStore:    addrStore,
+		txStore:      txStore,
+		scanReqChan:  make(chan *scanReq, 1),
+		chainReqChan: make(chan chainEventReq),
+		txManager:    txManager,
+		store:        store,
+		walletID:     walletID,
 	}
 }
 
@@ -794,6 +810,48 @@ func (s *syncer) requestScan(ctx context.Context, req *scanReq) error {
 	select {
 	case s.scanReqChan <- req:
 		return nil
+
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// requestChainEvent transfers prepared work to the existing syncer worker and
+// reports its result. Both waits observe Manager shutdown and permanent worker
+// exit, since a dead worker need not cancel the Wallet's lifetime context.
+func (s *syncer) requestChainEvent(ctx context.Context, event any,
+	stopping, workerDone <-chan struct{}) error {
+
+	// The result remains writable when shutdown releases the dispatcher;
+	// Manager still joins this worker before closing Store or returning.
+	req := chainEventReq{
+		event:  event,
+		result: make(chan error, 1),
+	}
+
+	select {
+	case s.chainReqChan <- req:
+	case <-stopping:
+		return ErrManagerStopped
+
+	case <-workerDone:
+		return ErrWalletStopped
+
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// Receipt alone is not successful delivery. A processor error must reach
+	// Manager, and no acknowledgment is required from an exited processor.
+	select {
+	case err := <-req.result:
+		return err
+
+	case <-stopping:
+		return ErrManagerStopped
+
+	case <-workerDone:
+		return ErrWalletStopped
 
 	case <-ctx.Done():
 		return ctx.Err()
@@ -2016,6 +2074,39 @@ func (w *Wallet) filterChainTxRecords(ctx context.Context,
 	return matches, nil
 }
 
+// handlePreparedChainUpdate filters shared records before reusing the atomic
+// Wallet batch path. The maintained source's matching assumptions stay local
+// to its existing handleChainUpdate route until the source cutover task.
+func (s *syncer) handlePreparedChainUpdate(ctx context.Context,
+	update any) error {
+
+	switch n := update.(type) {
+	case chain.RelevantTx:
+		// Resolve relevance before creating effects. With no match, the
+		// empty batch produces no Wallet history or transaction observation.
+		recs, err := s.txManager.filterChainTxRecords(
+			ctx, []*wtxmgr.TxRecord{n.TxRecord},
+		)
+		if err != nil {
+			return err
+		}
+
+		return s.putTxNotifications(ctx, s.prepareTxMatches(recs), n.Block)
+
+	case chain.FilteredBlockConnected:
+		// Keep block metadata even with no matched records: every Wallet's
+		// checkpoint must advance atomically with its own block effects.
+		recs, err := s.txManager.filterChainTxRecords(ctx, n.RelevantTxs)
+		if err != nil {
+			return err
+		}
+
+		return s.putBlockNotifications(ctx, s.prepareTxMatches(recs), n.Block)
+	}
+
+	return nil
+}
+
 // handleScanReq processes a user-initiated rescan request.
 func (s *syncer) handleScanReq(ctx context.Context,
 	req *scanReq) error {
@@ -2038,6 +2129,13 @@ func (s *syncer) handleScanReq(ctx context.Context,
 // cancellation occurs, processing the event accordingly.
 func (s *syncer) waitForEvent(ctx context.Context) error {
 	select {
+	// Prepared updates share the historical worker. Manager owns terminal
+	// failure handling, so acknowledge the exact result without retrying it.
+	case req := <-s.chainReqChan:
+		req.result <- s.handlePreparedChainUpdate(ctx, req.event)
+
+		return nil
+
 	// Process asynchronous notifications from the chain backend, such as
 	// new blocks or transactions.
 	case n, ok := <-s.cfg.Chain.Notifications():

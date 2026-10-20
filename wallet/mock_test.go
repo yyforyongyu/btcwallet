@@ -130,6 +130,15 @@ func (m *mockChainSyncer) requestScan(ctx context.Context, req *scanReq) error {
 	return args.Error(0)
 }
 
+// requestChainEvent supplies the configured processor result while retaining
+// the actual shutdown channels in the expectation's ownership boundary.
+func (m *mockChainSyncer) requestChainEvent(ctx context.Context, event any,
+	stopping, workerDone <-chan struct{}) error {
+
+	args := m.Called(ctx, event, stopping, workerDone)
+	return args.Error(0)
+}
+
 // syncState implements the chainSyncer interface.
 func (m *mockChainSyncer) syncState() syncState {
 	args := m.Called()
