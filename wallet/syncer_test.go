@@ -46,12 +46,20 @@ func newTestSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 
 	// Keep the existing mock publisher and use a real, empty registry for
 	// observations outside these persistence tests' subscription contract.
+	w := &Wallet{
+		cfg:   cfg,
+		store: store,
+		id:    walletID,
+	}
+
 	manager := struct {
 		TxPublisher
 		txNotifier
+		chainTxMatcher
 	}{
-		TxPublisher: publisher,
-		txNotifier:  &Wallet{},
+		TxPublisher:    publisher,
+		txNotifier:     w,
+		chainTxMatcher: w,
 	}
 
 	return newSyncer(
@@ -7398,9 +7406,11 @@ func TestLiveWatchScanRetry(t *testing.T) {
 	s.txManager = struct {
 		TxPublisher
 		txNotifier
+		chainTxMatcher
 	}{
-		TxPublisher: publisher,
-		txNotifier:  w,
+		TxPublisher:    publisher,
+		txNotifier:     w,
+		chainTxMatcher: w,
 	}
 
 	// Declare both readiness calls before releasing the worker; the retry

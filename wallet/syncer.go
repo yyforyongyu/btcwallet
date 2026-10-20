@@ -237,14 +237,23 @@ type chainSyncer interface {
 	syncState() syncState
 }
 
-// txManager combines the Wallet capabilities used by the syncer for
-// publication and notification after successful commits.
+// chainTxMatcher keeps prepared fanout relevance in the Wallet that owns the
+// address and spent-output policies, rather than in the shared dispatcher.
+type chainTxMatcher interface {
+	// filterChainTxRecords selects records without modifying source payloads.
+	filterChainTxRecords(ctx context.Context,
+		recs []*wtxmgr.TxRecord) ([]*wtxmgr.TxRecord, error)
+}
+
+// txManager combines Wallet matching with publication and notification after
+// successful commits through the existing syncer dependency.
 type txManager interface {
 	TxPublisher
 	txNotifier
+	chainTxMatcher
 }
 
-// Wallet supplies both capabilities through the same private dependency.
+// Wallet supplies these capabilities through the same private dependency.
 var _ txManager = (*Wallet)(nil)
 
 // syncer is a stateless blocking worker responsible for synchronizing the
@@ -1945,6 +1954,66 @@ func (s *syncer) extractAddrEntries(txOuts []*wire.TxOut) []AddrEntry {
 	}
 
 	return entries
+}
+
+// filterChainTxRecords preserves source order while selecting Wallet history.
+// Like addTxToWallet, relevance means crediting an owned address or spending
+// an owned output. Inputs may spend earlier records in this payload or
+// persisted Wallet outputs; earlier payload records are not yet committed.
+// Store credit resolution alone does not exclude unrelated transaction rows.
+func (w *Wallet) filterChainTxRecords(ctx context.Context,
+	recs []*wtxmgr.TxRecord) ([]*wtxmgr.TxRecord, error) {
+
+	matches := make([]*wtxmgr.TxRecord, 0, len(recs))
+
+	ownedOutputs := make(map[wire.OutPoint]struct{})
+	for _, rec := range recs {
+		// Reuse publication's ownership decision, including individual
+		// multisig members, before retaining a Wallet transaction row.
+		owned, err := w.filterOwnedAddresses(
+			ctx, w.extractTxAddrs(&rec.MsgTx),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("match chain outputs: %w", err)
+		}
+
+		// Retain owned credits until this entire block commits, so an
+		// outgoing child in the same payload can see its uncommitted parent.
+		for _, info := range owned {
+			for _, index := range info.outputIndices {
+				ownedOutputs[wire.OutPoint{
+					Hash: rec.Hash, Index: index,
+				}] = struct{}{}
+			}
+		}
+
+		// A debit-only child has no owned output of its own. Its parent's
+		// credits are visible here before Store can resolve those inputs.
+		relevant := len(owned) != 0
+		for _, input := range rec.MsgTx.TxIn {
+			if _, ok := ownedOutputs[input.PreviousOutPoint]; ok {
+				relevant = true
+				break
+			}
+		}
+
+		// Reuse persistent ownership as well: spent parents remain relevant
+		// for no-change confirmations and replacements, not just live UTXOs.
+		if !relevant {
+			relevant, err = w.spendsWalletOutput(ctx, &rec.MsgTx)
+			if err != nil {
+				return nil, fmt.Errorf("match chain inputs: %w", err)
+			}
+		}
+
+		// Preserve record references and order so the next Wallet receives
+		// the same source data for its independent matching pass.
+		if relevant {
+			matches = append(matches, rec)
+		}
+	}
+
+	return matches, nil
 }
 
 // handleScanReq processes a user-initiated rescan request.
