@@ -28,7 +28,8 @@ and use the [record template](../../docs/developer/benchmark/template.md).
   shared node seeding and SQL lifecycle in setup, independent of kvdb.
 - Report unprofiled ns/op, B/op and allocs/op. Capture CPU and heap profiles
   separately after setup and before cleanup; use heap baseline/delta analysis.
-- Keep one short record per method, with measured SHA, request, data, results and run
-  metadata. Keep execution commands in the shared benchmark README. Describe the common environment once in the
+- Keep one short record per method using the record template above. Keep raw
+  run metadata in evidence and commands in the shared benchmark README.
+  Describe the common environment once in the
   [reproducibility guide](../../docs/developer/benchmark/reproducibility.md).
   Add no reporting framework, custom CPU/RSS metrics or future API scaffolding.

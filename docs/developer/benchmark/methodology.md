@@ -3,7 +3,8 @@
 Use the same logical Wallet state and completed API operation across backends.
 Prioritize lnd's wallet use case. Keep data construction separate from the API
 being measured. The [reproducibility guide](reproducibility.md) records exact
-counts, seed paths, saved storage, environment. The [shared guide](README.md) owns execution commands.
+counts, seed paths, saved storage and environment. The
+[shared guide](README.md) owns execution commands.
 
 ## Why these datasets
 
@@ -90,7 +91,9 @@ Restore private storage and start a fresh Wallet for every invocation, including
 the first. This prevents the seed process's Wallet caches from carrying into
 the query. The first `b.Loop` resets time and allocation counts after setup.
 Loop exit stops timing before cleanup. Restoration, database readiness,
-connections and unlock are outside measurement.
+connections, unlock and request preparation are outside measurement. Timed
+calls include normal database I/O and waiting for PostgreSQL. Whole-command
+wall time includes setup and shutdown and is not the API latency metric.
 
 Call the selected API once after unlock, without timing or profiling. Use the
 same request and active Wallet for later timed calls. This excludes first-use
@@ -98,32 +101,64 @@ cache work for every implementation. Otherwise, one slow first call can fill
 a duration target while other implementations amortize it over many calls.
 These measurements compare repeated reads, not first-call latency.
 
-A duration such as `3s` is a target, not a fixed iteration count or a maximum
-call duration. Inspect iteration counts and require multiple timed calls in
-each accepted sample before interpreting repeated-call comparisons.
+A duration is a target, not a hard timeout or a guarantee of multiple calls.
+Inspect actual iteration counts before interpreting repeated-read results.
+Fixed-count groups must use the same iteration policy across the compared
+implementations. Keep single-call diagnostics separate from repeated-read
+summaries. The
+[collection record](reproducibility.md#serial-schedule-and-collection-record)
+identifies the default and material exceptions.
 
-Use one pinned Docker environment on the same host and architecture. Run one
-implementation at a time. Eight rotated/reversed orders place each of four
-backend slots in each position twice. Retain and report the actual order.
-Retain all raw attempts. Repeat samples
-that overlap competing
-jobs. Report the median of eight accepted samples per implementation and
-dataset. Compare time, bytes and allocation count against the declared baseline
-median. Use matching legacy where available, otherwise maintained kvdb. For
-lower values, divide baseline by measured value; for higher values, divide
-measured by baseline. Use green for lower, red for higher and white for
-equal or baseline. Use faster/slower for time and lower/higher for
-allocation metrics, with two decimal places and no multiplier sign.
+## Serial samples and aggregation
+
+Run one implementation at a time on the same host and architecture. Concurrent
+clients compete for CPU, memory and storage bandwidth, including the resources
+used by PostgreSQL. Competing Docker or build work can change the measured
+latency. Retain affected attempts and repeat samples after that work stops.
+
+Rotate and reverse implementation positions to reduce order bias from host
+load, cache state and other changes over a collection. A balanced schedule
+distributes positions; it does not prove equal native API work or remove all
+measurement bias. Request semantics and completed operations still need to
+match. The
+[schedule guide](reproducibility.md#serial-schedule-and-collection-record)
+distinguishes the driver's schedule from the actual retained collection groups.
+
+Summarize accepted unprofiled samples for each implementation and dataset.
+Repeated-read groups normally use eight samples; take the median separately
+for `ns/op`, `B/op` and `allocs/op`. Do not pool separate collections into a
+claimed contemporary balanced run, or treat a standalone diagnostic as an
+eight-sample median. Evidence identifies group membership and exceptions.
+
+Go allocation metrics cover the Wallet process, including its normal client
+work. They exclude PostgreSQL server memory. These are per-operation Go
+allocations, not whole-command memory or database-server resource measurements.
+
+## Ratio interpretation
+
+Compare each metric's median with the report's declared baseline median.
+For a value below baseline, divide baseline by measured value; for a value
+above baseline, divide measured value by baseline. Baseline and equal values
+use `1.00`. Compute from the unrounded values, then show two decimals.
 These descriptive ratios are not confidence intervals.
 
-Report unprofiled `ns/op`, `B/op` and `allocs/op`. Go allocation metrics cover
-the Wallet process; they exclude PostgreSQL server memory. Do not combine
-profiled and unprofiled samples. Collect CPU and heap profiles separately,
-after setup and the untimed call, before cleanup. Timer reset alone does not
-control profile capture. Use the post-setup heap baseline to separate fixture
-allocations from workload allocations. Distinguish retained heap from
-cumulative allocations.
-Profiles explain measured work; they do not replace unprofiled latency data.
+Each ratio cell contains only a colored dot and its number, such as `🟢 1.18`.
+Use one short legend per report: green below baseline, red above baseline,
+white baseline/equal. Do not add direction words, a multiplier sign or a
+percentage to each cell. The legend applies to all three metric columns.
+
+## Separate profiling
+
+Collect CPU and heap profiles in separate invocations after setup and the
+untimed first call, before Wallet cleanup. Timer reset alone does not control
+profile capture. Profiling adds overhead; its samples do not supply the
+unprofiled result tables.
+
+A post-setup heap baseline separates fixture allocation history from the
+workload. Distinguish cumulative allocations from retained heap when reading
+the delta. See [artifact analysis](reproducibility.md#artifacts-and-profiles)
+for the exact files and sample types. Profiles explain measured work; they
+do not replace unprofiled latency data.
 
 Read benchmarks share restored data, untimed request preparation, one first
 read and the common measurement loop. Only the API call varies. Chain sync

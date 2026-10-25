@@ -1,16 +1,17 @@
 # Benchmark reproducibility
 
-This document records the shared data and test setup. The
-[methodology](methodology.md) explains why we use them. All Wallet API
-benchmarks reuse these datasets.
-The lnd observation is complete; later methods reuse its model and saved data.
+This document records concrete settings, schedules, artifacts and saved data.
+The [methodology](methodology.md) explains their interpretation; the
+[shared commands](README.md) provide the entrypoint. Collection evidence owns
+actual run identity and execution details. The completed lnd observation below
+establishes the model; later methods reuse its data.
 
 ## Docker environment
 
 The recorded measurements use Docker 29.6.2 and `linux/arm64` on the same host.
 Docker fixes the client and server software and resource limits. Host load and
-hardware still affect results. Run one benchmark at a time, without competing
-Docker or build jobs.
+hardware still affect results. See the
+[serial sampling rationale](methodology.md#serial-samples-and-aggregation).
 
 | Component | Image and settings |
 | --- | --- |
@@ -28,54 +29,95 @@ Database storage is inside the Docker VM. Build and module caches use
 
 ## Run and repeat
 
-Run from the repository root. Docker must be available to the client, including
-its socket for PostgreSQL Testcontainers. No live Bitcoin node is required.
-The SQL setup uses the existing chain mock. The saved history supplies the
-query's confirmed tip.
+Run from the repository root with Docker available, including its socket for
+PostgreSQL Testcontainers. These read fixtures require no live Bitcoin node.
+The SQL setup uses the existing chain mock; saved history supplies the query's
+confirmed tip. Use the [shared commands](README.md) for explicit native
+selection or installed friendly selectors.
 
-Use the [shared commands](README.md) and the selected method record
-for its measured source revision and run metadata. Develop with one selected
-backend and the default smoke case.
-Select full datasets explicitly after code review and run approval.
+Develop with the default `smoke` case and one backend. Select full datasets
+only after code review and run approval. API records follow the
+[report template](template.md). Their measured source revision(s) identify the
+actual executed code, including different revisions across implementations.
 
-Select `legacy`, `kvdb`, `sqlite` or `postgres` to run one implementation.
-Use `large-node` to select the largest saved dataset. The default `smoke` case
-uses one call. Full cases default to a 3s target. Set `BENCH_PACKAGE` and
-`BENCH_CASE` for one exact entrypoint. The shared guide gives native selection
-commands. Method records retain
-the actual serial sample orders. Do not run backends concurrently.
+## Serial schedule and collection record
 
-The named volume `btcwallet-bench-fixtures` stores data across commands and
-code changes. It is mounted at `/fixtures`. On a cache miss, setup creates and
-saves the selected dataset. On a hit, it skips creation and restores private
-storage. Even the first invocation restores the saved snapshot before opening
-the measured Wallet. Do not delete this volume between performance changes.
-The source's fixture revision and SQL schema hash select compatible data.
+The symbol key is L=legacy kvdb, K=maintained kvdb, P=PostgreSQL and S=SQLite.
+The current driver's four-backend unprofiled `db=all` schedule is:
+
+`LKPS KPSL PSLK SLKP PKLS KLSP LSPK SPKL`
+
+With all leaves available, each backend appears in each position twice.
+Friendly selectors require installed native consumers. Explicit package/pattern
+inputs retain their chosen entrypoint. This driver policy does not reconstruct
+the history of a retained collection.
+
+Retained three-backend measurements used:
+
+`KPS KPS PSK SKP PKS KSP SPK SPK`
+
+Those positions are not balanced. Added legacy samples use separate `L` runs.
+Do not describe these reused groups and later legacy samples as one balanced
+contemporary four-backend collection. Evidence records their actual commands
+and grouping; do not infer the command's selection mode from its backend label.
+
+Retained large-node ListAddresses is a separate single-call diagnostic in
+`PSK` order. Its legacy diagnostic is collected separately. It has no profiles
+and is not part of the repeated-read median groups.
+
+Smoke defaults to `1x`. Full reads default to a `3s` target, not a hard timeout
+or a guarantee that N exceeds one. The current collection has these exceptions:
+
+| Method | Dataset | Timing policy |
+| --- | --- | --- |
+| ListAddresses | medium-node | `5x` |
+| GetAddressInfo | large-node | `5x` |
+| ListAddresses | large-node | Separate `1x` diagnostic per backend; no profiles |
+
+Keep exceptions identifiable in the collection record. Inspect actual counts
+and policies in evidence rather than assuming every result uses the default.
+Raw commands, dates, actual execution orders, run labels, source hashes,
+accepted/excluded attempts and per-run exceptions belong in that evidence.
+They are not repeated as routine metadata in each API report.
+
+## Persisted fixture reuse
+
+The named volume `btcwallet-bench-fixtures` is mounted at `/fixtures` and stores
+data across methods and code revisions. On a miss, setup creates and saves the
+selected dataset. On a hit, it restores private storage without creation.
+Even the first invocation restores the saved snapshot before opening the
+measured Wallet. Do not delete the volume between performance changes.
+
+The source's fixture revision and SQL bootstrap/migration hash select
+compatible data; query text, executable identity and commit SHA do not.
+See [preparation and storage](#prepare-and-save-data) for native snapshot paths.
 Direct Go runs without `BTCWALLET_BENCH_FIXTURE_DIR` use temporary data instead.
 
-Setup logs identify `fixture preparation` and `fixture restoration` separately.
-A repeated run should report restoration without preparation. For the recorded
-runs, the nine saved snapshots kept identical hashes, sizes and modification
-times. A rerun still pays build, restore, startup, unlock and cleanup costs.
-After unlock, call the selected API once with the measured request before
-starting profiles or `b.Loop`. Timed calls reuse that Wallet and request.
-Restore, startup, unlock, this first call and cleanup are outside API timing.
-Whole-command time includes them.
+Setup logs distinguish `fixture preparation` from `fixture restoration`.
+Repeated commands should restore without preparing. Evidence retains snapshot
+hashes, sizes and modification times before and after reuse. Restore, startup
+and cleanup still cost whole-command time; see the
+[measurement boundary](methodology.md#timing-and-profiles).
 
-The runner writes the selected binary and any profiles under
+## Artifacts and profiles
+
+Each executed benchmark writes under
 `<out>/<method>/<case>/<backend>/<timing|cpu|mem>/`.
-Keep stdout/stderr for every invocation, including errors and excluded attempts.
-Record the measured commit, exact command, sample order, date and wall time.
-If other jobs overlap a sample, retain that attempt and repeat the sample after
-they stop. Method records identify the samples used for their medians.
+Keep stdout/stderr for completed, failed and excluded invocations with their
+run evidence. Diagnostic captures are separate from unprofiled timing output.
 
-Use `profile=cpu` or `mem` for separate diagnostic runs. The runner
-prints `go tool pprof` analysis after cleanup. CPU profiles use `cpu.pprof`.
-Heap captures use `heap-before.pprof` and `heap-after.pprof`, with baseline
-subtraction for both `alloc_space` and `inuse_space`. Profile capture starts
-after setup and the untimed first call; it stops before Wallet cleanup. See the
-[measurement rationale](methodology.md#timing-and-profiles) before interpreting
-profiles or timing results.
+| Invocation | Files |
+| --- | --- |
+| All executed benchmarks | `benchmark.test` |
+| CPU | `cpu.pprof` |
+| Heap | `heap-before.pprof`, `heap-after.pprof` |
+
+The heap baseline is captured after setup and the untimed first API call.
+Subtract `heap-before.pprof` from `heap-after.pprof` with `go tool pprof -base`.
+Inspect `alloc_space` for allocation traffic since the baseline and
+`inuse_space` for the change in retained Go heap. Both snapshots use equal GC
+handling. The runner prints the analysis after benchmark cleanup. See the
+[profiling rationale](methodology.md#separate-profiling) for interpretation.
 
 ## Data source: an lnd node
 
