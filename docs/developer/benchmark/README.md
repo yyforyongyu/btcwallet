@@ -1,8 +1,9 @@
 # Benchmarks
 
-Use shared node datasets for Wallet read benchmarks. Prepare each dataset
-once per backend and fixture revision. Reuse saved data across methods and
-performance changes. Chain sync and startup need separate lifecycle benchmarks.
+Use shared node datasets for Wallet read benchmarks. Prepare each dataset one
+time per backend and fixture revision. Reuse saved data across methods and
+performance changes. Use separate lifecycle benchmarks for chain sync and
+startup.
 
 - [Methodology](methodology.md): dataset rationale, measurement boundaries,
   serial sampling, aggregation and ratio interpretation.
@@ -31,19 +32,20 @@ BENCH_PACKAGE=./wallet BENCH_CASE='^$' \
 The framework provides these friendly method selectors:
 `list-unspent`, `get-utxo`, `list-addresses`, `get-address-info`, `get-tx`,
 `list-txns`, `get-account` and `list-accounts`. Use these selectors only when
-the corresponding benchmark consumer is present. Explicit `BENCH_PACKAGE`
-and `BENCH_CASE` inputs take precedence and must be supplied together.
-They select one scalar leaf; collection shortcuts require friendly selectors.
+the related benchmark consumer is present. Supply explicit
+`BENCH_PACKAGE` and `BENCH_CASE` inputs together. They take precedence over
+friendly selectors and select one benchmark case. Use friendly selectors
+for collection shortcuts.
 
 Select `legacy`, `kvdb`, `sqlite` or `postgres` for one implementation.
-Friendly selectors select the installed native counterparts for each backend.
+Friendly selectors select the installed native benchmark for each backend.
 Explicit package/pattern inputs take precedence over friendly mapping.
 Native request semantics and the chosen comparison baseline belong in each API
-report. The original kvdb comparison matrices remain available.
+report. The original kvdb comparison matrices stay available.
 
 During development, use one affected backend and the default `smoke` case.
-Use unit tests for correctness. Complete code review and get run approval
-before full preparation or measurement.
+Use unit tests for correctness. Complete code review.
+Before full preparation or measurement, get run approval.
 
 ```sh
 # Replace the method label to check another installed read consumer.
@@ -68,12 +70,12 @@ make bench method="$method" db=all \
   2>&1 | tee /tmp/btcwallet-bench/"$run_label"/timing.log
 ```
 
-Keep each invocation's raw command and output in its run evidence. Follow the
-[report template](template.md) when writing the API record.
+Keep each invocation's raw command and output in its run evidence. Use the
+[report template](template.md) for each API record.
 
 ## Collect profiles
 
-Use one backend/case, or `db=all` and `profile=all` for available leaves.
+Use one backend/case, or `db=all` and `profile=all` for available benchmarks.
 See [profile interpretation](methodology.md#separate-profiling) and
 [artifact details](reproducibility.md#artifacts-and-profiles).
 

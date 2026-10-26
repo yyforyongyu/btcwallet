@@ -1,10 +1,10 @@
 # Benchmark reproducibility
 
 This document records concrete settings, schedules, artifacts and saved data.
-The [methodology](methodology.md) explains their interpretation; the
-[shared commands](README.md) provide the entrypoint. Collection evidence owns
+The [methodology](methodology.md) explains their interpretation. The
+[shared commands](README.md) give the entrypoint. Collection evidence gives
 actual run identity and execution details. The completed lnd observation below
-establishes the model; later methods reuse its data.
+establishes the model. Later methods reuse its data.
 
 ## Docker environment
 
@@ -15,30 +15,30 @@ hardware still affect results. See the
 
 | Component | Image and settings |
 | --- | --- |
-| Wallet client | `golang:1.25.11-bookworm`; 1 CPU, 4 GiB, no swap, GOMAXPROCS=1, CGO=0, `-buildvcs=false -trimpath -p=1`. |
-| PostgreSQL | `postgres:18-alpine`, version 18.4; 1 CPU, 1 GiB, bridge TCP, Testcontainers `fsync=off`. |
-| SQLite | Embedded in the client; WAL, foreign keys, 5s busy timeout. Both SQL pools use the normal 25-connection limit. |
+| Wallet client | `golang:1.25.11-bookworm`, 1 CPU, 4 GiB, no swap, GOMAXPROCS=1, CGO=0, `-buildvcs=false -trimpath -p=1`. |
+| PostgreSQL | `postgres:18-alpine`, version 18.4, 1 CPU, 1 GiB, bridge TCP, Testcontainers `fsync=off`. |
+| SQLite | Embedded in the client, WAL, foreign keys, 5s busy timeout. The two SQL pools use the usual 25-connection limit. |
 
 The runner in `scripts/benchmark.sh` pins the client digest to
 `sha256:b96f24a8d7d010ea0acb9c3ba99064740f02b6b984612b28bd3c9c5ab9453e38`.
 The [SQL setup](../../../wallet/bench/setup_test.go) pins the server digest to
 `sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15`.
-The runner contains the complete Docker invocation. Source is read-only.
+The runner contains the full Docker invocation. Source is read-only.
 Database storage is inside the Docker VM. Build and module caches use
 `/tmp/go-build-cache/benchmark` on the host.
 
 ## Run and repeat
 
-Run from the repository root with Docker available, including its socket for
-PostgreSQL Testcontainers. These read fixtures require no live Bitcoin node.
-The SQL setup uses the existing chain mock; saved history supplies the query's
+Run from the repository root with Docker available. Make its socket available
+for PostgreSQL Testcontainers. These read fixtures use no live Bitcoin node.
+The SQL setup uses the existing chain mock. Saved history supplies the query's
 confirmed tip. Use the [shared commands](README.md) for explicit native
 selection or installed friendly selectors.
 
 Develop with the default `smoke` case and one backend. Select full datasets
-only after code review and run approval. API records follow the
-[report template](template.md). Their measured source revision(s) identify the
-actual executed code, including different revisions across implementations.
+only after code review and run approval. Use the [report
+template](template.md) for API records. Their measured source revision(s)
+identify the executed code. Implementations can use different revisions.
 
 ## Serial schedule and collection record
 
@@ -47,10 +47,10 @@ The current driver's four-backend unprofiled `db=all` schedule is:
 
 `LKPS KPSL PSLK SLKP PKLS KLSP LSPK SPKL`
 
-With all leaves available, each backend appears in each position twice.
-Friendly selectors require installed native consumers. Explicit package/pattern
-inputs retain their chosen entrypoint. This driver policy does not reconstruct
-the history of a retained collection.
+With all benchmarks available, each backend appears in each position two times.
+Use friendly selectors only with installed native consumers. Explicit
+package/pattern inputs retain their chosen entrypoint. This driver policy does
+not reconstruct the history of a retained collection.
 
 Retained three-backend measurements used:
 
@@ -58,46 +58,48 @@ Retained three-backend measurements used:
 
 Those positions are not balanced. Added legacy samples use separate `L` runs.
 Do not describe these reused groups and later legacy samples as one balanced
-contemporary four-backend collection. Evidence records their actual commands
-and grouping; do not infer the command's selection mode from its backend label.
+four-backend collection. Evidence records their actual commands
+and groups. Do not infer the command's selection mode from its backend label.
 
 Retained large-node ListAddresses is a separate single-call diagnostic in
-`PSK` order. Its legacy diagnostic is collected separately. It has no profiles
-and is not part of the repeated-read median groups.
+`PSK` order. The legacy diagnostic uses a separate collection. It has no
+profiles and is not part of the repeated-read median groups.
 
-Smoke defaults to `1x`. Full reads default to a `3s` target, not a hard timeout
-or a guarantee that N exceeds one. The current collection has these exceptions:
+Smoke defaults to `1x`. Full reads default to a `3s` target, not a hard
+timeout or a guarantee that N is more than one. The current collection has
+these exceptions:
 
 | Method | Dataset | Timing policy |
 | --- | --- | --- |
 | ListAddresses | medium-node | `5x` |
 | GetAddressInfo | large-node | `5x` |
-| ListAddresses | large-node | Separate `1x` diagnostic per backend; no profiles |
+| ListAddresses | large-node | Separate `1x` diagnostic per backend, no profiles |
 
-Keep exceptions identifiable in the collection record. Inspect actual counts
-and policies in evidence rather than assuming every result uses the default.
-Raw commands, dates, actual execution orders, run labels, source hashes,
-accepted/excluded attempts and per-run exceptions belong in that evidence.
-They are not repeated as routine metadata in each API report.
+Keep exceptions identifiable in the collection record. Examine actual counts
+and policies in evidence. Do not use the default policy as the policy for all
+results. Raw commands, dates, actual execution orders, run labels, source
+hashes, accepted/excluded attempts and per-run exceptions belong in that
+evidence. Do not repeat them as usual metadata in each API report.
 
 ## Persisted fixture reuse
 
-The named volume `btcwallet-bench-fixtures` is mounted at `/fixtures` and stores
-data across methods and code revisions. On a miss, setup creates and saves the
-selected dataset. On a hit, it restores private storage without creation.
-Even the first invocation restores the saved snapshot before opening the
-measured Wallet. Do not delete the volume between performance changes.
+The runner mounts the named volume `btcwallet-bench-fixtures` at `/fixtures`.
+This volume stores data across methods and code revisions. On a miss, setup
+creates and saves the selected dataset. On a hit, it restores private storage
+without creation. Even the first invocation restores the saved snapshot before
+it opens the measured Wallet. Do not delete the volume between performance
+changes.
 
 The source's fixture revision and SQL bootstrap/migration hash select
-compatible data; query text, executable identity and commit SHA do not.
+compatible data. Query text, executable identity and commit SHA do not.
 See [preparation and storage](#prepare-and-save-data) for native snapshot paths.
 Direct Go runs without `BTCWALLET_BENCH_FIXTURE_DIR` use temporary data instead.
 
 Setup logs distinguish `fixture preparation` from `fixture restoration`.
-Repeated commands should restore without preparing. Evidence retains snapshot
-hashes, sizes and modification times before and after reuse. Restore, startup
-and cleanup still cost whole-command time; see the
-[measurement boundary](methodology.md#timing-and-profiles).
+Repeated commands should restore data without new preparation. Evidence keeps
+snapshot hashes, sizes and modification times before and after reuse. Restore,
+startup and cleanup still cost whole-command time. See the [measurement
+boundary](methodology.md#timing-and-profiles).
 
 ## Artifacts and profiles
 
@@ -112,10 +114,11 @@ run evidence. Diagnostic captures are separate from unprofiled timing output.
 | CPU | `cpu.pprof` |
 | Heap | `heap-before.pprof`, `heap-after.pprof` |
 
-The heap baseline is captured after setup and the untimed first API call.
+The benchmark captures the heap baseline after setup and the untimed first
+API call.
 Subtract `heap-before.pprof` from `heap-after.pprof` with `go tool pprof -base`.
-Inspect `alloc_space` for allocation traffic since the baseline and
-`inuse_space` for the change in retained Go heap. Both snapshots use equal GC
+Examine `alloc_space` for allocation traffic since the baseline and
+`inuse_space` for the change in retained Go heap. The two snapshots use equal GC
 handling. The runner prints the analysis after benchmark cleanup. See the
 [profiling rationale](methodology.md#separate-profiling) for interpretation.
 
@@ -131,14 +134,15 @@ The reference scenario had these steps:
    close. Each funding transaction spends the previous transaction's change.
 3. Close 98 channels cooperatively. Keep their returned wallet funds.
 4. Send ten outgoing HTLCs of 10,000 sat through each remaining channel.
-   The peer holds them. Both channels keep positive local and remote balances.
-   Force-close both channels from the funding node.
-5. Confirm commitments and advance CSV/CLTV maturity until both resolutions
+   The peer holds them. The two channels keep positive local and remote
+   balances.
+   Force-close the two channels from the funding node.
+5. Confirm commitments and advance CSV/CLTV maturity until the two resolutions
    finish. Let lnd select sweep batches and fee inputs. Record pending anchor
    sweeps separately.
 
 The reference used a fixed fee estimate of 2,500 sat/kw and the harness's
-normal confirmation and CSV settings. Settled payments do not create a wallet
+usual confirmation and CSV settings. Settled payments do not create a wallet
 transaction or a new ordinary address for each payment. The scenario omits
 these payments.
 
@@ -150,14 +154,16 @@ It counted imported pseudo-accounts separately from regular scoped accounts.
 
 Channel keys use scope `1017` and separate key-family accounts. Key derivation
 advances each index. Use inside a channel contract does not mark the key's
-ordinary address as used. `ListUnspent` walks unspent outputs and finds their
-owning addresses. It does not enumerate all unused channel keys. Separate
-accounts and branches keep channel keys out of ordinary address discovery.
-Broader load and rescan operations can still read these records.
+ordinary address as used.
+
+`ListUnspent` walks unspent outputs and finds their owning addresses. It does
+not enumerate all unused channel keys. Separate accounts and branches keep
+channel keys out of ordinary address discovery. Broader load and rescan
+operations can still read these records.
 
 ### Observed reference
 
-The reference passed on 2026-10-23. The lifecycle took 12m 19s; the whole test
+The reference passed on 2026-10-23. The lifecycle took 12m 19s. The whole test
 took 12m 23s and mined 731 blocks. This native macOS arm64 experiment used
 Go 1.27.3. It established data shape, not Docker API latency.
 
@@ -167,7 +173,7 @@ The local experiment commit is
 `16cfb4483d1f618bae04dbe9206584bf4ee2e72d` and btcd v0.26.0.
 The experiment is not in upstream lnd. These commands identify the completed
 reference run and require that checkout. Normal benchmark runs use the saved
-model data below; they do not run this lnd experiment again.
+model data below. They do not run this lnd experiment again.
 
 ```sh
 # Build the experiment harness and keep its raw RPC data and stopped snapshots.
@@ -189,37 +195,40 @@ make itest-only backend=btcd dbbackend=bbolt \
 | Wallet transaction records | 1 | 101 | 204 |
 | Confirmed spendable UTXOs | 1 | 1 | 101 |
 
-The 260 accounts comprise four ordinary default accounts and 256 scope-1017
+The 260 accounts contain four ordinary default accounts and 256 scope-1017
 accounts. Five imported pseudo-accounts are separate. The final address
 inventory has one BIP84 receiving address, 100 BIP86 change addresses and
 102 BIP86 external addresses. Key families 0–4 each have 100 keys. Family 5
 has 101 because lnd skips its first revocation-root index.
 
-The 204 records comprise one deposit, 100 funding transactions, 100 closes
+The 204 records contain one deposit, 100 funding transactions, 100 closes
 and three sweeps. The RPC gives positive confirmations for 202 records.
 Its two force-close records still have zero confirmations after resolution.
-The sweeper combines both local balances. It combines 20 HTLC timeout inputs
+
+The sweeper combines the two local balances. It combines 20 HTLC timeout inputs
 with one cooperative-close output for fees. It then sweeps the 20 second-stage
 outputs together. One HTLC does not imply one independent wallet transaction.
 
 The final 101 UTXOs are P2TR outputs: one funding-change output, 97 cooperative
 returns and three sweep outputs. Their total value is 89,636,054 sat.
-No channel resolution remains pending. Two uneconomical 330-sat anchor sweeps
-remain pending. They are not part of the spendable output count.
+No channel resolution is pending. Two uneconomical 330-sat anchor sweeps
+stay pending. They are not part of the spendable output count.
 
 ## Shared node datasets
 
 The [case builder](../../../wallet/internal/bwtest/bench_cases.go) models this
 history with deterministic unsigned transactions and foreign contracts.
-A shared fixed seed gives every backend the same account paths and scripts.
+A shared fixed seed gives each backend the same account paths and scripts.
 The builder keeps transaction links, credit ownership, values and script types.
 It does not sign channels or import lnd's channel database.
 
 Positive confirmation heights are dense. Each deposit's history has two
 unconfirmed force-close bookkeeping records. All ordinary credits at the
 endpoint are confirmed. Each deposit leaves one unused ordinary address.
-All channel keys remain unused. These choices normalize the reference data;
-they do not reproduce its full block schedule.
+All channel keys stay unused.
+
+These choices normalize the reference data. They do not reproduce its full
+block schedule.
 
 ### small-node
 
@@ -242,7 +251,7 @@ This case models the observed one-deposit history.
 
 This model repeats the normalized history for ten independent deposits in
 one Wallet. Accounts stay fixed. Addresses, keys and transaction links are
-distinct across deposits.
+different across deposits.
 
 | Parameter | Value |
 | --- | --- |
@@ -274,18 +283,19 @@ This model repeats the history for 100 deposits in one Wallet.
 | Final spendable P2TR outputs | 10,100 |
 | Final owned value | 8,963,605,400 sat |
 
-Each additional deposit needs one BIP84 receiving address, 100 BIP86 change
+Each added deposit needs one BIP84 receiving address, 100 BIP86 change
 addresses and 102 BIP86 closing/sweep addresses. Each key family gains 100 keys.
-Family 5 skips index zero once per Wallet. Transaction hashes, outpoints,
-foreign contracts and positive block metadata stay distinct. Received times
+Family 5 skips index zero one time per Wallet. Transaction hashes, outpoints,
+foreign contracts and positive block metadata stay different. Received times
 stay ordered across deposits.
 
 The model repeats three resolution transactions per deposit. Real lnd can
 combine sweeps across histories, select other fee inputs or consolidate funds.
-Its final counts can differ. The lnd experiment observed only the one-deposit
-origin.
+Its final counts can be different. The lnd experiment observed only the
+one-deposit origin.
+
 The names describe model sizes, not measured user populations. Related data
-grows together; these cases do not isolate the cost of live UTXO count.
+grows together. These cases do not isolate the cost of live UTXO count.
 
 The `smoke` development case uses one deposit and 20 channels. It has the same
 260 accounts, with 43 ordinary addresses, 121 channel keys, 44 transaction
@@ -293,24 +303,26 @@ records and 21 final UTXOs. Use it for fast development checks.
 
 ## Prepare and save data
 
-The shared [SQL setup](../../../wallet/bench/setup_test.go) owns common node preparation. It uses Manager to create and unlock the Wallet. It creates ordinary and internal
-accounts through public APIs. It allocates ordinary addresses in bulk and
-internal keys through the public key allocator. A separate Store writes the
-complete transaction history through `ApplyTxBatch`.
+The shared [SQL setup](../../../wallet/bench/setup_test.go) prepares common
+node data. It uses Manager to create and unlock the Wallet. It creates
+ordinary and internal accounts through public APIs. It allocates ordinary
+addresses in bulk and internal keys through the public key allocator. A
+separate Store writes the full transaction history through `ApplyTxBatch`.
 
 The [kvdb setup](../../../wallet/benchmark_helpers_test.go) uses its
 native Manager and scoped address manager. Its shared seeder derives addresses
-in bulk and apply history through Store, with confirmed-tip progression.
-Both suites must consume the same case definition. Legacy and maintained kvdb
+in bulk and applies history through Store, with confirmed-tip progression.
+The two suites must consume the same case definition. Legacy and maintained kvdb
 share one saved database per size. SQL preparation does not call the kvdb suite.
 
-Close all database users before saving data. Save kvdb and SQLite as closed
-files. Save PostgreSQL with a custom-format `pg_dump` archive. Restore a private
-copy before every invocation, even the first. This excludes seed-process caches
-from the measured Wallet. Keep prepared data for all benchmark methods.
-Analyze each private PostgreSQL restore before Wallet startup to give the
-planner column statistics. This work is outside timing. Reuse the saved
-archive without rebuilding its data.
+Before you save data, close all database users. Save kvdb and SQLite as closed
+files. Save PostgreSQL with a custom-format `pg_dump` archive. Restore a
+private copy before each invocation, even the first. The measured Wallet does
+not use seed-process caches. Keep prepared data for all benchmark methods.
+
+Before Wallet startup, make an analysis of each private PostgreSQL restore
+to give the planner column statistics. This work is outside timing. Reuse the
+saved archive without new data preparation.
 
 The Docker volume uses `lnd-wallet/v1/kvdb/<case>.db` for kvdb.
 SQL uses `lnd-wallet/v1/<schema-hash>/<backend>/<case>.db`, where the backend is
@@ -349,7 +361,7 @@ modification time after reuse. Saved runs did no seed work.
 
 #### large-node preparation
 
-These observations cover data preparation only. They do not measure API
+These observations measure data preparation only. They do not measure API
 latency. Each method record gives its API measurements.
 
 | Storage | Prepare | Accounts | Addresses/keys | History | Restore | First command | Reused command |
