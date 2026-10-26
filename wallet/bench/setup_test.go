@@ -85,49 +85,10 @@ func setupSQLBenchmarkWallet(tb testing.TB, backend wallet.DBBackend,
 	var container *postgres.PostgresContainer
 
 	if backend == wallet.DBBackendPostgres {
-		// SQL readiness waits through the image's bootstrap
-		// server. Register
-		// termination immediately, including partial container
-		// setup failure.
-		readiness := wait.ForSQL("5432/tcp", "pgx",
-			func(host string, port nat.Port) string {
-				return fmt.Sprintf(
-					"postgres://postgres:postgres@%s/postgres?sslmode=disable",
-					net.JoinHostPort(host, port.Port()),
-				)
-			},
-		)
+		container = setupBenchmarkPostgres(tb)
 
 		var err error
 
-		container, err = postgres.Run(tb.Context(), benchmarkPostgresImage,
-			postgres.WithDatabase("postgres"),
-			postgres.WithUsername("postgres"),
-			postgres.WithPassword("postgres"),
-			testcontainers.WithWaitStrategyAndDeadline(
-				2*time.Minute, readiness,
-			),
-			testcontainers.WithHostConfigModifier(
-				func(config *dockercontainer.HostConfig) {
-					config.NanoCPUs = 1_000_000_000
-					config.Memory = 1 << 30
-				},
-			),
-		)
-		if container != nil {
-			tb.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(
-					context.WithoutCancel(tb.Context()), time.Minute,
-				)
-				defer cancel()
-
-				require.NoError(tb, container.Terminate(
-					ctx, testcontainers.StopTimeout(0),
-				))
-			})
-		}
-
-		require.NoError(tb, err)
 		config.DataSource, err = container.ConnectionString(
 			tb.Context(), "sslmode=disable",
 		)
@@ -172,6 +133,60 @@ func setupSQLBenchmarkWallet(tb testing.TB, backend wallet.DBBackend,
 	}))
 
 	return w
+}
+
+// setupBenchmarkPostgres preserves the read suite's native server settings
+// for both read and startup fixtures; server readiness stays outside timing.
+func setupBenchmarkPostgres(tb testing.TB) *postgres.PostgresContainer {
+	tb.Helper()
+
+	var container *postgres.PostgresContainer
+
+	// SQL readiness waits through the image's bootstrap
+	// server. Register
+	// termination immediately, including partial container
+	// setup failure.
+	readiness := wait.ForSQL("5432/tcp", "pgx",
+		func(host string, port nat.Port) string {
+			return fmt.Sprintf(
+				"postgres://postgres:postgres@%s/postgres?sslmode=disable",
+				net.JoinHostPort(host, port.Port()),
+			)
+		},
+	)
+
+	var err error
+
+	container, err = postgres.Run(tb.Context(), benchmarkPostgresImage,
+		postgres.WithDatabase("postgres"),
+		postgres.WithUsername("postgres"),
+		postgres.WithPassword("postgres"),
+		testcontainers.WithWaitStrategyAndDeadline(
+			2*time.Minute, readiness,
+		),
+		testcontainers.WithHostConfigModifier(
+			func(config *dockercontainer.HostConfig) {
+				config.NanoCPUs = 1_000_000_000
+				config.Memory = 1 << 30
+			},
+		),
+	)
+	if container != nil {
+		tb.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(
+				context.WithoutCancel(tb.Context()), time.Minute,
+			)
+			defer cancel()
+
+			require.NoError(tb, container.Terminate(
+				ctx, testcontainers.StopTimeout(0),
+			))
+		})
+	}
+
+	require.NoError(tb, err)
+
+	return container
 }
 
 // startSQLBenchmarkManager registers shutdown before startup can fail. Stop
@@ -322,11 +337,30 @@ func restoreSQLBenchmarkFixture(tb testing.TB, config wallet.ManagerConfig,
 	require.NoError(tb, os.WriteFile(config.DataSource, data, 0o600))
 }
 
-// seedSQLBenchmarkWallet uses normal Manager account and key allocation,
-// followed by
-// Store history writes. The standalone seeding Store has no key deriver.
+// seedSQLBenchmarkWallet retains read fixture history application after
+// allocation; startup preparation reuses allocation without synthetic writes.
 func seedSQLBenchmarkWallet(tb testing.TB, manager *wallet.Manager,
 	store db.Store, workload bwtest.ListUnspentWorkload) {
+
+	tb.Helper()
+
+	w, scripts := allocateSQLBenchmarkWallet(tb, manager, workload)
+
+	phaseStarted := time.Now()
+
+	// SQL can persist the complete normalized graph and final tip through
+	// its existing batch transaction; no legacy sync-tip progression is
+	// needed.
+	require.NoError(tb, store.ApplyTxBatch(tb.Context(),
+		workload.Batch(w.ID(), scripts),
+	))
+	tb.Logf("fixture history: %s", time.Since(phaseStarted))
+}
+
+// allocateSQLBenchmarkWallet creates the shared accounts and key inventory
+// through public APIs, leaving its caller to choose real-chain or read history.
+func allocateSQLBenchmarkWallet(tb testing.TB, manager *wallet.Manager,
+	workload bwtest.ListUnspentWorkload) (*wallet.Wallet, [][]byte) {
 
 	tb.Helper()
 
@@ -411,15 +445,8 @@ func seedSQLBenchmarkWallet(tb testing.TB, manager *wallet.Manager,
 	}
 
 	tb.Logf("fixture allocation: %s", time.Since(phaseStarted))
-	phaseStarted = time.Now()
 
-	// SQL can persist the complete normalized graph and final tip through
-	// its existing batch transaction; no legacy sync-tip progression is
-	// needed.
-	require.NoError(tb, store.ApplyTxBatch(tb.Context(),
-		workload.Batch(w.ID(), scripts),
-	))
-	tb.Logf("fixture history: %s", time.Since(phaseStarted))
+	return w, scripts
 }
 
 // RunSQLBenchmark restores each shared case and prepares its API request before
