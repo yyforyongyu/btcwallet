@@ -584,6 +584,24 @@ func (w *Wallet) decorateInputs(ctx context.Context, packet *psbt.Packet,
 func (w *Wallet) decorateInput(ctx context.Context, pInput *psbt.PInput,
 	tx *wire.MsgTx, utxo *wire.TxOut) error {
 
+	// Script-path imports may commit to several leaves and have no single
+	// root origin. Funding needs their verified output facts, not a chosen
+	// spending leaf. Leave caller signing metadata for the signer to verify.
+	if txscript.IsPayToTaproot(utxo.PkScript) {
+		addr := extractAddrFromPKScript(utxo.PkScript, w.cfg.ChainParams)
+
+		info, err := w.getAddressInfo(ctx, addr)
+		if err != nil {
+			return err
+		}
+
+		if isScriptSpendAddress(info) {
+			addInputInfoSegWitV1(pInput, utxo, nil)
+
+			return nil
+		}
+	}
+
 	// Reuse the same wallet lookup and script-construction path as the signer,
 	// so PSBT decoration and spending metadata stay in sync.
 	scriptInfo, err := w.scriptForOutput(ctx, *utxo)

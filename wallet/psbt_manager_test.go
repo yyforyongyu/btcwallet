@@ -966,6 +966,78 @@ func TestDecorateInputsSuccess(t *testing.T) {
 	require.Len(t, packet.Inputs[2].Bip32Derivation, 1)
 }
 
+// TestDecorateInputsTaprootScript preserves caller spending metadata while
+// enriching an owned script input without selecting a leaf or root origin.
+func TestDecorateInputsTaprootScript(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a real Taproot commitment with caller-supplied internal key
+	// metadata. Storage owns the output but supplies no single-key origin.
+	key, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	t.Cleanup(key.Zero)
+
+	root := bytes.Repeat([]byte{2}, 32)
+	outputKey := txscript.ComputeTaprootOutputKey(key.PubKey(), root)
+	addr, err := address.NewAddressTaproot(
+		schnorr.SerializePubKey(outputKey), &chainParams,
+	)
+	require.NoError(t, err)
+	script, err := txscript.PayToAddrScript(addr)
+	require.NoError(t, err)
+
+	output := wire.NewTxOut(100_000, script)
+	outpoint := wire.OutPoint{
+		Hash: chainhash.Hash{1},
+	}
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(wire.NewTxIn(&outpoint, nil, nil))
+	packet, err := psbt.NewFromUnsignedTx(tx)
+	require.NoError(t, err)
+
+	origin := &psbt.TaprootBip32Derivation{
+		XOnlyPubKey: schnorr.SerializePubKey(key.PubKey()),
+		Bip32Path:   []uint32{1, 0},
+	}
+	packet.Inputs[0].TaprootBip32Derivation =
+		[]*psbt.TaprootBip32Derivation{origin}
+	packet.Inputs[0].TaprootMerkleRoot = root
+	packet.Inputs[0].TaprootInternalKey = origin.XOnlyPubKey
+	w, deps := createStartedSQLWalletWithMocks(t)
+	deps.store.On("GetUtxo", mock.Anything, db.GetUtxoQuery{
+		WalletID: w.id,
+		OutPoint: outpoint,
+	}).Return(testStoreUtxoInfo(outpoint, output), nil).Once()
+	deps.store.On("GetTxDetail", mock.Anything, db.GetTxDetailQuery{
+		WalletID: w.id,
+		Txid:     outpoint.Hash,
+	}).Return(testStoreTxDetail(outpoint.Hash, output), nil).Once()
+	deps.store.On("GetAddress", mock.Anything, db.GetAddressQuery{
+		WalletID:     w.id,
+		ScriptPubKey: script,
+	}).Return(&db.AddressInfo{
+		AddrType:     db.TaprootPubKey,
+		HasScript:    true,
+		ScriptPubKey: script,
+	}, nil).Once()
+
+	// Act through public decoration. No script-secret lookup is expected:
+	// funding the owned output does not choose or authorize a spending leaf.
+	decorated, err := w.DecorateInputs(t.Context(), packet, false)
+
+	// Assert the real UTXO facts and unchanged caller metadata. The fixture
+	// checks all expected Store calls once during its existing cleanup.
+	require.NoError(t, err)
+
+	input := decorated.Inputs[0]
+	require.Equal(t, output, input.WitnessUtxo)
+	require.Empty(t, input.Bip32Derivation)
+	require.Equal(t, []*psbt.TaprootBip32Derivation{origin},
+		input.TaprootBip32Derivation)
+	require.Equal(t, root, input.TaprootMerkleRoot)
+	require.Equal(t, origin.XOnlyPubKey, input.TaprootInternalKey)
+}
+
 // TestDecorateInputsErrUnknownRequired tests that DecorateInputs returns
 // ErrNotMine when an input is unknown and skipUnknown is false.
 func TestDecorateInputsErrUnknownRequired(t *testing.T) {
