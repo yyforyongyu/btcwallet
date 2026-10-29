@@ -3293,6 +3293,81 @@ func TestSignBip32PsbtInput(t *testing.T) {
 	require.Equal(t, pubKeyBytes, packet.Inputs[0].PartialSigs[0].PubKey)
 }
 
+// TestSignPsbtTweakedKey checks that a tweaked signature records the signing
+// public key while preserving the base key's BIP32 origin.
+func TestSignPsbtTweakedKey(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Resolve a real store-backed base key and spend an output for
+	// its tweaked key. The fixture already verifies all mock expectations.
+	w, mocks := createUnlockedWalletWithMocks(t)
+	path := waddrmgr.DerivationPath{}
+	baseKey, basePub := expectStoreSignerPrivKey(
+		t, mocks, w.id, waddrmgr.KeyScopeBIP0084, path,
+	)
+	t.Cleanup(baseKey.Zero)
+	tweak := new(btcec.ModNScalar).SetInt(1)
+	tweakedScalar := baseKey.Key
+	tweakedScalar.Add(tweak)
+	tweakedKey := btcec.PrivKeyFromScalar(&tweakedScalar)
+	t.Cleanup(tweakedKey.Zero)
+	pubKey := tweakedKey.PubKey().SerializeCompressed()
+	addr, err := address.NewAddressWitnessPubKeyHash(
+		address.Hash160(pubKey), &chainParams,
+	)
+	require.NoError(t, err)
+	script, err := txscript.PayToAddrScript(addr)
+	require.NoError(t, err)
+	utxo := wire.NewTxOut(1000, script)
+	tx := wire.NewMsgTx(2)
+	tx.AddTxIn(&wire.TxIn{})
+	tx.AddTxOut(wire.NewTxOut(900, script))
+	packet, err := psbt.NewFromUnsignedTx(tx)
+	require.NoError(t, err)
+	packet.Inputs[0].WitnessUtxo = utxo
+	packet.Inputs[0].SighashType = txscript.SigHashAll
+	packet.Inputs[0].Bip32Derivation = []*psbt.Bip32Derivation{
+		{
+			PubKey: basePub.SerializeCompressed(),
+			Bip32Path: []uint32{
+				hdkeychain.HardenedKeyStart + 84,
+				hdkeychain.HardenedKeyStart,
+				hdkeychain.HardenedKeyStart, 0, 0,
+			},
+		},
+	}
+
+	// Act: Sign through the public API using the same scalar tweak as the
+	// output, then let the PSBT finalizer assemble its P2WPKH witness.
+	result, err := w.SignPsbt(t.Context(), &SignPsbtParams{
+		Packet: packet,
+		InputTweakers: map[int]PrivKeyTweaker{
+			0: func(key *btcec.PrivateKey) (*btcec.PrivateKey, error) {
+				key.Key.Add(tweak)
+				return key, nil
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	// Assert: The signature names the tweaked key, the origin still names
+	// the base key, and the finalized transaction spends the actual output.
+	require.Equal(t, []uint32{0}, result.SignedInputs)
+	require.Len(t, packet.Inputs[0].PartialSigs, 1)
+	require.Equal(t, pubKey, packet.Inputs[0].PartialSigs[0].PubKey)
+	require.Equal(t, basePub.SerializeCompressed(),
+		packet.Inputs[0].Bip32Derivation[0].PubKey)
+	require.NoError(t, psbt.MaybeFinalizeAll(packet))
+	finalTx, err := psbt.Extract(packet)
+	require.NoError(t, err)
+	vm, err := txscript.NewEngine(
+		script, finalTx, 0, txscript.StandardVerifyFlags, nil, nil,
+		utxo.Value, txscript.NewCannedPrevOutputFetcher(script, utxo.Value),
+	)
+	require.NoError(t, err)
+	require.NoError(t, vm.Execute())
+}
+
 // TestSignPsbtFailNilParams tests that SignPsbt returns ErrNilSignPsbtParams
 // when provided with nil parameters.
 func TestSignPsbtFailNilParams(t *testing.T) {

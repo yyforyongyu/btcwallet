@@ -14,6 +14,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/psbt/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
@@ -1991,6 +1992,22 @@ func (w *Wallet) signBip32PsbtInput(ctx context.Context, packet *psbt.Packet,
 		Details:    details,
 	}
 
+	// A caller's tweak changes the signing public key, but not its base
+	// derivation origin. Capture the key during the existing signing call
+	// so the PartialSig can assemble a witness for the tweaked output.
+	signDerivation := *derivation
+	if tweaker != nil {
+		params.Tweaker = func(key *btcec.PrivateKey) (
+			*btcec.PrivateKey, error) {
+
+			key, err := tweaker(key)
+			if err == nil {
+				signDerivation.PubKey = key.PubKey().SerializeCompressed()
+			}
+			return key, err
+		}
+	}
+
 	// Compute the raw signature.
 	sig, err := w.computeRawSig(ctx, params)
 	if err != nil {
@@ -1998,7 +2015,7 @@ func (w *Wallet) signBip32PsbtInput(ctx context.Context, packet *psbt.Packet,
 	}
 
 	// Apply the signature to the PSBT input.
-	addBip32SigToPInput(pInput, sig, params.HashType, derivation, addrType)
+	addBip32SigToPInput(pInput, sig, params.HashType, &signDerivation, addrType)
 
 	return nil
 }
