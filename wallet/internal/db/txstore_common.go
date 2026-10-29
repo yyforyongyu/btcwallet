@@ -914,10 +914,13 @@ func checkReuseCreateTx(req CreateTxRequest,
 		return req.IsCoinbase && existing.Status == TxStatusOrphaned
 	}
 
-	// Non-coinbase rows only reuse the current unmined states.
-	// Once a row is invalidated, UpdateTx/DeleteTx no longer
-	// treat it as a live unmined target.
-	if !IsUnminedStatus(existing.Status) {
+	// A real block is authoritative even when an unmined replacement
+	// previously displaced this hash. Reuse the same graph reconciliation
+	// so confirmation restores the actual winner's spend edges atomically.
+	if !IsUnminedStatus(existing.Status) &&
+		existing.Status != TxStatusReplaced &&
+		existing.Status != TxStatusFailed {
+
 		return false
 	}
 
@@ -1097,8 +1100,8 @@ func handleTxDescendants(ctx context.Context, walletID int64,
 	return nil
 }
 
-// handleTxConflicts discovers the direct conflicting roots of a new confirmed
-// tx, rewrites them to replaced state, and marks their descendants failed.
+// handleTxConflicts rewrites conflicts of a confirmed or network-accepted
+// replacement to replaced state and marks their descendants failed.
 //
 // The replacement algorithm is intentionally ordered:
 //   - load the direct conflicting roots first
@@ -1114,8 +1117,9 @@ func handleTxDescendants(ctx context.Context, walletID int64,
 func handleTxConflicts(ctx context.Context, req CreateTxRequest,
 	replacementTxID int64, ops CreateTxOps) error {
 
-	// Only confirmed inserts can replace an active unmined branch.
-	if req.Params.Block == nil {
+	// A prepublication attempt must leave the original branch intact. Only
+	// confirmation or an explicitly accepted replacement can displace it.
+	if req.Params.Block == nil && !req.Params.ReplaceUnmined {
 		return nil
 	}
 
@@ -1347,7 +1351,7 @@ func createTxWithExisting(ctx context.Context, req CreateTxRequest,
 // caller has opened a backend-specific SQL transaction.
 //
 // The helper can either confirm an existing unmined row or Insert a new row.
-// For confirmed inserts it also reconciles any current direct conflict branch
+// Confirmed and accepted replacement inserts reconcile direct conflicts
 // before the new row claims wallet-owned inputs. The helper owns that ordering
 // so the backends only need to supply query wiring and type conversion.
 // Direct creation keeps strict label comparison; scan batches instead use

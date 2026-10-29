@@ -1155,6 +1155,12 @@ type CreateTxParams struct {
 	// coinbase rows and must not be used for ordinary transactions.
 	Status TxStatus
 
+	// ReplaceUnmined permits replacing conflicting unmined spends after the
+	// caller observes network acceptance. Prepublication writes leave this
+	// false so a rejected broadcast cannot invalidate the original branch.
+	// Confirmed observations already arbitrate conflicts through Block.
+	ReplaceUnmined bool
+
 	// Label is an optional label for the transaction.
 	Label string
 
