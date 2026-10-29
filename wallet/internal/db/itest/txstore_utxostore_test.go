@@ -5226,3 +5226,88 @@ func TestCreateTxAcceptedReplacement(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyTxBatchExcludesNoChainSync keeps key-only accounts out of automatic
+// notification credits while retaining their ordinary ownership metadata.
+func TestApplyTxBatchExcludesNoChainSync(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Materialize ordinary and excluded account addresses in the
+	// real SQL harness, with both scripts appearing in one observed tx.
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "batch-key-only-output")
+	scripts := make([][]byte, 0, 2)
+	outputs := make([]*wire.TxOut, 0, 2)
+	candidates := make(map[uint32][]address.Address)
+
+	for i, account := range []struct {
+		name     string
+		excluded bool
+	}{
+		{
+			name: "ordinary",
+		},
+		{
+			name:     "excluded",
+			excluded: true,
+		},
+	} {
+		_, err := store.CreateDerivedAccount(t.Context(),
+			db.CreateDerivedAccountParams{
+				WalletID:    walletID,
+				Scope:       db.KeyScopeBIP0084,
+				Name:        account.name,
+				NoChainSync: account.excluded,
+			}, SpendableDeriveFn())
+		require.NoError(t, err)
+
+		addr := newDerivedAddress(t, store, walletID,
+			db.KeyScopeBIP0084, account.name, false)
+		scripts = append(scripts, addr.ScriptPubKey)
+		outputs = append(outputs, wire.NewTxOut(5000, addr.ScriptPubKey))
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+			addr.ScriptPubKey, &chaincfg.RegressionNetParams,
+		)
+		require.NoError(t, err)
+
+		candidates[uint32(i)] = addrs
+	}
+
+	owned, err := store.ResolveOwnedAddresses(t.Context(),
+		db.ResolveOwnedAddressesQuery{
+			WalletID:      walletID,
+			ScriptPubKeys: scripts,
+		})
+	require.NoError(t, err)
+
+	tx := newRegularTx([]wire.OutPoint{randomOutPoint()}, outputs)
+
+	// Act: Admit chain-observed credit candidates through the transactional
+	// batch API, letting it apply account synchronization policy atomically.
+	err = store.ApplyTxBatch(t.Context(), db.TxBatchParams{
+		WalletID: walletID,
+		Transactions: []db.CreateTxParams{
+			{
+				WalletID:         walletID,
+				Tx:               tx,
+				Received:         time.Unix(1710009990, 0),
+				Status:           db.TxStatusPublished,
+				CreditCandidates: candidates,
+			},
+		},
+	})
+
+	// Assert: Both addresses remain owned, but only the ordinary output is
+	// credited. The excluded account's policy is exposed to publication too.
+	require.NoError(t, err)
+	detail, err := store.GetTxDetail(t.Context(), db.GetTxDetailQuery{
+		WalletID: walletID,
+		Txid:     tx.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Len(t, detail.OwnedOutputs, 1)
+	require.Zero(t, detail.OwnedOutputs[0].Index)
+	require.Len(t, owned, 2)
+	require.False(t, owned[string(scripts[0])].NoChainSync)
+	require.True(t, owned[string(scripts[1])].NoChainSync)
+}
