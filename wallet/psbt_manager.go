@@ -1495,6 +1495,7 @@ func (w *Wallet) signPsbtInput(ctx context.Context, packet *psbt.Packet,
 // conventions):
 //  1. Path length must be exactly 5.
 //  2. First 3 elements must be hardened.
+//
 // The coin type identifies a stored account scope, independently of the
 // address network. Signing resolves the exact scope and account from storage.
 //
@@ -1550,21 +1551,6 @@ func (w *Wallet) parseBip32Path(path []uint32) (BIP32Path, error) {
 	}
 
 	return bip32Path, nil
-}
-
-// addressTypeFromPurpose maps a BIP purpose to a wallet address type.
-func addressTypeFromPurpose(purpose uint32) (waddrmgr.AddressType, error) {
-	// TODO(yy): Currently, we hardcode the supported BIP purposes.
-	// A more robust solution would dynamically query the `waddrmgr` to
-	// determine supported key scopes configured in the database, allowing
-	// for custom purposes (e.g., LND's 1017 purpose key) to be seamlessly
-	// supported without code changes here.
-	addrType, err := waddrmgr.AddressTypeForPurpose(purpose)
-	if err != nil {
-		return 0, fmt.Errorf("%w: %d", ErrUnknownBip32Purpose, purpose)
-	}
-
-	return addrType, nil
 }
 
 // shouldSkipInput determines whether the input at the given index should be
@@ -2039,9 +2025,25 @@ func (w *Wallet) signBip32PsbtInput(ctx context.Context, packet *psbt.Packet,
 		return fmt.Errorf("invalid derivation path: %w", err)
 	}
 
-	addrType, err := addressTypeFromPurpose(path.KeyScope.Purpose)
-	if err != nil {
-		return err
+	// The prevout selects the signing algorithm. Custom stored scopes,
+	// including Lightning's purpose 1017, can spend standard scripts without
+	// pretending their key origin is an address-standard purpose.
+	var addrType waddrmgr.AddressType
+	switch class := txscript.GetScriptClass(utxo.PkScript); class {
+	case txscript.WitnessV0PubKeyHashTy, txscript.WitnessV0ScriptHashTy:
+		addrType = waddrmgr.WitnessPubKey
+	case txscript.ScriptHashTy:
+		addrType = waddrmgr.NestedWitnessPubKey
+	case txscript.PubKeyHashTy:
+		addrType = waddrmgr.PubKeyHash
+	case txscript.NonStandardTy, txscript.PubKeyTy, txscript.MultiSigTy,
+		txscript.NullDataTy, txscript.WitnessV1TaprootTy,
+		txscript.PayToAnchorTy, txscript.WitnessUnknownTy:
+
+		// Known unsupported classes share the existing rejection path.
+		fallthrough
+	default:
+		return fmt.Errorf("%w: %v", ErrUnknownAddressType, class)
 	}
 
 	// Construct SpendDetails for Legacy/SegWit input.
