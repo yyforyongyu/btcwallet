@@ -2189,62 +2189,6 @@ func TestParseBip32Path(t *testing.T) {
 	}
 }
 
-// TestAddressTypeFromPurpose tests that addressTypeFromPurpose returns the
-// correct AddressType for supported BIP32 purposes and returns an error for
-// unknown purposes.
-func TestAddressTypeFromPurpose(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		purpose     uint32
-		want        waddrmgr.AddressType
-		expectedErr error
-	}{
-		{
-			name:    "BIP44",
-			purpose: waddrmgr.KeyScopeBIP0044.Purpose,
-			want:    waddrmgr.PubKeyHash,
-		},
-		{
-			name:    "BIP49",
-			purpose: waddrmgr.KeyScopeBIP0049Plus.Purpose,
-			want:    waddrmgr.NestedWitnessPubKey,
-		},
-		{
-			name:    "BIP84",
-			purpose: waddrmgr.KeyScopeBIP0084.Purpose,
-			want:    waddrmgr.WitnessPubKey,
-		},
-		{
-			name:    "BIP86",
-			purpose: waddrmgr.KeyScopeBIP0086.Purpose,
-			want:    waddrmgr.TaprootPubKey,
-		},
-		{
-			name:        "unknown",
-			purpose:     999,
-			expectedErr: ErrUnknownBip32Purpose,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			// Act: Call addressTypeFromPurpose with the test
-			// purpose.
-			got, err := addressTypeFromPurpose(tc.purpose)
-
-			// Assert: Verify that the returned address type matches
-			// the expected type for the given purpose, or that the
-			// expected error is returned for unknown purposes.
-			require.ErrorIs(t, err, tc.expectedErr)
-			require.Equal(t, tc.want, got)
-		})
-	}
-}
-
 // TestShouldSkipInput tests that shouldSkipInput correctly identifies inputs
 // that should be skipped during signing (e.g., finalized inputs, inputs with
 // no derivation info) and those that should be processed.
@@ -3561,36 +3505,10 @@ func TestSignPsbtClassifiesSignError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Arrange: Build a packet with one input and a valid BIP-84
-			// derivation path.
-			tx := wire.NewMsgTx(2)
-			tx.AddTxIn(&wire.TxIn{})
-			tx.AddTxOut(&wire.TxOut{
-				Value: 1000, PkScript: []byte{},
-			})
-			packet, err := psbt.NewFromUnsignedTx(tx)
-			require.NoError(t, err)
-
-			p2wkhScript, err := txscript.PayToAddrScript(
-				&address.AddressWitnessPubKeyHash{},
-			)
-			require.NoError(t, err)
-
-			packet.Inputs[0].WitnessUtxo = &wire.TxOut{
-				Value:    1000,
-				PkScript: p2wkhScript,
-			}
-			packet.Inputs[0].Bip32Derivation =
-				[]*psbt.Bip32Derivation{{
-					Bip32Path: []uint32{
-						hdkeychain.HardenedKeyStart + 84,
-						hdkeychain.HardenedKeyStart + 1,
-						hdkeychain.HardenedKeyStart + 0,
-						0, 0,
-					},
-					PubKey: testValidKey().SerializeCompressed(),
-				}}
-			packet.Inputs[0].SighashType = txscript.SigHashAll
+			// Arrange: Use the existing valid P2WPKH fixture so execution
+			// reaches the programmed account-secret error, rather than
+			// rejecting an empty witness program as nonstandard.
+			packet := testP2WPKHSignPacket(t, 0)
 
 			w, mocks := createUnlockedWalletWithMocks(t)
 			mocks.store.On(
@@ -4050,7 +3968,8 @@ func TestSignBip32PsbtInputErrors(t *testing.T) {
 	err = w.signBip32PsbtInput(t.Context(), packet, 0, nil, nil)
 	require.ErrorIs(t, err, ErrInvalidBip32Path)
 
-	// Case 2: Unknown Purpose.
+	// Case 2: An unsupported prevout script must fail even for a valid
+	// derivation path. The public lnd regression covers custom scopes.
 	packet.Inputs[0].Bip32Derivation[0].Bip32Path = []uint32{
 		hdkeychain.HardenedKeyStart + 999, // Unknown
 		hdkeychain.HardenedKeyStart + 1,
@@ -4058,7 +3977,7 @@ func TestSignBip32PsbtInputErrors(t *testing.T) {
 		0, 0,
 	}
 	err = w.signBip32PsbtInput(t.Context(), packet, 0, nil, nil)
-	require.ErrorIs(t, err, ErrUnknownBip32Purpose)
+	require.ErrorIs(t, err, ErrUnknownAddressType)
 }
 
 // TestAddScriptToPInput tests that addScriptToPInput correctly updates
