@@ -3773,6 +3773,17 @@ func TestSignPsbtSkipsWalletRecord(t *testing.T) {
 	// Arrange: a packet the wallet has already signed once. The store
 	// lookup is programmed for that first pass only.
 	packet := testP2WPKHSignPacket(t, 0)
+	// A pay-join participant can provide both formats even for a SegWit v0
+	// prevout. Matching origins must not switch its signing algorithm.
+	origin := packet.Inputs[0].Bip32Derivation[0]
+	packet.Inputs[0].TaprootBip32Derivation = []*psbt.TaprootBip32Derivation{
+		{
+			XOnlyPubKey:          origin.PubKey[1:],
+			MasterKeyFingerprint: origin.MasterKeyFingerprint,
+			Bip32Path:            origin.Bip32Path,
+		},
+	}
+
 	derivations := clonePacket(packet).Inputs[0].Bip32Derivation
 
 	w, mocks := createUnlockedWalletWithMocks(t)
@@ -3823,6 +3834,16 @@ func TestSignPsbtSkipsWalletKeySpendRecord(t *testing.T) {
 				0, 0,
 			},
 		}}
+	// lnd can include both origin formats for the same key. Keep the
+	// redundant base record through both public signing passes.
+	packet.Inputs[0].Bip32Derivation = []*psbt.Bip32Derivation{
+		{
+			PubKey: walletPub.SerializeCompressed(),
+			Bip32Path: packet.Inputs[0].
+				TaprootBip32Derivation[0].Bip32Path,
+		},
+	}
+
 	derivations := clonePacket(packet).Inputs[0].TaprootBip32Derivation
 
 	w, mocks := createUnlockedWalletWithMocks(t)
