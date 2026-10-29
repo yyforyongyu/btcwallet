@@ -1783,3 +1783,50 @@ func TestBroadcastReplacement(t *testing.T) {
 		})
 	}
 }
+
+// TestBroadcastExcludesNoChainSync keeps key-only outputs out of automatic
+// tracking while still publishing a transaction with ordinary wallet change.
+func TestBroadcastExcludesNoChainSync(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Resolve one ordinary change address and one excluded key-only
+	// address. Fixture cleanup verifies the exact publication calls once.
+	w, m := createStartedWalletWithMocks(t)
+	change := mustNewStandalonePubKeyAddr(t)
+	keyOnly := mustNewStandalonePubKeyAddr(t)
+	changeScript := mustPayToAddrScript(change)
+	keyScript := mustPayToAddrScript(keyOnly)
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, nil))
+	tx.AddTxOut(wire.NewTxOut(4000, changeScript))
+	tx.AddTxOut(wire.NewTxOut(1000, keyScript))
+	m.chain.On("TestMempoolAccept", mock.Anything, mock.Anything).
+		Return([]*btcjson.TestMempoolAcceptResult{
+			{
+				Allowed: true,
+			},
+		}, nil).Once()
+	m.store.On("ResolveOwnedAddresses", mock.Anything,
+		matchResolveOwnedAddressesQuery(w.id, changeScript, keyScript),
+	).Return(map[string]*db.AddressInfo{
+		string(changeScript): {},
+		string(keyScript): {
+			NoChainSync: true,
+		},
+	}, nil).Once()
+	m.store.On("CreateTx", mock.Anything,
+		matchCreateTxParams(w.id, tx, testTxLabel,
+			map[uint32]address.Address{0: change}),
+	).Return(nil).Once()
+	m.chain.On("NotifyReceived", []address.Address{change}).Return(nil).Once()
+	m.chain.On("SendRawTransaction", tx, false).
+		Return((*chainhash.Hash)(nil), nil).Once()
+
+	// Act: Broadcast through the public Wallet API, including recording the
+	// credited outputs before publication and registering the receiving watch.
+	err := w.Broadcast(t.Context(), tx, testTxLabel)
+
+	// Assert: Publication succeeds with only ordinary change credited and
+	// watched; key-only ownership does not create an automatic wallet UTXO.
+	require.NoError(t, err)
+}

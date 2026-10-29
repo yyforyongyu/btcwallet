@@ -696,7 +696,13 @@ func (w *Wallet) filterOwnedAddresses(ctx context.Context,
 		return nil, err
 	}
 
-	for scriptKey := range owned {
+	for scriptKey, info := range owned {
+		// Key-only ownership permits signing, but does not opt this output
+		// into automatic transaction tracking or receiving watches.
+		if info.NoChainSync {
+			continue
+		}
+
 		key := scriptToKey[scriptKey]
 		ownedAddrs[key] = uniqueAddrs[key]
 	}
