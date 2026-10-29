@@ -2055,7 +2055,9 @@ func TestPopulatePsbtPacketSuccess(t *testing.T) {
 func TestParseBip32Path(t *testing.T) {
 	t.Parallel()
 
-	// Use mainnet params for testing (HDCoinType = 0).
+	// Arrange: Use mainnet address parameters while including an explicit
+	// coin-1 account scope. A stored scope need not use the address network's
+	// default coin type; malformed path prefixes must still be rejected.
 	chainParams := &chaincfg.MainNetParams
 	w := &Wallet{
 		cfg: Config{
@@ -2133,11 +2135,22 @@ func TestParseBip32Path(t *testing.T) {
 			expectedErr: ErrInvalidBip32Path,
 		},
 		{
-			name: "coin type mismatch",
+			name: "explicit account coin scope",
 			path: []uint32{
 				hardened(84), hardened(1), hardened(0), 0, 0,
 			},
-			expectedErr: ErrInvalidBip32Path,
+			wantPath: BIP32Path{
+				KeyScope: waddrmgr.KeyScope{
+					Purpose: 84,
+					Coin:    1,
+				},
+				DerivationPath: waddrmgr.DerivationPath{
+					InternalAccount: 0,
+					Account:         0,
+					Branch:          0,
+					Index:           0,
+				},
+			},
 		},
 		{
 			name: "unknown purpose (now allowed in parseBip32Path)",
