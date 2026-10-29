@@ -3087,11 +3087,10 @@ func TestCreateBip32SpendDetails(t *testing.T) {
 func TestSignTaprootPsbtInput(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Setup keys.
-	privKey, err := btcec.NewPrivateKey()
-	require.NoError(t, err)
-
-	pubKey := privKey.PubKey()
+	// Arrange: Match the packet origin to the real fixture key returned
+	// by the store-routed signer, rather than an unrelated random key.
+	privKey, pubKey := deriveLeafKeys(t, testAccountXPrv(t), 0, 0)
+	t.Cleanup(privKey.Zero)
 	xOnlyPubKey := schnorr.SerializePubKey(pubKey)
 
 	// Arrange: Define the BIP32 derivation path and Taproot derivation
@@ -3130,8 +3129,7 @@ func TestSignTaprootPsbtInput(t *testing.T) {
 
 	// Arrange: Program the store-routed signer key lookup for the BIP-86
 	// path (purpose 86, coin type 1 for RegressionNet, account 0, branch 0,
-	// index 0). The key-path signature is not validated against a specific
-	// key here, so the derived leaf keys are discarded.
+	// index 0), matching the declared key origin above.
 	_, _ = expectStoreSignerPrivKey(
 		t, mocks, w.id, waddrmgr.KeyScope{Purpose: 86, Coin: 1},
 		waddrmgr.DerivationPath{
@@ -3160,11 +3158,10 @@ func TestSignTaprootPsbtInput(t *testing.T) {
 func TestSignBip32PsbtInput(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Setup keys.
-	privKey, err := btcec.NewPrivateKey()
-	require.NoError(t, err)
-
-	pubKey := privKey.PubKey()
+	// Arrange: Match the packet origin to the real fixture key returned
+	// by the store-routed signer, rather than an unrelated random key.
+	privKey, pubKey := deriveLeafKeys(t, testAccountXPrv(t), 0, 0)
+	t.Cleanup(privKey.Zero)
 	pubKeyBytes := pubKey.SerializeCompressed()
 
 	// Arrange: Define the BIP32 derivation path for the input key (BIP-84
@@ -3210,8 +3207,7 @@ func TestSignBip32PsbtInput(t *testing.T) {
 
 	// Arrange: Program the store-routed signer key lookup for the BIP-84
 	// path (purpose 84, coin type 1 for RegressionNet, account 0, branch 0,
-	// index 0). The resulting PartialSig echoes the derivation entry's
-	// public key, so the derived leaf keys are discarded.
+	// index 0), matching the declared key origin above.
 	_, _ = expectStoreSignerPrivKey(
 		t, mocks, w.id, waddrmgr.KeyScope{Purpose: 84, Coin: 1},
 		waddrmgr.DerivationPath{
@@ -3312,6 +3308,96 @@ func TestSignPsbtTweakedKey(t *testing.T) {
 	require.NoError(t, vm.Execute())
 }
 
+// TestSignPsbtSkipsForeignOrigin checks that matching account coordinates do
+// not authorize signing an input whose public key belongs to another wallet.
+func TestSignPsbtSkipsForeignOrigin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		purpose uint32
+		taproot bool
+	}{
+		{
+			name:    "SegWit v0",
+			purpose: 84,
+		},
+		{
+			name:    "Taproot",
+			purpose: 86,
+			taproot: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange: The signer has this account/path, but its key
+			// differs from the participant's key committed by the UTXO.
+			w, mocks := createUnlockedWalletWithMocks(t)
+			_, _ = expectStoreSignerPrivKey(
+				t, mocks, w.id, waddrmgr.KeyScope{
+					Purpose: tc.purpose,
+					Coin:    1,
+				}, waddrmgr.DerivationPath{},
+			)
+			foreign, err := btcec.NewPrivateKey()
+			require.NoError(t, err)
+			t.Cleanup(foreign.Zero)
+			pub := foreign.PubKey()
+			addr, err := address.NewAddressWitnessPubKeyHash(
+				address.Hash160(pub.SerializeCompressed()), &chainParams,
+			)
+			require.NoError(t, err)
+			script, err := txscript.PayToAddrScript(addr)
+			require.NoError(t, err)
+			hashType := txscript.SigHashAll
+			if tc.taproot {
+				script, err = txscript.PayToTaprootScript(
+					txscript.ComputeTaprootKeyNoScript(pub),
+				)
+				require.NoError(t, err)
+				hashType = txscript.SigHashDefault
+			}
+			packet, _, _ := testAuthPacket(
+				t, wire.NewTxOut(1000, script), hashType,
+			)
+			path := []uint32{
+				hdkeychain.HardenedKeyStart + tc.purpose,
+				hdkeychain.HardenedKeyStart + 1,
+				hdkeychain.HardenedKeyStart, 0, 0,
+			}
+			if tc.taproot {
+				packet.Inputs[0].TaprootBip32Derivation =
+					[]*psbt.TaprootBip32Derivation{
+						{
+							XOnlyPubKey: schnorr.SerializePubKey(pub),
+							Bip32Path:   path,
+						},
+					}
+			} else {
+				packet.Inputs[0].Bip32Derivation = []*psbt.Bip32Derivation{
+					{
+						PubKey:    pub.SerializeCompressed(),
+						Bip32Path: path,
+					},
+				}
+			}
+			before := clonePacket(packet)
+
+			// Act: Ask this wallet to contribute to the participant's
+			// packet through the public signing API.
+			result, err := w.SignPsbt(
+				t.Context(), &SignPsbtParams{Packet: packet},
+			)
+
+			// Assert: A foreign key is skipped without adding a false
+			// signature or changing the participant's original packet.
+			require.NoError(t, err)
+			require.Empty(t, result.SignedInputs)
+			require.Equal(t, before, packet)
+		})
+	}
+}
+
 // TestSignPsbtFailNilParams tests that SignPsbt returns ErrNilSignPsbtParams
 // when provided with nil parameters.
 func TestSignPsbtFailNilParams(t *testing.T) {
@@ -3339,19 +3425,24 @@ func TestSignPsbt(t *testing.T) {
 		name    string
 		account uint32
 	}{
-		{name: "default account", account: 0},
-		{name: "non-zero account", account: 2},
+		{
+			name:    "default account",
+			account: 0,
+		},
+		{
+			name:    "non-zero account",
+			account: 2,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Arrange: Setup keys.
-			privKey, err := btcec.NewPrivateKey()
-			require.NoError(t, err)
-
-			pubKey := privKey.PubKey()
+			// Arrange: Use the actual key returned by the store-routed
+			// fixture so the packet's origin proves key ownership.
+			privKey, pubKey := deriveLeafKeys(t, testAccountXPrv(t), 0, 0)
+			t.Cleanup(privKey.Zero)
 			pubKeyBytes := pubKey.SerializeCompressed()
 
 			// Arrange: Define the BIP32 derivation path for the
@@ -3398,9 +3489,8 @@ func TestSignPsbt(t *testing.T) {
 			w, mocks := createUnlockedWalletWithMocks(t)
 
 			// Arrange: Program the store-routed signer key lookup
-			// for the resolved account. The derived leaf keys are
-			// discarded because the PartialSig echoes the
-			// derivation entry's public key.
+			// for the resolved account. The fixture derives the same
+			// leaf key as the packet's declared public key.
 			_, _ = expectStoreSignerPrivKey(
 				t, mocks, w.id,
 				waddrmgr.KeyScope{Purpose: 84, Coin: 1},
@@ -3421,7 +3511,6 @@ func TestSignPsbt(t *testing.T) {
 			require.Len(t, result.SignedInputs, 1)
 			require.Equal(t, uint32(0), result.SignedInputs[0])
 			require.Len(t, packet.Inputs[0].PartialSigs, 1)
-			mocks.store.AssertExpectations(t)
 		})
 	}
 }

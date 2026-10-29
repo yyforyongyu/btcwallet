@@ -1543,7 +1543,8 @@ func shouldSkipSigningError(err error, idx int) bool {
 	// operational Store, vault, tweaking and signing errors must reach the
 	// caller.
 	missingSigningKey := errors.Is(err, ErrAccountNotInStore) ||
-		errors.Is(err, ErrWatchOnlyAccount)
+		errors.Is(err, ErrWatchOnlyAccount) ||
+		errors.Is(err, ErrNoAssocPrivateKey)
 	if errors.Is(err, errComputeRawSig) && missingSigningKey {
 		log.Debugf("Skipping input %d: %v", idx, err)
 		return true
@@ -1920,8 +1921,22 @@ func (w *Wallet) signTaprootPsbtInput(ctx context.Context, packet *psbt.Packet,
 		SigHashes:  sigHashes,
 		HashType:   pInput.SighashType,
 		Path:       path,
-		Tweaker:    tweaker,
 		Details:    details,
+	}
+
+	// A path can exist in several participants' wallets. Verify the base
+	// key against the x-only origin before a caller tweak or signature so
+	// collaborative signing never produces another owner's invalid record.
+	params.Tweaker = func(key *btcec.PrivateKey) (*btcec.PrivateKey, error) {
+		if !bytes.Equal(key.PubKey().SerializeCompressed()[1:],
+			tapDerivation.XOnlyPubKey) {
+
+			return nil, ErrNoAssocPrivateKey
+		}
+		if tweaker != nil {
+			return tweaker(key)
+		}
+		return key, nil
 	}
 
 	// Compute the raw signature.
@@ -2003,24 +2018,25 @@ func (w *Wallet) signBip32PsbtInput(ctx context.Context, packet *psbt.Packet,
 		SigHashes:  sigHashes,
 		HashType:   pInput.SighashType,
 		Path:       path,
-		Tweaker:    tweaker,
 		Details:    details,
 	}
 
-	// A caller's tweak changes the signing public key, but not its base
-	// derivation origin. Capture the key during the existing signing call
-	// so the PartialSig can assemble a witness for the tweaked output.
+	// Verify ownership during the existing key lookup: another participant
+	// can use this same path under a different root. Capture a caller's
+	// tweaked signing key only after its base key matches the claimed origin.
 	signDerivation := *derivation
-	if tweaker != nil {
-		params.Tweaker = func(key *btcec.PrivateKey) (
-			*btcec.PrivateKey, error) {
-
-			key, err := tweaker(key)
-			if err == nil {
-				signDerivation.PubKey = key.PubKey().SerializeCompressed()
-			}
-			return key, err
+	params.Tweaker = func(key *btcec.PrivateKey) (*btcec.PrivateKey, error) {
+		if !bytes.Equal(key.PubKey().SerializeCompressed(), derivation.PubKey) {
+			return nil, ErrNoAssocPrivateKey
 		}
+		if tweaker != nil {
+			key, err = tweaker(key)
+			if err != nil {
+				return nil, err
+			}
+			signDerivation.PubKey = key.PubKey().SerializeCompressed()
+		}
+		return key, nil
 	}
 
 	// Compute the raw signature.
