@@ -749,9 +749,9 @@ func TestDecorateInputErrNotPubKey(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotPubKeyAddress)
 }
 
-// TestDecorateInputErrImported tests that decorateInput returns
-// ErrDerivationPathNotFound when the address is imported.
-func TestDecorateInputErrImported(t *testing.T) {
+// TestDecorateInputImportedFacts retains verified UTXO facts without inventing
+// root origin metadata for an owned public-key input.
+func TestDecorateInputImportedFacts(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Setup keys and address.
@@ -783,16 +783,20 @@ func TestDecorateInputErrImported(t *testing.T) {
 	tx := &wire.MsgTx{}
 	pInput := &psbt.PInput{}
 
-	// Act: Call decorateInput.
+	// Act: Decorate the owned input using the public-key script facts,
+	// even though the Store cannot provide its complete root origin.
 	_, err = w.decorateInput(t.Context(), pInput, tx, utxo)
 
-	// Assert: Verify the error.
-	require.ErrorIs(t, err, ErrDerivationPathNotFound)
+	// Assert: Funding metadata remains useful for an external signer, while
+	// absence of BIP32 origin stays explicit rather than filled with guesses.
+	require.NoError(t, err)
+	require.Equal(t, utxo, pInput.WitnessUtxo)
+	require.Empty(t, pInput.Bip32Derivation)
 }
 
-// TestDecorateInputErrDerivationMissing tests that decorateInput returns
-// ErrDerivationPathNotFound when derivation info is missing.
-func TestDecorateInputErrDerivationMissing(t *testing.T) {
+// TestDecorateInputUnknownOrigin retains verified UTXO facts without inventing
+// root origin metadata for an owned public-key input.
+func TestDecorateInputUnknownOrigin(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Setup keys and address.
@@ -824,11 +828,15 @@ func TestDecorateInputErrDerivationMissing(t *testing.T) {
 	tx := &wire.MsgTx{}
 	pInput := &psbt.PInput{}
 
-	// Act: Call decorateInput.
+	// Act: Decorate the owned input using the public-key script facts,
+	// even though the Store cannot provide its complete root origin.
 	_, err = w.decorateInput(t.Context(), pInput, tx, utxo)
 
-	// Assert: Verify the error.
-	require.ErrorIs(t, err, ErrDerivationPathNotFound)
+	// Assert: Funding metadata remains useful for an external signer, while
+	// absence of BIP32 origin stays explicit rather than filled with guesses.
+	require.NoError(t, err)
+	require.Equal(t, utxo, pInput.WitnessUtxo)
+	require.Empty(t, pInput.Bip32Derivation)
 }
 
 // TestDecorateInputNestedWitnessUsesRedeemScript verifies that nested witness
@@ -1100,8 +1108,8 @@ func TestDecorateInputsErrDecorationFailed(t *testing.T) {
 
 // TestFundPsbtImportedAccountSchema verifies strict and hybrid BIP49 change
 // from numberless XPub accounts uses the account's branch type without
-// inventing an origin. The input has a known origin; Task 482 owns funding
-// imported inputs whose origin is unknown.
+// inventing an origin, including numberless inputs with optional caller
+// metadata. A caller key that contradicts the owned script must still fail.
 func TestFundPsbtImportedAccountSchema(t *testing.T) {
 	t.Parallel()
 
@@ -1112,6 +1120,9 @@ func TestFundPsbtImportedAccountSchema(t *testing.T) {
 		addrType    db.AddressType
 		scriptClass txscript.ScriptClass
 		redeemClass txscript.ScriptClass
+		numberless  bool
+		callerKey   bool
+		conflict    bool
 	}{
 		{
 			name:        "preserve strict change",
@@ -1125,16 +1136,39 @@ func TestFundPsbtImportedAccountSchema(t *testing.T) {
 			scriptClass: txscript.WitnessV0PubKeyHashTy,
 			redeemClass: txscript.NonStandardTy,
 		},
+		{
+			name:        "numberless input without origin",
+			addrType:    db.WitnessPubKey,
+			scriptClass: txscript.WitnessV0PubKeyHashTy,
+			redeemClass: txscript.NonStandardTy,
+			numberless:  true,
+		},
+		{
+			name:        "numberless input with caller origin",
+			addrType:    db.WitnessPubKey,
+			scriptClass: txscript.WitnessV0PubKeyHashTy,
+			redeemClass: txscript.NonStandardTy,
+			numberless:  true,
+			callerKey:   true,
+		},
+		{
+			name:        "numberless input rejects conflicting key",
+			addrType:    db.WitnessPubKey,
+			scriptClass: txscript.WitnessV0PubKeyHashTy,
+			redeemClass: txscript.NonStandardTy,
+			numberless:  true,
+			callerKey:   true,
+			conflict:    true,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Arrange: Use a mature known-origin input so input decoration
-			// remains outside this regression. The explicit BIP49 change
-			// account has no account number, while its public child key
-			// still establishes the nested or native script facts.
+			// Arrange: Use a mature owned input with known script facts.
+			// Origin may be absent or caller-supplied; change is always a
+			// numberless account whose branch schema remains authoritative.
 			w, deps := createStartedSQLWalletWithMocks(t)
 			deps.syncer.On("syncState").Return(syncStateSynced).Once()
 
@@ -1165,11 +1199,26 @@ func TestFundPsbtImportedAccountSchema(t *testing.T) {
 				},
 			).Return(testStoreTxDetail(validUTXO.Hash, input), nil).
 				Once()
-			expectSignerDerivedAddressInfo(
-				t, w, deps, inputAddr, db.WitnessPubKey, pubKey,
-			)
-			deps.store.ExpectedCalls[len(deps.store.ExpectedCalls)-1].
-				Once()
+
+			if test.numberless {
+				deps.store.On("GetAddress", mock.Anything,
+					db.GetAddressQuery{
+						WalletID:     w.id,
+						ScriptPubKey: inputScript,
+					},
+				).Return(&db.AddressInfo{
+					AddrType:          db.WitnessPubKey,
+					HasDerivationPath: true,
+					ScriptPubKey:      inputScript,
+					PubKey:            inputKey,
+				}, nil).Once()
+			} else {
+				expectSignerDerivedAddressInfo(
+					t, w, deps, inputAddr, db.WitnessPubKey, pubKey,
+				)
+				deps.store.ExpectedCalls[len(deps.store.ExpectedCalls)-1].
+					Once()
+			}
 
 			accountName := "schema change"
 			scope := waddrmgr.KeyScopeBIP0049Plus
@@ -1201,10 +1250,13 @@ func TestFundPsbtImportedAccountSchema(t *testing.T) {
 			)
 			// The funded packet keeps this change, so FundPsbt
 			// registers it before returning.
-			deps.chain.On(
-				"WatchAddrsFromTip", w.lifetimeCtx,
-				[]address.Address{changeAddr},
-			).Return(nil).Once()
+			if !test.conflict {
+				deps.chain.On(
+					"WatchAddrsFromTip", w.lifetimeCtx,
+					[]address.Address{changeAddr},
+				).Return(nil).Once()
+			}
+
 			// HD coordinates and a public key establish script facts;
 			// the zero account-number pointer keeps the root origin absent.
 			changeInfo := new(db.AddressInfo)
@@ -1215,12 +1267,14 @@ func TestFundPsbtImportedAccountSchema(t *testing.T) {
 			changeInfo.ScriptPubKey = changeScript
 			changeInfo.PubKey = changeKey
 
-			deps.store.On("GetAddress", mock.Anything,
-				db.GetAddressQuery{
-					WalletID:     w.id,
-					ScriptPubKey: changeScript,
-				},
-			).Return(changeInfo, nil).Once()
+			if !test.conflict {
+				deps.store.On("GetAddress", mock.Anything,
+					db.GetAddressQuery{
+						WalletID:     w.id,
+						ScriptPubKey: changeScript,
+					},
+				).Return(changeInfo, nil).Once()
+			}
 
 			tx := wire.NewMsgTx(wire.TxVersion)
 			tx.AddTxIn(&wire.TxIn{
@@ -1233,7 +1287,32 @@ func TestFundPsbtImportedAccountSchema(t *testing.T) {
 			packet, err := psbt.NewFromUnsignedTx(tx)
 			require.NoError(t, err)
 
-			expectFundingLease(w, deps, []wire.OutPoint{validUTXO}, nil)
+			// Caller origin is opaque, but its key must agree with the
+			// verified script. No origin is invented for absent metadata.
+			if test.callerKey {
+				key := inputKey
+				if test.conflict {
+					other, _ := btcec.PrivKeyFromBytes([]byte{2})
+					key = other.PubKey().SerializeCompressed()
+					require.NotEqual(t, inputKey, key)
+				}
+
+				packet.Inputs[0].Bip32Derivation = []*psbt.Bip32Derivation{
+					{
+						PubKey: key,
+						Bip32Path: []uint32{
+							84 + hdkeychain.HardenedKeyStart,
+							0 + hdkeychain.HardenedKeyStart,
+							0 + hdkeychain.HardenedKeyStart,
+							0, 0,
+						},
+					},
+				}
+			}
+
+			if !test.conflict {
+				expectFundingLease(w, deps, []wire.OutPoint{validUTXO}, nil)
+			}
 
 			// Act: Fund the selected input through the public API and
 			// direct its remaining value to the numberless account.
@@ -1250,10 +1329,15 @@ func TestFundPsbtImportedAccountSchema(t *testing.T) {
 				},
 			)
 
-			// Assert: Check the allocated change's script and nested
-			// redeem facts without a fabricated root origin. The input
-			// retains its known UTXO/origin; shared fixture cleanup verifies
-			// each mock consumes only the required funding calls.
+			// Assert: Contradictory keys fail before leasing. Valid inputs
+			// retain script facts and only the origin somebody supplied;
+			// fixture cleanup verifies each required call once.
+			if test.conflict {
+				require.ErrorIs(t, err, ErrConflictingInputMetadata)
+				require.Nil(t, result)
+
+				return
+			}
 			require.NoError(t, err)
 
 			funded, changeIndex := result.Packet, result.ChangeIndex
@@ -1270,7 +1354,13 @@ func TestFundPsbtImportedAccountSchema(t *testing.T) {
 			require.Empty(t, output.Bip32Derivation)
 			require.Empty(t, output.TaprootBip32Derivation)
 			require.Equal(t, input, funded.Inputs[0].WitnessUtxo)
-			require.Len(t, funded.Inputs[0].Bip32Derivation, 1)
+
+			if test.numberless {
+				require.Equal(t, packet.Inputs[0].Bip32Derivation,
+					funded.Inputs[0].Bip32Derivation)
+			} else {
+				require.Len(t, funded.Inputs[0].Bip32Derivation, 1)
+			}
 		})
 	}
 }
@@ -6118,6 +6208,161 @@ func TestFundPsbtRejectsFieldTheSpendDoesNotUse(t *testing.T) {
 	require.ErrorIs(t, err, ErrConflictingInputMetadata)
 	require.Nil(t, result)
 	require.Equal(t, before, packetSnapshot(t, packet))
+}
+
+// TestFundPsbtRejectsForeignDerivations checks the public funding boundary:
+// caller origins must not become authoritative facts about a derived coin.
+func TestFundPsbtRejectsForeignDerivations(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Use one owned key and a different caller key for both spend
+	// families, so each row changes only the address and origin records.
+	inputKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	t.Cleanup(inputKey.Zero)
+
+	foreignKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	t.Cleanup(foreignKey.Zero)
+
+	witnessAddr, err := address.NewAddressWitnessPubKeyHash(
+		address.Hash160(inputKey.PubKey().SerializeCompressed()),
+		&chainParams,
+	)
+	require.NoError(t, err)
+
+	taprootAddr, err := address.NewAddressTaproot(
+		schnorr.SerializePubKey(inputKey.PubKey()), &chainParams,
+	)
+	require.NoError(t, err)
+
+	foreignBip32 := []*psbt.Bip32Derivation{
+		{
+			PubKey:               foreignKey.PubKey().SerializeCompressed(),
+			MasterKeyFingerprint: 2,
+			Bip32Path:            []uint32{1},
+		},
+	}
+	foreignTaproot := []*psbt.TaprootBip32Derivation{
+		{
+			XOnlyPubKey: schnorr.SerializePubKey(
+				foreignKey.PubKey(),
+			),
+			MasterKeyFingerprint: 2,
+			Bip32Path:            []uint32{1},
+		},
+	}
+
+	testCases := []struct {
+		name        string
+		inputAddr   address.Address
+		addressType db.AddressType
+		bip32       []*psbt.Bip32Derivation
+		taproot     []*psbt.TaprootBip32Derivation
+	}{
+		{
+			name:        "witness rejects foreign bip32",
+			inputAddr:   witnessAddr,
+			addressType: db.WitnessPubKey,
+			bip32:       foreignBip32,
+		},
+		{
+			name:        "witness rejects foreign taproot",
+			inputAddr:   witnessAddr,
+			addressType: db.WitnessPubKey,
+			taproot:     foreignTaproot,
+		},
+		{
+			name:        "taproot rejects foreign taproot",
+			inputAddr:   taprootAddr,
+			addressType: db.TaprootPubKey,
+			taproot:     foreignTaproot,
+		},
+		{
+			name:        "taproot rejects foreign bip32",
+			inputAddr:   taprootAddr,
+			addressType: db.TaprootPubKey,
+			bip32:       foreignBip32,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Fund a caller-selected, Wallet-derived coin.
+			// The fixture supplies its real key origin independently
+			// from the unrelated origin carried by the caller packet.
+			w, mocks := createStartedSQLWalletWithMocks(t)
+			mocks.syncer.On("syncState").Return(
+				syncStateSynced,
+			).Once()
+
+			outPoint := wire.OutPoint{
+				Hash:  chainhash.Hash{7},
+				Index: 0,
+			}
+			expectFundingSourcesForAddress(
+				t, w, mocks, outPoint, tc.inputAddr,
+				tc.addressType, inputKey.PubKey(),
+			)
+
+			// Allow an erroneous accepted run to return normally,
+			// so the public error assertion detects the regression
+			// instead of an unexpected lease call masking it.
+			mocks.store.On(
+				"LeaseOutputs", mock.Anything,
+				mock.MatchedBy(func(
+					params db.LeaseOutputsParams,
+				) bool {
+
+					return params.WalletID == w.id &&
+						params.ID != (db.LockID{}) &&
+						slices.Equal(
+							params.OutPoints,
+							[]wire.OutPoint{outPoint},
+						) &&
+						params.Duration == fundLeaseDuration
+				}),
+			).Return([]db.LeasedOutput{
+				{
+					OutPoint: outPoint,
+				},
+			}, nil).Maybe()
+
+			tx := wire.NewMsgTx(2)
+			tx.AddTxIn(&wire.TxIn{PreviousOutPoint: outPoint})
+
+			paymentScript := append(
+				[]byte{0x00, 0x14}, make([]byte, 20)...,
+			)
+			tx.AddTxOut(&wire.TxOut{
+				Value:    400_000,
+				PkScript: paymentScript,
+			})
+
+			packet, err := psbt.NewFromUnsignedTx(tx)
+			require.NoError(t, err)
+
+			packet.Inputs[0].Bip32Derivation = tc.bip32
+			packet.Inputs[0].TaprootBip32Derivation = tc.taproot
+			before := packetSnapshot(t, packet)
+
+			// Act: Pass caller metadata through the public request
+			// path, including decoration and conflict validation.
+			result, err := w.FundPsbt(t.Context(), &FundIntent{
+				Packet:  packet,
+				FeeRate: defaultFeeRate,
+			})
+
+			// Assert: Neither derivation family can describe a
+			// foreign key on this coin. Refusal returns no funded
+			// result and leaves the caller's packet untouched.
+			require.ErrorIs(t, err, ErrConflictingInputMetadata)
+			require.Nil(t, result)
+			require.Equal(t, before, packetSnapshot(t, packet))
+		})
+	}
 }
 
 // TestFundPsbtDuplicateOutputs verifies that two outputs paying exactly the

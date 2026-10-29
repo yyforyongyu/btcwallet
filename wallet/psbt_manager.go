@@ -513,7 +513,8 @@ type finalizePsbtReq struct {
 //  2. Enriches: If owned, calls `decorateInput` to add the full previous
 //     transaction (`NonWitnessUtxo`) or output (`WitnessUtxo`), along with
 //     BIP32 derivation paths (`Bip32Derivation` or `TaprootBip32Derivation`)
-//     and script information.
+//     and script information. Unknown root origins are omitted while verified
+//     UTXO and public-key script facts remain available for external signing.
 func (w *Wallet) DecorateInputs(ctx context.Context, packet *psbt.Packet,
 	skipUnknown bool) (*psbt.Packet, error) {
 
@@ -618,8 +619,42 @@ func (w *Wallet) decorateInput(ctx context.Context, pInput *psbt.PInput,
 	// With the managed address, we can now get the derivation information
 	// for the address.
 	derivation, err := derivationForAddressInfo(scriptInfo.AddressInfo)
+	if errors.Is(err, ErrDerivationPathNotFound) &&
+		scriptInfo.Derivation == nil && scriptInfo.PubKey != nil {
+
+		// A numberless imported child still has verified spending facts.
+		// Preserve a caller's origin only when its key matches those facts;
+		// never manufacture a root fingerprint or numbered account path.
+		known := scriptInfo.PubKey.SerializeCompressed()
+		for _, origin := range pInput.Bip32Derivation {
+			if origin == nil || !bytes.Equal(origin.PubKey, known) {
+				return waddrmgr.SpendTypeUnknown,
+					ErrConflictingInputMetadata
+			}
+		}
+
+		for _, origin := range pInput.TaprootBip32Derivation {
+			if !txscript.IsPayToTaproot(utxo.PkScript) ||
+				origin == nil ||
+				!bytes.Equal(origin.XOnlyPubKey, known[1:]) {
+
+				return waddrmgr.SpendTypeUnknown,
+					ErrConflictingInputMetadata
+			}
+		}
+
+		err = nil
+	}
 	if err != nil {
 		return waddrmgr.SpendTypeUnknown, err
+	}
+
+	// Caller origins are seeded for imports whose path is unknown. With a
+	// known origin, rebuild both families so reconciliation compares caller
+	// records against Wallet facts instead of accepting them as those facts.
+	if derivation != nil {
+		pInput.Bip32Derivation = nil
+		pInput.TaprootBip32Derivation = nil
 	}
 
 	// With all the information gathered, we'll now populate the PSBT
@@ -1054,7 +1089,7 @@ func (w *Wallet) populatePsbtPacket(ctx context.Context, packet *psbt.Packet,
 	packet.UnsignedTx = tx
 	packet.Inputs = make([]psbt.PInput, len(tx.TxIn))
 
-	for _, txIn := range tx.TxIn {
+	for i, txIn := range tx.TxIn {
 		caller, ok := callerInputs[txIn.PreviousOutPoint]
 		if !ok {
 			// An input the wallet selected itself, which keeps
@@ -1063,6 +1098,12 @@ func (w *Wallet) populatePsbtPacket(ctx context.Context, packet *psbt.Packet,
 		}
 
 		txIn.Sequence = caller.sequence
+		// Validate caller origin keys during decoration even when the
+		// Wallet lacks a full origin. The existing reconciliation below
+		// still checks all other metadata against the decorated facts.
+		packet.Inputs[i].Bip32Derivation = caller.pInput.Bip32Derivation
+		packet.Inputs[i].TaprootBip32Derivation =
+			caller.pInput.TaprootBip32Derivation
 	}
 
 	// Authoring leaves the caller's outputs in their own order and swaps
@@ -2808,9 +2849,12 @@ func addInputInfoSegWitV0Common(in *psbt.PInput, prevTx *wire.MsgTx,
 	}
 	in.SighashType = txscript.SigHashAll
 
-	// Include the derivation path for each input.
-	in.Bip32Derivation = []*psbt.Bip32Derivation{
-		derivationInfo,
+	// Include a root origin only when known; verified UTXO/script facts
+	// remain sufficient to fund an imported input for an external signer.
+	if derivationInfo != nil {
+		in.Bip32Derivation = []*psbt.Bip32Derivation{
+			derivationInfo,
+		}
 	}
 
 	// For nested P2WKH we need to add the redeem script to the input,
@@ -2846,6 +2890,11 @@ func addInputInfoSegWitV1(in *psbt.PInput, utxo *wire.TxOut,
 		PkScript: utxo.PkScript,
 	}
 	in.SighashType = txscript.SigHashDefault
+
+	// A numberless imported input has script facts without a root origin.
+	if derivationInfo == nil {
+		return
+	}
 
 	// Taproot inputs carry only the taproot-specific derivation. Emitting a
 	// parallel Bip32Derivation would make the input ambiguous for the
