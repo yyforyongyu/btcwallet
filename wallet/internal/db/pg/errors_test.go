@@ -120,6 +120,52 @@ func TestMapErr(t *testing.T) {
 	require.Equal(t, dberr.ClassFatal, err.Class())
 }
 
+// TestMapErrTransactionHashConflict preserves the duplicate identity needed
+// to reconcile an accepted transaction that chain notification already stored.
+func TestMapErrTransactionHashConflict(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name       string
+		constraint string
+		duplicate  bool
+	}{
+		{
+			name:       "wallet transaction hash",
+			constraint: "uidx_transactions_hash",
+			duplicate:  true,
+		},
+		{
+			name:       "unrelated unique index",
+			constraint: "uidx_other_transaction_field",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange the wrapped driver error returned by a failed
+			// transaction insert, retaining its exact unique index.
+			cause := &pgconn.PgError{
+				Code:           codeUniqueViolation,
+				ConstraintName: test.constraint,
+			}
+			insertErr := fmt.Errorf("insert tx row: %w", cause)
+
+			// Act at the backend's Store error classification boundary.
+			err := mapErr(insertErr)
+
+			// Assert only the transaction hash index gains the duplicate
+			// identity; classification and original cause remain visible.
+			require.Equal(t, test.duplicate, errors.Is(
+				err, db.ErrTxAlreadyExists,
+			))
+			require.ErrorIs(t, err, cause)
+			require.Equal(t, dberr.ReasonConstraint, err.Reason)
+			require.Equal(t, codeUniqueViolation, err.Code)
+		})
+	}
+}
+
 // TestMapErrAccountNameConflict keeps name and number collision identities
 // distinct without classifying unrelated unique failures.
 func TestMapErrAccountNameConflict(t *testing.T) {

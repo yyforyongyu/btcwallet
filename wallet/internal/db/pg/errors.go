@@ -24,6 +24,9 @@ const accountNumberConstraint = "uidx_accounts_scope_account_number"
 // addressScriptConstraint identifies one canonical script within a wallet.
 const addressScriptConstraint = "uidx_addresses_wallet_script_pub_key"
 
+// transactionHashConstraint identifies one transaction hash within a wallet.
+const transactionHashConstraint = "uidx_transactions_hash"
+
 // SQLSTATE helper constants support PostgreSQL error classification.
 const (
 	// connectionExceptionClass identifies PostgreSQL SQLSTATE class 08,
@@ -125,6 +128,12 @@ func mapErr(err error) *dberr.SQLError {
 				// of its canonical raw-import row.
 				err = fmt.Errorf("%w: %w",
 					db.ErrAddressAlreadyExists, err)
+
+			case transactionHashConstraint:
+				// A concurrent notification may already have stored
+				// an accepted transaction; the caller reconciles it.
+				err = fmt.Errorf("%w: %w",
+					db.ErrTxAlreadyExists, err)
 			}
 		}
 
