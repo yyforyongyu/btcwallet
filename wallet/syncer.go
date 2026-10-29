@@ -946,6 +946,9 @@ func (s *syncer) applyStoreTxBatch(ctx context.Context,
 			Status:           status,
 			Label:            label,
 			CreditCandidates: creditCandidates,
+			// Chain observations already establish acceptance, unlike
+			// the publisher's initial record-before-send attempt.
+			ReplaceUnmined: true,
 		})
 	}
 

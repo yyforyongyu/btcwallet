@@ -43,6 +43,7 @@ func matchCreateTxParams(walletID uint32, tx *wire.MsgTx, label string,
 			!params.Received.IsZero() &&
 			params.Block == nil &&
 			params.Status == db.TxStatusPublished &&
+			!params.ReplaceUnmined &&
 			params.Label == label &&
 			addressCreditsEqual(params.Credits, credits)
 	})
@@ -678,7 +679,7 @@ func TestRecordTxAndCredits(t *testing.T) {
 			}
 
 			err := w.recordTxAndCredits(
-				t.Context(), tx, label, credits,
+				t.Context(), tx, label, credits, false,
 			)
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
@@ -748,7 +749,7 @@ func TestRecordTxAndCreditsDeterministicMultiOwned(t *testing.T) {
 			).Return(nil).Once()
 
 			err := w.recordTxAndCredits(
-				t.Context(), tx, "", tc.credits,
+				t.Context(), tx, "", tc.credits, false,
 			)
 			require.NoError(t, err)
 		})
@@ -824,7 +825,7 @@ func TestAddTxToWallet(t *testing.T) {
 
 		// Add the transaction to the wallet.
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
 		require.NoError(t, err)
 
@@ -873,7 +874,7 @@ func TestAddTxToWallet(t *testing.T) {
 
 		// Add the transaction to the wallet.
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
 		require.NoError(t, err)
 
@@ -914,7 +915,7 @@ func TestAddTxToWallet(t *testing.T) {
 		).Return(nil).Once()
 
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
 		require.NoError(t, err)
 
@@ -1697,4 +1698,88 @@ func TestBroadcastRetryLiveDuplicateIdempotent(t *testing.T) {
 
 	err = w.Broadcast(t.Context(), tx, label)
 	require.NoError(t, err)
+}
+
+// TestBroadcastReplacement records a conflicting spend only after the backend
+// accepts it, leaving the original spend untouched when publication fails.
+func TestBroadcastReplacement(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		sendErr error
+	}{
+		{
+			name: "accepted replacement",
+		},
+		{
+			name:    "rejected replacement preserves original",
+			sendErr: errPublish,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: The initial atomic recording finds an existing
+			// spender. Only an accepted send may authorize replacing
+			// that record; fixture cleanup verifies every mock once.
+			w, m := createStartedWalletWithMocks(t)
+			addr := mustNewStandalonePubKeyAddr(t)
+			script := mustPayToAddrScript(addr)
+			tx := wire.NewMsgTx(wire.TxVersion)
+			tx.AddTxIn(&wire.TxIn{
+				PreviousOutPoint: wire.OutPoint{
+					Hash: chainhash.Hash{3},
+				},
+			})
+			tx.AddTxOut(&wire.TxOut{
+				Value:    10000,
+				PkScript: script,
+			})
+
+			m.chain.On("TestMempoolAccept",
+				mock.Anything, mock.Anything,
+			).Return([]*btcjson.TestMempoolAcceptResult{
+				{
+					Allowed: true,
+				},
+			}, nil).Once()
+
+			resolved := m.store.On("ResolveOwnedAddresses", mock.Anything,
+				matchResolveOwnedAddressesQuery(w.id, script),
+			).Return(ownedAddrsResult(script), nil).Once()
+			if tc.sendErr == nil {
+				resolved.Twice()
+			}
+
+			m.store.On("CreateTx", mock.Anything,
+				matchCreateTxParams(w.id, tx, testTxLabel,
+					map[uint32]address.Address{0: addr}),
+			).Return(db.ErrTxInputConflict).Once()
+			m.chain.On("NotifyReceived",
+				[]address.Address{addr},
+			).Return(nil).Once()
+
+			sent := m.chain.On("SendRawTransaction", tx, false).
+				Return((*chainhash.Hash)(nil), tc.sendErr).Once()
+			if tc.sendErr == nil {
+				m.store.On("CreateTx", mock.Anything,
+					mock.MatchedBy(func(p db.CreateTxParams) bool {
+						return p.WalletID == w.id &&
+							p.Tx == tx && p.ReplaceUnmined
+					}),
+				).Return(nil).Once().NotBefore(sent)
+			}
+
+			// Act: Exercise the public publication request, including
+			// backend admission and the subsequent atomic recording.
+			err := w.Broadcast(t.Context(), tx, testTxLabel)
+
+			// Assert: Acceptance tracks the replacement; rejection
+			// returns the backend error without invalidating or deleting
+			// the original spend through another Store mutation.
+			require.ErrorIs(t, err, tc.sendErr)
+		})
+	}
 }

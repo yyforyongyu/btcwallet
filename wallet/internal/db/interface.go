@@ -462,6 +462,8 @@ type TxStore interface {
 	// The create path does not infer whether an unmined transaction should
 	// start in TxStatusPending or TxStatusPublished; callers must provide that
 	// choice explicitly in CreateTxParams.
+	// ReplaceUnmined additionally admits a network-accepted replacement;
+	// ordinary prepublication writes retain the conflicting original spend.
 	CreateTx(ctx context.Context, params CreateTxParams) error
 
 	// UpdateTx patches the mutable metadata for one existing wallet-scoped

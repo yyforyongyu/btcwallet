@@ -5103,3 +5103,126 @@ func TestApplyTxBatchDuplicate(t *testing.T) {
 		)
 	})
 }
+
+// TestCreateTxAcceptedReplacement checks that network acceptance displaces an
+// unmined spend, while confirmation of either competing hash remains final.
+func TestCreateTxAcceptedReplacement(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		confirmOriginal bool
+	}{
+		{
+			name: "replacement confirms",
+		},
+		{
+			name:            "original confirms",
+			confirmOriginal: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Record a real wallet credit and its original
+			// unmined spender through the public Store operations.
+			store := NewTestStore(t)
+			walletID := newWallet(t, store, "accepted-replacement")
+			createDerivedAccount(t, store, walletID,
+				db.KeyScopeBIP0084, "default")
+			addr := newDerivedAddress(t, store, walletID,
+				db.KeyScopeBIP0084, "default", false)
+			parent := newRegularTx([]wire.OutPoint{randomOutPoint()},
+				[]*wire.TxOut{
+					{
+						Value:    10000,
+						PkScript: addr.ScriptPubKey,
+					},
+				})
+			parentParams := db.CreateTxParams{
+				WalletID: walletID,
+				Tx:       parent,
+				Received: time.Unix(1710001500, 0),
+				Status:   db.TxStatusPublished,
+				Credits:  map[uint32]address.Address{0: nil},
+			}
+			require.NoError(t, store.CreateTx(t.Context(), parentParams))
+
+			outpoint := wire.OutPoint{Hash: parent.TxHash(), Index: 0}
+			original := newRegularTx([]wire.OutPoint{outpoint},
+				[]*wire.TxOut{
+					{
+						Value:    8000,
+						PkScript: addr.ScriptPubKey,
+					},
+				})
+			originalParams := parentParams
+			originalParams.Tx = original
+			require.NoError(t, store.CreateTx(t.Context(), originalParams))
+
+			replacement := original.Copy()
+			replacement.TxOut[0].Value = 7000
+			replacementParams := originalParams
+			replacementParams.Tx = replacement
+			replacementParams.ReplaceUnmined = true
+
+			// Act: Admit an accepted replacement without a fabricated
+			// block. Its existing graph write must release the original
+			// input claim before recording the new spender atomically.
+			err := store.CreateTx(t.Context(), replacementParams)
+
+			// Assert: The original becomes replaced and only the new
+			// change output remains spendable through public queries.
+			require.NoError(t, err)
+			old, err := store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: walletID,
+				Txid:     original.TxHash(),
+			})
+			require.NoError(t, err)
+			require.Equal(t, db.TxStatusReplaced, old.Status)
+			_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+				WalletID: walletID,
+				OutPoint: wire.OutPoint{Hash: original.TxHash()},
+			})
+			require.ErrorIs(t, err, db.ErrUtxoNotFound)
+
+			// Act: A real block may confirm either hash, including the
+			// original if a miner included it before seeing the RBF.
+			winner, loser := replacementParams, original
+			if tc.confirmOriginal {
+				winner, loser = originalParams, replacement
+			}
+
+			block := CreateBlockFixture(t, store.Queries(), 260)
+			winner.Block = &block
+			err = store.CreateTx(t.Context(), winner)
+
+			// Assert: Block truth determines the winner and its change;
+			// another accepted unmined spend cannot displace it.
+			require.NoError(t, err)
+			mined, err := store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: walletID,
+				Txid:     winner.Tx.TxHash(),
+			})
+			require.NoError(t, err)
+			require.Equal(t, db.TxStatusPublished, mined.Status)
+			require.NotNil(t, mined.Block)
+			_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+				WalletID: walletID,
+				OutPoint: wire.OutPoint{Hash: winner.Tx.TxHash()},
+			})
+			require.NoError(t, err)
+			_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+				WalletID: walletID,
+				OutPoint: wire.OutPoint{Hash: loser.TxHash()},
+			})
+			require.ErrorIs(t, err, db.ErrUtxoNotFound)
+
+			replacementParams.Tx = replacement.Copy()
+			replacementParams.Tx.TxOut[0].Value = 6000
+			err = store.CreateTx(t.Context(), replacementParams)
+			require.ErrorIs(t, err, db.ErrTxInputConflict)
+		})
+	}
+}
