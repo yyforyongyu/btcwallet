@@ -733,6 +733,11 @@ func (s *Store) legacyConfirmedDuplicateMatches(
 		return false, fmt.Errorf("read duplicate tx status: %w", err)
 	}
 
+	// A confirmed chain observation carries no authoritative user label.
+	// Preserve the stored label on replay; explicit UpdateTx owns changes
+	// to that metadata. Block, status and credit conflicts still fail below.
+	req.Params.Label = existing.Label
+
 	return s.legacyDuplicateMatches(addrmgrNs, existing, status, req)
 }
 

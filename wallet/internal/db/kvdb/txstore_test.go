@@ -3207,6 +3207,74 @@ func TestApplyTxBatchCreditNilFallback(t *testing.T) {
 	addrStore.AssertNotCalled(t, "MarkUsed", mock.Anything, mock.Anything)
 }
 
+// TestApplyScanBatchConfirmedReplayKeepsLabel verifies that a scan can replay
+// a labeled confirmed transaction and advance synchronization without treating
+// the scan's absent user label as conflicting transaction data.
+func TestApplyScanBatchConfirmedReplayKeepsLabel(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: persist a confirmed transaction with a user label. The scan
+	// reports the same chain facts without label metadata, as lnd's funding
+	// transaction does when live notification precedes catch-up scanning.
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+	newAddrmgrNamespace(t, dbConn)
+	txStore := newTxStore(t, dbConn)
+	addrStore := &bwmock.AddrStore{}
+	defer addrStore.AssertExpectations(t)
+	store := NewStore(dbConn, txStore, addrStore)
+
+	txMsg := &wire.MsgTx{Version: 1}
+	txMsg.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash: chainhash.Hash{72},
+	}})
+	txMsg.AddTxOut(&wire.TxOut{Value: 10_000, PkScript: []byte{0x51}})
+	block := db.Block{
+		Hash:      chainhash.Hash{73},
+		Height:    148,
+		Timestamp: time.Unix(1710004300, 0),
+	}
+	params := db.CreateTxParams{
+		WalletID: 0,
+		Tx:       txMsg,
+		Received: block.Timestamp,
+		Block:    &block,
+		Status:   db.TxStatusPublished,
+		Label:    "channel funding",
+	}
+	require.NoError(t, store.ApplyTxBatch(t.Context(), db.TxBatchParams{
+		WalletID:     0,
+		Transactions: []db.CreateTxParams{params},
+	}))
+	addrStore.On("SyncedTo").Return(waddrmgr.BlockStamp{}).Once()
+	addrStore.On("SetSyncedTo", mock.Anything, mock.MatchedBy(
+		func(tip *waddrmgr.BlockStamp) bool {
+			return tip.Height == int32(block.Height) &&
+				tip.Hash == block.Hash
+		},
+	)).Return(nil).Once()
+	params.Label = ""
+
+	// Act: apply the repeated confirmed observation through the actual scan
+	// batch API, including its sync-tip update in the same transaction.
+	err := store.ApplyScanBatch(t.Context(), db.ScanBatchParams{
+		WalletID:     0,
+		Transactions: []db.CreateTxParams{params},
+		SyncedBlocks: []db.Block{block},
+	})
+
+	// Assert: replay succeeds and preserves the stored user label and block.
+	// The mock's single tip-write expectation also proves scanning advanced.
+	require.NoError(t, err)
+	info, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: 0,
+		Txid:     txMsg.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, "channel funding", info.Label)
+	require.Equal(t, block.Hash, info.Block.Hash)
+}
+
 // TestApplyScanBatchRecordsTxAndSyncedBlocks verifies that kvdb.Store applies
 // scan-discovered transactions and connected sync blocks in one write batch.
 func TestApplyScanBatchRecordsTxAndSyncedBlocks(t *testing.T) {
