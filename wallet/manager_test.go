@@ -17,6 +17,7 @@ import (
 	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/bwtest/keyvaultmock"
 	walletmock "github.com/btcsuite/btcwallet/wallet/internal/bwtest/mock"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
@@ -3076,6 +3077,103 @@ func TestManagerCreateRecoveryValidation(t *testing.T) {
 			params = sqliteCreateParams(t)
 			_, err = manager.Create(params)
 			require.NoError(t, err)
+		})
+	}
+}
+
+// TestManagerStartRescansFromBirthday checks explicit recovery before Wallet
+// publication and preserves a failed rewind as a terminal startup error.
+func TestManagerStartRescansFromBirthday(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "rescan requested",
+		},
+		{
+			name: "rewind rejected",
+			err:  errDBMock,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Reopen a Wallet processed past its birthday. The
+			// fixture joins shutdown before checking strict expectations.
+			store := &walletmock.Store{}
+			vault := &keyvaultmock.Vault{}
+			t.Cleanup(func() {
+				store.AssertExpectations(t)
+				vault.AssertExpectations(t)
+			})
+
+			birthday := db.Block{Height: 100}
+			store.On("GetWallet", mock.Anything, "rescan").Return(
+				&db.WalletInfo{
+					BirthdayBlock: &birthday,
+					SyncedTo:      &db.Block{Height: 200},
+				}, nil,
+			).Once()
+			store.On("RewindWallet", mock.Anything,
+				db.RewindWalletParams{
+					WalletID: 1,
+					Block:    birthday,
+				},
+			).Return(tc.err).Once()
+
+			if tc.err == nil {
+				store.On("ListAccounts", mock.Anything,
+					db.ListAccountsQuery{WalletID: 1},
+				).Return([]db.AccountInfo{}, nil).Once()
+				store.On("DeleteExpiredLeases", mock.Anything,
+					uint32(1),
+				).Return(nil).Once()
+				vault.On("Lock").Return().Once()
+			}
+
+			backend := &managerBackendMock{}
+			backend.On("listWallets", mock.Anything).Return(
+				[]*walletData{
+					{
+						id:    1,
+						name:  "rescan",
+						store: store,
+						vault: vault,
+					},
+				}, nil,
+			).Once()
+			backend.On("close").Return(nil).Once()
+			manager := newManagerLifecycleTest(t, backend)
+			manager.config.RescanOnStart = true
+			chain, ok := manager.config.ChainSource.(*bwmock.Chain)
+			require.True(t, ok)
+			chain.On("IsCurrent").Return(false).Maybe()
+
+			if tc.err == nil {
+				// Successful startup starts the Manager reader; a nil
+				// source keeps it idle until fixture cleanup cancels it.
+				chain.On("Notifications").
+					Return((<-chan any)(nil)).Once()
+			}
+
+			// Act: Start through the public Manager boundary, requesting
+			// the rewind before any Wallet handle can be returned.
+			wallets, err := manager.Start(t.Context())
+
+			// Assert: Successful startup publishes the Wallet only after
+			// rewind; a Store error returns no usable partial result.
+			if tc.err != nil {
+				require.ErrorIs(t, err, tc.err)
+				require.Nil(t, wallets)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Len(t, wallets, 1)
 		})
 	}
 }

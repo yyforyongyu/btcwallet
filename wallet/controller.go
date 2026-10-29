@@ -901,6 +901,9 @@ func (w *Wallet) handleReq(req any) {
 //  5. Persist the new birthday block, mark it as verified, and update the
 //     wallet's sync tip to this point to ensure a clean rescan range.
 //  6. Update the memory cache.
+//
+// An explicit startup rescan also rewinds an already verified birthday before
+// any background worker or public Wallet handle can observe readiness.
 func (w *Wallet) verifyBirthday(ctx context.Context) error {
 	walletInfo, err := w.store.GetWallet(ctx, w.cfg.Name)
 	if err != nil {
@@ -922,6 +925,20 @@ func (w *Wallet) verifyBirthday(ctx context.Context) error {
 		log.Infof("Birthday block verified: height=%d, hash=%v",
 			birthdayBlock.Height, birthdayBlock.Hash)
 		w.birthdayBlock = birthdayBlock
+
+		// Reuse the atomic wallet-scoped rewind rather than erase labels or
+		// race a runtime Resync against the initial synchronization worker.
+		if w.cfg.RescanOnStart && walletInfo.SyncedTo != nil &&
+			walletInfo.SyncedTo.Height > walletInfo.BirthdayBlock.Height {
+
+			err = w.store.RewindWallet(ctx, db.RewindWalletParams{
+				WalletID: w.id,
+				Block:    *walletInfo.BirthdayBlock,
+			})
+			if err != nil {
+				return fmt.Errorf("rewind startup rescan: %w", err)
+			}
+		}
 
 		return nil
 	}
