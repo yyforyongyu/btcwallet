@@ -595,61 +595,56 @@ func (w *Wallet) NewAccount(ctx context.Context,
 // handleNewAccount performs derivation and persistence only after mainLoop
 // admits the request; handleReq owns its shutdown completion.
 func (w *Wallet) handleNewAccount(req newAccountReq) {
-	// Admission makes Stop drain the persisted-scope read together with the
-	// write. Reject scope conflicts before preparing secrets or mutating Store.
-	err := w.validateNewAccountScope(req.ctx, &req.params)
-	if err != nil {
-		req.resp <- accountResp{err: err}
-
-		return
-	}
-
-	// An occupied name takes precedence over mode or derivation refusals.
-	err = w.requireAccountNameAvailable(
-		req.ctx, waddrmgr.KeyScope(req.params.Scope), req.params.Name,
-	)
-	if err != nil {
-		req.resp <- accountResp{err: err}
-
-		return
-	}
-
-	if w.IsWatchOnly() {
-		req.resp <- accountResp{err: errWatchOnlyAccountDerivation}
-
-		return
-	}
-
-	// When an account does not watch for on-chain synchronization, its
-	// account number must be specified; sequential allocation is unsupported.
-	if req.params.AccountNumber == nil && req.params.NoChainSync {
-		req.resp <- accountResp{
-			err: fmt.Errorf("no-chain-sync account creation: %w",
-				ErrAccountOperationUnsupported),
-		}
-
-		return
-	}
-
-	deriveFn, err := w.buildAccountDeriveFn(req.ctx)
-	if err != nil {
-		req.resp <- accountResp{err: err}
-
-		return
-	}
-
-	info, err := w.store.CreateDerivedAccount(req.ctx, req.params, deriveFn)
-	if err != nil {
-		req.resp <- accountResp{err: err}
-
-		return
-	}
-
-	account, err := w.accountInfoFromStore(info)
+	account, err := w.createDerivedAccount(req.ctx, req.params)
 	req.resp <- accountResp{
 		info: account,
 		err:  err,
 	}
+}
+
+// createDerivedAccount shares normal account creation with private SQL wallet
+// initialization, which must finish before the first recovery scan starts.
+// The caller owns lifecycle admission and has unlocked the private vault.
+func (w *Wallet) createDerivedAccount(ctx context.Context,
+	params db.CreateDerivedAccountParams) (*AccountInfo, error) {
+
+	// Admission makes Stop drain the persisted-scope read together with the
+	// write. Reject scope conflicts before preparing secrets or mutating Store.
+	err := w.validateNewAccountScope(ctx, &params)
+	if err != nil {
+		return nil, err
+	}
+
+	// An occupied name takes precedence over mode or derivation refusals.
+	err = w.requireAccountNameAvailable(
+		ctx, waddrmgr.KeyScope(params.Scope), params.Name,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if w.IsWatchOnly() {
+		return nil, errWatchOnlyAccountDerivation
+	}
+
+	// When an account does not watch for on-chain synchronization, its
+	// account number must be specified; sequential allocation is unsupported.
+	if params.AccountNumber == nil && params.NoChainSync {
+		return nil, fmt.Errorf("no-chain-sync account creation: %w",
+			ErrAccountOperationUnsupported)
+	}
+
+	deriveFn, err := w.buildAccountDeriveFn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := w.store.CreateDerivedAccount(ctx, params, deriveFn)
+	if err != nil {
+		return nil, err
+	}
+
+	return w.accountInfoFromStore(info)
 }
 
 // validateNewAccountSchema checks branch types and the complete path without

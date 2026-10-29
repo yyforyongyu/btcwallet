@@ -2966,3 +2966,116 @@ func TestManagerChainCanceledSourceRejectsCreate(t *testing.T) {
 	require.ErrorIs(t, err, ErrManagerStopped)
 	require.Nil(t, w)
 }
+
+// TestManagerCreateInitialDerivedAccounts verifies fresh recovery creation
+// returns locked, spendable payment accounts rather than watch-only imports.
+func TestManagerCreateInitialDerivedAccounts(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Request two payment scopes in a real SQL wallet. The existing
+	// fixture owns shutdown and verifies its chain mock after workers stop.
+	manager := testSQLiteManager(t)
+	params := sqliteCreateParams(t)
+	zero := AccountNumber(0)
+	window := uint32(2)
+	params.RecoveryWindow = &window
+
+	for _, scope := range []waddrmgr.KeyScope{
+		waddrmgr.KeyScopeBIP0084,
+		waddrmgr.KeyScopeBIP0086,
+	} {
+		schema := waddrmgr.ScopeAddrMap[scope]
+		params.InitialDerivedAccounts = append(
+			params.InitialDerivedAccounts, NewAccountParams{
+				Scope:         scope,
+				Name:          waddrmgr.DefaultAccountName,
+				AccountNumber: &zero,
+				AddrSchema:    &schema,
+			},
+		)
+	}
+
+	// Act: Create through the public Manager entry point. Its initial account
+	// work must finish before publication while leaving private access locked.
+	w, err := manager.Create(params)
+	require.NoError(t, err)
+	info, err := w.Info(t.Context())
+	require.NoError(t, err)
+
+	// Assert: Both exact accounts are root-derived, and normal authentication
+	// still succeeds after the temporary creation-time vault access ends.
+	require.True(t, info.Locked)
+
+	for _, account := range params.InitialDerivedAccounts {
+		stored, err := w.GetAccount(t.Context(), account.Scope, account.Name)
+		require.NoError(t, err)
+		require.False(t, stored.IsImported)
+		require.Equal(t, &zero, stored.AccountNumber)
+	}
+	require.NoError(t, w.Unlock(t.Context(), UnlockRequest{
+		Passphrase: params.PrivatePassphrase,
+		Timeout:    -1,
+	}))
+	addr, err := w.NewAddress(t.Context(), NewAccountSelectorByName(
+		waddrmgr.KeyScopeBIP0084, waddrmgr.DefaultAccountName,
+	), false)
+	require.NoError(t, err)
+	key, err := w.GetPrivKeyForAddress(t.Context(), addr.Addr)
+	require.NoError(t, err)
+	require.NotNil(t, key)
+	key.Zero()
+}
+
+// TestManagerCreateRecoveryValidation verifies invalid recovery initialization
+// is rejected before it can leave an unusable wallet in the durable set.
+func TestManagerCreateRecoveryValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		shell bool
+	}{
+		{
+			name: "excessive recovery window",
+		},
+		{
+			name:  "derived account in a keyless shell",
+			shell: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Start an empty real SQL Manager, then select one
+			// malformed creation input without changing any stored data.
+			manager := testSQLiteManager(t)
+			params := sqliteCreateParams(t)
+
+			if tc.shell {
+				params.Mode = ModeShell
+				params.Seed = nil
+				params.WatchOnly = true
+				params.InitialDerivedAccounts = []NewAccountParams{
+					{
+						Name: waddrmgr.DefaultAccountName,
+					},
+				}
+			} else {
+				window := uint32(MaxRecoveryWindow + 1)
+				params.RecoveryWindow = &window
+			}
+
+			// Act: Submit the invalid request through public creation.
+			w, err := manager.Create(params)
+
+			// Assert: The request fails without publishing a partial
+			// Wallet; corrected input can still create the same name.
+			require.Nil(t, w)
+			require.ErrorIs(t, err, ErrWalletParams)
+			params = sqliteCreateParams(t)
+			_, err = manager.Create(params)
+			require.NoError(t, err)
+		})
+	}
+}

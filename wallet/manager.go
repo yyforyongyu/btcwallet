@@ -113,6 +113,16 @@ type CreateWalletParams struct {
 	// honored for ModeShell.
 	InitialAccounts []ImportAccountParams
 
+	// InitialDerivedAccounts creates SQL root-derived accounts before the
+	// first chain scan. Spendable modes only; legacy kvdb creates its native
+	// default scopes itself and does not accept this option.
+	InitialDerivedAccounts []NewAccountParams
+
+	// RecoveryWindow overrides the Manager default for this creation's first
+	// scan. Nil inherits the default; zero explicitly disables lookahead.
+	// The override is not persisted and does not alter sibling Wallet policy.
+	RecoveryWindow *uint32
+
 	// WatchOnly requests a watch-only wallet and is valid only for ModeShell.
 	WatchOnly bool
 
@@ -152,7 +162,7 @@ type Manager struct {
 	// every wallet this Manager serves.
 	backend managerBackend
 
-	// config is the immutable shared policy retained at construction.
+	// config is the immutable shared default policy retained at construction.
 	config ManagerConfig
 
 	// chainSyncer owns live routing for every Wallet served by this Manager.
@@ -183,8 +193,8 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	}
 
 	// Clone mutable network state and resolve defaults before the backend is
-	// opened, making the retained configuration the sole runtime authority for
-	// every Wallet assembled by this Manager.
+	// opened, retaining isolated defaults for every assembled Wallet. Creation
+	// may explicitly override its own first-scan recovery window.
 	chainParams, err := cloneChainParams(cfg.ChainParams)
 	if err != nil {
 		return nil, fmt.Errorf("copy chain parameters: %w", err)
@@ -529,6 +539,8 @@ func validateManagedWalletName(name string) error {
 // Create persists, starts, and publishes one Wallet while Manager is running.
 // Duplicate creation returns no Wallet and ErrWalletExists while preserving
 // the existing Wallet and its credentials, including all aliases on kvdb.
+// SQL initial derived accounts are ready before the first scan; creation's
+// optional recovery window overrides the Manager default for that runtime.
 //
 // TODO(yy): Add a context parameter once wallet creation uses a single atomic
 // database transaction.
@@ -568,8 +580,8 @@ func (m *Manager) Create(params CreateWalletParams) (*Wallet, error) {
 		return nil, err
 	}
 
-	// Parameter validation permits initial accounts only in shell mode, so
-	// import any requested accounts before the Wallet starts.
+	// Initial imported accounts belong to shell mode and must also be ready
+	// before the Wallet starts its first recovery scan.
 	if len(params.InitialAccounts) > 0 {
 		err = w.importInitialAccounts(
 			context.Background(), params.InitialAccounts,
@@ -630,6 +642,37 @@ func (m *Manager) createWallet(params CreateWalletParams) (*Wallet, error) {
 		return nil, err
 	}
 
+	// SQL has no built-in payment scopes. Validate the caller's exact account
+	// requests before wallet persistence, then reuse normal Store derivation.
+	if m.config.Backend == DBBackendKVDB &&
+		len(params.InitialDerivedAccounts) > 0 {
+
+		return nil, ErrAccountOperationUnsupported
+	}
+
+	accounts := make([]db.CreateDerivedAccountParams, 0,
+		len(params.InitialDerivedAccounts))
+	for _, account := range params.InitialDerivedAccounts {
+		err = validateAccountName(account.Name)
+		if err != nil {
+			return nil, err
+		}
+
+		storeParams := db.CreateDerivedAccountParams{
+			Scope:         db.KeyScope(account.Scope),
+			Name:          account.Name,
+			AccountNumber: (*uint32)(account.AccountNumber),
+			NoChainSync:   account.NoChainSync,
+		}
+
+		err = validateNewAccountSchema(&storeParams, account.AddrSchema)
+		if err != nil {
+			return nil, newAccountErr(err)
+		}
+
+		accounts = append(accounts, storeParams)
+	}
+
 	rootKey, err := m.deriveRootKey(params)
 	if err != nil {
 		return nil, err
@@ -649,12 +692,51 @@ func (m *Manager) createWallet(params CreateWalletParams) (*Wallet, error) {
 		return nil, err
 	}
 
+	if params.RecoveryWindow != nil {
+		walletCfg.RecoveryWindow = *params.RecoveryWindow
+	}
+
 	data, err := m.backend.create(context.Background(), params, rootKey)
 	if err != nil {
 		return nil, err
 	}
 
-	return newManagedWallet(walletCfg, data, m.chainSyncer), nil
+	w := newManagedWallet(walletCfg, data, m.chainSyncer)
+	if len(accounts) > 0 {
+		err = w.createInitialDerivedAccounts(
+			context.Background(), accounts, params.PrivatePassphrase,
+		)
+		if err != nil {
+			return nil, errors.Join(err, w.stop())
+		}
+	}
+
+	return w, nil
+}
+
+// createInitialDerivedAccounts installs payment accounts before any worker or
+// recovery scan can observe the wallet. The creation credential temporarily
+// unlocks its private vault; publication still returns a locked Wallet.
+func (w *Wallet) createInitialDerivedAccounts(ctx context.Context,
+	accounts []db.CreateDerivedAccountParams, passphrase []byte) error {
+
+	err := w.keyVault.Unlock(ctx, passphrase)
+	if err != nil {
+		return fmt.Errorf("unlock initial accounts: %w", err)
+	}
+	defer w.keyVault.Lock()
+
+	for _, account := range accounts {
+		account.WalletID = w.id
+
+		_, err = w.createDerivedAccount(ctx, account)
+		if err != nil {
+			return fmt.Errorf("create initial account %s: %w",
+				account.Name, newAccountErr(err))
+		}
+	}
+
+	return nil
 }
 
 // validateInitialAccounts checks resolved scope and script ownership before
@@ -745,6 +827,18 @@ func (w *Wallet) importInitialAccounts(ctx context.Context,
 //
 //nolint:cyclop
 func (p *CreateWalletParams) validate(chainParams *chaincfg.Params) error {
+	// Recovery is an explicit creation input, validated before key or Store
+	// work. Watch-only shells already use their initial imported accounts.
+	if p.RecoveryWindow != nil && *p.RecoveryWindow > MaxRecoveryWindow {
+		return fmt.Errorf("%w: recovery window exceeds %d",
+			ErrWalletParams, MaxRecoveryWindow)
+	}
+
+	if p.Mode == ModeShell && len(p.InitialDerivedAccounts) > 0 {
+		return fmt.Errorf("%w: initial derived accounts require a root",
+			ErrWalletParams)
+	}
+
 	if p.Mode != ModeShell && len(p.InitialAccounts) > 0 {
 		return fmt.Errorf("%w: initial accounts should only be set "+
 			"for ModeShell", ErrWalletParams)
