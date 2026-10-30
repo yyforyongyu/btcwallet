@@ -331,7 +331,7 @@ func TestManagerChainRollbackDuringInitializationRetry(t *testing.T) {
 
 		deps.chain.On("IsCurrent").Return(true).Once()
 		deps.store.On("GetWallet", mock.Anything, testWalletName).
-			Return(&db.WalletInfo{SyncedTo: &tip}, nil).Once()
+			Return(&db.WalletInfo{SyncedTo: &tip}, nil).Twice()
 		deps.store.On("ListSyncedBlocks", mock.Anything,
 			db.ListSyncedBlocksQuery{StartHeight: 0, EndHeight: 2}).
 			Return([]db.Block{tip}, nil).Once()
@@ -351,12 +351,15 @@ func TestManagerChainRollbackDuringInitializationRetry(t *testing.T) {
 		m.started.Store(true)
 		m.wallets[w.cfg.Name] = w
 
-		// Act: Queue a filtered event before the disconnect, then let the
-		// same worker enter retry. No second initialization is permitted by
-		// the strict mocks; it must drain this mailbox in its existing wait.
+		// Act: Queue an at-tip event so its write is admitted before the
+		// disconnect; future history stays deferred. The same worker must
+		// drain this mailbox in retry without a second initialization.
 		require.NoError(t, m.dispatchChainEvent(t.Context(),
 			chain.FilteredBlockConnected{
-				Block: &wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 3}},
+				Block: &wtxmgr.BlockMeta{Block: wtxmgr.Block{
+					Height: int32(tip.Height),
+					Hash:   tip.Hash,
+				}},
 			}))
 		w.wg.Go(w.runSyncLoop)
 		synctest.Wait()
