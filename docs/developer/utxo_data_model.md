@@ -128,13 +128,20 @@ We distinguish between a transaction's **Validity** (Status) and its **Confirmat
 
 | Status Code | Meaning | Affects Balance? |
 | :--- | :--- | :--- |
-| `0` (`pending`) | Created locally, not yet broadcast. | **Yes** (Factual) |
-| `1` (`published`) | Active in mempool or blockchain. | **Yes** (If valid) |
+| `0` (`pending`) | Created locally, not yet submitted for publication tracking. | **Yes** (Factual) |
+| `1` (`published`) | Observed on chain/network or recorded for publication and rebroadcast. | **Yes** (If valid) |
 | `2` (`replaced`) | Replaced by a higher-fee transaction (RBF). | **No** |
 | `3` (`failed`) | Invalidated by a conflicting transaction (Double-Spend). | **No** |
 | `4` (`orphaned`) | Coinbase tx that was reorged out (Invalid). | **No** |
 
 *Additional invariant: Coinbase transactions cannot exist in the mempool. A coinbase transaction is either confirmed (`BlockHeight IS NOT NULL` and `Status = 1`, `published`) or orphaned (`Status = 4`, `orphaned`, and `BlockHeight IS NULL`).*
+
+Publication tracking is not proof of network acceptance. `Broadcast` records
+wallet-related transactions as `published` before sending, and failed first
+sends and retries retain their history and input claims. Preflight rejection
+occurs before recording. A caller can explicitly remove an unconfirmed branch
+with `DeleteUnconfirmedTx`; a send error alone does not trigger removal or
+change validity. Garbage collection is a separate policy.
 
 Factual-balance note: the SQL Store layer treats both `pending` and
 `published` parent transactions as part of the current live UTXO set. More
