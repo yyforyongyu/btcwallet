@@ -34,6 +34,15 @@ func (s *Store) CreateTx(ctx context.Context,
 	}
 
 	return s.execWrite(ctx, func(qtx *sqlc.Queries) error {
+		// Order admission with the Wallet-row lock before reading a hash;
+		// another writer must commit before we decide whether to insert it.
+		_, err := qtx.GetWalletForAccountCreation(
+			ctx, int64(params.WalletID),
+		)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("lock wallet transaction admission: %w", err)
+		}
+
 		return db.CreateTxWithOps(ctx, req, &createTxOps{
 			invalidateUnminedTxOps: invalidateUnminedTxOps{
 				qtx: qtx,

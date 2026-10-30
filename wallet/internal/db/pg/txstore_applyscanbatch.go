@@ -41,6 +41,15 @@ func (s *Store) ApplyScanBatch(ctx context.Context,
 	}
 
 	return s.execWrite(ctx, func(qtx *sqlc.Queries) error {
+		// Lock before horizons and tips as well as transaction rows, keeping
+		// recovery and live admission in the same order until SQL commit.
+		_, err := qtx.GetWalletForAccountCreation(
+			ctx, int64(params.WalletID),
+		)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("lock wallet transaction admission: %w", err)
+		}
+
 		ops := scanHorizonOps{qtx: qtx, walletID: params.WalletID}
 		for i := range params.Horizons {
 			err := db.ExtendScanHorizon(
@@ -56,7 +65,7 @@ func (s *Store) ApplyScanBatch(ctx context.Context,
 		// created. CreateTxWithOps needs the confirming block row during
 		// PrepareBlock, so creating transactions first would fail with
 		// ErrBlockNotFound.
-		err := applyBatchSyncedBlocks(ctx, qtx, params)
+		err = applyBatchSyncedBlocks(ctx, qtx, params)
 		if err != nil {
 			return err
 		}

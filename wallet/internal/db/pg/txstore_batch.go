@@ -35,7 +35,16 @@ func (s *Store) ApplyTxBatch(ctx context.Context,
 	}
 
 	return s.execWrite(ctx, func(qtx *sqlc.Queries) error {
-		err := applyBatchSyncTip(ctx, qtx, params)
+		// Take the Wallet-row lock before tip and transaction writes so
+		// every admission checks existing hashes in the same lock order.
+		_, err := qtx.GetWalletForAccountCreation(
+			ctx, int64(params.WalletID),
+		)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("lock wallet transaction admission: %w", err)
+		}
+
+		err = applyBatchSyncTip(ctx, qtx, params)
 		if err != nil {
 			return err
 		}
