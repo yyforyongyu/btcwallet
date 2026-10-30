@@ -891,6 +891,13 @@ func (s *Store) applyUnconfirmedDuplicate(
 		return nil
 	}
 
+	// An observation queued before publication can omit the publisher's
+	// label. Resolve that omission from the row in this write transaction,
+	// while leaving explicit labels and other metadata strictly checked.
+	if req.Params.Label == "" {
+		req.Params.Label = existing.Label
+	}
+
 	matches, err := s.legacyDuplicateMatches(
 		addrmgrNs, existing, status, req,
 	)
