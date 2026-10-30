@@ -2123,6 +2123,75 @@ func TestApplyTxBatchConfirmedDuplicatePreservesUnminedLabel(t *testing.T) {
 	require.Equal(t, originalLabel, txInfo.Label)
 }
 
+// TestApplyTxBatchUnminedReplayPreservesLabel verifies that a mempool echo
+// without a label accepts an already-published transaction and retains the
+// publisher's label, even when the observation predates the stored row.
+func TestApplyTxBatchUnminedReplayPreservesLabel(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a real store with a labeled published transaction. A queued
+	// observation may have read no row before publication, so its later batch
+	// carries no label even though admission now finds the publisher's row.
+	dbConn, cleanup := newTestDB(t)
+	t.Cleanup(cleanup)
+	newAddrmgrNamespace(t, dbConn)
+	store := NewStore(dbConn, newTxStore(t, dbConn), nil)
+
+	txMsg := wire.NewMsgTx(1)
+	txMsg.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+		Hash:  chainhash.Hash{72},
+		Index: 0,
+	}, nil, nil))
+	txMsg.AddTxOut(&wire.TxOut{Value: 10_000, PkScript: []byte{0x51}})
+
+	const originalLabel = "publisher sweep"
+
+	err := store.CreateTx(t.Context(), db.CreateTxParams{
+		WalletID:         0,
+		Tx:               txMsg,
+		Received:         time.Unix(1710004300, 0),
+		Block:            nil,
+		Status:           db.TxStatusPublished,
+		ReplaceUnmined:   false,
+		Label:            originalLabel,
+		Credits:          nil,
+		CreditCandidates: nil,
+	})
+	require.NoError(t, err)
+
+	// Act by applying the delayed unmined observation with its label omitted;
+	// no metadata update is requested by this chain notification.
+	err = store.ApplyTxBatch(t.Context(), db.TxBatchParams{
+		WalletID: 0,
+		Transactions: []db.CreateTxParams{
+			{
+				WalletID:         0,
+				Tx:               txMsg,
+				Received:         time.Unix(1710004400, 0),
+				Block:            nil,
+				Status:           db.TxStatusPublished,
+				ReplaceUnmined:   false,
+				Label:            "",
+				Credits:          nil,
+				CreditCandidates: nil,
+			},
+		},
+		SyncedTo: nil,
+	})
+
+	// Assert that replay succeeds and a public read retains the publisher's
+	// label and published, unconfirmed state rather than replacing metadata.
+	require.NoError(t, err)
+	txInfo, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: 0,
+		Txid:     txMsg.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Nil(t, txInfo.Block)
+	require.Equal(t, db.TxStatusPublished, txInfo.Status)
+	require.Equal(t, originalLabel, txInfo.Label)
+}
+
 // TestApplyTxBatchPromotesPendingDuplicate verifies that a mempool echo can
 // promote a locally-created pending transaction to published without replacing
 // the existing label.
