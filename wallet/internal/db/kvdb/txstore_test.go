@@ -3,6 +3,7 @@ package kvdb
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -2456,6 +2457,101 @@ func TestApplyTxBatchResolvesCreditCandidates(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// BenchmarkApplyTxBatchCreditAdmission measures incoming credit admission as
+// the receiving account grows, exposing unnecessary per-credit address walks.
+func BenchmarkApplyTxBatchCreditAdmission(b *testing.B) {
+	for _, count := range []uint32{16, 256} {
+		b.Run(fmt.Sprintf("addresses%d", count), func(b *testing.B) {
+			// Arrange: Populate one real BIP84 account before timing so
+			// each batch admits one credit against an existing address
+			// set, matching live notification and scan ingestion.
+			dbConn, cleanup := newTestDB(b)
+			b.Cleanup(cleanup)
+			mgr := newRealAddrManager(b, dbConn)
+			store := NewStore(dbConn, newTxStore(b, dbConn), mgr)
+			scoped, err := mgr.FetchScopedKeyManager(
+				waddrmgr.KeyScopeBIP0084,
+			)
+			require.NoError(b, err)
+
+			var addrs []waddrmgr.ManagedAddress
+
+			err = walletdb.Update(
+				dbConn, func(tx walletdb.ReadWriteTx) error {
+					ns := tx.ReadWriteBucket(waddrmgr.NamespaceKey)
+
+					err := mgr.Unlock(ns, []byte("private"))
+					if err != nil {
+						return err
+					}
+
+					addrs, err = scoped.NextExternalAddresses(
+						ns, waddrmgr.DefaultAccountNum, count,
+					)
+
+					return err
+				},
+			)
+			require.NoError(b, err)
+
+			addr := addrs[0].Address()
+			script, err := txscript.PayToAddrScript(addr)
+			require.NoError(b, err)
+
+			msg := wire.NewMsgTx(wire.TxVersion)
+			msg.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+				Hash:  chainhash.Hash{1},
+				Index: 0,
+			}, nil, nil))
+			msg.AddTxOut(wire.NewTxOut(10_000, script))
+			params := db.TxBatchParams{
+				WalletID: 0,
+				Transactions: []db.CreateTxParams{
+					{
+						WalletID:       0,
+						Tx:             msg,
+						Status:         db.TxStatusPublished,
+						Received:       time.Unix(1710003110, 0),
+						Block:          nil,
+						ReplaceUnmined: false,
+						Label:          "",
+						Credits:        nil,
+						CreditCandidates: map[uint32][]address.Address{
+							0: {addr},
+						},
+					},
+				},
+				SyncedTo: nil,
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			// Act: Distinct inputs avoid replay shortcuts while keeping
+			// the measured batch size independent of account size.
+			for b.Loop() {
+				msg.TxIn[0].PreviousOutPoint.Index++
+
+				require.NoError(b, store.ApplyTxBatch(b.Context(), params))
+			}
+
+			b.StopTimer()
+
+			// Assert: Check the final public detail outside the timed
+			// phase so fast rejection cannot look like fast admission.
+			detail, err := store.GetTxDetail(
+				b.Context(), db.GetTxDetailQuery{
+					WalletID: 0,
+					Txid:     msg.TxHash(),
+				},
+			)
+			require.NoError(b, err)
+			require.Len(b, detail.OwnedOutputs, 1)
+			require.EqualValues(b, 10_000, detail.OwnedOutputs[0].Amount)
+		})
+	}
+}
+
 // TestApplyTxBatchMatchesScanOwnership keeps notification credits aligned with
 // native scope/branch scanning without removing key ownership or signing data.
 func TestApplyTxBatchMatchesScanOwnership(t *testing.T) {
@@ -4420,19 +4516,18 @@ var rewindAddrManagerSeed = []byte{
 	0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
 }
 
-// newRealAddrManager creates the waddrmgr namespace and a real address manager
-// in the test database, returning the opened manager. The manager is used by
-// the rollback atomicity test because, unlike the mock address store, its
-// SetSyncedTo performs a real namespace write that bbolt reverts on rollback.
-func newRealAddrManager(t *testing.T,
+// newRealAddrManager creates a real address manager for tests and benchmarks.
+// Its native derivation supports credit-admission measurements, and its
+// SetSyncedTo performs real writes that rollback tests can verify in bbolt.
+func newRealAddrManager(tb testing.TB,
 	dbConn walletdb.DB) *waddrmgr.Manager {
 
-	t.Helper()
+	tb.Helper()
 
 	rootKey, err := hdkeychain.NewMaster(
 		rewindAddrManagerSeed, &chaincfg.RegressionNetParams,
 	)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	pubPass := []byte("public")
 	privPass := []byte("private")
@@ -4449,7 +4544,7 @@ func newRealAddrManager(t *testing.T,
 			time.Time{},
 		)
 	})
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	var mgr *waddrmgr.Manager
 
@@ -4459,8 +4554,8 @@ func newRealAddrManager(t *testing.T,
 
 		return err
 	})
-	require.NoError(t, err)
-	t.Cleanup(mgr.Close)
+	require.NoError(tb, err)
+	tb.Cleanup(mgr.Close)
 
 	return mgr
 }
