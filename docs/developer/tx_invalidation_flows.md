@@ -20,11 +20,16 @@ From the wallet's point of view, a small set of events can change tx history:
   block/status fields without rewriting graph edges.
 - invalidation of an unmined branch, e.g. when a confirmed conflict or a reorg
   invalidates one local spend and its dependent descendants.
-- removal of an unmined branch, e.g. when a caller drops a local spend, or
-  publication cleanup drops one it could not publish, with its dependent
-  descendants.
+- explicit removal of an unmined branch, when a caller drops a local spend
+  with its dependent descendants through `DeleteUnconfirmedTx`.
 - rollback of confirmed history at a block boundary, e.g. when a reorg
   disconnects blocks and rewinds formerly confirmed wallet history.
+
+Publication errors do not remove recorded history or release spend edges.
+This includes failed first sends and retries: a send refusal does not prove
+permanent invalidity. Preflight refusal happens before recording; backends
+without preflight retain the attempt when the actual send fails. Explicit
+branch removal remains available to callers; garbage collection is separate.
 
 The first two events place invalidation in the broader tx-store model. The
 branch-mutating workflows described here are the ones that discover dependent

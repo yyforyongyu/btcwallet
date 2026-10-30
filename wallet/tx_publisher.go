@@ -11,7 +11,6 @@
 package wallet
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,7 +24,6 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
-	"github.com/davecgh/go-spew/spew"
 )
 
 var (
@@ -165,6 +163,11 @@ func (w *Wallet) checkMempoolAcceptance(_ context.Context,
 // A backend that cannot answer the mempool acceptance check does not stop the
 // publish: the tx is sent without a verdict, so a nil return reports that it
 // was handed to the network, not that the network kept it.
+//
+// Preflight rejection does not record a transaction. Once recorded for
+// publication, even a failed first send retains its history and input claims
+// for rebroadcast; a publish error does not prove it can never confirm.
+// Callers can explicitly remove an unconfirmed branch with DeleteUnconfirmedTx.
 func (w *Wallet) Broadcast(ctx context.Context, tx *wire.MsgTx,
 	label string) error {
 
@@ -211,14 +214,10 @@ func (w *Wallet) handleBroadcast(r broadcastReq) {
 		return
 	}
 
-	// First, we'll attempt to add the tx to our wallet's DB. This will
-	// allow us to track the tx's confirmation status, and also
-	// re-broadcast it upon startup. If any of the subsequent steps fail,
-	// this tx is removed via DeleteUnminedTx.
-	//
-	// recorded reports whether a tx row was actually written; it gates the
-	// removal below so a wallet-unrelated tx (never recorded) is not
-	// removed, which would clobber the publish error with ErrTxNotFound.
+	// Record before publication to track confirmations and rebroadcasts.
+	// Failed sends retain the row and input claims because rejection does
+	// not prove permanent invalidity. recorded gates success notification
+	// for wallet-related transactions, including debit-only sweeps.
 	ourAddrs, recorded, err := w.addTxToWallet(r.ctx, r.tx, r.label, false)
 	// A failed atomic create leaves the original spend intact. Publish the
 	// replacement first; only actual backend acceptance may displace it.
@@ -229,9 +228,8 @@ func (w *Wallet) handleBroadcast(r broadcastReq) {
 		return
 	}
 
-	// Now, we'll attempt to publish the tx. On successful attempt, we
-	// return immediately. On any failures, we remove it from the tx store
-	// to prevent subsequent attempts with stale transaction data.
+	// Attempt publication without erasing the recorded branch on failure.
+	// The original send error still tells the caller this attempt failed.
 	err = w.publishTx(r.tx, ourAddrs)
 	if err == nil {
 		if replacement {
@@ -260,30 +258,6 @@ func (w *Wallet) handleBroadcast(r broadcastReq) {
 
 	txid := r.tx.TxHash()
 	log.Errorf("%v: broadcast failed: %v", txid, err)
-
-	// If we never recorded this tx (it is wallet-unrelated), there is
-	// nothing to remove, so we return the original publish error as-is
-	// rather than overwriting it with cleanup context.
-	if !recorded {
-		r.respErrChan <- err
-
-		return
-	}
-
-	// If the tx was rejected for any other reason, then we'll remove it from
-	// the tx store, as otherwise, we'll attempt to continually re-broadcast
-	// it, and the UTXO state of the wallet won't be accurate.
-	removeErr := w.deleteUnminedTx(r.ctx, r.tx)
-	if removeErr != nil {
-		log.Warnf("Unable to remove tx %v after broadcast failed: %v",
-			txid, removeErr)
-
-		// Return a wrapped error to give the caller full context.
-		r.respErrChan <- fmt.Errorf("broadcast failed: %w; and failed to "+
-			"remove from wallet: %v", err, removeErr)
-
-		return
-	}
 
 	r.respErrChan <- err
 }
@@ -394,10 +368,9 @@ type ownedAddrInfo struct {
 // the necessary database writes, ensuring that the exclusive database lock is
 // held for the shortest possible time.
 //
-// It returns the wallet-owned output addresses and a recorded flag reporting
-// whether a tx row was actually written to the store. The flag is required
-// because a debit-only sweep records a row yet returns zero addresses, so
-// callers cannot infer recording from the address slice alone.
+// It returns wallet-owned output addresses and a recorded flag for success
+// notification. A live duplicate also counts as recorded; a debit-only sweep
+// records a row without returning addresses, so the slice cannot be the flag.
 // replaceUnmined is set only after network acceptance. On an input conflict,
 // owned addresses are still returned for the existing publication watch setup.
 func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
@@ -417,7 +390,7 @@ func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 
 	// If the transaction has no outputs relevant to us, it may still be a
 	// sweep that spends our own coins. We check the input side before
-	// giving up so the tx is still tracked (and can later be removed).
+	// giving up so its spend remains tracked for confirmation and rebroadcast.
 	if len(ownedAddrs) == 0 {
 		spendsOurs, err := w.spendsWalletOutput(ctx, tx)
 		if err != nil {
@@ -426,7 +399,7 @@ func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 
 		// Neither outputs nor inputs are wallet-relevant, so we can
 		// safely exit without recording anything. recorded is false so
-		// the caller does not remove a tx that was never written.
+		// success does not announce a transaction with no wallet detail.
 		if !spendsOurs {
 			return nil, false, nil
 		}
@@ -541,10 +514,9 @@ func (w *Wallet) recordTxAndCredits(ctx context.Context, tx *wire.MsgTx,
 }
 
 // handleExistingTx reconciles a record-before-publish duplicate for txHash
-// against the stored row's status. Publication cleanup removes its rows, so a
-// duplicate here is normally a live, tracked tx. A terminal row can still
-// exist, left by conflict handling or a reorg, and reviving it would need the
-// spend edges those events cleared to be re-claimed as a graph-affecting
+// against the stored row's status. A failed publish retains its live row for
+// retries. A terminal row left by conflict handling or a reorg instead needs
+// the spend edges those events cleared to be re-claimed as a graph-affecting
 // lifecycle change. Only treat the duplicate as success when the row is still
 // live for the publish flow.
 func (w *Wallet) handleExistingTx(ctx context.Context, txHash chainhash.Hash,
@@ -862,56 +834,14 @@ func (w *Wallet) publishTx(tx *wire.MsgTx, ourAddrs []address.Address) error {
 
 		// The tx is already known, confirmed, or in the mempool, so it
 		// was accepted by the network. Treat this as a successful
-		// publish so the recorded tx keeps being tracked rather than
-		// removed by the caller.
+		// publish; the caller can report success for an already accepted
+		// transaction.
 		log.Infof("%v: tx already known/confirmed/in mempool", txid)
 
 		return nil
 
-	// If the tx was rejected for any other reason, then we'll return the
-	// error and let the caller handle the cleanup.
+	// Preserve other errors for the caller without changing stored history.
 	default:
 		return rpcErr
 	}
-}
-
-// deleteUnminedTx removes a tx and its recorded descendants from the
-// unconfirmed store. A publication error does not prove the tx can never
-// confirm, so cleanup leaves no history the chain would later contradict.
-func (w *Wallet) deleteUnminedTx(ctx context.Context,
-	tx *wire.MsgTx) error {
-
-	txHash := tx.TxHash()
-
-	dbErr := w.store.DeleteUnminedTx(ctx, db.DeleteUnminedTxParams{
-		WalletID: w.id,
-		Txid:     txHash,
-	})
-	if dbErr != nil {
-		log.Warnf("Unable to remove invalid tx %v: %v", txHash,
-			dbErr)
-
-		return dbErr
-	}
-
-	log.Infof("Removed invalid tx: %v", txHash)
-
-	// The serialized tx is for logging only, don't fail on the error.
-	var txRaw bytes.Buffer
-
-	_ = tx.Serialize(&txRaw)
-
-	// Optionally log the tx in debug when the size is manageable.
-	const maxTxSizeForLog = 1_000_000
-	if txRaw.Len() < maxTxSizeForLog {
-		log.Debugf("Removed invalid tx: %v \n hex=%x",
-			newLogClosure(func() string {
-				return spew.Sdump(tx)
-			}), txRaw.Bytes())
-	} else {
-		log.Debugf("Removed invalid tx %v due to its size "+
-			"being too large", txHash)
-	}
-
-	return nil
 }

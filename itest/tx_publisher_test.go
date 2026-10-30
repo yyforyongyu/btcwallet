@@ -480,10 +480,12 @@ func testBroadcastAlreadyKnown(h *bwtest.HarnessTest) {
 	h.MineBlockWithTx(tx)
 }
 
-// testBroadcastRejected verifies that a transaction the network refuses is
-// reported with a stable identity and claims no coin: neither of its outputs
-// becomes spendable, and the coin it named is still there afterwards.
+// testBroadcastRejected verifies the stable refusal error and public recording
+// boundary: preflight refusal claims no coin, while send-time refusal retains
+// the already-recorded transaction and its input claims for rebroadcast.
 func testBroadcastRejected(h *bwtest.HarnessTest) {
+	// Arrange: Fund one wallet coin and build a signed dust payment whose
+	// only refusal is the relay policy, keeping both outputs wallet-owned.
 	w, funding := h.NewWallet(bwtest.WalletFixture{
 		AddrType: txPublisherFundingType,
 		Amounts:  []btcutil.Amount{oneBTC},
@@ -526,8 +528,12 @@ func testBroadcastRejected(h *bwtest.HarnessTest) {
 		},
 	})
 
+	// Act: Publish through the public API to expose the documented boundary
+	// between preflight refusal and rejection after the row is recorded.
 	err = w.Broadcast(h.Context(), tx, "")
 
+	// Assert: Preserve the refusal and mempool outcome, then inspect the
+	// retained or untouched inputs and outputs promised by that boundary.
 	require.ErrorIs(
 		h, err, chain.ErrDust, "dust transaction was not refused",
 	)
@@ -535,10 +541,31 @@ func testBroadcastRejected(h *bwtest.HarnessTest) {
 	// The refusal published nothing.
 	h.AssertTxNotInMempool(tx.TxHash())
 
-	// It left no record either. A backend that answers the acceptance check
-	// refuses before Broadcast records anything, while neutrino has no
-	// answer to refuse with, so it records, publishes, and removes the
-	// branch once its peer rejects. Both end with the wallet holding no row.
+	// A backend without preflight can refuse only after recording. Retain
+	// that attempt and its spend edges even though it is not in the mempool.
+	if !h.Backend.SupportsMempoolAcceptance() {
+		detail, err := w.GetTx(h.Context(), tx.TxHash())
+		require.NoError(h, err)
+		require.Equal(h, wallet.TxStatusPublished, detail.Status)
+		require.Nil(h, detail.Block)
+
+		for i, output := range tx.TxOut {
+			utxo, err := w.GetUtxo(h.Context(), wire.OutPoint{
+				Hash:  tx.TxHash(),
+				Index: uint32(i),
+			})
+			require.NoError(h, err)
+			require.Equal(h, btcutil.Amount(output.Value), utxo.Amount)
+		}
+
+		_, err = w.GetUtxo(h.Context(), spent)
+		require.ErrorIs(h, err, wallet.ErrUnknownOutput)
+
+		return
+	}
+
+	// Preflight refusal happens before recording, leaving neither a row
+	// nor output credits and keeping the named input untouched.
 	_, err = w.GetTx(h.Context(), tx.TxHash())
 	require.ErrorIs(
 		h, err, wallet.ErrTxNotFound,
