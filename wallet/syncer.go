@@ -938,6 +938,13 @@ func (s *syncer) applyStoreTxBatch(ctx context.Context,
 			return err
 		}
 
+		// A queued mempool echo can outlive the replacement that made its
+		// row terminal. Keep that history intact; only a real confirming
+		// block may restore it through the Store's reconciliation path.
+		if block == nil && !db.IsUnminedStatus(status) {
+			continue
+		}
+
 		transactions = append(transactions, db.CreateTxParams{
 			WalletID:         s.walletID,
 			Tx:               &match.Rec.MsgTx,
@@ -973,7 +980,8 @@ func (s *syncer) applyStoreTxBatch(ctx context.Context,
 }
 
 // txNotificationState returns the status and label to use for a relevant tx
-// notification recorded through the Store path.
+// notification recorded through the Store path. Terminal unmined status lets
+// the caller discard a stale mempool echo without rewriting that history.
 func (s *syncer) txNotificationState(ctx context.Context,
 	txHash chainhash.Hash, block *db.Block) (db.TxStatus, string, error) {
 
@@ -998,8 +1006,12 @@ func (s *syncer) txNotificationState(ctx context.Context,
 		return 0, "", fmt.Errorf("get tx %v: %w", txHash, err)
 	}
 
-	if info.Block != nil || !db.IsUnminedStatus(info.Status) {
+	if info.Block != nil {
 		return status, label, nil
+	}
+
+	if !db.IsUnminedStatus(info.Status) {
+		return info.Status, info.Label, nil
 	}
 
 	return status, info.Label, nil

@@ -1295,6 +1295,77 @@ func TestProcessRelevantTxPreservesUnminedMetadata(t *testing.T) {
 	store.AssertExpectations(t)
 }
 
+// TestProcessRelevantTxKeepsTerminalHistory verifies delayed mempool echoes do
+// not revive failed or replaced transactions and stall chain synchronization.
+func TestProcessRelevantTxKeepsTerminalHistory(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []db.TxStatus{
+		db.TxStatusReplaced,
+		db.TxStatusFailed,
+	} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange a terminal transaction already superseded by the
+			// wallet's current history. A queued unmined echo must not
+			// include it in the batch that applies chain observations.
+			const walletID uint32 = 9
+
+			store := &walletmock.Store{}
+			defer store.AssertExpectations(t)
+
+			s := newTestSyncer(
+				Config{ChainParams: &chainParams}, nil, nil,
+				nil, store, walletID,
+			)
+			addr, err := address.NewAddressPubKeyHash(
+				make([]byte, 20), &chainParams,
+			)
+			require.NoError(t, err)
+
+			script, err := txscript.PayToAddrScript(addr)
+			require.NoError(t, err)
+
+			tx := wire.NewMsgTx(1)
+			tx.AddTxOut(&wire.TxOut{
+				Value:    1000,
+				PkScript: script,
+			})
+			rec, err := wtxmgr.NewTxRecordFromMsgTx(
+				tx, time.Unix(456, 0).UTC(),
+			)
+			require.NoError(t, err)
+			store.On("GetTx", mock.Anything, db.GetTxQuery{
+				WalletID: walletID,
+				Txid:     rec.Hash,
+			}).Return(&db.TxInfo{
+				Hash:   rec.Hash,
+				Status: status,
+				Label:  "existing sweep",
+			}, nil).Once()
+			store.On("ApplyTxBatch", mock.Anything, db.TxBatchParams{
+				WalletID:     walletID,
+				Transactions: []db.CreateTxParams{},
+			}).Return(nil).Once()
+
+			// Act through the prepared-event entry point used when
+			// Manager routes a delayed observation after replacement.
+			err = s.processChainEvent(t.Context(), chainEvent{
+				notification: chain.RelevantTx{
+					TxRecord: rec,
+					Block:    nil,
+				},
+				matches: liveMatches(rec),
+			})
+
+			// Assert processing can continue with no terminal row in
+			// the batch; deferred verification checks each call once.
+			require.NoError(t, err)
+		})
+	}
+}
+
 // TestProcessRelevantTxUsesBareMultisigMember verifies store-backed relevant
 // transaction notifications keep bare-multisig credit candidates when the
 // wallet owns a member pubkey address but not the full multisig output script.
