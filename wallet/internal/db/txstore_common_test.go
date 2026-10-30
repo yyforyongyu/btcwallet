@@ -804,6 +804,44 @@ func TestCreateTxWithOpsIdempotentDuplicate(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestApplyBatchTxPreservesUnminedLabel verifies a label-free mempool echo can
+// replay a transaction labeled by a concurrent publisher without metadata loss.
+func TestApplyBatchTxPreservesUnminedLabel(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a published row that became visible after the observation was
+	// prepared without a label. Edge replay must use its committed metadata.
+	req := testCreateTxRequest(t)
+	req.Params.Status = TxStatusPublished
+	req.Params.Label = ""
+	existing := CreateTxExistingTarget{
+		ID:         4,
+		Status:     TxStatusPublished,
+		IsCoinbase: req.IsCoinbase,
+		Label:      "publisher sweep",
+	}
+	replay := req
+	replay.Params.Label = existing.Label
+
+	ops := &mockCreateTxOps{}
+	t.Cleanup(func() {
+		ops.AssertExpectations(t)
+	})
+	ops.On("LoadExisting", mock.Anything, req).Return(&existing, nil).Once()
+	ops.On("InsertCredits", mock.Anything, replay, int64(4)).Return(nil).Once()
+	ops.On("MarkInputsSpent", mock.Anything, replay, int64(4)).
+		Return(nil).Once()
+	ops.On("DeleteSpentLeases", mock.Anything, req.Params.WalletID,
+		req.TxHash).Return(nil).Once()
+
+	// Act through the shared batch entry point used by both SQL backends.
+	err := ApplyBatchTxWithOps(t.Context(), req, ops)
+
+	// Assert the real duplicate is replayed with its label intact; Cleanup
+	// verifies the single metadata read and each required edge operation.
+	require.NoError(t, err)
+}
+
 // TestCreateTxWithOpsValidatesIdempotentDuplicateCredits verifies that the
 // duplicate replay path validates requested credit addresses before it treats a
 // matching tx row as idempotent.
