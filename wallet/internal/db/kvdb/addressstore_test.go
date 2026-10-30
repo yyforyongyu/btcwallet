@@ -49,7 +49,7 @@ func TestAddressStoreNewDerivedAddress(t *testing.T) {
 	// Assert the child retains local signing custody and its real account
 	// identity, including through point and account-scoped ownership reads.
 	require.NoError(t, err)
-	require.Equal(t, uint32(1), info.ID)
+	require.Zero(t, info.ID)
 	require.False(t, info.IsImported)
 	require.False(t, info.IsWatchOnly)
 	require.Equal(t, db.WitnessPubKey, info.AddrType)
@@ -84,7 +84,13 @@ func TestAddressStoreNewDerivedAddress(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Len(t, result.Items, 1)
-	require.Equal(t, *info, result.Items[0])
+
+	// Assert pagination still assigns its first cursor, while every other
+	// field matches the point result that has no durable address identity.
+	require.Equal(t, uint32(1), result.Items[0].ID)
+	listed := result.Items[0]
+	listed.ID = 0
+	require.Equal(t, *info, listed)
 }
 
 // TestAddressStoreNewDerivedAddressByNumber verifies that resolved numeric

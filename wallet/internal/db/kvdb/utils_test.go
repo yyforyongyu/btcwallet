@@ -18,19 +18,19 @@ import (
 
 const defaultDBTimeout = 10 * time.Second
 
-// newTestDB creates a temporary bdb walletdb for kvdb store tests.
+// newTestDB creates a temporary bdb walletdb for kvdb tests and benchmarks.
 //
 // It returns the opened database and a cleanup function that must be called
 // after the test completes.
-func newTestDB(t *testing.T) (walletdb.DB, func()) {
-	t.Helper()
+func newTestDB(tb testing.TB) (walletdb.DB, func()) {
+	tb.Helper()
 
-	dbPath := filepath.Join(t.TempDir(), "wallet.db")
+	dbPath := filepath.Join(tb.TempDir(), "wallet.db")
 
 	dbConn, err := walletdb.Create(
 		"bdb", dbPath, true, defaultDBTimeout, false,
 	)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	cleanup := func() {
 		_ = dbConn.Close()
@@ -43,8 +43,8 @@ func newTestDB(t *testing.T) (walletdb.DB, func()) {
 //
 // NOTE: The kvdb Store under test expects the walletdb top-level bucket key
 // `wtxmgrNamespaceKey` to exist and contain a valid wtxmgr store.
-func newTxStore(t *testing.T, dbConn walletdb.DB) *wtxmgr.Store {
-	t.Helper()
+func newTxStore(tb testing.TB, dbConn walletdb.DB) *wtxmgr.Store {
+	tb.Helper()
 
 	var txStore *wtxmgr.Store
 
@@ -63,7 +63,7 @@ func newTxStore(t *testing.T, dbConn walletdb.DB) *wtxmgr.Store {
 
 		return err
 	})
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	return txStore
 }
