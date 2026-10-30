@@ -110,6 +110,9 @@ getblock batch, implying about 2.8 GB of reply hex at this payload before copies
 and decoded objects. This requires the explicit startup capacity budget in the
 [environment table](reproducibility.md#docker-environment). Keep those fixed
 settings across implementations and record them with the measured cohort.
+The current matched-mode protocol gives Core 16 GiB for every configuration
+after a 12 GiB daemon OOM in the full-window pilot. Historical observations
+retain their original resource profiles and are not pooled with this cohort.
 The small pilot establishes validity/reuse, not full-window memory feasibility.
 
 Use 1x for each restored lifecycle. CPU and heap captures are separate 1x runs;

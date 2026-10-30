@@ -71,7 +71,7 @@ CPUs and architectures; a speedup factor applies to its measured environment.
 | Component | Image and settings |
 | --- | --- |
 | Wallet client | `golang:1.25.11-bookworm`; 1 CPU, 4 GiB for reads or 16 GiB for start-to-synced, no swap, GOMAXPROCS=1, CGO=0, `-buildvcs=false -trimpath -p=1`. |
-| Bitcoin Core (startup only) | `lightninglabs/bitcoin-core:30`, version 30.2, digest `sha256:844f2a308e243ce3aa3df7918bd2fe230259419280f7826a62b896510ad3dcbd`, 1 CPU, 12 GiB, no swap, regtest, `-disablewallet -txindex -blockfilterindex=1 -mocktime=2100000000`, RPC/ZMQ. |
+| Bitcoin Core (startup only) | `lightninglabs/bitcoin-core:30`, version 30.2, digest `sha256:844f2a308e243ce3aa3df7918bd2fe230259419280f7826a62b896510ad3dcbd`, 1 CPU, 16 GiB, no swap, regtest, `-disablewallet -txindex -blockfilterindex=1 -mocktime=2100000000`, RPC/ZMQ. |
 | PostgreSQL | `postgres:18-alpine`, version 18.4; 1 CPU, 1 GiB, same-host bridge TCP, `fsync=on`. |
 | SQLite | Embedded in the client; WAL, native `synchronous=FULL`, foreign keys, 5s busy timeout. Both SQL pools use the normal 25-connection limit. |
 
@@ -450,8 +450,9 @@ hits-0 attempt at `ff8ac2997bb64e0b41e82a0216d66651ee0099fb` exhausted the
 former ten-minute preparation context. It supplied no sync metric or recorded
 OOM event; its 619.103s whole-command duration is a failed preparation outcome.
 
-Use the resource table above for every implementation in this cohort. The
-Docker VM allocation was increased to 32 GB before collection. Old startup
+This historical protocol used a 16 GiB client and 12 GiB Core for every
+implementation, with a separate 1 GiB PostgreSQL server. The Docker VM
+allocation was increased to 32 GB before collection. Old startup
 observations used smaller container limits and a different dense chain;
 retain their provenance and exclusions rather than pooling them with v2.
 Two selected SQLite smoke invocations establish real-chain validity and
@@ -497,12 +498,13 @@ profiles were collected for this cohort.
 
 The separately approved five-case collection ran from 2026-10-26 10:19 UTC
 through 2026-10-27 05:52 UTC on measured source
-`f575c826401688678350fb745d5dc2621cf9e169`. The Docker VM had a 32 GB allocation
-(33,601,318,912 bytes reported usable) and four CPUs. Client, Core and PostgreSQL
-limits remained those in the Docker environment table. The first full-window
-SQLite probe prepared its target in 14m29.349s and its native fixture in
-14m33.459s; its 120.970s sync observation is one accepted timing sample.
-Preparation and whole-command duration are not startup latency.
+`f575c826401688678350fb745d5dc2621cf9e169`. The Docker VM had a 32 GB
+allocation (33,601,318,912 bytes reported usable) and four CPUs. Client, Core
+and PostgreSQL limits were 16, 12 and 1 GiB respectively, each with one CPU
+and no swap. The first full-window SQLite probe prepared its target in
+14m29.349s and its native fixture in 14m33.459s; its 120.970s sync observation
+is one accepted timing sample. Preparation and whole-command duration are not
+startup latency.
 
 The accepted set has 160 unprofiled timing invocations: eight independent 1x
 samples per implementation/case. Another 20 CPU and 20 heap invocations each
@@ -812,6 +814,26 @@ its v3 closed fixtures. Separate output roots distinguish modes without
 changing fixture identity, storage settings, resources or timer boundaries.
 Go dependencies resolve through `go.mod` and `go.sum`; no local btcd workspace
 or replacement supplies reported results. The chain daemon remains pinned Core.
+
+### Capacity gate and excluded pilot
+
+The first matched-mode pilot at
+`855720690fd31e40e9567950e68ecc74127f5404` used a 12 GiB Core limit.
+SQLite CFilters completed correctly, but its paired full-block timing was
+excluded because another task's integration container overlapped it. The
+quiet full-block replacement recorded a Core OOM and daemon exit 137, then
+client exit 2 with no sync metric. All attempts remain in task-local evidence
+under `runs/cfilters-current`; the successful filter pilot is also excluded
+from the new resource profile's cohort.
+
+The current protocol gives Core 16 GiB uniformly across all seven
+configurations. Client and PostgreSQL caps remain 16 and 1 GiB; payload,
+modules, images, CPU, no-swap policy and deadlines remain fixed. The Docker
+VM still reports 33,601,318,912 bytes and four CPUs. Limits are not memory
+reservations, and their combined caps exceed VM RAM. Complete fresh smoke
+and persistent-reuse checks, then the populated SQLite CFilter/full-block
+pair without any OOM before scaling. A further operation failure stops
+collection for assessment; there is no automatic capacity adjustment.
 
 A matched collection has seven configurations for each existing full case:
 legacy rescan plus full-block/compact-filter modes for maintained kvdb,

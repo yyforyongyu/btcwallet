@@ -33,7 +33,9 @@ const (
 
 // Native daemon resources and notification cadence match every implementation.
 const (
-	syncBenchmarkMemory          = 12 << 30
+	// Full-block batches build multi-gigabyte RPC replies. Keep every
+	// mode above the daemon's observed 12 GiB OOM limit for that workload.
+	syncBenchmarkMemory          = 16 << 30
 	syncBenchmarkZMQDeadline     = 5 * time.Second
 	syncBenchmarkMempoolInterval = 100 * time.Millisecond
 )
