@@ -2058,13 +2058,14 @@ func matchStoreScanSyncedBlocks(params db.ScanBatchParams, wantSynced bool,
 }
 
 // matchStoreScanTx reports whether the batched scan transaction carries the
-// fixture's wallet, hash, receive time, credit, status, and confirming block.
+// fixture's wallet, hash, time, candidate, status, and confirming block.
 func matchStoreScanTx(txParams db.CreateTxParams, walletID uint32,
 	fixture storeScanBatchFixture) bool {
 
-	creditAddr, ok := txParams.Credits[0]
-	if !ok || creditAddr == nil || txParams.Tx == nil ||
-		txParams.Block == nil {
+	// Scans defer credit admission to the Store, just like live observations.
+	candidates := txParams.CreditCandidates[0]
+	if len(txParams.Credits) != 0 || len(candidates) != 1 ||
+		candidates[0] == nil || txParams.Tx == nil || txParams.Block == nil {
 
 		return false
 	}
@@ -2077,7 +2078,7 @@ func matchStoreScanTx(txParams db.CreateTxParams, walletID uint32,
 		txParams.Tx.TxHash() == fixture.tx.TxHash() &&
 		txParams.Received.Equal(fixture.received) &&
 		txParams.Status == db.TxStatusPublished &&
-		creditAddr.EncodeAddress() == fixture.addr.EncodeAddress()
+		candidates[0].EncodeAddress() == fixture.addr.EncodeAddress()
 }
 
 // matchStoreScanBatch matches the store scan batch produced by scan routing.
@@ -2201,6 +2202,158 @@ func TestPutTargetedBatchStore(t *testing.T) {
 	// Assert: The store saw transactions and horizons, but no synced blocks.
 	require.NoError(t, err)
 	store.AssertExpectations(t)
+}
+
+// TestScanCreditsMatchLivePolicy verifies a scan and its confirmed live replay
+// retain ordinary change without crediting a custom external signing key.
+func TestScanCreditsMatchLivePolicy(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Use real address and transaction managers so the Store applies
+	// its receiving policy to ordinary change and a key-only custom scope.
+	s, mgr, dbConn := newStoreScanSyncer(t)
+
+	var change, signingKey address.Address
+
+	err := walletdb.Update(dbConn, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		bip84, err := mgr.FetchScopedKeyManager(waddrmgr.KeyScopeBIP0084)
+		if err != nil {
+			return err
+		}
+
+		internal, err := bip84.NextInternalAddresses(ns, 0, 1)
+		if err != nil {
+			return err
+		}
+
+		change = internal[0].Address()
+
+		custom, err := mgr.NewScopedKeyManager(ns, waddrmgr.KeyScope{
+			Purpose: 1017,
+			Coin:    1,
+		}, waddrmgr.ScopeAddrSchema{
+			ExternalAddrType: waddrmgr.WitnessPubKey,
+			InternalAddrType: waddrmgr.WitnessPubKey,
+		})
+		if err != nil {
+			return err
+		}
+
+		external, err := custom.NextExternalAddresses(ns, 0, 1)
+		if err != nil {
+			return err
+		}
+
+		signingKey = external[0].Address()
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	// The scanner watches these keys, but watching a signing key must not
+	// make its output spendable wallet credit. Both paths observe one block.
+	msg := wire.NewMsgTx(wire.TxVersion)
+	msg.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+		Hash:  chainhash.Hash{71},
+		Index: 0,
+	}, nil, nil))
+
+	for _, addr := range []address.Address{change, signingKey} {
+		script, err := txscript.PayToAddrScript(addr)
+		require.NoError(t, err)
+		msg.AddTxOut(wire.NewTxOut(10_000, script))
+	}
+
+	block := &wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{
+			Hash:   chainhash.Hash{72},
+			Height: 1,
+		},
+		Time: time.Unix(1710003120, 0),
+	}
+	record, err := wtxmgr.NewTxRecordFromMsgTx(msg, block.Time)
+	require.NoError(t, err)
+
+	matches := TxEntries{
+		{
+			Rec: record,
+			Entries: []AddrEntry{
+				{
+					IsLookahead: false,
+					addrScope: waddrmgr.AddrScope{
+						BranchScope: waddrmgr.BranchScope{
+							Scope:   waddrmgr.KeyScopeBIP0084,
+							Account: 0,
+							Branch:  waddrmgr.InternalBranch,
+						},
+						Index: 0,
+					},
+					Address: change,
+					Credit: wtxmgr.CreditEntry{
+						Index:  0,
+						Change: true,
+					},
+				},
+				{
+					IsLookahead: false,
+					addrScope: waddrmgr.AddrScope{
+						BranchScope: waddrmgr.BranchScope{
+							Scope: waddrmgr.KeyScope{
+								Purpose: 1017,
+								Coin:    1,
+							},
+							Account: 0,
+							Branch:  waddrmgr.ExternalBranch,
+						},
+						Index: 0,
+					},
+					Address: signingKey,
+					Credit: wtxmgr.CreditEntry{
+						Index:  1,
+						Change: false,
+					},
+				},
+			},
+		},
+	}
+
+	// Act: Persist the actual scan batch, then replay the same confirmed
+	// observation through live admission, which resolves automatic credits.
+	params, err := s.storeScanBatchParams(
+		NewRecoveryState(0, &chaincfg.SimNetParams, nil),
+		[]scanResult{
+			{
+				BlockProcessResult: &BlockProcessResult{
+					RelevantTxs:     []*btcutil.Tx{btcutil.NewTx(msg)},
+					FoundHorizons:   nil,
+					RelevantOutputs: matches,
+					Expanded:        false,
+				},
+				meta:       block,
+				parentHash: *chaincfg.SimNetParams.GenesisHash,
+			},
+		}, true,
+	)
+	require.NoError(t, err)
+	err = s.store.ApplyScanBatch(t.Context(), params)
+	require.NoError(t, err)
+	replayErr := s.putTxNotifications(t.Context(), matches, block)
+
+	// Assert: The replay is idempotent because both observations retain only
+	// ordinary change; the key-only output never enters spendable ownership.
+	require.NoError(t, replayErr)
+	detail, err := s.store.GetTxDetail(t.Context(), db.GetTxDetailQuery{
+		WalletID: 0,
+		Txid:     record.Hash,
+	})
+	require.NoError(t, err)
+	require.Len(t, detail.OwnedOutputs, 1)
+	require.Equal(t, uint32(0), detail.OwnedOutputs[0].Index)
+	require.Equal(t, btcutil.Amount(10_000), detail.OwnedOutputs[0].Amount)
+	require.NotNil(t, detail.Block)
+	require.Equal(t, block.Hash, detail.Block.Hash)
 }
 
 // TestScanHorizonParamsStampsAccountIdentity verifies that scanHorizonParams
