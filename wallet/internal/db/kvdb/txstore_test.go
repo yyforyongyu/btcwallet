@@ -141,6 +141,147 @@ func TestCreateTxUnminedWithCreditSuccess(t *testing.T) {
 	addrStore.AssertCalled(t, "MarkUsed", mock.Anything, mock.Anything)
 }
 
+// TestUnminedTxConflictAdmission verifies publication replaces an unmined spend
+// only after acceptance, and a delayed notification cannot undo that decision.
+func TestUnminedTxConflictAdmission(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		replace bool
+		delayed bool
+	}{
+		{
+			name:    "publication retains conflict before acceptance",
+			replace: false,
+			delayed: false,
+		},
+		{
+			name:    "publication replaces accepted conflict",
+			replace: true,
+			delayed: false,
+		},
+		{
+			name:    "notification preserves accepted replacement",
+			replace: true,
+			delayed: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Give both conflicting transactions a real wallet
+			// address so row and UTXO queries exercise persisted credits.
+			dbConn, cleanup := newTestDB(t)
+			t.Cleanup(cleanup)
+			mgr := newRealAddrManager(t, dbConn)
+			store := NewStore(dbConn, newTxStore(t, dbConn), mgr)
+
+			var addr address.Address
+
+			err := walletdb.Update(dbConn,
+				func(tx walletdb.ReadWriteTx) error {
+					ns := tx.ReadWriteBucket(waddrmgr.NamespaceKey)
+
+					scope, err := mgr.FetchScopedKeyManager(
+						waddrmgr.KeyScopeBIP0084,
+					)
+					if err != nil {
+						return err
+					}
+
+					addrs, err := scope.NextInternalAddresses(ns, 0, 1)
+					if err != nil {
+						return err
+					}
+
+					addr = addrs[0].Address()
+
+					return nil
+				})
+			require.NoError(t, err)
+			script, err := txscript.PayToAddrScript(addr)
+			require.NoError(t, err)
+
+			original := wire.NewMsgTx(2)
+			original.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+				Hash:  chainhash.Hash{81},
+				Index: 0,
+			}, nil, nil))
+			original.AddTxOut(wire.NewTxOut(9_000, script))
+			params := db.CreateTxParams{
+				WalletID:         0,
+				Tx:               original,
+				Received:         time.Unix(1710003000, 0),
+				Block:            nil,
+				Status:           db.TxStatusPublished,
+				ReplaceUnmined:   false,
+				Label:            "",
+				Credits:          map[uint32]address.Address{0: addr},
+				CreditCandidates: nil,
+			}
+			require.NoError(t, store.CreateTx(t.Context(), params))
+
+			replacement := original.Copy()
+			replacement.TxOut[0].Value = 8_000
+			replacementParams := params
+			replacementParams.Tx = replacement
+			replacementParams.ReplaceUnmined = test.replace
+
+			// Act: Attempt publication's write, then optionally deliver
+			// the original's queued event after replacement was accepted.
+			err = store.CreateTx(t.Context(), replacementParams)
+			if test.delayed {
+				require.NoError(t, err)
+
+				params.ReplaceUnmined = true
+				err = store.ApplyTxBatch(t.Context(), db.TxBatchParams{
+					WalletID:     0,
+					Transactions: []db.CreateTxParams{params},
+					SyncedTo:     nil,
+				})
+			}
+
+			// Assert: A refused write keeps the original; acceptance and
+			// delayed notification both leave only the replacement credit.
+			retained, absent := replacement, original
+			if !test.replace {
+				require.ErrorIs(t, err, db.ErrTxInputConflict)
+
+				retained, absent = original, replacement
+			} else {
+				require.NoError(t, err)
+			}
+
+			info, err := store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: 0,
+				Txid:     retained.TxHash(),
+			})
+			require.NoError(t, err)
+			require.Equal(t, retained.TxHash(), info.Hash)
+			_, err = store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: 0,
+				Txid:     absent.TxHash(),
+			})
+			require.ErrorIs(t, err, db.ErrTxNotFound)
+			utxos, err := store.ListUTXOs(t.Context(), db.ListUtxosQuery{
+				WalletID:    0,
+				Scope:       nil,
+				Account:     nil,
+				AccountName: nil,
+				MinConfs:    nil,
+				MaxConfs:    nil,
+			})
+			require.NoError(t, err)
+			require.Len(t, utxos, 1)
+			require.Equal(t, retained.TxHash(), utxos[0].OutPoint.Hash)
+			require.EqualValues(t, retained.TxOut[0].Value, utxos[0].Amount)
+		})
+	}
+}
+
 // TestCreateTxDuplicateReturnsStoreError verifies that duplicate unmined tx
 // inserts are translated to db.ErrTxAlreadyExists.
 func TestCreateTxDuplicateReturnsStoreError(t *testing.T) {

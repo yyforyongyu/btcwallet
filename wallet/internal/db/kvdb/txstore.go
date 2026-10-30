@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
@@ -39,21 +40,10 @@ var errLegacyTxStatusUnexpectedSize = errors.New(
 
 // CreateTx records an unmined transaction through the legacy wtxmgr path.
 //
-// Unlike the SQL backends, kvdb does NOT route through the shared
-// db.CreateTxWithOps orchestration, and this divergence is deliberate. That
-// shared flow owns the full CreateTx contract: confirmed-transaction inserts,
-// input-conflict discovery, invalidation/replacement of the displaced unmined
-// branch, and wallet-owned spent-input marking. The legacy wtxmgr data model
-// underneath kvdb is unmined-only and has no representation for that
-// confirmed-history, replacement, or spend-edge bookkeeping, so an adapter for
-// the shared ops would collapse most stages to notImplemented and add
-// boilerplate without sharing meaningful logic.
-//
-// kvdb therefore implements only the unmined-insertion path directly and
-// returns an explicit unsupported error for confirmed inserts (Block != nil)
-// below. It still reuses the shared, backend-independent request preparation
-// (db.NewCreateTxRequest) so parameter validation stays uniform across
-// backends; only the post-validation write sequencing is bespoke.
+// Unmined conflicts are rejected before publication unless ReplaceUnmined
+// authorizes replacing them. The legacy store removes displaced branches;
+// it does not retain SQL-style replacement history. Confirmed inserts remain
+// unsupported here and are recorded through the batch notification path.
 func (s *Store) CreateTx(ctx context.Context,
 	params db.CreateTxParams) error {
 
@@ -106,6 +96,15 @@ func (s *Store) createTxWithTx(tx walletdb.ReadWriteTx,
 		return errMissingTxmgrNamespace
 	}
 
+	// Admission and branch removal share the insertion's write transaction,
+	// so rejection or any later credit error leaves the original intact.
+	err := s.reconcileUnminedConflicts(
+		txmgrNs, txRec, params.ReplaceUnmined,
+	)
+	if err != nil {
+		return err
+	}
+
 	exists, err := s.txStore.InsertTxCheckIfExists(
 		txmgrNs, txRec, nil,
 	)
@@ -134,6 +133,62 @@ func (s *Store) createTxWithTx(tx walletdb.ReadWriteTx,
 	return s.addCreateTxCredits(
 		addrmgrNs, txmgrNs, txRec, params.Credits,
 	)
+}
+
+// reconcileUnminedConflicts rejects conflicting spends unless replacement is
+// authorized, then removes branches inside the caller's write transaction.
+func (s *Store) reconcileUnminedConflicts(ns walletdb.ReadWriteBucket,
+	rec *wtxmgr.TxRecord, replace bool) error {
+
+	// The legacy store exposes its unmined set rather than a conflict index.
+	// Match its inputs against this request without adding persistent state.
+	unmined, err := s.txStore.UnminedTxs(ns)
+	if err != nil {
+		return fmt.Errorf("list unmined conflicts: %w", err)
+	}
+
+	inputs := make(map[wire.OutPoint]struct{}, len(rec.MsgTx.TxIn))
+	for _, input := range rec.MsgTx.TxIn {
+		inputs[input.PreviousOutPoint] = struct{}{}
+	}
+
+	for _, pending := range unmined {
+		hash := pending.TxHash()
+		if hash == rec.Hash {
+			continue
+		}
+
+		conflict := slices.ContainsFunc(pending.TxIn,
+			func(input *wire.TxIn) bool {
+				_, ok := inputs[input.PreviousOutPoint]
+				return ok
+			})
+		if !conflict {
+			continue
+		}
+
+		if !replace {
+			return db.ErrTxInputConflict
+		}
+
+		// An earlier branch removal may already have removed this member
+		// of the snapshot. Reuse native recursive deletion for live roots.
+		details, err := s.txStore.TxDetails(ns, &hash)
+		if err != nil {
+			return fmt.Errorf("read unmined conflict: %w", err)
+		}
+
+		if details == nil {
+			continue
+		}
+
+		err = s.txStore.RemoveUnminedTx(ns, &details.TxRecord)
+		if err != nil {
+			return fmt.Errorf("remove unmined conflict: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // addCreateTxCredits records wallet-owned outputs for a legacy transaction.
@@ -778,6 +833,17 @@ func (s *Store) applyUnconfirmedLegacyTx(
 		return s.applyUnconfirmedDuplicate(
 			addrmgrNs, txmgrNs, existing, txRec.Hash, req,
 		)
+	}
+
+	// A delayed mempool event cannot arbitrate conflicting spends after
+	// publication removed its old row. Only publication or a block may do so.
+	err = s.reconcileUnminedConflicts(txmgrNs, txRec, false)
+	if errors.Is(err, db.ErrTxInputConflict) {
+		return nil
+	}
+
+	if err != nil {
+		return err
 	}
 
 	credits, err := s.legacyCreditEntries(addrmgrNs, req)
