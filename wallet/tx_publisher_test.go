@@ -18,6 +18,7 @@ import (
 	"github.com/btcsuite/btcd/wire/v2"
 	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
 	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -1828,5 +1829,100 @@ func TestBroadcastExcludesNoChainSync(t *testing.T) {
 
 	// Assert: Publication succeeds with only ordinary change credited and
 	// watched; key-only ownership does not create an automatic wallet UTXO.
+	require.NoError(t, err)
+}
+
+// TestBroadcastExcludesLegacyKeyScope keeps automatic KVDB credits consistent
+// with native scanning, including imported-xpub key families and raw imports.
+func TestBroadcastExcludesLegacyKeyScope(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: All four outputs are owned, but only ordinary change and the
+	// raw import belong to the native scan set. Imported HD keys retain a
+	// derivation path, so their imported origin cannot enable chain tracking.
+	w, m := createStartedWalletWithMocks(t)
+	change := mustNewStandalonePubKeyAddr(t)
+	rawImport := mustNewStandalonePubKeyAddr(t)
+	derived := mustNewStandalonePubKeyAddr(t)
+	importedHD := mustNewStandalonePubKeyAddr(t)
+	changeScript := mustPayToAddrScript(change)
+	rawScript := mustPayToAddrScript(rawImport)
+	derivedScript := mustPayToAddrScript(derived)
+	importedScript := mustPayToAddrScript(importedHD)
+	customScope := db.KeyScope{
+		Purpose: 1017,
+		Coin:    1,
+	}
+	owned := map[string]*db.AddressInfo{
+		string(changeScript): {
+			KeyScope:          db.KeyScopeBIP0084,
+			HasDerivationPath: true,
+			Branch:            waddrmgr.InternalBranch,
+		},
+		string(rawScript): {
+			KeyScope:   customScope,
+			IsImported: true,
+		},
+		string(derivedScript): {
+			KeyScope:          customScope,
+			HasDerivationPath: true,
+			Branch:            waddrmgr.ExternalBranch,
+		},
+		string(importedScript): {
+			KeyScope:          customScope,
+			IsImported:        true,
+			HasDerivationPath: true,
+			Branch:            waddrmgr.ExternalBranch,
+		},
+	}
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, nil))
+
+	for _, script := range [][]byte{
+		changeScript, rawScript, derivedScript, importedScript,
+	} {
+		tx.AddTxOut(wire.NewTxOut(1000, script))
+	}
+
+	m.chain.On("TestMempoolAccept", mock.Anything, mock.Anything).
+		Return([]*btcjson.TestMempoolAcceptResult{
+			{
+				Allowed: true,
+			},
+		}, nil).Once()
+	m.store.On("ResolveOwnedAddresses", mock.Anything,
+		matchResolveOwnedAddressesQuery(
+			w.id, changeScript, rawScript, derivedScript, importedScript,
+		),
+	).Return(owned, nil).Once()
+	m.store.On("CreateTx", mock.Anything,
+		matchCreateTxParams(
+			w.id, tx, testTxLabel,
+			map[uint32]address.Address{
+				0: change,
+				1: rawImport,
+			},
+		),
+	).Return(nil).Once()
+	// Watch ordering follows a map; compare the eligible addresses as a set
+	// while requiring that neither HD key-family output is registered.
+	m.chain.On("NotifyReceived", mock.MatchedBy(
+		func(addrs []address.Address) bool {
+			return len(addrs) == 2 &&
+				((addrs[0].String() == change.String() &&
+					addrs[1].String() == rawImport.String()) ||
+					(addrs[1].String() == change.String() &&
+						addrs[0].String() == rawImport.String()))
+		},
+	)).Return(nil).Once()
+	m.chain.On("SendRawTransaction", tx, false).
+		Return((*chainhash.Hash)(nil), nil).Once()
+
+	// Act: Publish through the public API so recording and receiving watches
+	// must agree on the same native relevance decision before broadcast.
+	err := w.Broadcast(t.Context(), tx, testTxLabel)
+
+	// Assert: Publication succeeds with only the scan-eligible outputs. The
+	// fixture cleanup verifies all exact recording/watch expectations once.
 	require.NoError(t, err)
 }

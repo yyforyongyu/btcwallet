@@ -23,6 +23,7 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/davecgh/go-spew/spew"
 )
@@ -700,6 +701,16 @@ func (w *Wallet) filterOwnedAddresses(ctx context.Context,
 		// Key-only ownership permits signing, but does not opt this output
 		// into automatic transaction tracking or receiving watches.
 		if info.NoChainSync {
+			continue
+		}
+
+		// Native KVDB scans omit custom-scope external HD keys, including
+		// imported-xpub children. Raw single imports have no path and
+		// remain eligible through the separate imported-address scan set.
+		if w.addrStore != nil && info.HasDerivationPath &&
+			info.Branch != waddrmgr.InternalBranch &&
+			!waddrmgr.IsDefaultScope(waddrmgr.KeyScope(info.KeyScope)) {
+
 			continue
 		}
 
