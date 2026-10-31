@@ -142,8 +142,8 @@ func TestCreateTxUnminedWithCreditSuccess(t *testing.T) {
 	addrStore.AssertCalled(t, "MarkUsed", mock.Anything, mock.Anything)
 }
 
-// TestUnminedTxConflictAdmission verifies publication replaces an unmined spend
-// only after acceptance, and a delayed notification cannot undo that decision.
+// TestUnminedTxConflictAdmission verifies that refused writes keep the original
+// and permitted competing writes preserve both native claims through replay.
 func TestUnminedTxConflictAdmission(t *testing.T) {
 	t.Parallel()
 
@@ -158,12 +158,12 @@ func TestUnminedTxConflictAdmission(t *testing.T) {
 			delayed: false,
 		},
 		{
-			name:    "publication replaces accepted conflict",
+			name:    "publication retains permitted competing claims",
 			replace: true,
 			delayed: false,
 		},
 		{
-			name:    "notification preserves accepted replacement",
+			name:    "notification preserves competing claims",
 			replace: true,
 			delayed: true,
 		},
@@ -232,7 +232,7 @@ func TestUnminedTxConflictAdmission(t *testing.T) {
 			replacementParams.ReplaceUnmined = test.replace
 
 			// Act: Attempt publication's write, then optionally deliver
-			// the original's queued event after replacement was accepted.
+			// the original's queued event after the competing send.
 			err = store.CreateTx(t.Context(), replacementParams)
 			if test.delayed {
 				require.NoError(t, err)
@@ -245,28 +245,35 @@ func TestUnminedTxConflictAdmission(t *testing.T) {
 				})
 			}
 
-			// Assert: A refused write keeps the original; acceptance and
-			// delayed notification both leave only the replacement credit.
-			retained, absent := replacement, original
+			// Assert: Refusal keeps only the original, while a permitted
+			// competing write and replay retain both native histories and
+			// credits until confirmation decides which branch survives.
 			if !test.replace {
 				require.ErrorIs(t, err, db.ErrTxInputConflict)
-
-				retained, absent = original, replacement
 			} else {
 				require.NoError(t, err)
 			}
 
 			info, err := store.GetTx(t.Context(), db.GetTxQuery{
 				WalletID: 0,
-				Txid:     retained.TxHash(),
+				Txid:     original.TxHash(),
 			})
 			require.NoError(t, err)
-			require.Equal(t, retained.TxHash(), info.Hash)
+			require.Equal(t, original.TxHash(), info.Hash)
 			_, err = store.GetTx(t.Context(), db.GetTxQuery{
 				WalletID: 0,
-				Txid:     absent.TxHash(),
+				Txid:     replacement.TxHash(),
 			})
-			require.ErrorIs(t, err, db.ErrTxNotFound)
+
+			creditCount := 1
+			if test.replace {
+				require.NoError(t, err)
+
+				creditCount++
+			} else {
+				require.ErrorIs(t, err, db.ErrTxNotFound)
+			}
+
 			utxos, err := store.ListUTXOs(t.Context(), db.ListUtxosQuery{
 				WalletID:    0,
 				Scope:       nil,
@@ -276,11 +283,109 @@ func TestUnminedTxConflictAdmission(t *testing.T) {
 				MaxConfs:    nil,
 			})
 			require.NoError(t, err)
-			require.Len(t, utxos, 1)
-			require.Equal(t, retained.TxHash(), utxos[0].OutPoint.Hash)
-			require.EqualValues(t, retained.TxOut[0].Value, utxos[0].Amount)
+			require.Len(t, utxos, creditCount)
+
+			for _, utxo := range utxos {
+				value := original.TxOut[0].Value
+				if utxo.OutPoint.Hash == replacement.TxHash() {
+					require.True(t, test.replace)
+
+					value = replacement.TxOut[0].Value
+				} else {
+					require.Equal(t, original.TxHash(),
+						utxo.OutPoint.Hash)
+				}
+
+				require.EqualValues(t, value, utxo.Amount)
+			}
 		})
 	}
+}
+
+// TestDeleteUnminedTxKeepsConflictingSpend verifies that deleting one unmined
+// competitor cannot release a fee input still claimed by another recorded tx.
+func TestDeleteUnminedTxKeepsConflictingSpend(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Use real wallet credit and transaction stores so both spends
+	// claim the same confirmed input, as competing anchor attempts do.
+	store, mgr, txStore, cleanup := newCreditedFixture(t)
+	t.Cleanup(cleanup)
+	funding := creditAccountAddressAtHeight(
+		t, store.db, mgr, txStore, waddrmgr.KeyScopeBIP0084, 0,
+		btcutil.Amount(10_000), 1, false,
+	)
+	original := wire.NewMsgTx(2)
+	original.AddTxIn(wire.NewTxIn(&funding, nil, nil))
+	original.AddTxOut(wire.NewTxOut(9_000, []byte{txscript.OP_TRUE}))
+	params := db.CreateTxParams{
+		WalletID:         0,
+		Tx:               original,
+		Received:         time.Unix(1710003000, 0),
+		Block:            nil,
+		Status:           db.TxStatusPublished,
+		ReplaceUnmined:   false,
+		Label:            "",
+		Credits:          nil,
+		CreditCandidates: nil,
+	}
+	require.NoError(t, store.CreateTx(t.Context(), params))
+
+	competing := original.Copy()
+	competing.TxOut[0].Value = 8_000
+	params.Tx = competing
+	params.ReplaceUnmined = true
+	require.NoError(t, store.CreateTx(t.Context(), params))
+
+	// Act: Remove the competing branch, modeling an SPV send whose parent
+	// later loses while the original spend remains in the miner's mempool.
+	err := store.DeleteUnminedTx(t.Context(), db.DeleteUnminedTxParams{
+		WalletID: 0,
+		Txid:     competing.TxHash(),
+	})
+	require.NoError(t, err)
+
+	// Assert: The original history and input claim must survive together,
+	// excluding the fee input from both point lookup and coin selection.
+	info, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: 0,
+		Txid:     original.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, original.TxHash(), info.Hash)
+	_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: 0,
+		OutPoint: funding,
+	})
+	require.ErrorIs(t, err, db.ErrUtxoNotFound)
+	utxos, err := store.ListUTXOs(t.Context(), db.ListUtxosQuery{
+		WalletID:    0,
+		Scope:       nil,
+		Account:     nil,
+		AccountName: nil,
+		MinConfs:    nil,
+		MaxConfs:    nil,
+	})
+	require.NoError(t, err)
+	require.Empty(t, utxos)
+
+	// Act: Remove the final claim to distinguish correct spend retention
+	// from an input that becomes permanently hidden after either deletion.
+	err = store.DeleteUnminedTx(t.Context(), db.DeleteUnminedTxParams{
+		WalletID: 0,
+		Txid:     original.TxHash(),
+	})
+	require.NoError(t, err)
+
+	// Assert: With neither spender recorded, the confirmed funding output
+	// is available again with its original identity and amount.
+	utxo, err := store.GetUtxo(t.Context(), db.GetUtxoQuery{
+		WalletID: 0,
+		OutPoint: funding,
+	})
+	require.NoError(t, err)
+	require.Equal(t, funding, utxo.OutPoint)
+	require.Equal(t, btcutil.Amount(10_000), utxo.Amount)
 }
 
 // TestCreateTxDuplicateReturnsStoreError verifies that duplicate unmined tx

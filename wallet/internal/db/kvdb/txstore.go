@@ -40,10 +40,10 @@ var errLegacyTxStatusUnexpectedSize = errors.New(
 
 // CreateTx records an unmined transaction through the legacy wtxmgr path.
 //
-// Unmined conflicts are rejected before publication unless ReplaceUnmined
-// authorizes replacing them. The legacy store removes displaced branches;
-// it does not retain SQL-style replacement history. Confirmed inserts remain
-// unsupported here and are recorded through the batch notification path.
+// ReplaceUnmined admits competing spends without discarding native input
+// claims: a successful SPV send may be an orphan rather than a mempool winner.
+// Confirmation resolves conflicts. Confirmed inserts remain unsupported here
+// and are recorded through the batch notification path.
 func (s *Store) CreateTx(ctx context.Context,
 	params db.CreateTxParams) error {
 
@@ -96,8 +96,8 @@ func (s *Store) createTxWithTx(tx walletdb.ReadWriteTx,
 		return errMissingTxmgrNamespace
 	}
 
-	// Admission and branch removal share the insertion's write transaction,
-	// so rejection or any later credit error leaves the original intact.
+	// Admission shares insertion's write transaction so a refused write
+	// cannot change either the original record or its input claims.
 	err := s.reconcileUnminedConflicts(
 		txmgrNs, txRec, params.ReplaceUnmined,
 	)
@@ -135,10 +135,16 @@ func (s *Store) createTxWithTx(tx walletdb.ReadWriteTx,
 	)
 }
 
-// reconcileUnminedConflicts rejects conflicting spends unless replacement is
-// authorized, then removes branches inside the caller's write transaction.
+// reconcileUnminedConflicts rejects unpermitted competing writes while leaving
+// native wtxmgr claims intact until confirmation or explicit branch deletion.
 func (s *Store) reconcileUnminedConflicts(ns walletdb.ReadWriteBucket,
 	rec *wtxmgr.TxRecord, replace bool) error {
+
+	// Native spender lists retain both claims so deleting an orphan cannot
+	// release an input still used by a competing unmined transaction.
+	if replace {
+		return nil
+	}
 
 	// The legacy store exposes its unmined set rather than a conflict index.
 	// Match its inputs against this request without adding persistent state.
@@ -163,28 +169,8 @@ func (s *Store) reconcileUnminedConflicts(ns walletdb.ReadWriteBucket,
 				_, ok := inputs[input.PreviousOutPoint]
 				return ok
 			})
-		if !conflict {
-			continue
-		}
-
-		if !replace {
+		if conflict {
 			return db.ErrTxInputConflict
-		}
-
-		// An earlier branch removal may already have removed this member
-		// of the snapshot. Reuse native recursive deletion for live roots.
-		details, err := s.txStore.TxDetails(ns, &hash)
-		if err != nil {
-			return fmt.Errorf("read unmined conflict: %w", err)
-		}
-
-		if details == nil {
-			continue
-		}
-
-		err = s.txStore.RemoveUnminedTx(ns, &details.TxRecord)
-		if err != nil {
-			return fmt.Errorf("remove unmined conflict: %w", err)
 		}
 	}
 
@@ -835,8 +821,9 @@ func (s *Store) applyUnconfirmedLegacyTx(
 		)
 	}
 
-	// A delayed mempool event cannot arbitrate conflicting spends after
-	// publication removed its old row. Only publication or a block may do so.
+	// A delayed mempool event cannot authorize a competing write. Keep the
+	// recorded claims until publication permits insertion or a block
+	// resolves it.
 	err = s.reconcileUnminedConflicts(txmgrNs, txRec, false)
 	if errors.Is(err, db.ErrTxInputConflict) {
 		return nil
