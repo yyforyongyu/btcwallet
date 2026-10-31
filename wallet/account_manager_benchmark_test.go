@@ -754,6 +754,16 @@ func BenchmarkManagerInitialDerivedAccounts(b *testing.B) {
 			open:  testSQLiteManager,
 			batch: true,
 		},
+		{
+			name:  "kvdb/individual",
+			open:  testKVDBManager,
+			batch: false,
+		},
+		{
+			name:  "kvdb/initial",
+			open:  testKVDBManager,
+			batch: true,
+		},
 	}
 	for _, tc := range tests {
 		b.Run(tc.name, func(b *testing.B) {

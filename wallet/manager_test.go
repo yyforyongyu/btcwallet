@@ -2990,103 +2990,141 @@ func TestManagerChainCanceledSourceRejectsCreate(t *testing.T) {
 func TestManagerCreateInitialDerivedAccounts(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Request payment scopes and all Lightning families through the
-	// existing real-Store fixture, which owns worker and mock cleanup.
-	manager := testSQLiteManager(t)
-	params := sqliteCreateParams(t)
-	zero := AccountNumber(0)
-	window := uint32(2)
-	params.RecoveryWindow = &window
-
-	for _, scope := range []waddrmgr.KeyScope{
-		waddrmgr.KeyScopeBIP0084,
-		waddrmgr.KeyScopeBIP0086,
-	} {
-		schema := waddrmgr.ScopeAddrMap[scope]
-
-		params.InitialDerivedAccounts = append(
-			params.InitialDerivedAccounts, NewAccountParams{
-				Scope:         scope,
-				Name:          waddrmgr.DefaultAccountName,
-				AccountNumber: &zero,
-				AddrSchema:    &schema,
-			},
-		)
+	tests := []struct {
+		name       string
+		open       func(testing.TB) *Manager
+		syncPolicy bool
+	}{
+		{
+			name:       "sqlite",
+			open:       testSQLiteManager,
+			syncPolicy: true,
+		},
+		{
+			name:       "kvdb",
+			open:       testKVDBManager,
+			syncPolicy: false,
+		},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	familyScope := waddrmgr.KeyScope{Purpose: 1017, Coin: 1}
-	familySchema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0084]
+			// Arrange: Request payment scopes and every Lightning family.
+			// Real-Store fixtures own worker and mock-expectation cleanup.
+			manager := tc.open(t)
+			params := sqliteCreateParams(t)
+			params.PubPassphrase = []byte(InsecurePubPassphrase)
 
-	for number := AccountNumber(0); number <= 255; number++ {
-		name := fmt.Sprintf("act:%d", number)
-		if number == 0 {
-			name = waddrmgr.DefaultAccountName
-		}
+			if !tc.syncPolicy {
+				chain, ok := manager.config.ChainSource.(*bwmock.Chain)
+				require.True(t, ok)
+				chain.On("NotifyReceived", mock.Anything).Return(nil).Once()
+			}
 
-		params.InitialDerivedAccounts = append(
-			params.InitialDerivedAccounts, NewAccountParams{
-				Scope:         familyScope,
-				Name:          name,
-				AccountNumber: &number,
-				AddrSchema:    &familySchema,
-				NoChainSync:   true,
-			},
-		)
+			zero := AccountNumber(0)
+			window := uint32(2)
+			params.RecoveryWindow = &window
+
+			for _, scope := range []waddrmgr.KeyScope{
+				waddrmgr.KeyScopeBIP0084,
+				waddrmgr.KeyScopeBIP0086,
+			} {
+				schema := waddrmgr.ScopeAddrMap[scope]
+
+				params.InitialDerivedAccounts = append(
+					params.InitialDerivedAccounts, NewAccountParams{
+						Scope:         scope,
+						Name:          waddrmgr.DefaultAccountName,
+						AccountNumber: &zero,
+						NoChainSync:   false,
+						AddrSchema:    &schema,
+					},
+				)
+			}
+
+			familyScope := waddrmgr.KeyScope{Purpose: 1017, Coin: 1}
+			familySchema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0084]
+
+			for number := AccountNumber(0); number <= 255; number++ {
+				name := fmt.Sprintf("act:%d", number)
+				if number == 0 {
+					name = waddrmgr.DefaultAccountName
+				}
+
+				params.InitialDerivedAccounts = append(
+					params.InitialDerivedAccounts, NewAccountParams{
+						Scope:         familyScope,
+						Name:          name,
+						AccountNumber: &number,
+						AddrSchema:    &familySchema,
+						NoChainSync:   true,
+					},
+				)
+			}
+
+			// Act: Create through Manager; account initialization must
+			// finish before publication, leaving private access locked.
+			w, err := manager.Create(params)
+			require.NoError(t, err)
+			info, err := w.Info(t.Context())
+			require.NoError(t, err)
+
+			// Assert: Export paths and backend policy survive creation,
+			// then normal authentication enables payment signing.
+			require.True(t, info.Locked)
+
+			for _, account := range params.InitialDerivedAccounts {
+				stored, err := w.GetAccount(
+					t.Context(), account.Scope, account.Name,
+				)
+				require.NoError(t, err)
+				require.False(t, stored.IsImported)
+				require.Equal(t, account.AccountNumber, stored.AccountNumber)
+				require.Equal(t, account.NoChainSync && tc.syncPolicy,
+					stored.NoChainSync)
+			}
+
+			families, err := w.ListAccountsByScope(t.Context(), familyScope)
+			require.NoError(t, err)
+			require.Len(t, families, 256)
+
+			// Compare the last export with the supplied seed's path; a
+			// wrong creation root must not satisfy metadata checks.
+			root, err := hdkeychain.NewMaster(params.Seed, &chainParams)
+			require.NoError(t, err)
+
+			defer root.Zero()
+
+			expected, err := deriveBIP44AccountKey(
+				root, db.KeyScope(familyScope), 255,
+			)
+			require.NoError(t, err)
+
+			defer expected.Zero()
+
+			expectedPub, err := expected.Neuter()
+			require.NoError(t, err)
+			last, err := w.GetAccount(t.Context(), familyScope, "act:255")
+			require.NoError(t, err)
+			require.Equal(t,
+				db.AccountXPubPayload([]byte(expectedPub.String())),
+				db.AccountXPubPayload(last.PublicKey),
+			)
+			require.NoError(t, w.Unlock(t.Context(), UnlockRequest{
+				Passphrase: params.PrivatePassphrase,
+				Timeout:    -1,
+			}))
+			addr, err := w.NewAddress(t.Context(), NewAccountSelectorByName(
+				waddrmgr.KeyScopeBIP0084, waddrmgr.DefaultAccountName,
+			), false)
+			require.NoError(t, err)
+			key, err := w.GetPrivKeyForAddress(t.Context(), addr.Addr)
+			require.NoError(t, err)
+			require.NotNil(t, key)
+			key.Zero()
+		})
 	}
-
-	// Act: Create through the public Manager entry point. Its initial account
-	// work must finish before publication while leaving private access locked.
-	w, err := manager.Create(params)
-	require.NoError(t, err)
-	info, err := w.Info(t.Context())
-	require.NoError(t, err)
-
-	// Assert: The complete export retains its requested paths and policy,
-	// and normal authentication still enables payment signing after creation.
-	require.True(t, info.Locked)
-
-	for _, account := range params.InitialDerivedAccounts {
-		stored, err := w.GetAccount(t.Context(), account.Scope, account.Name)
-		require.NoError(t, err)
-		require.False(t, stored.IsImported)
-		require.Equal(t, account.AccountNumber, stored.AccountNumber)
-		require.Equal(t, account.NoChainSync, stored.NoChainSync)
-	}
-
-	families, err := w.ListAccountsByScope(t.Context(), familyScope)
-	require.NoError(t, err)
-	require.Len(t, families, 256)
-
-	// Compare the final exported account to the supplied seed's actual path,
-	// so borrowing the wrong creation root cannot satisfy metadata checks.
-	root, err := hdkeychain.NewMaster(params.Seed, &chainParams)
-	require.NoError(t, err)
-
-	defer root.Zero()
-
-	expected, err := deriveBIP44AccountKey(root, db.KeyScope(familyScope), 255)
-	require.NoError(t, err)
-
-	defer expected.Zero()
-
-	expectedPub, err := expected.Neuter()
-	require.NoError(t, err)
-	last, err := w.GetAccount(t.Context(), familyScope, "act:255")
-	require.NoError(t, err)
-	require.Equal(t, db.AccountXPubPayload([]byte(expectedPub.String())),
-		db.AccountXPubPayload(last.PublicKey))
-	require.NoError(t, w.Unlock(t.Context(), UnlockRequest{
-		Passphrase: params.PrivatePassphrase,
-		Timeout:    -1,
-	}))
-	addr, err := w.NewAddress(t.Context(), NewAccountSelectorByName(
-		waddrmgr.KeyScopeBIP0084, waddrmgr.DefaultAccountName,
-	), false)
-	require.NoError(t, err)
-	key, err := w.GetPrivKeyForAddress(t.Context(), addr.Addr)
-	require.NoError(t, err)
-	require.NotNil(t, key)
-	key.Zero()
 }
 
 // TestManagerCreateRecoveryValidation verifies invalid recovery initialization
@@ -3238,4 +3276,86 @@ func TestManagerStartRescansFromBirthday(t *testing.T) {
 			require.Len(t, wallets, 1)
 		})
 	}
+}
+
+// TestManagerKVDBInitialAccountsRollback verifies a failed initialization
+// cannot publish partial accounts or leave their cached keys across reopen.
+func TestManagerKVDBInitialAccountsRollback(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: The second family reuses the first name after its native
+	// writer has warmed the cache, forcing failure inside the account batch.
+	path := testKVDBPath(t)
+	manager := testKVDBManagerAt(t, path)
+	params := sqliteCreateParams(t)
+	params.PubPassphrase = []byte(InsecurePubPassphrase)
+	scope := waddrmgr.KeyScope{Purpose: 1017, Coin: 1}
+	schema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0084]
+
+	for number := AccountNumber(1); number <= 2; number++ {
+		params.InitialDerivedAccounts = append(
+			params.InitialDerivedAccounts, NewAccountParams{
+				Scope:         scope,
+				Name:          "initial-conflict",
+				AccountNumber: &number,
+				AddrSchema:    &schema,
+				NoChainSync:   true,
+			},
+		)
+	}
+
+	// Act: Submit the conflicting batch and release its complete owner
+	// before opening the durable wallet through a fresh public Manager.
+	w, err := manager.Create(params)
+	require.ErrorIs(t, err, ErrAccountAlreadyExists)
+	require.Nil(t, w)
+	require.NoError(t, manager.Stop())
+
+	chain := createTestChain(t)
+	chain.On("NotifyReceived", mock.Anything).Return(nil).Once()
+	reopened, err := NewManager(t.Context(), ManagerConfig{
+		Backend:                 DBBackendKVDB,
+		DataSource:              path,
+		ChainParams:             chainParams,
+		ChainSource:             chain,
+		KVDBPubPassphrase:       params.PubPassphrase,
+		MaxConnections:          0,
+		SyncMethod:              SyncMethodAuto,
+		WalletSyncRetryInterval: 0,
+		RecoveryWindow:          0,
+		RescanOnStart:           false,
+		AutoLockDuration:        0,
+		MaxCFilterItems:         0,
+		SignetChallengeDigest:   nil,
+		NoFreelistSync:          false,
+		Timeout:                 0,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, reopened.Stop())
+	})
+	wallets, err := reopened.Start(t.Context())
+	require.NoError(t, err)
+	require.Len(t, wallets, 1)
+	w = wallets[0]
+
+	// Assert: Only the native scope default committed. Normal authenticated
+	// creation can now reuse the rolled-back number and sign with its key.
+	accounts, err := w.ListAccountsByScope(t.Context(), scope)
+	require.NoError(t, err)
+	require.Len(t, accounts, 1)
+	require.Zero(t, *accounts[0].AccountNumber)
+	require.NoError(t, w.Unlock(t.Context(), UnlockRequest{
+		Passphrase: params.PrivatePassphrase,
+		Timeout:    -1,
+	}))
+	_, err = w.NewAccount(t.Context(), params.InitialDerivedAccounts[0])
+	require.NoError(t, err)
+	addr, err := w.NewAddress(t.Context(), NewAccountSelectorByName(
+		scope, "initial-conflict",
+	), false)
+	require.NoError(t, err)
+	key, err := w.GetPrivKeyForAddress(t.Context(), addr.Addr)
+	require.NoError(t, err)
+	key.Zero()
 }

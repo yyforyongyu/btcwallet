@@ -113,9 +113,9 @@ type CreateWalletParams struct {
 	// honored for ModeShell.
 	InitialAccounts []ImportAccountParams
 
-	// InitialDerivedAccounts creates SQL root-derived accounts before the
-	// first chain scan. Spendable modes only; legacy kvdb creates its native
-	// default scopes itself and does not accept this option.
+	// InitialDerivedAccounts creates root-derived accounts before the first
+	// chain scan. Spendable modes only. KVDB reuses native account zero and
+	// ignores NoChainSync, as on the ordinary account API.
 	InitialDerivedAccounts []NewAccountParams
 
 	// RecoveryWindow overrides the Manager default for this creation's first
@@ -539,7 +539,7 @@ func validateManagedWalletName(name string) error {
 // Create persists, starts, and publishes one Wallet while Manager is running.
 // Duplicate creation returns no Wallet and ErrWalletExists while preserving
 // the existing Wallet and its credentials, including all aliases on kvdb.
-// SQL initial derived accounts are ready before the first scan; creation's
+// Initial derived accounts are ready before the first scan; creation's
 // optional recovery window overrides the Manager default for that runtime.
 //
 // TODO(yy): Add a context parameter once wallet creation uses a single atomic
@@ -642,14 +642,8 @@ func (m *Manager) createWallet(params CreateWalletParams) (*Wallet, error) {
 		return nil, err
 	}
 
-	// SQL has no built-in payment scopes. Validate the caller's exact account
-	// requests before wallet persistence, then reuse normal Store derivation.
-	if m.config.Backend == DBBackendKVDB &&
-		len(params.InitialDerivedAccounts) > 0 {
-
-		return nil, ErrAccountOperationUnsupported
-	}
-
+	// Validate requested paths before either backend prepares durable state;
+	// backend creation reuses the normalized inputs and existing derivation.
 	accounts := make([]db.CreateDerivedAccountParams, 0,
 		len(params.InitialDerivedAccounts))
 	for _, account := range params.InitialDerivedAccounts {
