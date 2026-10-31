@@ -901,3 +901,81 @@ func TestCreateAccountIdentityConcurrent(t *testing.T) {
 	require.Zero(t, addresses)
 	require.Equal(t, wantNext, next)
 }
+
+// TestCreateInitialDerivedAccounts verifies a later batch refusal rolls back
+// preceding accounts and allocation before a corrected initialization retries.
+func TestCreateInitialDerivedAccounts(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Keep an existing scope/account so rollback must preserve its
+	// cursor as well as remove accounts written earlier in the failed batch.
+	store := NewTestStore(t)
+	walletID := newWallet(t, store, "initial-derived-batch")
+	scope := db.KeyScopeBIP0084
+	_, err := store.CreateDerivedAccount(t.Context(),
+		db.CreateDerivedAccountParams{
+			WalletID:      walletID,
+			Scope:         scope,
+			Name:          "existing",
+			AddrSchema:    nil,
+			AccountNumber: nil,
+			NoChainSync:   false,
+		}, SpendableDeriveFn(),
+	)
+	require.NoError(t, err)
+
+	accounts := []db.CreateDerivedAccountParams{
+		{
+			WalletID:      0,
+			Scope:         scope,
+			Name:          "batch-first",
+			AddrSchema:    nil,
+			AccountNumber: nil,
+			NoChainSync:   false,
+		},
+		{
+			WalletID:      0,
+			Scope:         scope,
+			Name:          "batch-first",
+			AddrSchema:    nil,
+			AccountNumber: nil,
+			NoChainSync:   false,
+		},
+	}
+
+	// Act: The second name conflicts with the first write in this same
+	// transaction, after the first account has already consumed a number.
+	err = store.CreateInitialDerivedAccounts(
+		t.Context(), walletID, accounts, SpendableDeriveFn(),
+	)
+
+	// Assert: No partial account survives, and correcting only the name
+	// installs both accounts at the original next numbers, without a gap.
+	require.ErrorIs(t, err, db.ErrAccountNameConflict)
+	stored, err := store.ListAccounts(t.Context(), db.ListAccountsQuery{
+		WalletID:      walletID,
+		Scope:         nil,
+		Name:          nil,
+		ChainSyncOnly: false,
+		SkipBalance:   false,
+	})
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+
+	accounts[1].Name = "batch-second"
+	require.NoError(t, store.CreateInitialDerivedAccounts(
+		t.Context(), walletID, accounts, SpendableDeriveFn(),
+	))
+
+	for i, account := range accounts {
+		stored, err := store.GetAccount(t.Context(), db.GetAccountQuery{
+			WalletID:      walletID,
+			Scope:         scope,
+			Name:          &account.Name,
+			AccountNumber: nil,
+			SkipBalance:   false,
+		})
+		require.NoError(t, err)
+		require.EqualValues(t, i+1, *stored.AccountNumber)
+	}
+}

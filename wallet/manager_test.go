@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"iter"
 	"sync"
 	"testing"
@@ -412,7 +413,11 @@ func TestManagerChainRollbackCreate(t *testing.T) {
 		}).Return(nil).Once()
 
 	params := managerLifecycleCreateParams("created")
-	backend.On("create", mock.Anything, params, (*hdkeychain.ExtendedKey)(nil)).
+	// An empty initial batch isolates Create's rollback exclusion here.
+	backend.On(
+		"create", mock.Anything, params, (*hdkeychain.ExtendedKey)(nil),
+		[]db.CreateDerivedAccountParams{},
+	).
 		Return(&walletData{
 			id:    2,
 			name:  params.Name,
@@ -1225,10 +1230,11 @@ func (b *managerBackendMock) listWallets(
 
 // create returns the storage result configured by the current test.
 func (b *managerBackendMock) create(ctx context.Context,
-	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey) (
+	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey,
+	accounts []db.CreateDerivedAccountParams) (
 	*walletData, error) {
 
-	args := b.Called(ctx, params, rootKey)
+	args := b.Called(ctx, params, rootKey, accounts)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
@@ -1917,7 +1923,10 @@ func TestManagerCreateLifecycleSerializesStop(t *testing.T) {
 	backend.On("listWallets", mock.Anything).Return([]*walletData{}, nil).Once()
 
 	params := managerLifecycleCreateParams("created")
-	backend.On("create", mock.Anything, params, mock.Anything).
+	backend.On(
+		"create", mock.Anything, params, mock.Anything,
+		[]db.CreateDerivedAccountParams{},
+	).
 		Return(&walletData{
 			id:    1,
 			name:  params.Name,
@@ -2000,7 +2009,10 @@ func TestManagerCreateLifecycleStartFailureStopsManager(t *testing.T) {
 	params := managerLifecycleCreateParams("candidate")
 	backend := &managerBackendMock{}
 	backend.On("listWallets", mock.Anything).Return([]*walletData{}, nil).Once()
-	backend.On("create", mock.Anything, params, mock.Anything).
+	backend.On(
+		"create", mock.Anything, params, mock.Anything,
+		[]db.CreateDerivedAccountParams{},
+	).
 		Return(&walletData{
 			id:    1,
 			name:  params.Name,
@@ -2426,7 +2438,10 @@ func TestManagerCreateBoundsGenesisSecrets(t *testing.T) {
 			var observedRoot *hdkeychain.ExtendedKey
 
 			backend := &managerBackendMock{}
-			backend.On("create", mock.Anything, params, mock.Anything).
+			backend.On(
+				"create", mock.Anything, params, mock.Anything,
+				[]db.CreateDerivedAccountParams{},
+			).
 				Return(&walletData{
 					id:    1,
 					name:  params.Name,
@@ -2498,7 +2513,10 @@ func TestManagerCreateBoundsGenesisSecretsOnFailure(t *testing.T) {
 			var observedRoot *hdkeychain.ExtendedKey
 
 			backend := &managerBackendMock{}
-			backend.On("create", mock.Anything, params, mock.Anything).
+			backend.On(
+				"create", mock.Anything, params, mock.Anything,
+				[]db.CreateDerivedAccountParams{},
+			).
 				Return(nil, errDBMock).Run(func(args mock.Arguments) {
 				var ok bool
 				observedRoot, ok = args.Get(2).(*hdkeychain.ExtendedKey)
@@ -2613,7 +2631,10 @@ func TestManagerCreateBoundsGenesisSecretsOnPanic(t *testing.T) {
 	var observedRoot *hdkeychain.ExtendedKey
 
 	backend := &managerBackendMock{}
-	backend.On("create", mock.Anything, params, mock.Anything).
+	backend.On(
+		"create", mock.Anything, params, mock.Anything,
+		[]db.CreateDerivedAccountParams{},
+	).
 		Return(nil, nil).Run(func(args mock.Arguments) {
 		var ok bool
 		observedRoot, ok = args.Get(2).(*hdkeychain.ExtendedKey)
@@ -3542,13 +3563,13 @@ func TestManagerChainCanceledSourceRejectsCreate(t *testing.T) {
 	require.Nil(t, w)
 }
 
-// TestManagerCreateInitialDerivedAccounts verifies fresh recovery creation
-// returns locked, spendable payment accounts rather than watch-only imports.
+// TestManagerCreateInitialDerivedAccounts verifies creation publishes locked,
+// spendable payment accounts and the complete remote-signer family export.
 func TestManagerCreateInitialDerivedAccounts(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Request two payment scopes in a real SQL wallet. The existing
-	// fixture owns shutdown and verifies its chain mock after workers stop.
+	// Arrange: Request payment scopes and all Lightning families through the
+	// existing real-Store fixture, which owns worker and mock cleanup.
 	manager := testSQLiteManager(t)
 	params := sqliteCreateParams(t)
 	zero := AccountNumber(0)
@@ -3560,12 +3581,33 @@ func TestManagerCreateInitialDerivedAccounts(t *testing.T) {
 		waddrmgr.KeyScopeBIP0086,
 	} {
 		schema := waddrmgr.ScopeAddrMap[scope]
+
 		params.InitialDerivedAccounts = append(
 			params.InitialDerivedAccounts, NewAccountParams{
 				Scope:         scope,
 				Name:          waddrmgr.DefaultAccountName,
 				AccountNumber: &zero,
 				AddrSchema:    &schema,
+			},
+		)
+	}
+
+	familyScope := waddrmgr.KeyScope{Purpose: 1017, Coin: 1}
+	familySchema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0084]
+
+	for number := AccountNumber(0); number <= 255; number++ {
+		name := fmt.Sprintf("act:%d", number)
+		if number == 0 {
+			name = waddrmgr.DefaultAccountName
+		}
+
+		params.InitialDerivedAccounts = append(
+			params.InitialDerivedAccounts, NewAccountParams{
+				Scope:         familyScope,
+				Name:          name,
+				AccountNumber: &number,
+				AddrSchema:    &familySchema,
+				NoChainSync:   true,
 			},
 		)
 	}
@@ -3577,16 +3619,40 @@ func TestManagerCreateInitialDerivedAccounts(t *testing.T) {
 	info, err := w.Info(t.Context())
 	require.NoError(t, err)
 
-	// Assert: Both exact accounts are root-derived, and normal authentication
-	// still succeeds after the temporary creation-time vault access ends.
+	// Assert: The complete export retains its requested paths and policy,
+	// and normal authentication still enables payment signing after creation.
 	require.True(t, info.Locked)
 
 	for _, account := range params.InitialDerivedAccounts {
 		stored, err := w.GetAccount(t.Context(), account.Scope, account.Name)
 		require.NoError(t, err)
 		require.False(t, stored.IsImported)
-		require.Equal(t, &zero, stored.AccountNumber)
+		require.Equal(t, account.AccountNumber, stored.AccountNumber)
+		require.Equal(t, account.NoChainSync, stored.NoChainSync)
 	}
+
+	families, err := w.ListAccountsByScope(t.Context(), familyScope)
+	require.NoError(t, err)
+	require.Len(t, families, 256)
+
+	// Compare the final exported account to the supplied seed's actual path,
+	// so borrowing the wrong creation root cannot satisfy metadata checks.
+	root, err := hdkeychain.NewMaster(params.Seed, &chainParams)
+	require.NoError(t, err)
+
+	defer root.Zero()
+
+	expected, err := deriveBIP44AccountKey(root, db.KeyScope(familyScope), 255)
+	require.NoError(t, err)
+
+	defer expected.Zero()
+
+	expectedPub, err := expected.Neuter()
+	require.NoError(t, err)
+	last, err := w.GetAccount(t.Context(), familyScope, "act:255")
+	require.NoError(t, err)
+	require.Equal(t, db.AccountXPubPayload([]byte(expectedPub.String())),
+		db.AccountXPubPayload(last.PublicKey))
 	require.NoError(t, w.Unlock(t.Context(), UnlockRequest{
 		Passphrase: params.PrivatePassphrase,
 		Timeout:    -1,
