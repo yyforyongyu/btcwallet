@@ -3,6 +3,7 @@ package wallet
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/stretchr/testify/require"
@@ -708,6 +709,107 @@ func BenchmarkImportAccountAPI(b *testing.B) {
 				require.NoError(b, err)
 
 				count++
+			}
+		})
+	}
+}
+
+// BenchmarkManagerInitialDerivedAccounts compares the public creation batch
+// with the cutover's individual family calls using the same locked result.
+func BenchmarkManagerInitialDerivedAccounts(b *testing.B) {
+	// Arrange: All samples use the same exact family paths. Database/chain
+	// fixture setup and teardown are excluded from the measured operation.
+	scope := waddrmgr.KeyScope{Purpose: 1017, Coin: 1}
+	schema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0084]
+
+	var accounts []NewAccountParams
+
+	for number := AccountNumber(0); number <= 255; number++ {
+		name := fmt.Sprintf("act:%d", number)
+		if number == 0 {
+			name = waddrmgr.DefaultAccountName
+		}
+
+		accounts = append(accounts, NewAccountParams{
+			Scope:         scope,
+			Name:          name,
+			AccountNumber: &number,
+			AddrSchema:    &schema,
+			NoChainSync:   true,
+		})
+	}
+
+	tests := []struct {
+		name  string
+		open  func(testing.TB) *Manager
+		batch bool
+	}{
+		{
+			name:  "sqlite/individual",
+			open:  testSQLiteManager,
+			batch: false,
+		},
+		{
+			name:  "sqlite/initial",
+			open:  testSQLiteManager,
+			batch: true,
+		},
+	}
+	for _, tc := range tests {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			for b.Loop() {
+				b.StopTimer()
+
+				manager := tc.open(b)
+
+				params := CreateWalletParams{
+					Name:                   "initial-benchmark",
+					Mode:                   ModeImportSeed,
+					Seed:                   make([]byte, 32),
+					RootKey:                nil,
+					PubPassphrase:          []byte("public"),
+					PrivatePassphrase:      []byte("private"),
+					Birthday:               time.Now(),
+					InitialAccounts:        nil,
+					InitialDerivedAccounts: nil,
+					RecoveryWindow:         nil,
+					WatchOnly:              false,
+				}
+				if tc.batch {
+					params.InitialDerivedAccounts = accounts
+				}
+
+				b.StartTimer()
+
+				// Act: Measure creation plus family preparation, ending
+				// locked in both public API sequences.
+				w, err := manager.Create(params)
+				require.NoError(b, err)
+
+				if !tc.batch {
+					require.NoError(b, w.Unlock(b.Context(), UnlockRequest{
+						Passphrase: params.PrivatePassphrase,
+						Timeout:    -1,
+					}))
+
+					for _, account := range accounts {
+						_, err = w.NewAccount(b.Context(), account)
+						require.NoError(b, err)
+					}
+
+					require.NoError(b, w.Lock(b.Context()))
+				}
+
+				b.StopTimer()
+
+				// Assert: Join workers before another sample; existing
+				// fixture cleanup owns the single mock verification.
+				require.NoError(b, manager.Stop())
+
+				// Loop requires a running timer at its iteration boundary.
+				b.StartTimer()
 			}
 		})
 	}

@@ -71,7 +71,8 @@ func newKVDBManagerBackend(cfg ManagerConfig) (*kvdbManagerBackend, error) {
 
 // create initializes and opens the one legacy wallet served by the backend.
 func (b *kvdbManagerBackend) create(ctx context.Context,
-	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey) (
+	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey,
+	_ []db.CreateDerivedAccountParams) (
 	*walletData, error) {
 
 	if b.store != nil {

@@ -670,6 +670,12 @@ func (m *Manager) createWallet(params CreateWalletParams) (*Wallet, error) {
 			return nil, newAccountErr(err)
 		}
 
+		// Initialization retains the account API's exact-path requirement
+		// for exclusion, before preparing any durable wallet state.
+		if storeParams.NoChainSync && storeParams.AccountNumber == nil {
+			return nil, ErrAccountOperationUnsupported
+		}
+
 		accounts = append(accounts, storeParams)
 	}
 
@@ -696,47 +702,14 @@ func (m *Manager) createWallet(params CreateWalletParams) (*Wallet, error) {
 		walletCfg.RecoveryWindow = *params.RecoveryWindow
 	}
 
-	data, err := m.backend.create(context.Background(), params, rootKey)
+	data, err := m.backend.create(
+		context.Background(), params, rootKey, accounts,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	w := newManagedWallet(walletCfg, data, m.chainSyncer)
-	if len(accounts) > 0 {
-		err = w.createInitialDerivedAccounts(
-			context.Background(), accounts, params.PrivatePassphrase,
-		)
-		if err != nil {
-			return nil, errors.Join(err, w.stop())
-		}
-	}
-
-	return w, nil
-}
-
-// createInitialDerivedAccounts installs payment accounts before any worker or
-// recovery scan can observe the wallet. The creation credential temporarily
-// unlocks its private vault; publication still returns a locked Wallet.
-func (w *Wallet) createInitialDerivedAccounts(ctx context.Context,
-	accounts []db.CreateDerivedAccountParams, passphrase []byte) error {
-
-	err := w.keyVault.Unlock(ctx, passphrase)
-	if err != nil {
-		return fmt.Errorf("unlock initial accounts: %w", err)
-	}
-	defer w.keyVault.Lock()
-
-	for _, account := range accounts {
-		account.WalletID = w.id
-
-		_, err = w.createDerivedAccount(ctx, account)
-		if err != nil {
-			return fmt.Errorf("create initial account %s: %w",
-				account.Name, newAccountErr(err))
-		}
-	}
-
-	return nil
+	return newManagedWallet(walletCfg, data, m.chainSyncer), nil
 }
 
 // validateInitialAccounts checks resolved scope and script ownership before
