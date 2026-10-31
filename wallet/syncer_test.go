@@ -405,54 +405,92 @@ func TestCheckRollbackDetected(t *testing.T) {
 	store.AssertExpectations(t)
 }
 
-// TestInitChainSync verifies the initial synchronization sequence.
+// TestInitChainSync verifies initial history-read success and failure preserve
+// the correct readiness state at the controller's initialization boundary.
 func TestInitChainSync(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Initialize a store-backed syncer and mock its dependencies
-	// for the initial synchronization sequence.
-	mockChain := &bwmock.Chain{}
-	store := &walletmock.Store{}
-	mockPublisher := &mockTxPublisher{}
+	testCases := []struct {
+		name      string
+		listErr   error
+		wantState syncState
+	}{
+		{
+			name:      "HistoryReady",
+			listErr:   nil,
+			wantState: syncStateSynced,
+		},
+		{
+			name:      "HistoryReadFailure",
+			listErr:   errBroadcast,
+			wantState: syncStateSyncing,
+		},
+	}
 
-	s := newTestSyncer(
-		Config{Chain: mockChain}, nil, nil, mockPublisher,
-		store, 0,
-	)
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 
-	// Mock backend synchronization check.
-	mockChain.On("IsCurrent").Return(true).Once()
+			// Arrange: An already-current wallet needs no rollback or
+			// scan; only its initial history read can prevent readiness.
+			var (
+				mockChain bwmock.Chain
+				store     walletmock.Store
+				cfg       Config
+				info      db.WalletInfo
+				tip       db.Block
+				addresses page.Result[db.AddressInfo, uint32]
+			)
 
-	// Registration reads an empty watch set before enabling blocks.
-	store.On("ListAccounts", mock.Anything, db.ListAccountsQuery{
-		WalletID:      0,
-		SkipBalance:   true,
-		ChainSyncOnly: true,
-	}).Return([]db.AccountInfo(nil), nil).Once()
-	expectImportedScanAddressPage(
-		store, 0, page.Result[db.AddressInfo, uint32]{},
-	)
-	store.On("ListOutputsToWatch", mock.Anything, uint32(0)).
-		Return([]db.UtxoInfo(nil), nil).Once()
-	mockChain.On(
-		"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
-	).Return(nil).Once()
+			cfg.Chain = &mockChain
+			info.SyncedTo = &tip
+			s := newTestSyncer(
+				cfg, nil, nil, nil, &store, 0,
+			)
 
-	mockChain.On("NotifyBlocks").Return(nil).Once()
+			mockChain.On("IsCurrent").Return(true).Once()
+			store.On("GetWallet", mock.Anything, mock.Anything).
+				Return(&info, nil).Twice()
+			store.On("ListAccounts", mock.Anything,
+				db.ListAccountsQuery{
+					WalletID:      0,
+					Scope:         nil,
+					Name:          nil,
+					SkipBalance:   true,
+					ChainSyncOnly: true,
+				},
+			).Return([]db.AccountInfo(nil), nil).Once()
+			expectImportedScanAddressPage(
+				&store, 0, addresses,
+			)
+			store.On("ListOutputsToWatch", mock.Anything, uint32(0)).
+				Return([]db.UtxoInfo(nil), nil).Once()
+			mockChain.On("WatchAddrsFromTip", mock.Anything,
+				[]address.Address(nil),
+			).Return(nil).Once()
+			mockChain.On("NotifyBlocks").Return(nil).Once()
+			mockChain.On("GetBestBlock").Return(
+				&chainhash.Hash{}, int32(0), nil,
+			).Once()
+			store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+				WalletID:    0,
+				StartHeight: 0,
+				EndHeight:   0,
+				UnminedOnly: true,
+			}).Return([]db.TxInfo(nil), testCase.listErr).Once()
 
-	// The synced tip read at the start of the rollback check. A height of 0
-	// means checkRollback reads the tip and returns without scanning any
-	// block ranges.
-	store.On("GetWallet", mock.Anything, mock.Anything).Return(
-		&db.WalletInfo{}, nil).Once()
+			// Act: Complete initial synchronization and read history
+			// through the same boundary used by a controller retry.
+			err := s.initChainSync(t.Context())
 
-	// Act & Assert: Verify that the initial chain synchronization
-	// sequence completes successfully.
-	err := s.initChainSync(t.Context())
-	require.NoError(t, err)
-
-	store.AssertExpectations(t)
-	mockChain.AssertExpectations(t)
+			// Assert: A history error retains its identity and revokes
+			// readiness; successful initialization admits live work.
+			require.ErrorIs(t, err, testCase.listErr)
+			require.Equal(t, testCase.wantState, s.syncState())
+			store.AssertExpectations(t)
+			mockChain.AssertExpectations(t)
+		})
+	}
 }
 
 // TestScanBatchHeadersOnly verifies header-only scan logic.
@@ -4220,34 +4258,35 @@ func TestWaitForEventRewindFailure(t *testing.T) {
 	mockChain.AssertExpectations(t)
 }
 
-// TestSyncerFullRun verifies the full run loop coordination.
+// TestSyncerFullRun verifies startup rebroadcast does not repeat while live
+// notifications are drained, so retained history cannot stall chain updates.
 func TestSyncerFullRun(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Initialize a store-backed syncer and set up extensive mocks
-	// to simulate a full run loop execution. The synced tip and unmined
-	// transactions are read through the store; the legacy address manager
-	// only supplies the backend birthday.
+	// Arrange: Keep one published transaction unmined while two queued block
+	// notifications drive the real mailbox without a sleep or extra worker.
 	mockChain := &bwmock.Chain{}
-	mockAddrStore := &bwmock.AddrStore{}
 	mockPublisher := &mockTxPublisher{}
 	store := &walletmock.Store{}
 
-	s := newTestSyncer(
-		Config{Chain: mockChain}, mockAddrStore, nil, mockPublisher,
-		store, uint32(0),
+	var (
+		cfg  Config
+		info db.WalletInfo
+		tip  db.Block
 	)
 
-	// Mock initial chain sync sequence.
-	mockAddrStore.On("Birthday").Return(time.Now()).Once()
-	mockChain.On("IsCurrent").Return(true).Once()
-	expectSyncedTip(store, waddrmgr.BlockStamp{Height: 100})
+	cfg.Chain = mockChain
+	tip.Height = 100
+	info.SyncedTo = &tip
+	s := newTestSyncer(cfg, nil, nil, mockPublisher, store, 0)
 
-	// Mock rollback check dependencies. The store and the remote chain agree
-	// across the scanned batch, so no rollback occurs.
+	mockChain.On("IsCurrent").Return(true).Once()
+	store.On("GetWallet", mock.Anything, mock.Anything).Return(
+		&info, nil,
+	).Times(5)
 	expectMatchingRollbackBatch(store, mockChain)
 
-	// Registration reads an empty watch set before enabling blocks.
+	// Register the empty watch set before catching up and replaying history.
 	store.On("ListAccounts", mock.Anything, db.ListAccountsQuery{
 		WalletID:      0,
 		SkipBalance:   true,
@@ -4261,33 +4300,80 @@ func TestSyncerFullRun(t *testing.T) {
 	mockChain.On(
 		"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
 	).Return(nil).Once()
-
 	mockChain.On("NotifyBlocks").Return(nil).Once()
 
-	// Mock advancement to the current best block.
-	mockChain.On(
-		"GetBestBlock",
-	).Return(&chainhash.Hash{}, int32(100), nil).Once()
-
-	// Mock retrieval of unmined transactions through the store.
-	store.On("ListTxns", mock.Anything, mock.Anything).Return(
-		[]db.TxInfo(nil), nil,
-	).Once()
-
-	// Set up for the event waiting phase of the run loop.
 	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
 
-	// Use a goroutine to cancel the context after a delay to allow the
-	// syncer to enter its event loop.
-	go func() {
-		time.Sleep(1500 * time.Millisecond)
+	mockChain.On("GetBestBlock").Return(
+		&chainhash.Hash{}, int32(100), nil,
+	).Times(3)
+
+	// The fourth tip read follows initialization and both queued events.
+	// Cancel there so the Manager-owned inbox stays open during shutdown.
+	mockChain.On("GetBestBlock").Run(func(mock.Arguments) {
 		cancel()
-	}()
+	}).Return(&chainhash.Hash{}, int32(100), nil).Once()
 
-	// Act & Assert: Execute the syncer's run loop and verify that it
-	// completes all initial sync steps and enters the idle loop.
+	// History remains available after the first send; live events must not
+	// request it again or issue a second broadcast of the same transaction.
+	tx := wire.NewMsgTx(2)
+
+	var previous wire.OutPoint
+
+	tx.AddTxIn(wire.NewTxIn(&previous, nil, nil))
+	tx.AddTxOut(wire.NewTxOut(1000, nil))
+	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID:    0,
+		StartHeight: 0,
+		EndHeight:   0,
+		UnminedOnly: true,
+	}).Return([]db.TxInfo{
+		{
+			Hash:         tx.TxHash(),
+			Status:       db.TxStatusPublished,
+			SerializedTx: serializeTx(t, tx),
+			Received:     time.Time{},
+			Block:        nil,
+			Label:        "",
+		},
+	}, nil).Once()
+	mockPublisher.On("Broadcast", mock.Anything, mock.MatchedBy(
+		func(candidate *wire.MsgTx) bool {
+			return candidate.TxHash() == tx.TxHash()
+		},
+	), "").Return(nil).Once()
+
+	events := make(chan chainEvent, 2)
+	s.chainEventChan = events
+
+	event := chainEvent{
+		notification: chain.BlockConnected{
+			Block: wtxmgr.Block{
+				Hash:   chainhash.Hash{},
+				Height: 100,
+			},
+			Time: time.Time{},
+		},
+		matches: nil,
+	}
+
+	events <- event
+
+	events <- event
+
+	// Act: Run initialization and consume both prepared live events before
+	// the arranged context cancellation ends the existing worker.
 	err := s.run(ctx)
+
+	// Assert: Both events were drained after one history replay, and normal
+	// cancellation ended the loop without closing the Manager's mailbox.
 	require.NoError(t, err)
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+	require.Empty(t, events)
+	store.AssertExpectations(t)
+	mockChain.AssertExpectations(t)
+	mockPublisher.AssertExpectations(t)
 }
 
 var (
@@ -6485,8 +6571,8 @@ func TestHandleChainUpdate_Error(t *testing.T) {
 	store.AssertExpectations(t)
 }
 
-// TestRunSyncStep_Success verifies the idle path in runSyncStep.
-func TestRunSyncStep_Success(t *testing.T) {
+// TestRunSyncStepSuccess verifies the idle path in runSyncStep.
+func TestRunSyncStepSuccess(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Setup a store-backed syncer and mock a notification arrival
@@ -6502,9 +6588,6 @@ func TestRunSyncStep_Success(t *testing.T) {
 	mockChain.On("GetBestBlock").Return(&chainhash.Hash{}, int32(100),
 		nil).Once()
 
-	store.On("ListTxns", mock.Anything, mock.Anything).Return(
-		[]db.TxInfo{}, nil).Once()
-
 	notifChan := make(chan chainEvent, 1)
 	s.chainEventChan = notifChan
 
@@ -6512,10 +6595,11 @@ func TestRunSyncStep_Success(t *testing.T) {
 		notification: chain.BlockConnected{Block: wtxmgr.Block{Height: 101}},
 	}
 
-	// Act: Execute a sync step.
+	// Act: Advance the current tip and consume the queued block notification.
 	err := s.runSyncStep(t.Context())
 
-	// Assert: Verify success.
+	// Assert: The live step handles its event without loading history, leaving
+	// initial rebroadcast to the initialization boundary.
 	require.NoError(t, err)
 
 	store.AssertExpectations(t)
@@ -6871,37 +6955,6 @@ func TestAdvanceChainSync_SmallGap(t *testing.T) {
 	require.False(t, finished)
 	require.Equal(t, syncStateSynced, s.syncState())
 	store.AssertExpectations(t)
-}
-
-// TestRunSyncStep_BroadcastError verifies error propagation.
-func TestRunSyncStep_BroadcastError(t *testing.T) {
-	t.Parallel()
-
-	// Arrange: Setup a store-backed syncer where the unmined-transaction
-	// read fails during a sync step.
-	mockChain := &bwmock.Chain{}
-	store := &walletmock.Store{}
-
-	s := newTestSyncer(
-		Config{Chain: mockChain}, nil, nil, nil,
-		store, uint32(0),
-	)
-
-	mockChain.On("GetBestBlock").Return(&chainhash.Hash{}, int32(100),
-		nil).Once()
-	expectSyncedTip(store, waddrmgr.BlockStamp{Height: 100})
-
-	store.On("ListTxns", mock.Anything, mock.Anything).Return(
-		([]db.TxInfo)(nil), errBroadcast).Once()
-
-	// Act: Execute a sync step.
-	err := s.runSyncStep(t.Context())
-
-	// Assert: Verify failure.
-	require.ErrorIs(t, err, errBroadcast)
-
-	store.AssertExpectations(t)
-	mockChain.AssertExpectations(t)
 }
 
 // TestFetchAndFilterBlocks_DispatchError verifies error from
