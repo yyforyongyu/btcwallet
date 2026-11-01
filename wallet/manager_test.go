@@ -24,6 +24,7 @@ import (
 	walletmock "github.com/btcsuite/btcwallet/wallet/internal/bwtest/mock"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	dbruntime "github.com/btcsuite/btcwallet/wallet/internal/db/runtime"
+	"github.com/btcsuite/btcwallet/walletdb"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/mock"
@@ -2276,6 +2277,139 @@ func TestKVDBManagerBackendListsZeroOrOneWallet(t *testing.T) {
 		require.Len(t, wallets, 1)
 		require.Empty(t, wallets[0].name)
 	})
+}
+
+// TestManagerKVDBOpen verifies custom databases retain their Wallet across a
+// failed public-password startup and release ownership for a later Manager.
+func TestManagerKVDBOpen(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Persist a real legacy Wallet, then supply only an opener so
+	// remote construction cannot accidentally fall back to a local path.
+	dbPath := testKVDBPath(t)
+	creator := testKVDBManagerAt(t, dbPath)
+	created, err := creator.Create(CreateWalletParams{
+		Name:              testWalletName,
+		Mode:              ModeShell,
+		WatchOnly:         true,
+		PubPassphrase:     []byte(InsecurePubPassphrase),
+		PrivatePassphrase: []byte("private"),
+		Birthday:          time.Now(),
+	})
+	require.NoError(t, err)
+
+	walletID := created.ID()
+
+	require.NoError(t, creator.Stop())
+	cfg := ManagerConfig{
+		Backend:           DBBackendKVDB,
+		ChainParams:       chainParams,
+		ChainSource:       createTestChain(t),
+		KVDBPubPassphrase: []byte("wrong public password"),
+		KVDBOpen: func(context.Context) (walletdb.DB, error) {
+			// A bounded bbolt lock exposes leaked ownership on retry.
+			return walletdb.Open("bdb", dbPath, true, time.Second, false)
+		},
+	}
+
+	// Act: Fail authenticated startup, then reopen the same database with
+	// the correct credential through a fresh Manager, as an unlock retry does.
+	failed, err := NewManager(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = failed.Stop() })
+	_, err = failed.Start(t.Context())
+	require.Error(t, err)
+
+	cfg.KVDBPubPassphrase = []byte(InsecurePubPassphrase)
+	manager, err := NewManager(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.Stop() })
+	wallets, err := manager.Start(t.Context())
+
+	// Assert: Retry loads the same persisted identity, and Stop releases the
+	// custom database so another owner can acquire it without waiting forever.
+	require.NoError(t, err)
+	require.Len(t, wallets, 1)
+	require.Equal(t, walletID, wallets[0].ID())
+	require.NoError(t, manager.Stop())
+	dbConn, err := cfg.KVDBOpen(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, dbConn.Close())
+}
+
+// TestManagerKVDBOpenFailure verifies storage-open errors remain identifiable
+// during Manager construction and the pre-password existence probe.
+func TestManagerKVDBOpenFailure(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Return one recognizable connection failure without creating
+	// any database. Both public entry points must preserve that failure.
+	openErr := errors.New("remote wallet database unavailable")
+	cfg := ManagerConfig{
+		Backend:     DBBackendKVDB,
+		ChainParams: chainParams,
+		ChainSource: createTestChain(t),
+		KVDBOpen: func(context.Context) (walletdb.DB, error) {
+			return nil, openErr
+		},
+	}
+
+	// Act: Submit the same storage selection for runtime construction and
+	// for an existence check before any wallet credential is known.
+	manager, managerErr := NewManager(t.Context(), cfg)
+	exists, probeErr := KVDBWalletExists(t.Context(), cfg)
+
+	// Assert: Neither failure becomes successful absence or a partial runtime,
+	// and callers can identify the underlying connection error in both paths.
+	require.Nil(t, manager)
+	require.ErrorIs(t, managerErr, openErr)
+	require.False(t, exists)
+	require.ErrorIs(t, probeErr, openErr)
+}
+
+// TestKVDBWalletExists verifies remote existence checks distinguish empty and
+// initialized storage without a public password or a retained database handle.
+func TestKVDBWalletExists(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Open and close an empty database, then configure an opener
+	// without network policy or public credentials for the pre-unlock probe.
+	dbPath := testKVDBPath(t)
+	empty := testKVDBManagerAt(t, dbPath)
+	require.NoError(t, empty.Stop())
+
+	cfg := ManagerConfig{
+		Backend: DBBackendKVDB,
+		KVDBOpen: func(context.Context) (walletdb.DB, error) {
+			return walletdb.Open("bdb", dbPath, true, time.Second, false)
+		},
+	}
+
+	// Act: Probe empty storage, then create a Wallet using a non-default
+	// public password after the probe releases its database connection.
+	exists, err := KVDBWalletExists(t.Context(), cfg)
+	require.NoError(t, err)
+	require.False(t, exists)
+	creator := testKVDBManagerAt(t, dbPath)
+	_, err = creator.Create(CreateWalletParams{
+		Name:              testWalletName,
+		Mode:              ModeShell,
+		WatchOnly:         true,
+		PubPassphrase:     []byte("non-default public password"),
+		PrivatePassphrase: []byte("private"),
+		Birthday:          time.Now(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, creator.Stop())
+	exists, err = KVDBWalletExists(t.Context(), cfg)
+
+	// Assert: Namespace presence is visible without that password, and the
+	// successful probe also releases its handle for the eventual real startup.
+	require.NoError(t, err)
+	require.True(t, exists)
+	dbConn, err := cfg.KVDBOpen(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, dbConn.Close())
 }
 
 // TestManagerCreateRejectsMissingIdentityBeforeAssembly verifies Create

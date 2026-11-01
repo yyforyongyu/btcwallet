@@ -226,7 +226,7 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 
 	switch cfg.Backend {
 	case DBBackendKVDB:
-		backend, err = newKVDBManagerBackend(cfg)
+		backend, err = newKVDBManagerBackend(ctx, cfg)
 
 	case DBBackendSQLite:
 		backend, err = newSQLiteManagerBackend(ctx, cfg, identity)

@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/big"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/walletdb"
 )
 
 const (
@@ -54,13 +56,24 @@ var errUnsupportedBackend = errors.New("unsupported database backend")
 //	SignetChallengeDigest              SQL backends
 //	NoFreelistSync, Timeout            kvdb only
 //	KVDBPubPassphrase                  kvdb only
+//	KVDBOpen                           kvdb only
 type ManagerConfig struct {
 	// Backend selects the database implementation. Required.
 	Backend DBBackend
 
 	// DataSource locates the database: a filesystem path for kvdb and
-	// SQLite, and a DSN for PostgreSQL. Required.
+	// SQLite, and a DSN for PostgreSQL. Required unless KVDBOpen is set for
+	// the kvdb backend.
 	DataSource string
+
+	// KVDBOpen replaces the local bbolt opener for the legacy kvdb backend.
+	// Each call must return a fresh, usable database whose ownership passes
+	// to Manager or KVDBWalletExists. They close it after their work ends.
+	// On error, the callback must clean up and return a nil database.
+	// SQL backends ignore this callback.
+	//
+	// Deprecated: remove this hook with legacy kvdb support.
+	KVDBOpen func(context.Context) (walletdb.DB, error)
 
 	// MaxConnections bounds the SQL connection pool. Zero uses the store
 	// default.
@@ -157,7 +170,10 @@ func (c ManagerConfig) validateBackend() error {
 		return fmt.Errorf("%w: %q", errUnsupportedBackend, c.Backend)
 	}
 
-	if c.DataSource == "" {
+	// A custom walletdb opener carries its own remote connection settings;
+	// it must not need a placeholder local filename to pass validation.
+	customKVDB := c.Backend == DBBackendKVDB && c.KVDBOpen != nil
+	if c.DataSource == "" && !customKVDB {
 		return fmt.Errorf("%w: DataSource", ErrMissingParam)
 	}
 

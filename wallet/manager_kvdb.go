@@ -37,7 +37,25 @@ var _ managerBackend = (*kvdbManagerBackend)(nil)
 // a Manager.
 //
 // Deprecated: remove this constructor with kvdb support.
-func newKVDBManagerBackend(cfg ManagerConfig) (*kvdbManagerBackend, error) {
+func newKVDBManagerBackend(ctx context.Context,
+	cfg ManagerConfig) (*kvdbManagerBackend, error) {
+
+	// Remote walletdb drivers keep their connection configuration in the
+	// caller's opener. The existing backend still owns and closes the result,
+	// so failed startup and later password retries never reuse a closed DB.
+	if cfg.KVDBOpen != nil {
+		dbConn, err := cfg.KVDBOpen(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("open kvdb: %w", err)
+		}
+
+		return &kvdbManagerBackend{
+			db:          dbConn,
+			chainParams: &cfg.ChainParams,
+			pubPass:     cfg.KVDBPubPassphrase,
+		}, nil
+	}
+
 	err := os.MkdirAll(filepath.Dir(cfg.DataSource), defaultWalletDBDirPerm)
 	if err != nil {
 		return nil, fmt.Errorf("create kvdb directory: %w", err)
@@ -67,6 +85,44 @@ func newKVDBManagerBackend(cfg ManagerConfig) (*kvdbManagerBackend, error) {
 		chainParams: &cfg.ChainParams,
 		pubPass:     cfg.KVDBPubPassphrase,
 	}, nil
+}
+
+// KVDBWalletExists opens and closes the configured legacy database to check for
+// wallet state without a public passphrase or a running Manager. It accepts
+// only the kvdb backend. Either wallet namespace counts as existing state; a
+// Manager still validates incomplete or corrupt wallets instead of replacing
+// them. Read and close errors remain visible to the caller.
+//
+// Deprecated: remove this probe with legacy kvdb support.
+func KVDBWalletExists(ctx context.Context, cfg ManagerConfig) (bool, error) {
+	// This probe needs only storage selection, before startup knows the
+	// wallet credentials or constructs its network and chain runtime.
+	if cfg.Backend != DBBackendKVDB {
+		return false, fmt.Errorf("%w: kvdb backend required", ErrInvalidParam)
+	}
+
+	err := cfg.validateBackend()
+	if err != nil {
+		return false, err
+	}
+
+	backend, err := newKVDBManagerBackend(ctx, cfg)
+	if err != nil {
+		return false, err
+	}
+
+	// Namespace creation is atomic. Treat partial state as occupied too, so
+	// a later authenticated open reports its error rather than creating keys.
+	var exists bool
+
+	err = walletdb.View(backend.db, func(tx walletdb.ReadTx) error {
+		exists = tx.ReadBucket(waddrmgrNamespaceKey) != nil ||
+			tx.ReadBucket(wtxmgrNamespaceKey) != nil
+
+		return nil
+	})
+
+	return exists, errors.Join(err, backend.close())
 }
 
 // create initializes and opens the one legacy wallet served by the backend.

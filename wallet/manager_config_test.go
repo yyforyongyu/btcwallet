@@ -1,6 +1,8 @@
 package wallet
 
 import (
+	"context"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
+	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,12 +50,23 @@ func TestManagerConfigValidate(t *testing.T) {
 	aboveMaximumRetry.WalletSyncRetryInterval = maxBackoff + 1
 	aboveMaximumRecovery := validRuntimeManagerConfig()
 	aboveMaximumRecovery.RecoveryWindow = MaxRecoveryWindow + 1
+	customKVDB := validRuntimeManagerConfig()
+	customKVDB.Backend = DBBackendKVDB
+	customKVDB.DataSource = ""
+	customKVDB.KVDBOpen = func(context.Context) (walletdb.DB, error) {
+		// Validation must accept an opener without acquiring its database.
+		return nil, errors.New("unexpected database open during validation")
+	}
 	tests := []struct {
 		name    string
 		cfg     ManagerConfig
 		wantIs  error
 		wantMsg string
 	}{
+		{
+			name: "kvdb custom opener without local path",
+			cfg:  customKVDB,
+		},
 		{
 			name: "kvdb",
 			cfg: ManagerConfig{
