@@ -408,7 +408,10 @@ func TestManagerChainRollbackCreate(t *testing.T) {
 		}).Return(nil).Once()
 
 	params := managerLifecycleCreateParams("created")
-	backend.On("create", mock.Anything, params, (*hdkeychain.ExtendedKey)(nil)).
+	backend.On(
+		"create", mock.Anything, params, (*hdkeychain.ExtendedKey)(nil),
+		([]db.CreateDerivedAccountParams)(nil),
+	).
 		Return(&walletData{
 			id:    2,
 			name:  params.Name,
@@ -1221,10 +1224,11 @@ func (b *managerBackendMock) listWallets(
 
 // create returns the storage result configured by the current test.
 func (b *managerBackendMock) create(ctx context.Context,
-	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey) (
+	params CreateWalletParams, rootKey *hdkeychain.ExtendedKey,
+	accounts []db.CreateDerivedAccountParams) (
 	*walletData, error) {
 
-	args := b.Called(ctx, params, rootKey)
+	args := b.Called(ctx, params, rootKey, accounts)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
@@ -1913,7 +1917,10 @@ func TestManagerCreateLifecycleSerializesStop(t *testing.T) {
 	backend.On("listWallets", mock.Anything).Return([]*walletData{}, nil).Once()
 
 	params := managerLifecycleCreateParams("created")
-	backend.On("create", mock.Anything, params, mock.Anything).
+	backend.On(
+		"create", mock.Anything, params, mock.Anything,
+		([]db.CreateDerivedAccountParams)(nil),
+	).
 		Return(&walletData{
 			id:    1,
 			name:  params.Name,
@@ -1996,7 +2003,10 @@ func TestManagerCreateLifecycleStartFailureStopsManager(t *testing.T) {
 	params := managerLifecycleCreateParams("candidate")
 	backend := &managerBackendMock{}
 	backend.On("listWallets", mock.Anything).Return([]*walletData{}, nil).Once()
-	backend.On("create", mock.Anything, params, mock.Anything).
+	backend.On(
+		"create", mock.Anything, params, mock.Anything,
+		([]db.CreateDerivedAccountParams)(nil),
+	).
 		Return(&walletData{
 			id:    1,
 			name:  params.Name,
@@ -2422,7 +2432,10 @@ func TestManagerCreateBoundsGenesisSecrets(t *testing.T) {
 			var observedRoot *hdkeychain.ExtendedKey
 
 			backend := &managerBackendMock{}
-			backend.On("create", mock.Anything, params, mock.Anything).
+			backend.On(
+				"create", mock.Anything, params, mock.Anything,
+				([]db.CreateDerivedAccountParams)(nil),
+			).
 				Return(&walletData{
 					id:    1,
 					name:  params.Name,
@@ -2494,7 +2507,10 @@ func TestManagerCreateBoundsGenesisSecretsOnFailure(t *testing.T) {
 			var observedRoot *hdkeychain.ExtendedKey
 
 			backend := &managerBackendMock{}
-			backend.On("create", mock.Anything, params, mock.Anything).
+			backend.On(
+				"create", mock.Anything, params, mock.Anything,
+				([]db.CreateDerivedAccountParams)(nil),
+			).
 				Return(nil, errDBMock).Run(func(args mock.Arguments) {
 				var ok bool
 				observedRoot, ok = args.Get(2).(*hdkeychain.ExtendedKey)
@@ -2609,7 +2625,10 @@ func TestManagerCreateBoundsGenesisSecretsOnPanic(t *testing.T) {
 	var observedRoot *hdkeychain.ExtendedKey
 
 	backend := &managerBackendMock{}
-	backend.On("create", mock.Anything, params, mock.Anything).
+	backend.On(
+		"create", mock.Anything, params, mock.Anything,
+		([]db.CreateDerivedAccountParams)(nil),
+	).
 		Return(nil, nil).Run(func(args mock.Arguments) {
 		var ok bool
 		observedRoot, ok = args.Get(2).(*hdkeychain.ExtendedKey)
