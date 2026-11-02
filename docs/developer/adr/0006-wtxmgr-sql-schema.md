@@ -10,7 +10,8 @@
 - **Amends:** None.
 - **Supersedes:** None.
 - **Amended by:** [ADR 0015](0015-sql-shared-chain-ownership.md) for SQL block
-  identity and canonical-frontier semantics.
+  identity and canonical-frontier semantics; [ADR 0018](0018-accepted-transaction-conflicts.md)
+  for accepted unmined replacements and authoritative confirmation.
 - **Superseded by:** None.
 
 ## 1. Context

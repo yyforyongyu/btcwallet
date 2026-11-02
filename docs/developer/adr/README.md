@@ -71,3 +71,7 @@ relationship metadata, but do not rewrite its historical decision body.
 - [ADR 0017: Manager Chain Routing](./0017-manager-chain-routing.md) proposes
   moving live matching to Manager while retaining Wallet-owned processing and
   historical recovery; partially amends ADR 0015.
+
+- [ADR 0018: Accepted Transaction
+  Conflicts](./0018-accepted-transaction-conflicts.md) amends ADR 0006 for
+  accepted unmined SQL replacements and confirmation of invalidated history.

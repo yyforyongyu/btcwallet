@@ -42,6 +42,7 @@ func matchCreateTxParams(walletID uint32, tx *wire.MsgTx, label string,
 			!params.Received.IsZero() &&
 			params.Block == nil &&
 			params.Status == db.TxStatusPublished &&
+			!params.ReplaceUnmined &&
 			params.Label == label &&
 			addressCreditsEqual(params.Credits, credits)
 	})
@@ -608,7 +609,7 @@ func TestRecordTxAndCredits(t *testing.T) {
 						index: 0,
 						addr:  addr,
 					},
-				},
+				}, false,
 			)
 
 			// Assert: A live row needs no redundant update; terminal
@@ -666,7 +667,9 @@ func TestRecordTxAndCreditsUpdatesDuplicate(t *testing.T) {
 			).Return(nil).Once()
 
 			// Act: Retry recording through the legacy duplicate outcome.
-			err := w.recordTxAndCredits(t.Context(), tx, label, nil)
+			err := w.recordTxAndCredits(
+				t.Context(), tx, label, nil, false,
+			)
 
 			// Assert: The unchanged Store API still supports both updates;
 			// fixture cleanup checks each required call once.
@@ -758,7 +761,7 @@ func TestRecordTxAndCreditsDeterministicMultiOwned(t *testing.T) {
 			// Act: Record the two members in the current table
 			// ordering.
 			err := w.recordTxAndCredits(
-				t.Context(), tx, "", tc.credits,
+				t.Context(), tx, "", tc.credits, false,
 			)
 
 			// Assert: Require the same canonical credit mapping for
@@ -847,7 +850,7 @@ func TestAddTxToWallet(t *testing.T) {
 		// Act: Resolve wallet relevance and record the resulting owned
 		// credits.
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
 
 		// Assert: Check recording and returned addresses while the
@@ -900,7 +903,7 @@ func TestAddTxToWallet(t *testing.T) {
 		// Act: Resolve wallet relevance and record the resulting owned
 		// credits.
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
 
 		// Assert: Check recording and returned addresses while the
@@ -955,7 +958,7 @@ func TestAddTxToWallet(t *testing.T) {
 		// Act: Resolve wallet relevance and record the resulting owned
 		// credits.
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
 
 		// Assert: Check recording and returned addresses while the
@@ -2139,4 +2142,65 @@ func TestBroadcastReorgPublishFailureRetainsSpend(t *testing.T) {
 			require.Equal(t, untouched, utxos[0].OutPoint)
 		})
 	}
+}
+
+// TestBroadcastReplacement admits a competing spend only after a successful
+// send, preserving the original claim and causal error on the rejected attempt.
+func TestBroadcastReplacement(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Reuse the started Wallet fixture for a rejected send followed
+	// by an accepted retry. Strict Store expectations permit reconciliation
+	// only after the second send; fixture cleanup verifies each mock once.
+	w, m := createStartedWalletWithMocks(t)
+	addr := mustNewStandalonePubKeyAddr(t)
+	script := mustPayToAddrScript(addr)
+	tx := subscriptionTx(script, 91)
+
+	m.chain.On("TestMempoolAccept", mock.Anything, mock.Anything).
+		Return(nil, chain.ErrUnimplemented).Twice()
+	m.store.On("ResolveOwnedAddresses", mock.Anything,
+		matchResolveOwnedAddressesQuery(w.id, script),
+	).Return(ownedAddrsResult(script), nil).Times(3)
+	m.store.On("CreateTx", mock.Anything,
+		matchCreateTxParams(w.id, tx, testTxLabel,
+			map[uint32]address.Address{0: addr}),
+	).Return(db.ErrTxInputConflict).Twice()
+	m.chain.On("NotifyReceived", []address.Address{addr}).
+		Return(nil).Twice()
+	rejected := m.chain.On("SendRawTransaction", tx, false).
+		Return((*chainhash.Hash)(nil), errPublish).Once()
+	accepted := m.chain.On("SendRawTransaction", tx, false).
+		Return((*chainhash.Hash)(nil), nil).Once().NotBefore(rejected)
+	m.store.On("CreateTx", mock.Anything,
+		mock.MatchedBy(func(params db.CreateTxParams) bool {
+			return params.WalletID == w.id && params.Tx == tx &&
+				params.Label == testTxLabel && params.ReplaceUnmined
+		}),
+	).Return(nil).Once().NotBefore(accepted)
+	// The refreshed parent verifies retained bytes after successful recording;
+	// return that same accepted serialization without weakening its guard.
+	m.store.On("GetTx", mock.Anything, db.GetTxQuery{
+		WalletID: w.id,
+		Txid:     tx.TxHash(),
+	}).Return(&db.TxInfo{
+		SerializedTx: serializeTx(t, tx),
+		Status:       db.TxStatusPublished,
+		Label:        testTxLabel,
+	}, nil).Once().NotBefore(accepted)
+
+	// Act: Reject the first public publication without authorizing any
+	// replacement write that could displace the original claim.
+	err := w.Broadcast(t.Context(), tx, testTxLabel)
+
+	// Assert: The refusal retains the actual send error, with no accepted
+	// write allowed by the arranged ordering before the successful send.
+	require.ErrorIs(t, err, errPublish)
+
+	// Act: Retry the same transaction after the backend accepts its send.
+	err = w.Broadcast(t.Context(), tx, testTxLabel)
+
+	// Assert: Accepted publication succeeds only after its graph is recorded;
+	// fixture cleanup verifies the exact Store and chain expectations once.
+	require.NoError(t, err)
 }

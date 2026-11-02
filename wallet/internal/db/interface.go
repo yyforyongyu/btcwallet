@@ -462,6 +462,11 @@ type TxStore interface {
 	// The create path does not infer whether an unmined transaction should
 	// start in TxStatusPending or TxStatusPublished; callers must provide that
 	// choice explicitly in CreateTxParams.
+	// ReplaceUnmined admits a competing send after acceptance: SQL reconciles
+	// its active branch, while native KVDB retains competing unmined claims
+	// until confirmation. Prepublication writes preserve the original claim.
+	// A confirming block may restore replaced or failed regular rows and
+	// their actual credits and spend edges atomically; unmined replay cannot.
 	CreateTx(ctx context.Context, params CreateTxParams) error
 
 	// UpdateTx patches the mutable metadata for one existing wallet-scoped
