@@ -1606,7 +1606,7 @@ func matchUnminedTxBatchState(walletID uint32, tx *wire.MsgTx,
 		}
 
 		txParams := params.Transactions[0]
-		if txParams.Block != nil {
+		if txParams.Block != nil || !txParams.ReplaceUnmined {
 			return false
 		}
 

@@ -43,6 +43,7 @@ func matchCreateTxParams(walletID uint32, tx *wire.MsgTx, label string,
 			!params.Received.IsZero() &&
 			params.Block == nil &&
 			params.Status == db.TxStatusPublished &&
+			!params.ReplaceUnmined &&
 			params.Label == label &&
 			addressCreditsEqual(params.Credits, credits)
 	})
@@ -536,8 +537,8 @@ func mustNewStandalonePubKeyAddr(t *testing.T) *address.AddressPubKey {
 func TestRecordTxAndCredits(t *testing.T) {
 	t.Parallel()
 
-	// Create a sample transaction with one input and one output with a value
-	// of 10000.
+	// Arrange: Use one output and its owned address across the existing
+	// admission cases, isolating duplicate status and label reconciliation.
 	tx := &wire.MsgTx{
 		TxIn:  []*wire.TxIn{{}},
 		TxOut: []*wire.TxOut{{Value: 10000}},
@@ -624,6 +625,8 @@ func TestRecordTxAndCredits(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
+			// Arrange: Declare the selected admission result and any required
+			// metadata reconciliation; fixture cleanup verifies the mocks.
 			w, mocks := createStartedWalletWithMocks(t)
 			txid := tx.TxHash()
 
@@ -669,9 +672,14 @@ func TestRecordTxAndCredits(t *testing.T) {
 				).Return(nil).Once()
 			}
 
+			// Act: Record an ordinary prepublication attempt, allowing only
+			// the existing duplicate path to reconcile live metadata.
 			err := w.recordTxAndCredits(
-				t.Context(), tx, label, credits,
+				t.Context(), tx, label, credits, false,
 			)
+
+			// Assert: Retained-invalid history preserves its sentinel; live
+			// or new history completes the arranged credit and metadata writes.
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
 				return
@@ -690,6 +698,8 @@ func TestRecordTxAndCredits(t *testing.T) {
 func TestRecordTxAndCreditsDeterministicMultiOwned(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: Reuse one output with two owned members so either input
+	// ordering must resolve to the same canonical Store credit.
 	tx := &wire.MsgTx{
 		TxIn:  []*wire.TxIn{{}},
 		TxOut: []*wire.TxOut{{Value: 10000}},
@@ -733,15 +743,21 @@ func TestRecordTxAndCreditsDeterministicMultiOwned(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
+			// Arrange: Require the smaller encoded owner for this ordering;
+			// the shared fixture owns the single mock verification.
 			w, mocks := createStartedWalletWithMocks(t)
 
 			mocks.store.On("CreateTx", mock.Anything,
 				matchCreateTxParams(w.id, tx, "", expectedCredits),
 			).Return(nil).Once()
 
+			// Act: Record the supplied credit order through normal admission.
 			err := w.recordTxAndCredits(
-				t.Context(), tx, "", tc.credits,
+				t.Context(), tx, "", tc.credits, false,
 			)
+
+			// Assert: Successful recording must satisfy the exact canonical
+			// owner expectation, independent of slice or map iteration order.
 			require.NoError(t, err)
 		})
 	}
@@ -753,7 +769,8 @@ func TestRecordTxAndCreditsDeterministicMultiOwned(t *testing.T) {
 func TestAddTxToWallet(t *testing.T) {
 	t.Parallel()
 
-	// Create some addresses for testing.
+	// Arrange: Share owned and unowned output scripts across the receiving,
+	// unrelated and debit-only cases without changing their input relevance.
 	ownedPrivKey, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
 	ownedAddr, err := address.NewAddressPubKey(
@@ -797,11 +814,8 @@ func TestAddTxToWallet(t *testing.T) {
 
 		w, m := createStartedWalletWithMocks(t)
 
-		// This test case simulates the scenario where the
-		// transaction has outputs owned by the wallet. We expect
-		// the wallet to identify these outputs, record the
-		// transaction, and credit the wallet with the new UTXOs.
-		//
+		// Arrange: Resolve both repeated owned outputs while leaving the
+		// unrelated script out of the exact credit map written to the Store.
 		m.store.On("ResolveOwnedAddresses", mock.Anything,
 			matchResolveOwnedAddressesQuery(w.id, ownedScript, unownedScript),
 		).Return(ownedAddrsResult(ownedScript), nil).Once()
@@ -814,16 +828,17 @@ func TestAddTxToWallet(t *testing.T) {
 			matchCreateTxParams(w.id, tx, label, expectedCredits),
 		).Return(nil).Once()
 
-		// Add the transaction to the wallet.
+		// Act: Build and record the prepublication plan from the resolved
+		// ownership and the existing input-relevance checks.
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
-		require.NoError(t, err)
 
-		// The tx was written, so recorded is true.
+		// Assert: Owned outputs record the transaction and return one watch
+		// address despite its appearance in two credited outputs.
+		require.NoError(t, err)
 		require.True(t, recorded)
 
-		// Check that the returned addresses are correct.
 		require.Len(t, ourAddrs, 1)
 		require.Equal(
 			t, ownedAddr.String(),
@@ -836,13 +851,8 @@ func TestAddTxToWallet(t *testing.T) {
 
 		w, m := createStartedWalletWithMocks(t)
 
-		// This test case simulates the scenario where the
-		// transaction has neither outputs nor inputs owned by the
-		// wallet. We expect the wallet to identify this and exit
-		// early without recording the transaction.
-		//
-		// Set up the mock for the Store to own no
-		// addresses.
+		// Arrange: Resolve no output ownership and make both current-UTXO
+		// and historical-parent lookups miss, leaving the tx unrelated.
 		m.store.On("ResolveOwnedAddresses", mock.Anything,
 			matchResolveOwnedAddressesQuery(w.id, ownedScript, unownedScript),
 		).Return(ownedAddrsResult(), nil).Once()
@@ -863,15 +873,15 @@ func TestAddTxToWallet(t *testing.T) {
 			Txid:     tx.TxIn[0].PreviousOutPoint.Hash,
 		}).Return((*db.TxDetailInfo)(nil), db.ErrTxNotFound).Once()
 
-		// Add the transaction to the wallet.
+		// Act: Build and record the prepublication plan from the resolved
+		// ownership and the existing input-relevance checks.
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
-		require.NoError(t, err)
 
-		// We expect no addresses to be returned, no calls to the
-		// transaction store, and recorded to be false because nothing
-		// was written.
+		// Assert: Unrelated input and output history yields no receiving
+		// addresses and no recorded transaction; strict mocks forbid writes.
+		require.NoError(t, err)
 		require.Nil(t, ourAddrs)
 		require.False(t, recorded)
 	})
@@ -881,9 +891,8 @@ func TestAddTxToWallet(t *testing.T) {
 
 		w, m := createStartedWalletWithMocks(t)
 
-		// A sweep pays no wallet-owned outputs but spends a wallet
-		// UTXO, so it must still be recorded (with an empty credit
-		// set) so it can be tracked and later removed.
+		// Arrange: Resolve no receiving outputs but return an owned input,
+		// requiring a tracked debit with an empty credit map.
 		m.store.On("ResolveOwnedAddresses", mock.Anything,
 			matchResolveOwnedAddressesQuery(w.id, ownedScript, unownedScript),
 		).Return(ownedAddrsResult(), nil).Once()
@@ -905,14 +914,15 @@ func TestAddTxToWallet(t *testing.T) {
 			),
 		).Return(nil).Once()
 
+		// Act: Record the debit-only attempt through the same admission
+		// path used for transactions that return receiving addresses.
 		ourAddrs, recorded, err := w.addTxToWallet(
-			t.Context(), tx, label,
+			t.Context(), tx, label, false,
 		)
-		require.NoError(t, err)
 
-		// A debit-only sweep credits no wallet outputs, so no
-		// addresses are returned, yet recorded is true because the tx
-		// row was written.
+		// Assert: A debit-only sweep returns no receiving addresses but
+		// remains recorded so confirmation and retained history can track it.
+		require.NoError(t, err)
 		require.Nil(t, ourAddrs)
 		require.True(t, recorded)
 	})
@@ -1677,4 +1687,55 @@ func TestBroadcastReorgPublishFailureRetainsSpend(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, utxos, 1)
 	require.Equal(t, untouched, utxos[0].OutPoint)
+}
+
+// TestBroadcastReplacement admits a competing spend only after a successful
+// send, preserving the original claim and causal error on the rejected attempt.
+func TestBroadcastReplacement(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Reuse the started Wallet fixture for a rejected send followed
+	// by an accepted retry. Strict Store expectations permit reconciliation
+	// only after the second send; fixture cleanup verifies each mock once.
+	w, m := createStartedWalletWithMocks(t)
+	addr := mustNewStandalonePubKeyAddr(t)
+	script := mustPayToAddrScript(addr)
+	tx := subscriptionTx(script, 91)
+
+	m.chain.On("TestMempoolAccept", mock.Anything, mock.Anything).
+		Return(nil, chain.ErrUnimplemented).Twice()
+	m.store.On("ResolveOwnedAddresses", mock.Anything,
+		matchResolveOwnedAddressesQuery(w.id, script),
+	).Return(ownedAddrsResult(script), nil).Times(3)
+	m.store.On("CreateTx", mock.Anything,
+		matchCreateTxParams(w.id, tx, testTxLabel,
+			map[uint32]address.Address{0: addr}),
+	).Return(db.ErrTxInputConflict).Twice()
+	m.chain.On("NotifyReceived", []address.Address{addr}).
+		Return(nil).Twice()
+	rejected := m.chain.On("SendRawTransaction", tx, false).
+		Return((*chainhash.Hash)(nil), errPublish).Once()
+	accepted := m.chain.On("SendRawTransaction", tx, false).
+		Return((*chainhash.Hash)(nil), nil).Once().NotBefore(rejected)
+	m.store.On("CreateTx", mock.Anything,
+		mock.MatchedBy(func(params db.CreateTxParams) bool {
+			return params.WalletID == w.id && params.Tx == tx &&
+				params.Label == testTxLabel && params.ReplaceUnmined
+		}),
+	).Return(nil).Once().NotBefore(accepted)
+
+	// Act: Reject the first public publication without authorizing any
+	// replacement write that could displace the original claim.
+	err := w.Broadcast(t.Context(), tx, testTxLabel)
+
+	// Assert: The refusal retains the actual send error, with no accepted
+	// write allowed by the arranged ordering before the successful send.
+	require.ErrorIs(t, err, errPublish)
+
+	// Act: Retry the same transaction after the backend accepts its send.
+	err = w.Broadcast(t.Context(), tx, testTxLabel)
+
+	// Assert: Accepted publication succeeds only after its graph is recorded;
+	// fixture cleanup verifies the exact Store and chain expectations once.
+	require.NoError(t, err)
 }

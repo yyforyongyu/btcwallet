@@ -220,8 +220,11 @@ func (w *Wallet) handleBroadcast(r broadcastReq) {
 	// Record before publication so confirmation tracking and rebroadcast
 	// can proceed even when sending fails. recorded gates success
 	// notifications for wallet-relevant transactions.
-	ourAddrs, recorded, err := w.addTxToWallet(r.ctx, r.tx, r.label)
-	if err != nil {
+	ourAddrs, recorded, err := w.addTxToWallet(r.ctx, r.tx, r.label, false)
+	// Preserve the original graph until the backend accepts a competing send.
+	// Failed atomic admission still supplies the addresses needed for watches.
+	replacement := errors.Is(err, db.ErrTxInputConflict)
+	if err != nil && !replacement {
 		r.respErrChan <- err
 
 		return
@@ -231,6 +234,18 @@ func (w *Wallet) handleBroadcast(r broadcastReq) {
 	// preserve its history and input spend links for later observations.
 	err = w.publishTx(r.tx, ourAddrs)
 	if err == nil {
+		if replacement {
+			_, recorded, err = w.addTxToWallet(
+				r.ctx, r.tx, r.label, true,
+			)
+			if err != nil {
+				r.respErrChan <- fmt.Errorf("record accepted "+
+					"replacement: %w", err)
+
+				return
+			}
+		}
+
 		// Only recorded Wallet transactions have a detail to announce.
 		// Best-effort notification cannot undo a successful publication.
 		if recorded {
@@ -356,9 +371,10 @@ type ownedAddrInfo struct {
 //
 // It returns the wallet-owned output addresses and whether wallet-relevant
 // recording succeeded, including duplicate reconciliation. A debit-only
-// sweep is recorded despite returning zero owned addresses.
+// sweep is recorded despite returning zero owned addresses. replaceUnmined
+// permits reconciliation after acceptance; input conflicts retain watch data.
 func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
-	label string) ([]address.Address, bool, error) {
+	label string, replaceUnmined bool) ([]address.Address, bool, error) {
 
 	// Stage 1: Extract potential addresses from all transaction outputs.
 	// This is a CPU-intensive operation that is performed entirely in
@@ -390,7 +406,7 @@ func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 		// The tx spends a wallet output but credits none, so record it
 		// with an empty credit set. It is now tracked, so recorded is
 		// true even though no addresses are returned.
-		err = w.recordTxAndCredits(ctx, tx, label, nil)
+		err = w.recordTxAndCredits(ctx, tx, label, nil, replaceUnmined)
 		if err != nil {
 			return nil, false, err
 		}
@@ -430,18 +446,23 @@ func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 	// Stage 4: Atomically execute the write plan. This is the only stage
 	// that takes an exclusive database lock, and it is designed to be as
 	// fast as possible, containing no business logic.
-	err = w.recordTxAndCredits(ctx, tx, label, creditsToWrite)
+	err = w.recordTxAndCredits(
+		ctx, tx, label, creditsToWrite, replaceUnmined,
+	)
 	if err != nil {
-		return nil, false, err
+		// The caller uses this watch plan only when the atomic write
+		// reports an input conflict; other errors still stop publication.
+		return ourAddrs, false, err
 	}
 
 	return ourAddrs, true, nil
 }
 
 // recordTxAndCredits performs a single atomic database transaction to execute a
-// pre-computed "write plan" for a transaction.
+// pre-computed "write plan" for a transaction. replaceUnmined authorizes
+// reconciliation only after acceptance of a competing send.
 func (w *Wallet) recordTxAndCredits(ctx context.Context, tx *wire.MsgTx,
-	label string, creditsToWrite []creditInfo) error {
+	label string, creditsToWrite []creditInfo, replaceUnmined bool) error {
 
 	// The Store contract records exactly one credit per output index
 	// (CreateTxParams.Credits is keyed by index, so "duplicate credited
@@ -468,12 +489,13 @@ func (w *Wallet) recordTxAndCredits(ctx context.Context, tx *wire.MsgTx,
 	txHash := tx.TxHash()
 
 	err := w.store.CreateTx(ctx, db.CreateTxParams{
-		WalletID: w.id,
-		Tx:       tx,
-		Received: time.Now(),
-		Status:   db.TxStatusPublished,
-		Label:    label,
-		Credits:  credits,
+		WalletID:       w.id,
+		Tx:             tx,
+		Received:       time.Now(),
+		Status:         db.TxStatusPublished,
+		ReplaceUnmined: replaceUnmined,
+		Label:          label,
+		Credits:        credits,
 	})
 	if err == nil {
 		return nil

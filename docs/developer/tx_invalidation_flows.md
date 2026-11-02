@@ -127,8 +127,24 @@ depends on which wallet event started the flow.
 | --- | --- | --- | --- |
 | `InvalidateUnminedTx` | `failed` | `failed` | The wallet has evidence one local unmined branch is invalid. |
 | `DeleteUnminedTx` | removed | removed | A caller explicitly removes an unconfirmed tx and its recorded descendants. |
-| `CreateTx` conflict handling | direct conflict roots become `replaced` | dependent descendants become `failed` | A newly confirmed winner claims wallet-owned inputs already spent by an unmined branch. |
+| `CreateTx` conflict handling | direct conflict roots become `replaced` | dependent descendants become `failed` | A confirmed winner or explicitly accepted unmined replacement claims inputs spent by another unmined branch. |
 | `RollbackToBlock` | disconnected coinbase roots become `orphaned` | dependent descendants become `failed` | A reorg disconnects the confirming block for the root branch. |
+
+An unmined publication uses `CreateTxParams.ReplaceUnmined` only after a
+successful send. A failed prepublication admission or rejected send preserves
+the existing branch. SQL performs accepted replacement through the same graph
+workflow as confirmation, without a second lock or mutation coordinator.
+
+A confirming observation may reuse a regular row previously marked `replaced`
+or `failed`, restore it to `published`, and rebuild its actual credits and
+spend edges atomically. This does not automatically restore other descendants:
+each needs its own confirming observation. Unmined echoes remain unable to
+revive invalid history. This amends the original terminal-state interpretation
+of [ADR 0006](./adr/0006-wtxmgr-sql-schema.md), as recorded in
+[ADR 0018](./adr/0018-accepted-transaction-conflicts.md).
+
+Native KVDB retains competing unmined claims until block confirmation. The
+accepted-send contract does not impose SQL's active-branch rewrite on it.
 
 Row-local metadata patching does not enter this branch workflow because it does
 not discover descendants or rewrite spend edges.
