@@ -150,8 +150,8 @@ var (
 	// ErrUtxoNotFound is returned when a UTXO is not found in the database.
 	ErrUtxoNotFound = errors.New("utxo not found")
 
-	// ErrTxInputConflict is returned when CreateTx references a wallet-owned
-	// input that is already claimed by another recorded wallet spend.
+	// ErrTxInputConflict is returned when CreateTx competes with another
+	// recorded spend, including publication attempts sharing external inputs.
 	ErrTxInputConflict = errors.New(
 		"transaction input conflicts with another wallet spend",
 	)

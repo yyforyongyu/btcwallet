@@ -5227,6 +5227,116 @@ func TestCreateTxAcceptedReplacement(t *testing.T) {
 	}
 }
 
+// TestCreateTxExternalInputReplacement keeps competing publication attempts
+// atomic even when their shared input has no wallet credit, as with channel
+// sweeps; only an accepted replacement may displace the tracked original.
+func TestCreateTxExternalInputReplacement(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		replace        bool
+		createErr      error
+		originalStatus db.TxStatus
+		lookupErr      error
+		visibleIndex   int
+	}{
+		{
+			name:           "unaccepted competition",
+			createErr:      db.ErrTxInputConflict,
+			originalStatus: db.TxStatusPublished,
+			lookupErr:      db.ErrTxNotFound,
+			visibleIndex:   0,
+		},
+		{
+			name:           "accepted replacement",
+			replace:        true,
+			originalStatus: db.TxStatusReplaced,
+			visibleIndex:   1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Retain a publication-tracked payment with an
+			// external input and an ordinary owned output. Without a
+			// parent credit, conflict discovery must use the tx inputs.
+			store := NewTestStore(t)
+			walletID := newWallet(t, store, "external-replacement")
+			createDerivedAccount(
+				t, store, walletID, db.KeyScopeBIP0084, "default",
+			)
+			addr := newDerivedAddress(
+				t, store, walletID, db.KeyScopeBIP0084, "default",
+				false,
+			)
+			original := newRegularTx(
+				[]wire.OutPoint{randomOutPoint()},
+				[]*wire.TxOut{
+					{
+						Value:    10000,
+						PkScript: addr.ScriptPubKey,
+					},
+				},
+			)
+			params := db.CreateTxParams{
+				WalletID: walletID,
+				Tx:       original,
+				Received: time.Unix(1710001510, 0),
+				Status:   db.TxStatusPublished,
+				Credits:  map[uint32]address.Address{0: nil},
+			}
+			require.NoError(t, store.CreateTx(t.Context(), params))
+
+			replacement := original.Copy()
+			replacement.TxOut[0].Value = 9000
+			params.Tx = replacement
+			params.ReplaceUnmined = tc.replace
+			hashes := []chainhash.Hash{
+				original.TxHash(),
+				replacement.TxHash(),
+			}
+			visibleHash := hashes[tc.visibleIndex]
+
+			// Act: Submit the same competing spend with only the
+			// acceptance authorization varied between the two rows.
+			err := store.CreateTx(t.Context(), params)
+
+			// Assert: Refusal rolls back the replacement row and leaves
+			// the original live; acceptance replaces that original.
+			// Exactly the winning credit must remain visible to lnd.
+			require.ErrorIs(t, err, tc.createErr)
+			old, err := store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: walletID,
+				Txid:     original.TxHash(),
+			})
+			require.NoError(t, err)
+			require.Equal(t, tc.originalStatus, old.Status)
+			_, err = store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: walletID,
+				Txid:     replacement.TxHash(),
+			})
+			require.ErrorIs(t, err, tc.lookupErr)
+			visible, err := store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: walletID,
+				Txid:     visibleHash,
+			})
+			require.NoError(t, err)
+			require.Equal(t, db.TxStatusPublished, visible.Status)
+			utxos, err := store.ListUTXOs(
+				t.Context(), db.ListUtxosQuery{
+					WalletID: walletID,
+				},
+			)
+			require.NoError(t, err)
+			require.Len(t, utxos, 1)
+			require.Equal(t, wire.OutPoint{Hash: visibleHash},
+				utxos[0].OutPoint)
+		})
+	}
+}
+
 // TestApplyTxBatchExcludesNoChainSync keeps key-only accounts out of automatic
 // notification credits while retaining their ordinary ownership metadata.
 func TestApplyTxBatchExcludesNoChainSync(t *testing.T) {

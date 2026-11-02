@@ -967,6 +967,9 @@ func TestCreateTxWithOpsIgnoresUnminedConfirmedDuplicate(t *testing.T) {
 func TestCreateTxWithOpsConfirmExisting(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: Confirm an existing pending row with no competing credit
+	// edges or raw-input candidates; the existing row must be reused.
+
 	req, err := NewCreateTxRequest(CreateTxParams{
 		WalletID: 5,
 		Tx:       testRegularMsgTx(),
@@ -993,13 +996,20 @@ func TestCreateTxWithOpsConfirmExisting(t *testing.T) {
 	ops.On("ListConflictTxns", mock.Anything, req).Return(
 		[]int64(nil), []chainhash.Hash(nil), nil,
 	).Once()
+	ops.On("ListUnminedTxRecords", mock.Anything, int64(5)).Return(
+		[]UnminedTxRecord(nil), nil,
+	).Once()
 	ops.On("InsertCredits", mock.Anything, req, int64(7)).Return(nil).Once()
 	ops.On("MarkInputsSpent", mock.Anything, req, int64(7)).Return(nil).Once()
 
 	ops.On("DeleteSpentLeases", mock.Anything, req.Params.WalletID,
 		req.TxHash).Return(nil).Once()
 
+	// Act: Apply the confirming observation to the already stored hash.
 	err = CreateTxWithOps(context.Background(), req, ops)
+
+	// Assert: Confirmation succeeds without another insertion; Cleanup
+	// verifies the single shared snapshot read and every required edge write.
 	require.NoError(t, err)
 }
 
@@ -1568,12 +1578,15 @@ func TestCollectConflictDescendants(t *testing.T) {
 func TestHandleTxConflicts(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: Keep the winner's input separate from descendant inputs,
+	// so these fixtures model a displaced branch rather than extra roots.
+
 	rootHash := chainhash.Hash{1}
 	childHash := chainhash.Hash{2}
 	grandchildHash := chainhash.Hash{3}
 	req, err := NewCreateTxRequest(CreateTxParams{
 		WalletID: 7,
-		Tx:       testRegularMsgTx(),
+		Tx:       testRegularMsgTxWithSeed(9),
 		Received: time.Unix(456, 0),
 		Block:    testBlock(77),
 		Status:   TxStatusPublished,
@@ -1624,7 +1637,11 @@ func TestHandleTxConflicts(t *testing.T) {
 	ops.On("MarkTxnsFailed", mock.Anything, int64(7), []int64{2, 3}).
 		Return(nil).Once()
 
+	// Act: Reconcile the confirmed winner through the shared Store flow.
 	err = handleTxConflicts(t.Context(), req, 9, ops)
+
+	// Assert: Reconciliation succeeds; Cleanup checks that the root stays
+	// replaced and both descendant generations lose their spend claims.
 	require.NoError(t, err)
 }
 
@@ -1634,12 +1651,15 @@ func TestHandleTxConflicts(t *testing.T) {
 func TestHandleTxConflictsKeepsDirectRootsReplaced(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: Keep the winner's input separate from descendant inputs,
+	// so these fixtures model a displaced branch rather than extra roots.
+
 	rootAHash := chainhash.Hash{1}
 	rootBHash := chainhash.Hash{2}
 	childHash := chainhash.Hash{3}
 	req, err := NewCreateTxRequest(CreateTxParams{
 		WalletID: 7,
-		Tx:       testRegularMsgTx(),
+		Tx:       testRegularMsgTxWithSeed(9),
 		Received: time.Unix(456, 0),
 		Block:    testBlock(77),
 		Status:   TxStatusPublished,
@@ -1685,7 +1705,11 @@ func TestHandleTxConflictsKeepsDirectRootsReplaced(t *testing.T) {
 	ops.On("MarkTxnsFailed", mock.Anything, int64(7), []int64{3}).Return(nil).
 		Once()
 
+	// Act: Reconcile the confirmed winner through the shared Store flow.
 	err = handleTxConflicts(t.Context(), req, 9, ops)
+
+	// Assert: Reconciliation succeeds; Cleanup checks that both direct roots
+	// stay replaced and only the third row becomes a failed descendant.
 	require.NoError(t, err)
 }
 
@@ -1731,9 +1755,12 @@ func TestHandleTxConflictsNoDescendants(t *testing.T) {
 func TestHandleTxConflictsMarkFailedError(t *testing.T) {
 	t.Parallel()
 
+	// Arrange: Keep the winner's input separate from descendant inputs,
+	// so these fixtures model a displaced branch rather than extra roots.
+
 	req, err := NewCreateTxRequest(CreateTxParams{
 		WalletID: 7,
-		Tx:       testRegularMsgTx(),
+		Tx:       testRegularMsgTxWithSeed(9),
 		Received: time.Unix(456, 0),
 		Block:    testBlock(77),
 		Status:   TxStatusPublished,
@@ -1772,7 +1799,11 @@ func TestHandleTxConflictsMarkFailedError(t *testing.T) {
 	ops.On("MarkTxnsFailed", mock.Anything, int64(7), []int64{2}).Return(
 		errConflictMarkFailed).Once()
 
+	// Act: Reconcile the confirmed winner through the shared Store flow.
 	err = handleTxConflicts(t.Context(), req, 9, ops)
+
+	// Assert: Forward the wrapped descendant failure; Cleanup also checks
+	// that the direct-root replacement and history writes were attempted.
 	require.ErrorIs(t, err, errConflictMarkFailed)
 	require.ErrorContains(t, err, "mark conflict descendants failed")
 }

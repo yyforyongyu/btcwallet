@@ -1100,8 +1100,8 @@ func handleTxDescendants(ctx context.Context, walletID int64,
 	return nil
 }
 
-// handleTxConflicts rewrites conflicts of a confirmed or network-accepted
-// replacement to replaced state and marks their descendants failed.
+// handleTxConflicts rejects competing publication attempts and reconciles
+// confirmed or network-accepted replacements with their displaced branches.
 //
 // The replacement algorithm is intentionally ordered:
 //   - load the direct conflicting roots first
@@ -1117,9 +1117,12 @@ func handleTxDescendants(ctx context.Context, walletID int64,
 func handleTxConflicts(ctx context.Context, req CreateTxRequest,
 	replacementTxID int64, ops CreateTxOps) error {
 
-	// A prepublication attempt must leave the original branch intact. Only
-	// confirmation or an explicitly accepted replacement can displace it.
-	if req.Params.Block == nil && !req.Params.ReplaceUnmined {
+	// Pending plans may coexist before their parent credits are discovered.
+	// Publication tracking must detect competition before recording credits;
+	// only confirmation or accepted replacement may displace the old branch.
+	if req.Params.Block == nil && !req.Params.ReplaceUnmined &&
+		req.Params.Status != TxStatusPublished {
+
 		return nil
 	}
 
@@ -1130,22 +1133,54 @@ func handleTxConflicts(ctx context.Context, req CreateTxRequest,
 		return fmt.Errorf("list conflict txns: %w", err)
 	}
 
+	// Wallet-credit edges miss external inputs, such as channel sweeps.
+	// Reuse the live graph snapshot to find those direct conflicts and later
+	// discover descendants before any replacement mutation changes the graph.
+	walletID := int64(req.Params.WalletID)
+
+	candidates, err := ops.ListUnminedTxRecords(ctx, walletID)
+	if err != nil {
+		return fmt.Errorf("list create tx conflict candidates: %w", err)
+	}
+
+	inputs := make(map[wire.OutPoint]struct{}, len(req.Params.Tx.TxIn))
+	for _, input := range req.Params.Tx.TxIn {
+		inputs[input.PreviousOutPoint] = struct{}{}
+	}
+
+	for _, candidate := range candidates {
+		// Insert has already made this request's own row visible. Credit
+		// edges may also have identified a candidate as a direct root.
+		if candidate.Hash == req.TxHash ||
+			slices.Contains(rootIDs, candidate.ID) {
+
+			continue
+		}
+
+		for _, input := range candidate.Tx.TxIn {
+			if _, ok := inputs[input.PreviousOutPoint]; !ok {
+				continue
+			}
+
+			rootIDs = append(rootIDs, candidate.ID)
+			rootHashes = append(rootHashes, candidate.Hash)
+
+			break
+		}
+	}
+
 	// Exit early if there are no conflicts.
 	if len(rootIDs) == 0 {
 		return nil
 	}
 
-	walletID := int64(req.Params.WalletID)
-
-	// Discover descendants before any mutation starts.
-	// Later rewrites can otherwise hide part of the displaced
-	// branch from the graph walk.
-	descendantIDs, err := collectConflictDescendants(
-		ctx, walletID, rootHashes, rootIDs, ops,
-	)
-	if err != nil {
-		return err
+	// Refusing this atomic create retains the original publication attempt
+	// without adding another visible credit before backend acceptance.
+	if req.Params.Block == nil && !req.Params.ReplaceUnmined {
+		return ErrTxInputConflict
 	}
+
+	descendantIDs := CollectDescendantTxIDs(rootHashes, rootIDs, candidates)
 
 	// Direct roots keep the replacement state and replacement history.
 	err = handleRootTxns(ctx, walletID, rootIDs, replacementTxID, ops)
