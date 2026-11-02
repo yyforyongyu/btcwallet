@@ -5103,3 +5103,151 @@ func TestApplyTxBatchDuplicate(t *testing.T) {
 		)
 	})
 }
+
+// TestCreateTxAcceptedReplacement checks that network acceptance displaces an
+// unmined spend, while confirmation of either competing hash remains final.
+func TestCreateTxAcceptedReplacement(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		confirmOriginal bool
+		childStatus     db.TxStatus
+	}{
+		{
+			name:        "replacement confirms",
+			childStatus: db.TxStatusFailed,
+		},
+		{
+			name:            "original confirms",
+			confirmOriginal: true,
+			childStatus:     db.TxStatusPublished,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Record a real wallet credit and its original
+			// unmined spender through the public Store operations.
+			store := NewTestStore(t)
+			walletID := newWallet(t, store, "accepted-replacement")
+			createDerivedAccount(
+				t, store, walletID, db.KeyScopeBIP0084, "default",
+			)
+			addr := newDerivedAddress(
+				t, store, walletID, db.KeyScopeBIP0084, "default", false,
+			)
+			parent := newRegularTx(
+				[]wire.OutPoint{randomOutPoint()},
+				[]*wire.TxOut{wire.NewTxOut(10000, addr.ScriptPubKey)},
+			)
+			parentParams := db.CreateTxParams{
+				WalletID: walletID,
+				Tx:       parent,
+				Received: time.Unix(1710001500, 0),
+				Status:   db.TxStatusPublished,
+				Credits:  map[uint32]address.Address{0: nil},
+			}
+			require.NoError(t, store.CreateTx(t.Context(), parentParams))
+
+			outpoint := wire.OutPoint{Hash: parent.TxHash(), Index: 0}
+			original := parent.Copy()
+			original.TxIn[0].PreviousOutPoint = outpoint
+			original.TxOut[0].Value = 8000
+			originalParams := parentParams
+			originalParams.Tx = original
+			require.NoError(t, store.CreateTx(t.Context(), originalParams))
+
+			// A displaced descendant becomes failed, but block truth may
+			// still confirm it together with the original parent.
+			child := original.Copy()
+			child.TxIn[0].PreviousOutPoint.Hash = original.TxHash()
+			child.TxOut[0].Value = 6000
+			childParams := originalParams
+			childParams.Tx = child
+			require.NoError(t, store.CreateTx(t.Context(), childParams))
+
+			replacement := original.Copy()
+			replacement.TxOut[0].Value = 7000
+			replacementParams := originalParams
+			replacementParams.Tx = replacement
+			replacementParams.ReplaceUnmined = true
+
+			// Act: Admit an accepted replacement without a fabricated
+			// block. Its existing graph write must release the original
+			// input claim before recording the new spender atomically.
+			err := store.CreateTx(t.Context(), replacementParams)
+
+			// Assert: The original becomes replaced and only the new
+			// change output remains spendable through public queries.
+			require.NoError(t, err)
+			old, err := store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: walletID,
+				Txid:     original.TxHash(),
+			})
+			require.NoError(t, err)
+			require.Equal(t, db.TxStatusReplaced, old.Status)
+			_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+				WalletID: walletID,
+				OutPoint: wire.OutPoint{Hash: original.TxHash()},
+			})
+			require.ErrorIs(t, err, db.ErrUtxoNotFound)
+
+			// Act: A real block may confirm either hash, including the
+			// original if a miner included it before seeing the RBF.
+			winner, loser := replacementParams, original
+
+			creditHash := replacement.TxHash()
+			if tc.confirmOriginal {
+				winner, loser = originalParams, replacement
+				creditHash = child.TxHash()
+			}
+
+			block := CreateBlockFixture(t, store.Queries(), 260)
+			winner.Block = &block
+
+			confirmations := []db.CreateTxParams{winner}
+			if tc.confirmOriginal {
+				childParams.Block = &block
+				confirmations = append(confirmations, childParams)
+			}
+
+			err = store.ApplyTxBatch(t.Context(), db.TxBatchParams{
+				WalletID: walletID, Transactions: confirmations,
+			})
+
+			// Assert: Block truth determines the winner and its change;
+			// another accepted unmined spend cannot displace it.
+			require.NoError(t, err)
+			mined, err := store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: walletID,
+				Txid:     winner.Tx.TxHash(),
+			})
+			require.NoError(t, err)
+			require.Equal(t, db.TxStatusPublished, mined.Status)
+			require.NotNil(t, mined.Block)
+			storedChild, err := store.GetTx(t.Context(), db.GetTxQuery{
+				WalletID: walletID, Txid: child.TxHash(),
+			})
+			require.NoError(t, err)
+			require.Equal(t, tc.childStatus, storedChild.Status)
+			require.Equal(t, tc.confirmOriginal, storedChild.Block != nil)
+			_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+				WalletID: walletID,
+				OutPoint: wire.OutPoint{Hash: creditHash},
+			})
+			require.NoError(t, err)
+			_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+				WalletID: walletID,
+				OutPoint: wire.OutPoint{Hash: loser.TxHash()},
+			})
+			require.ErrorIs(t, err, db.ErrUtxoNotFound)
+
+			replacementParams.Tx = replacement.Copy()
+			replacementParams.Tx.TxOut[0].Value = 6000
+			err = store.CreateTx(t.Context(), replacementParams)
+			require.ErrorIs(t, err, db.ErrTxInputConflict)
+		})
+	}
+}
