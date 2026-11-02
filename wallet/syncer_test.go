@@ -8620,3 +8620,46 @@ func TestManagerRollbackKvdbOrphanCoinbaseSpends(t *testing.T) {
 	require.Len(t, history, 1)
 	require.Equal(t, coinbase.Hash, history[0].Hash)
 }
+
+// TestProcessRelevantTxKeepsTerminalHistory ignores a queued mempool echo of
+// an already replaced spend without reviving it or retrying Store refusal.
+func TestProcessRelevantTxKeepsTerminalHistory(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Reuse prepared-event and transaction fixtures for a known
+	// replaced spend. No transaction may enter the observation write batch;
+	// this literal mock has no fixture cleanup, so verify it once on exit.
+	store := &walletmock.Store{}
+	defer store.AssertExpectations(t)
+
+	s := newTestSyncer(
+		Config{ChainParams: &chainParams}, nil, nil, nil, store, 9,
+	)
+	record, err := wtxmgr.NewTxRecordFromMsgTx(
+		subscriptionTx(nil, 93), time.Unix(456, 0).UTC(),
+	)
+	require.NoError(t, err)
+	store.On("GetTx", mock.Anything, db.GetTxQuery{
+		WalletID: 9,
+		Txid:     record.Hash,
+	}).Return(&db.TxInfo{
+		Hash:   record.Hash,
+		Status: db.TxStatusReplaced,
+		Label:  "existing sweep",
+	}, nil).Once()
+	store.On("ApplyTxBatch", mock.Anything, db.TxBatchParams{
+		WalletID:     9,
+		Transactions: []db.CreateTxParams{},
+	}).Return(nil).Once()
+
+	// Act: Process the queued observation through the same entry point that
+	// receives Manager-prepared relevant transactions after replacement.
+	err = s.processChainEvent(t.Context(), chainEvent{
+		notification: chain.RelevantTx{TxRecord: record},
+		matches:      liveMatches(record),
+	})
+
+	// Assert: Processing succeeds without writing terminal history again;
+	// deferred verification checks the single snapshot and empty batch.
+	require.NoError(t, err)
+}
