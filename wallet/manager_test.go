@@ -39,7 +39,7 @@ func TestWalletID(t *testing.T) {
 }
 
 // TestManagerBuildsWalletsFromRuntimePolicy verifies sibling SQL Wallets use
-// identical Manager policy while retaining independent mutable snapshots.
+// inherited and explicit policy while retaining independent mutable snapshots.
 func TestManagerBuildsWalletsFromRuntimePolicy(t *testing.T) {
 	t.Parallel()
 
@@ -90,14 +90,16 @@ func TestManagerBuildsWalletsFromRuntimePolicy(t *testing.T) {
 	first, err := manager.Create(params)
 	require.NoError(t, err)
 
+	zero := uint32(0)
 	params.Name = secondWalletName
+	params.RecoveryWindow = &zero
 	second, err := manager.Create(params)
 	require.NoError(t, err)
 
 	first.cfg.ChainParams.Name = "mutated"
 
 	// Assert: Verify the caller-owned source is shared while scalar policy is
-	// identical, network snapshots are independent, and each Store call occurs
+	// copied, the zero override stays local, and each Store call occurs
 	// exactly once.
 	require.Same(t, chainSource, first.cfg.Chain)
 	require.Same(t, chainSource, second.cfg.Chain)
@@ -107,7 +109,8 @@ func TestManagerBuildsWalletsFromRuntimePolicy(t *testing.T) {
 	require.Equal(t, first.cfg.WalletSyncRetryInterval,
 		second.cfg.WalletSyncRetryInterval)
 	require.Equal(t, uint32(12), first.cfg.RecoveryWindow)
-	require.Equal(t, first.cfg.RecoveryWindow, second.cfg.RecoveryWindow)
+	require.Zero(t, second.cfg.RecoveryWindow)
+	require.Equal(t, uint32(12), manager.config.RecoveryWindow)
 	require.Equal(t, 3*time.Minute, first.cfg.AutoLockDuration)
 	require.Equal(t, first.cfg.AutoLockDuration, second.cfg.AutoLockDuration)
 	require.Equal(t, uint32(50), first.cfg.MaxCFilterItems)
@@ -3567,6 +3570,8 @@ func TestManagerCreateInitialDerivedAccounts(t *testing.T) {
 	// existing real-Store fixture, which owns worker and mock cleanup.
 	manager := testSQLiteManager(t)
 	params := sqliteCreateParams(t)
+	window := uint32(32)
+	params.RecoveryWindow = &window
 	zero := AccountNumber(0)
 
 	for _, scope := range []waddrmgr.KeyScope{
@@ -3614,6 +3619,7 @@ func TestManagerCreateInitialDerivedAccounts(t *testing.T) {
 
 	// Assert: The complete export retains its requested paths and policy,
 	// and normal authentication still enables payment signing after creation.
+	require.Equal(t, window, w.cfg.RecoveryWindow)
 	require.True(t, info.Locked)
 
 	for _, account := range params.InitialDerivedAccounts {
@@ -3665,4 +3671,139 @@ func TestManagerCreateInitialDerivedAccounts(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, key)
 	key.Zero()
+}
+
+// TestManagerCreateRecoveryValidation verifies malformed initialization is
+// rejected before persistence and permits a corrected request for the same
+// name.
+func TestManagerCreateRecoveryValidation(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Build invalid requests from one valid seed, changing only the
+	// requested contract violation. Each row receives an empty real Store.
+	base := sqliteCreateParams(t)
+	zero, one := AccountNumber(0), AccountNumber(1)
+	window := uint32(MaxRecoveryWindow + 1)
+	excessive := base
+	excessive.RecoveryWindow = &window
+	shell := base
+	shell.Mode, shell.Seed, shell.WatchOnly = ModeShell, nil, true
+	shell.InitialDerivedAccounts = []NewAccountParams{
+		{
+			Scope: waddrmgr.KeyScopeBIP0084,
+			Name:  waddrmgr.DefaultAccountName,
+		},
+	}
+	custom := base
+	custom.InitialDerivedAccounts = []NewAccountParams{
+		{
+			Scope:         waddrmgr.KeyScope{Purpose: 1017, Coin: 1},
+			Name:          "family",
+			AccountNumber: &zero,
+		},
+	}
+	firstSchema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0084]
+	secondSchema := waddrmgr.ScopeAddrMap[waddrmgr.KeyScopeBIP0086]
+	conflicting := base
+	conflicting.InitialDerivedAccounts = []NewAccountParams{
+		{
+			Scope:         waddrmgr.KeyScope{Purpose: 1017, Coin: 1},
+			Name:          "first",
+			AccountNumber: &zero,
+			AddrSchema:    &firstSchema,
+		},
+		{
+			Scope:         waddrmgr.KeyScope{Purpose: 1017, Coin: 1},
+			Name:          "second",
+			AccountNumber: &one,
+			AddrSchema:    &secondSchema,
+		},
+	}
+	noSync := base
+	noSync.InitialDerivedAccounts = []NewAccountParams{
+		{
+			Scope:       waddrmgr.KeyScopeBIP0084,
+			Name:        waddrmgr.DefaultAccountName,
+			NoChainSync: true,
+		},
+	}
+
+	tests := []struct {
+		name   string
+		params CreateWalletParams
+		err    error
+	}{
+		{
+			name:   "excessive recovery window",
+			params: excessive,
+			err:    ErrWalletParams,
+		},
+		{
+			name:   "derived account in a keyless shell",
+			params: shell,
+			err:    ErrWalletParams,
+		},
+		{
+			name:   "custom scope without schema",
+			params: custom,
+			err:    ErrInvalidParam,
+		},
+		{
+			name:   "conflicting scope schemas",
+			params: conflicting,
+			err:    ErrInvalidParam,
+		},
+		{
+			name:   "no chain sync without exact account",
+			params: noSync,
+			err:    ErrAccountOperationUnsupported,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			manager := testSQLiteManager(t)
+
+			// Act: Submit malformed input through public creation.
+			w, err := manager.Create(tc.params)
+
+			// Assert: No Wallet is published or name consumed; a valid
+			// request can still create that same identity afterward.
+			require.Nil(t, w)
+			require.ErrorIs(t, err, tc.err)
+			_, err = manager.Create(base)
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestManagerCreateRejectsKVDBInitialAccounts preserves ordinary native
+// creation while refusing SQL-only initialization before consuming its name.
+func TestManagerCreateRejectsKVDBInitialAccounts(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Supply valid native credentials and one initial account to the
+	// existing real KVDB fixture; no separate native batch is owned here.
+	manager := testKVDBManager(t)
+	params := sqliteCreateParams(t)
+	params.PubPassphrase = []byte(InsecurePubPassphrase)
+	params.InitialDerivedAccounts = []NewAccountParams{
+		{
+			Scope: waddrmgr.KeyScopeBIP0084,
+			Name:  waddrmgr.DefaultAccountName,
+		},
+	}
+
+	// Act: Request the unsupported initialization through public creation.
+	w, err := manager.Create(params)
+
+	// Assert: Refusal leaves no published Wallet; removing the SQL-only option
+	// permits ordinary creation of the same name with the same credentials.
+	require.Nil(t, w)
+	require.ErrorIs(t, err, ErrAccountOperationUnsupported)
+
+	params.InitialDerivedAccounts = nil
+	_, err = manager.Create(params)
+	require.NoError(t, err)
 }
