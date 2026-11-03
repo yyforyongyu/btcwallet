@@ -3905,10 +3905,10 @@ func TestApplyTxBatchStoresTxAndSyncTip(t *testing.T) {
 		walletInfo.SyncedTo.Timestamp.Unix())
 }
 
-// TestApplyTxBatchRejectsStaleDuplicateTx verifies that a duplicate batch
-// observation is not skipped when the existing row is terminal history. A blind
-// ErrTxAlreadyExists skip would leave the failed row in place while reporting a
-// successful batch application.
+// TestApplyTxBatchRejectsStaleDuplicateTx keeps Pending requests strict when
+// the stored row has failed. Only Published network echoes may be ignored
+// against terminal history inside the batch transaction; a Pending request
+// must not report a successful creation without recording its requested state.
 func TestApplyTxBatchRejectsStaleDuplicateTx(t *testing.T) {
 	t.Parallel()
 
@@ -5104,8 +5104,8 @@ func TestApplyTxBatchDuplicate(t *testing.T) {
 	})
 }
 
-// TestCreateTxAcceptedReplacement checks that network acceptance displaces an
-// unmined spend, while confirmation of either competing hash remains final.
+// TestCreateTxAcceptedReplacement checks that accepted replacements survive
+// stale unmined echoes; confirmation of either competing hash stays final.
 func TestCreateTxAcceptedReplacement(t *testing.T) {
 	t.Parallel()
 
@@ -5161,6 +5161,12 @@ func TestCreateTxAcceptedReplacement(t *testing.T) {
 			originalParams.Tx = original
 			require.NoError(t, store.CreateTx(t.Context(), originalParams))
 
+			// Prepare the network echo before replacement, reproducing
+			// the syncer's metadata-read/write gap without timing hooks.
+			observation := originalParams
+			observation.ReplaceUnmined = true
+			tip := NewBlockFixture(259)
+
 			replacement := original.Copy()
 			replacement.TxOut[0].Value = 7000
 			replacementParams := originalParams
@@ -5171,9 +5177,18 @@ func TestCreateTxAcceptedReplacement(t *testing.T) {
 			// block. Its existing graph write must release the original
 			// input claim before recording the new spender atomically.
 			err := store.CreateTx(t.Context(), replacementParams)
+			require.NoError(t, err)
 
-			// Assert: The original becomes replaced and only the new
-			// change output remains spendable through public queries.
+			// Act: Deliver the queued echo after replacement committed.
+			// Its obsolete state must not abort the batch's sync progress.
+			err = store.ApplyTxBatch(t.Context(), db.TxBatchParams{
+				WalletID:     walletID,
+				Transactions: []db.CreateTxParams{observation},
+				SyncedTo:     &tip,
+			})
+
+			// Assert: The original remains replaced and only the new
+			// credit is spendable, while the batch commits its sync tip.
 			require.NoError(t, err)
 			old, err := store.GetTx(t.Context(), db.GetTxQuery{
 				WalletID: walletID,
@@ -5187,16 +5202,30 @@ func TestCreateTxAcceptedReplacement(t *testing.T) {
 			})
 			require.ErrorIs(t, err, db.ErrUtxoNotFound)
 
+			_, err = store.GetUtxo(t.Context(), db.GetUtxoQuery{
+				WalletID: walletID,
+				OutPoint: wire.OutPoint{Hash: replacement.TxHash()},
+			})
+			require.NoError(t, err)
+			info, err := store.GetWallet(t.Context(), "accepted-replacement")
+			require.NoError(t, err)
+			require.NotNil(t, info.SyncedTo)
+			require.Equal(t, tip.Hash, info.SyncedTo.Hash)
+
 			// Act: A real block may confirm either hash, including the
 			// original if a miner included it before seeing the RBF.
+			// Use the syncer's batch path to exercise the guard boundary.
 			winner, loser := replacementParams, original
 			if tc.confirmOriginal {
 				winner, loser = originalParams, replacement
 			}
 
-			block := CreateBlockFixture(t, store.Queries(), 260)
+			block := NewBlockFixture(260)
 			winner.Block = &block
-			err = store.CreateTx(t.Context(), winner)
+			err = store.ApplyTxBatch(t.Context(), db.TxBatchParams{
+				WalletID:     walletID,
+				Transactions: []db.CreateTxParams{winner},
+			})
 
 			// Assert: Block truth determines the winner and its change;
 			// another accepted unmined spend cannot displace it.
