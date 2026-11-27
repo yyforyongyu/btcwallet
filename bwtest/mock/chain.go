@@ -6,6 +6,7 @@ package mock
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/btcsuite/btcd/address/v2"
@@ -41,35 +42,40 @@ func NewGenesisChain(tb testing.TB, current bool) *Chain {
 	tb.Helper()
 
 	params := &chaincfg.RegressionNetParams
-	chain := &Chain{}
+	m := &Chain{}
 
 	// Tests can replace these defaults when registration is under test.
-	chain.On("BackEnd").Return("mock").Maybe()
-	chain.On("Notifications").Return((<-chan any)(nil)).Maybe()
-	chain.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
+	m.On("BackEnd").Return("mock").Maybe()
+	m.On("Notifications").Return((<-chan any)(nil)).Maybe()
+	m.On("SubscribeChainEvents", mock.Anything).Return(
+		func(ctx context.Context) chain.EventSubscription {
+			return NewEventSubscription(ctx, m)
+		},
+	).Maybe()
+	m.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
 		Return(nil).Maybe()
-	chain.On("NotifySpent", mock.Anything).Return(nil).Maybe()
-	chain.On("IsCurrent").Return(current).Maybe()
+	m.On("NotifySpent", mock.Anything).Return(nil).Maybe()
+	m.On("IsCurrent").Return(current).Maybe()
 
 	// Only a current backend subscribes after completing startup sync.
 	if current {
-		chain.On("NotifyBlocks").Return(nil).Maybe()
+		m.On("NotifyBlocks").Return(nil).Maybe()
 	}
 
-	chain.On("GetBestBlock").Return(
+	m.On("GetBestBlock").Return(
 		params.GenesisHash, int32(0), nil,
 	).Maybe()
-	chain.On("GetBlockHash", int64(0)).Return(
+	m.On("GetBlockHash", int64(0)).Return(
 		params.GenesisHash, nil,
 	).Maybe()
-	chain.On("GetBlockHeader", params.GenesisHash).Return(
+	m.On("GetBlockHeader", params.GenesisHash).Return(
 		&params.GenesisBlock.Header, nil,
 	).Maybe()
 	tb.Cleanup(func() {
-		chain.AssertExpectations(tb)
+		m.AssertExpectations(tb)
 	})
 
-	return chain
+	return m
 }
 
 // Start implements the chain.Interface interface.
@@ -236,10 +242,184 @@ func (m *Chain) Notifications() <-chan any {
 func (m *Chain) SubscribeChainEvents(
 	ctx context.Context) chain.EventSubscription {
 
+	type enrollFunc = func(context.Context) chain.EventSubscription
+
 	args := m.Called(ctx)
+	if enroll, ok := args.Get(0).(enrollFunc); ok {
+		return enroll(ctx)
+	}
+
 	sub, _ := args.Get(0).(chain.EventSubscription)
 
 	return sub
+}
+
+// eventSubBufferSize matches chain's per-subscription event buffer so overflow
+// tests exercise the same bounded queue semantics in memory.
+const eventSubBufferSize = 100
+
+// EventSubscription is an in-memory mock implementation of
+// chain.EventSubscription for tests and benchmarks.
+type EventSubscription struct {
+	mu       sync.Mutex
+	client   chain.Interface
+	events   chan chain.Event
+	done     chan struct{}
+	canceled <-chan struct{}
+	stopCtx  func() bool
+	closed   bool
+	err      error
+}
+
+// A compile-time assertion to ensure that EventSubscription implements
+// chain.EventSubscription.
+var _ chain.EventSubscription = (*EventSubscription)(nil)
+
+// NewEventSubscription creates an in-memory EventSubscription tied to ctx that
+// delegates WatchAddrs and WatchOutputs to client when non-nil.
+func NewEventSubscription(ctx context.Context,
+	client chain.Interface) *EventSubscription {
+
+	sub := &EventSubscription{
+		client: client,
+		events: make(chan chain.Event, eventSubBufferSize),
+		done:   make(chan struct{}),
+	}
+	if ctx == nil {
+		return sub
+	}
+
+	sub.canceled = ctx.Done()
+	if ctx.Err() != nil {
+		sub.closeLocked(nil)
+
+		return sub
+	}
+
+	sub.stopCtx = context.AfterFunc(ctx, func() {
+		sub.Close(nil)
+	})
+
+	return sub
+}
+
+// Events returns the buffered event channel for this mock subscription.
+func (s *EventSubscription) Events() <-chan chain.Event {
+	return s.events
+}
+
+// Done returns the completion channel for this mock subscription.
+func (s *EventSubscription) Done() <-chan struct{} {
+	return s.done
+}
+
+// Err returns the terminal error after Done closes.
+func (s *EventSubscription) Err() error {
+	select {
+	case <-s.done:
+		return s.err
+	default:
+		return nil
+	}
+}
+
+// Send enqueues event on this subscription or retires it with
+// chain.ErrEventSubscriptionBufferFull if its buffer is full.
+func (s *EventSubscription) Send(event chain.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+
+	select {
+	case s.events <- event:
+	default:
+		s.closeLocked(chain.ErrEventSubscriptionBufferFull)
+	}
+}
+
+// Close retires this subscription once with err.
+func (s *EventSubscription) Close(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.closeLocked(err)
+}
+
+// closeLocked retires the subscription while s.mu is held.
+func (s *EventSubscription) closeLocked(err error) {
+	if s.closed {
+		return
+	}
+
+	s.closed = true
+	s.err = err
+
+	if s.stopCtx != nil {
+		s.stopCtx()
+	}
+
+	close(s.events)
+	close(s.done)
+}
+
+// checkWatchable verifies ctx and subscription liveness before forwarding
+// watch registration to the mock client.
+func (s *EventSubscription) checkWatchable(ctx context.Context) error {
+	err := ctx.Err()
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-s.canceled:
+		return context.Canceled
+	default:
+	}
+
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+
+	if closed {
+		return context.Canceled
+	}
+
+	return nil
+}
+
+// WatchAddrs forwards address watch registration to the backing mock client.
+func (s *EventSubscription) WatchAddrs(ctx context.Context,
+	addrs []address.Address) error {
+
+	err := s.checkWatchable(ctx)
+	if err != nil {
+		return err
+	}
+
+	if s.client == nil {
+		return nil
+	}
+
+	return s.client.WatchAddrsFromTip(ctx, addrs)
+}
+
+// WatchOutputs forwards output watch registration to the backing mock client.
+func (s *EventSubscription) WatchOutputs(ctx context.Context,
+	outpoints []*wire.OutPoint) error {
+
+	err := s.checkWatchable(ctx)
+	if err != nil {
+		return err
+	}
+
+	if s.client == nil || len(outpoints) == 0 {
+		return nil
+	}
+
+	return s.client.NotifySpent(outpoints)
 }
 
 // BackEnd implements the chain.Interface interface.
