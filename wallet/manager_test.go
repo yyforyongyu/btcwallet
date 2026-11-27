@@ -2609,6 +2609,9 @@ func TestManagerRollbackKvdbAheadOfTip(t *testing.T) {
 		Maybe()
 	source.On("GetBlockHash", int64(1)).Return(&stamp.Hash, nil).Once()
 	expectDisconnectHeaders(source, 2, stamp.Hash, replacement.Hash)
+	source.On("GetBlockHeader", &replacement.Hash).Return(
+		&wire.BlockHeader{PrevBlock: stamp.Hash}, nil,
+	).Once()
 	require.NoError(t, s.processChainEvent(t.Context(), chain.Event{
 		Type:        chain.EventMempoolTx,
 		Block:       &old,
