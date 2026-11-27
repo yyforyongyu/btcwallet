@@ -367,6 +367,7 @@ func (w *Wallet) broadcastTx(ctx context.Context, tx *wire.MsgTx,
 	// Mempool-known submissions repair history without sending again. Other
 	// send replies have no graph authority: competing attempts stay recorded.
 	if !errors.Is(mempoolErr, errAlreadyBroadcasted) {
+		//nolint:contextcheck // Broadcast drains under Wallet lifetime.
 		err = w.publishTx(tx, ourAddrs)
 		if err != nil {
 			return w.handlePublicationFailure(ctx, tx, recorded, err)
@@ -964,7 +965,22 @@ func (w *Wallet) publishTx(tx *wire.MsgTx, ourAddrs []address.Address) error {
 	// interaction within it.
 	err := w.sync.watchAddrs(w.lifetimeCtx, ourAddrs)
 	if err != nil {
-		return err
+		// Stop cancels lifetimeCtx before draining an admitted
+		// Broadcast whose tx is already persisted in Store. Complete
+		// native watch registration and relay with a non-canceled
+		// context while keeping genuine backend errors visible.
+		if w.lifetimeCtx.Err() == nil ||
+			!errors.Is(err, context.Canceled) {
+
+			return err
+		}
+
+		err = w.cfg.Chain.WatchAddrsFromTip(
+			context.WithoutCancel(w.lifetimeCtx), ourAddrs,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	txid := tx.TxHash()

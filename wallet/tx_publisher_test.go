@@ -1208,6 +1208,72 @@ func TestPublishTx(t *testing.T) {
 	}
 }
 
+// TestPublishTxCompletesDuringWalletStop verifies that an admitted publishTx
+// whose lifetimeCtx was canceled by Stop still completes native watch
+// registration and SendRawTransaction while surfacing genuine backend errors.
+func TestPublishTxCompletesDuringWalletStop(t *testing.T) {
+	t.Parallel()
+
+	addr, err := address.NewAddressWitnessPubKeyHash(
+		make([]byte, 20), &chainParams,
+	)
+	require.NoError(t, err)
+
+	tx := &wire.MsgTx{}
+	addrs := []address.Address{addr}
+
+	t.Run("fallback registers and sends", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange: Cancel the Wallet's lifetime context after admission
+		// so scoped WatchAddrs returns context.Canceled, forcing
+		// the draining fallback to WatchAddrsFromTip and
+		// SendRawTransaction.
+		w, m := createStartedWalletWithMocks(t)
+		w.cancel()
+
+		m.chain.On(
+			"WatchAddrsFromTip",
+			mock.MatchedBy(func(ctx context.Context) bool {
+				return ctx.Err() == nil
+			}),
+			addrs,
+		).Return(nil).Once()
+		m.chain.On("SendRawTransaction", tx, false).
+			Return(nil, nil).Once()
+
+		// Act: Complete publication on the draining Wallet.
+		err := w.publishTx(tx, addrs)
+
+		// Assert: Native watch registration and send both succeeded.
+		require.NoError(t, err)
+	})
+
+	t.Run("fallback preserves backend error", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange: Cancel lifetimeCtx and return a genuine backend
+		// error from the non-canceled WatchAddrsFromTip fallback.
+		w, m := createStartedWalletWithMocks(t)
+		w.cancel()
+
+		m.chain.On(
+			"WatchAddrsFromTip",
+			mock.MatchedBy(func(ctx context.Context) bool {
+				return ctx.Err() == nil
+			}),
+			addrs,
+		).Return(errDummy).Once()
+
+		// Act: Attempt publication on the draining Wallet.
+		err := w.publishTx(tx, addrs)
+
+		// Assert: The backend watch error is returned and send is not
+		// invoked.
+		require.ErrorIs(t, err, errDummy)
+	})
+}
+
 // TestBroadcastSuccess publishes ordinary change while keeping an excluded
 // key-only output out of automatic credits and receiving watches.
 func TestBroadcastSuccess(t *testing.T) {
