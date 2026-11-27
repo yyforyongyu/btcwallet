@@ -1885,7 +1885,10 @@ func TestControllerRescanFullMailboxStops(t *testing.T) {
 	mailboxChan := make(chan *scanReq, 1)
 	mailboxChan <- &scanReq{}
 
-	w.sync = &syncer{scanReqChan: mailboxChan}
+	w.sync = &syncer{
+		scanReqChan: mailboxChan,
+		sub:         stubChainEventSub{},
+	}
 	startLoadedWalletForTest(t, w)
 	deps.syncer.On("syncState").Return(syncStateSynced).Once()
 	deps.vault.On("Lock").Return().Once()
@@ -2884,7 +2887,7 @@ func TestWaitForBackoffStableRun(t *testing.T) {
 	// timer seam that records the reset value while firing immediately.
 	retryInterval := 3 * time.Second
 	w := &Wallet{
-		sync:        &syncer{},
+		sync:        &syncer{sub: stubChainEventSub{}},
 		lifetimeCtx: context.Background(),
 		cfg: Config{
 			WalletSyncRetryInterval: retryInterval,
@@ -2951,7 +2954,7 @@ func TestWaitForBackoff_MaxBackoffCap(t *testing.T) {
 
 	// Arrange: Create a wallet.
 	w := &Wallet{
-		sync:        &syncer{},
+		sync:        &syncer{sub: stubChainEventSub{}},
 		lifetimeCtx: context.Background(),
 	}
 
@@ -2987,7 +2990,7 @@ func TestWaitForBackoff_Shutdown(t *testing.T) {
 	cancel()
 
 	w := &Wallet{
-		sync:        &syncer{},
+		sync:        &syncer{sub: stubChainEventSub{}},
 		lifetimeCtx: ctx,
 	}
 

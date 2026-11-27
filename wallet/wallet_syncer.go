@@ -228,6 +228,18 @@ type scanResult struct {
 // chainProcessor abstracts Wallet event processing and recovery, allowing
 // Wallet and controller tests to replace the existing worker.
 type chainProcessor interface {
+	// watchAddrs registers newly watched addresses on this worker's
+	// lifetime-scoped chain event subscription.
+	watchAddrs(ctx context.Context, addrs []address.Address) error
+
+	// streamDone returns a channel that closes when this worker's
+	// lifetime-scoped chain event subscription retires.
+	streamDone() <-chan struct{}
+
+	// streamErr returns the terminal subscription error after streamDone
+	// closes.
+	streamErr() error
+
 	// run executes the main synchronization loop.
 	run(ctx context.Context) error
 
@@ -292,6 +304,9 @@ type syncer struct {
 	chainSyncer    chainRouter
 	chainEventChan <-chan chainEvent
 
+	// sub is this Wallet's lifetime-scoped chain event subscription.
+	sub chain.EventSubscription
+
 	// pendingDisconnect retains the first failed live disconnect so the
 	// next initialization replays it before startup rollback or later
 	// mailbox events can overtake it.
@@ -300,6 +315,37 @@ type syncer struct {
 
 // A compile-time assertion to ensure that syncer implements chainProcessor.
 var _ chainProcessor = (*syncer)(nil)
+
+// watchAddrs registers addresses on this syncer's lifetime-scoped chain event
+// subscription.
+func (s *syncer) watchAddrs(ctx context.Context,
+	addrs []address.Address) error {
+
+	if s.sub == nil {
+		return ctx.Err()
+	}
+
+	return s.sub.WatchAddrs(ctx, addrs)
+}
+
+// streamDone returns a channel that closes after this syncer's chain event
+// subscription retires.
+func (s *syncer) streamDone() <-chan struct{} {
+	if s.sub == nil {
+		return nil
+	}
+
+	return s.sub.Done()
+}
+
+// streamErr returns the terminal subscription error after streamDone closes.
+func (s *syncer) streamErr() error {
+	if s.sub == nil {
+		return nil
+	}
+
+	return s.sub.Err()
+}
 
 // refreshLiveWatches registers stored addresses and outpoints for transaction
 // notifications. The Store selects the addresses and outputs to watch.

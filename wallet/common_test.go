@@ -210,6 +210,10 @@ func testSQLManager(tb testing.TB, store *walletmock.Store) *Manager {
 func startLoadedWalletForTest(t *testing.T, w *Wallet) {
 	t.Helper()
 
+	if w.sync == nil {
+		w.sync = &mockChainProcessor{}
+	}
+
 	require.NoError(t, w.state.toStarting())
 	require.NoError(t, w.state.toStarted())
 
@@ -334,6 +338,7 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 	// Match managed assembly so every producer declares its routing interest.
 	w.chainSyncer = newChainSyncer(mockChain, &chainParams)
 	w.chainEventChan = make(chan chainEvent, 1)
+	mockSyncer.sub = bwmock.NewEventSubscription(ctx, mockChain)
 	w.cache = newStoreRuntimeCache(mockStore)
 
 	// Stop the timer immediately to avoid leaks.
