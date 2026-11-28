@@ -4172,8 +4172,8 @@ func TestRefreshLiveWatches(t *testing.T) {
 	chainSource.On("NotifySpent", []*wire.OutPoint{&outpoint}).
 		Return(nil).Once()
 
-	// Act: Refresh through the same method used by initialization and by
-	// the worker after committed scan results introduce new interests.
+	// Act: Refresh through the startup watch-registration entry called by
+	// performRuntimeSetup before the sync loop starts.
 	err = s.refreshLiveWatches(t.Context())
 
 	// Assert: Both native calls preserve the Store-selected identities;
@@ -10769,14 +10769,14 @@ func TestReplayPendingEventsDropsStaleEvents(t *testing.T) {
 	}
 }
 
-// TestPutSyncBatchAppliesPendingBeforeRefreshLiveWatches verifies that
+// TestPutSyncBatchAppliesPendingBeforeSyncLiveWatches verifies that
 // putSyncBatch applies an older queued block confirmation before
-// refreshLiveWatches drains a newer disconnect for that same block.
-func TestPutSyncBatchAppliesPendingBeforeRefreshLiveWatches(t *testing.T) {
+// syncLiveWatches drains a newer disconnect for that same block.
+func TestPutSyncBatchAppliesPendingBeforeSyncLiveWatches(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Queue a block 2 confirmation before putSyncBatch commits a
-	// batch that triggers refreshLiveWatches, and deliver block 2's
+	// batch that triggers syncLiveWatches, and deliver block 2's
 	// disconnect during WatchAddrsFromTip.
 	store := &walletmock.Store{}
 	src := &bwmock.Chain{}
@@ -10863,8 +10863,8 @@ func TestPutSyncBatchAppliesPendingBeforeRefreshLiveWatches(t *testing.T) {
 		&genesis, map[uint32]*chainhash.Hash{2: nil},
 	).Return(nil).Once().NotBefore(watchCall)
 
-	// Act: Commit the sync batch so pending applies before
-	// refreshLiveWatches drains the newer disconnect.
+	// Act: Commit the sync batch so pending applies before syncLiveWatches
+	// drains the newer disconnect.
 	err = s.putSyncBatch(
 		t.Context(), scanState, []scanResult{fixture.result},
 	)
@@ -10875,13 +10875,13 @@ func TestPutSyncBatchAppliesPendingBeforeRefreshLiveWatches(t *testing.T) {
 }
 
 // TestInitChainSyncFailsWhenWatchDisconnectFails verifies that a failed
-// EventBlockDisconnected drained during initChainSync's refreshLiveWatches
+// EventBlockDisconnected drained during initChainSync's syncLiveWatches
 // propagates an error and queues later drained events instead of stranding
 // replay and letting waitForEvent overtake the pending disconnect.
 func TestInitChainSyncFailsWhenWatchDisconnectFails(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Make initChainSync reach refreshLiveWatches, then deliver a
+	// Arrange: Make initChainSync reach syncLiveWatches, then deliver a
 	// disconnect whose backend check fails followed by a newer mempool tx.
 	store := &walletmock.Store{}
 	src := &bwmock.Chain{}
@@ -10928,7 +10928,7 @@ func TestInitChainSyncFailsWhenWatchDisconnectFails(t *testing.T) {
 	// fails and arms pendingDisconnect.
 	src.On("IsCurrent").Return(false).Once()
 
-	// Act: Run initChainSync through refreshLiveWatches.
+	// Act: Run initChainSync through syncLiveWatches.
 	err = s.initChainSync(t.Context())
 
 	// Assert: initChainSync returns the disconnect error so runSyncLoop
@@ -10937,4 +10937,66 @@ func TestInitChainSyncFailsWhenWatchDisconnectFails(t *testing.T) {
 	require.ErrorContains(t, err, "disconnect source is not current")
 	require.Equal(t, &detachedMeta, s.pendingDisconnect)
 	require.Equal(t, []chain.Event{newerEvent}, s.pendingEvents)
+}
+
+// TestRefreshLiveWatchesStartupQueuesDisconnect verifies that startup watch
+// setup buffers drained disconnects and actionable events into pendingEvents
+// for initChainSync instead of failing performRuntimeSetup on a transient
+// reorg.
+func TestRefreshLiveWatchesStartupQueuesDisconnect(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Emit a disconnect and a mempool tx while startup
+	// refreshLiveWatches runs WatchAddrsFromTip, without expecting any
+	// Store writes or IsCurrent disconnect proof during startup setup.
+	store := &walletmock.Store{}
+	src := &bwmock.Chain{}
+	sub := bwmock.NewEventSubscription(t.Context(), src)
+	s := newSyncer(
+		Config{Chain: src, ChainParams: &chainParams},
+		nil, nil, &Wallet{}, store, 7, sub,
+	)
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		src.AssertExpectations(t)
+	})
+
+	detachedMeta := wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Height: 3, Hash: chainhash.Hash{3}},
+	}
+	disconnectEvent := chain.Event{
+		Type:  chain.EventBlockDisconnected,
+		Block: &detachedMeta,
+	}
+
+	mempoolTx := subscriptionTx([]byte{txscript.OP_TRUE}, 41)
+	mempoolRec, err := wtxmgr.NewTxRecordFromMsgTx(mempoolTx, time.Now())
+	require.NoError(t, err)
+
+	mempoolEvent := chain.Event{
+		Type:        chain.EventMempoolTx,
+		RelevantTxs: []*wtxmgr.TxRecord{mempoolRec},
+	}
+
+	store.On("LoadWatchSet", mock.Anything, uint32(7)).Return(
+		db.WatchSet{}, nil,
+	).Once()
+	src.On(
+		"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
+	).Run(func(mock.Arguments) {
+		sub.Send(disconnectEvent)
+		sub.Send(mempoolEvent)
+	}).Return(nil).Once()
+
+	// Act: Run startup refreshLiveWatches before runSyncLoop starts.
+	err = s.refreshLiveWatches(t.Context())
+
+	// Assert: Startup watch installation succeeds and preserves both
+	// events in source order for initChainSync to replay.
+	require.NoError(t, err)
+	require.Nil(t, s.pendingDisconnect)
+	require.Equal(
+		t, []chain.Event{disconnectEvent, mempoolEvent},
+		s.pendingEvents,
+	)
 }

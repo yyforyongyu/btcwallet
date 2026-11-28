@@ -341,8 +341,25 @@ func (s *syncer) streamErr() error {
 }
 
 // refreshLiveWatches registers stored addresses and outpoints for transaction
-// notifications. The Store selects the addresses and outputs to watch.
+// notifications before the sync loop starts, queuing drained actionable events
+// into pendingEvents so initChainSync replays them after backend sync without
+// failing Wallet startup on retryable disconnects.
 func (s *syncer) refreshLiveWatches(ctx context.Context) error {
+	return s.registerLiveWatches(ctx, false)
+}
+
+// syncLiveWatches registers stored addresses and outpoints for transaction
+// notifications during synchronization and applies drained actionable events
+// in source order on the owning goroutine.
+func (s *syncer) syncLiveWatches(ctx context.Context) error {
+	return s.registerLiveWatches(ctx, true)
+}
+
+// registerLiveWatches loads the Store's coherent watch snapshot and installs
+// address and outpoint notifications while draining scoped events.
+func (s *syncer) registerLiveWatches(ctx context.Context,
+	applyEvents bool) error {
+
 	// Read both interest groups together so retries cannot combine address
 	// and output selections from separately timed storage snapshots.
 	watches, err := s.store.LoadWatchSet(ctx, s.walletID)
@@ -369,9 +386,11 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 	// on this owning goroutine while watch RPCs run so synchronous backend
 	// notifications (for example, mempool spends from NotifySpent) cannot
 	// overflow the bounded subscription buffer.
-	err = s.runWatchWithDrain(ctx, func(watchCtx context.Context) error {
-		return s.sub.WatchAddrs(watchCtx, addrs)
-	})
+	err = s.runWatchWithDrain(
+		ctx, func(watchCtx context.Context) error {
+			return s.sub.WatchAddrs(watchCtx, addrs)
+		}, applyEvents,
+	)
 	if err != nil {
 		return fmt.Errorf("register addresses: %w", err)
 	}
@@ -386,16 +405,19 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 		outpoints = append(outpoints, &watches.OutPoints[i])
 	}
 
-	return s.runWatchWithDrain(ctx, func(watchCtx context.Context) error {
-		return s.sub.WatchOutputs(watchCtx, outpoints)
-	})
+	return s.runWatchWithDrain(
+		ctx, func(watchCtx context.Context) error {
+			return s.sub.WatchOutputs(watchCtx, outpoints)
+		}, applyEvents,
+	)
 }
 
 // runWatchWithDrain runs a blocking watch registration call while buffering
 // non-empty events from s.sub.Events in memory on the owning goroutine, then
-// applies those buffered events in source order once registration finishes.
+// queues or applies those buffered events in source order once registration
+// finishes.
 func (s *syncer) runWatchWithDrain(ctx context.Context,
-	register func(context.Context) error) error {
+	register func(context.Context) error, applyEvents bool) error {
 
 	watchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -430,7 +452,7 @@ func (s *syncer) runWatchWithDrain(ctx context.Context,
 
 drainRemaining:
 	// Empty any events already enqueued by the completed watch call before
-	// applying them or starting a subsequent outpoint chunk.
+	// finalizing them or starting a subsequent outpoint chunk.
 	for {
 		select {
 		case event, ok := <-s.sub.Events():
@@ -441,11 +463,29 @@ drainRemaining:
 			buffered = appendWatchEvent(buffered, event)
 
 		default:
-			applyErr := s.applyWatchEvents(ctx, buffered)
+			applyErr := s.finishWatchEvents(
+				ctx, buffered, applyEvents,
+			)
 
 			return errors.Join(watchErr, applyErr)
 		}
 	}
+}
+
+// finishWatchEvents either defers drained events into pendingEvents for
+// initChainSync replay or applies them immediately in source order.
+func (s *syncer) finishWatchEvents(ctx context.Context, events []chain.Event,
+	applyEvents bool) error {
+
+	if !applyEvents {
+		for _, event := range events {
+			s.queuePendingEvent(event)
+		}
+
+		return nil
+	}
+
+	return s.applyWatchEvents(ctx, events)
 }
 
 // appendWatchEvent discards empty pre-sync connected blocks immediately and
@@ -530,8 +570,9 @@ func isStalePendingReplayErr(event chain.Event, err error) bool {
 		errors.Is(err, db.ErrBlockMismatch)
 }
 
-// replayPendingEvents drains queued actionable events in source order after a
-// pending disconnect succeeds.
+// replayPendingEvents drains queued actionable events captured during startup
+// watch setup or while a failed disconnect awaited retry, applying them in
+// source order.
 func (s *syncer) replayPendingEvents(ctx context.Context) error {
 	for len(s.pendingEvents) > 0 {
 		event := s.pendingEvents[0]
@@ -638,8 +679,9 @@ func (s *syncer) initChainSync(ctx context.Context) error {
 		}
 	}
 
-	// Replay actionable events drained while the failed disconnect awaited
-	// retry before checkRollback inspects the reconciled checkpoint.
+	// Replay actionable events drained during startup watch setup or while
+	// a failed disconnect awaited retry before checkRollback inspects the
+	// reconciled checkpoint.
 	if len(s.pendingEvents) > 0 {
 		err = s.replayPendingEvents(ctx)
 		if err != nil {
@@ -658,7 +700,7 @@ func (s *syncer) initChainSync(ctx context.Context) error {
 	//
 	// TODO(yy): Avoid rereading and registering the full set on each retry
 	// while preserving registration that failed after a committed scan.
-	err = s.refreshLiveWatches(ctx)
+	err = s.syncLiveWatches(ctx)
 	if err != nil {
 		return err
 	}
@@ -1455,7 +1497,7 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 		s.txManager.notifyTx(ctx, tx.Tx.TxHash())
 	}
 
-	// Apply the older retained observation before refreshLiveWatches drains
+	// Apply the older retained observation before syncLiveWatches drains
 	// newer events from s.sub.Events so a later disconnect cannot run ahead
 	// of an earlier confirmation. A zero-value EventUnknown is a no-op.
 	err = s.processChainEventBeforeSync(ctx, pending)
@@ -1466,7 +1508,7 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 	// A committed horizon or credit can introduce watches after startup;
 	// finish registration before catch-up reports this batch complete.
 	if refreshWatches {
-		return s.refreshLiveWatches(ctx)
+		return s.syncLiveWatches(ctx)
 	}
 
 	return nil
@@ -1514,7 +1556,7 @@ func (s *syncer) putTargetedBatch(ctx context.Context,
 	// Targeted scans can also store new addresses and outputs. Register
 	// them after the commit using the scan worker's lifetime context.
 	if len(params.Horizons) > 0 || len(params.Transactions) > 0 {
-		return s.refreshLiveWatches(ctx), pendingErr
+		return s.syncLiveWatches(ctx), pendingErr
 	}
 
 	return nil, pendingErr
