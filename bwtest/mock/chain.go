@@ -254,21 +254,22 @@ func (m *Chain) SubscribeChainEvents(
 	return sub
 }
 
-// eventSubBufferSize matches chain's per-subscription event buffer so overflow
-// tests exercise the same bounded queue semantics in memory.
+// eventSubBufferSize is the bounded in-memory buffer capacity of mock
+// EventSubscription instances used in tests and benchmarks.
 const eventSubBufferSize = 100
 
 // EventSubscription is an in-memory mock implementation of
 // chain.EventSubscription for tests and benchmarks.
 type EventSubscription struct {
-	mu       sync.Mutex
-	client   chain.Interface
-	events   chan chain.Event
-	done     chan struct{}
-	canceled <-chan struct{}
-	stopCtx  func() bool
-	closed   bool
-	err      error
+	mu           sync.Mutex
+	client       chain.Interface
+	events       chan chain.Event
+	done         chan struct{}
+	canceled     <-chan struct{}
+	stopCtx      func() bool
+	watchedAddrs map[string]struct{}
+	closed       bool
+	err          error
 }
 
 // A compile-time assertion to ensure that EventSubscription implements
@@ -281,9 +282,10 @@ func NewEventSubscription(ctx context.Context,
 	client chain.Interface) *EventSubscription {
 
 	sub := &EventSubscription{
-		client: client,
-		events: make(chan chain.Event, eventSubBufferSize),
-		done:   make(chan struct{}),
+		client:       client,
+		events:       make(chan chain.Event, eventSubBufferSize),
+		done:         make(chan struct{}),
+		watchedAddrs: make(map[string]struct{}),
 	}
 	if ctx == nil {
 		return sub
@@ -390,7 +392,24 @@ func (s *EventSubscription) checkWatchable(ctx context.Context) error {
 	return nil
 }
 
-// WatchAddrs forwards address watch registration to the backing mock client.
+// HasWatchedAddr reports whether addr has been registered through WatchAddrs on
+// this mock subscription.
+func (s *EventSubscription) HasWatchedAddr(addr address.Address) bool {
+	if addr == nil {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, ok := s.watchedAddrs[addr.EncodeAddress()]
+
+	return ok
+}
+
+// WatchAddrs records addrs on this mock subscription before forwarding address
+// watch registration to the backing mock client, rolling back newly added keys
+// if the backend call fails.
 func (s *EventSubscription) WatchAddrs(ctx context.Context,
 	addrs []address.Address) error {
 
@@ -399,11 +418,38 @@ func (s *EventSubscription) WatchAddrs(ctx context.Context,
 		return err
 	}
 
+	added := make([]string, 0, len(addrs))
+
+	s.mu.Lock()
+	for _, addr := range addrs {
+		if addr == nil {
+			continue
+		}
+
+		key := addr.EncodeAddress()
+		if _, exists := s.watchedAddrs[key]; !exists {
+			s.watchedAddrs[key] = struct{}{}
+			added = append(added, key)
+		}
+	}
+	s.mu.Unlock()
+
 	if s.client == nil {
 		return nil
 	}
 
-	return s.client.WatchAddrsFromTip(ctx, addrs)
+	err = s.client.WatchAddrsFromTip(ctx, addrs)
+	if err != nil {
+		s.mu.Lock()
+		for _, key := range added {
+			delete(s.watchedAddrs, key)
+		}
+		s.mu.Unlock()
+
+		return err
+	}
+
+	return nil
 }
 
 // WatchOutputs forwards output watch registration to the backing mock client.
