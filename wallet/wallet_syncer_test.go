@@ -9823,28 +9823,33 @@ func TestSyncerRetriesFailedDisconnect(t *testing.T) {
 }
 
 // TestSyncerWaitForRetryServicesEvent verifies that waitForRetry processes a
-// queued mailbox event before the retry timer expires and pauses mailbox reads
-// once a failed disconnect is retained in pendingDisconnect.
+// queued mailbox event before the retry timer expires, keeps draining
+// s.sub.Events once pendingDisconnect is set, discards empty connected blocks,
+// and retains subsequent actionable events in source order.
 func TestSyncerWaitForRetryServicesEvent(t *testing.T) {
 	t.Parallel()
 
 	synctest.Test(t, func(t *testing.T) {
 		t.Helper()
 
-		// Arrange: Queue a failing BlockDisconnected followed by a
-		// second disconnect event so waitForRetry must pause mailbox
-		// reads after retaining the first failure.
+		// Arrange: Queue a failing BlockDisconnected followed by an
+		// empty connected block and a second disconnect so waitForRetry
+		// must keep draining without applying the second disconnect.
 		retry := make(chan time.Time)
 		src := &bwmock.Chain{}
 		src.On("IsCurrent").Return(false).Once()
 		t.Cleanup(func() { src.AssertExpectations(t) })
 
-		events := make(chan chain.Event, 2)
+		events := make(chan chain.Event, 3)
 		s := newTestSyncer(Config{Chain: src}, nil, nil, nil, nil, 1)
 		setTestSyncerEvents(s, events)
 
 		meta1 := wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 5}}
 		meta2 := wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 4}}
+		second := chain.Event{
+			Type:  chain.EventBlockDisconnected,
+			Block: &meta2,
+		}
 
 		events <- chain.Event{
 			Type:  chain.EventBlockDisconnected,
@@ -9852,13 +9857,14 @@ func TestSyncerWaitForRetryServicesEvent(t *testing.T) {
 		}
 
 		events <- chain.Event{
-			Type:  chain.EventBlockDisconnected,
-			Block: &meta2,
+			Type:  chain.EventBlockConnected,
+			Block: &wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 6}},
 		}
 
-		// Act: Start waitForRetry, wait until the worker processes the
-		// first event and blocks on the retry channel without draining
-		// the second event, then release retry.
+		events <- second
+
+		// Act: Start waitForRetry, wait until the worker drains the
+		// channel and blocks on retry, then release retry.
 		errCh := make(chan error, 1)
 		go func() {
 			errCh <- s.waitForRetry(t.Context(), retry)
@@ -9869,53 +9875,92 @@ func TestSyncerWaitForRetryServicesEvent(t *testing.T) {
 
 		err := <-errCh
 
-		// Assert: waitForRetry returns nil, retains only the first
-		// failed disconnect, and leaves the second event unread.
+		// Assert: waitForRetry returns nil, drains the channel, retains
+		// the first failed disconnect in pendingDisconnect, discards
+		// the empty block, and queues the second disconnect for replay.
 		require.NoError(t, err)
 		require.Equal(t, &meta1, s.pendingDisconnect)
-		require.Len(t, events, 1)
+		require.Empty(t, events)
+		require.Equal(t, []chain.Event{second}, s.pendingEvents)
 	})
 }
 
-// TestSyncerWaitUntilBackendSyncedPausesPendingDisconnect verifies that
-// waitUntilBackendSynced does not consume queued mailbox events while a
-// previously failed disconnect awaits retry in pendingDisconnect.
-func TestSyncerWaitUntilBackendSyncedPausesPendingDisconnect(t *testing.T) {
+// TestSyncerWaitUntilBackendSyncedDrainsDuringPendingDisconnect verifies that
+// waitUntilBackendSynced keeps draining s.sub.Events while a previously failed
+// disconnect awaits retry, discarding empty connected blocks across more than
+// the subscription buffer capacity and queuing actionable events in order.
+func TestSyncerWaitUntilBackendSyncedDrainsDuringPendingDisconnect(
+	t *testing.T) {
+
 	t.Parallel()
 
 	synctest.Test(t, func(t *testing.T) {
 		t.Helper()
 
 		// Arrange: Configure a syncer with a retained pendingDisconnect
-		// and one queued event in s.sub.Events while the backend
-		// becomes current on its next poll tick.
+		// on a bounded mock subscription while the backend becomes
+		// current on its next poll tick.
 		src := &bwmock.Chain{}
 		src.On("IsCurrent").Return(false).Once()
 		src.On("IsCurrent").Return(true).Once()
 		t.Cleanup(func() { src.AssertExpectations(t) })
 
-		events := make(chan chain.Event, 1)
-		s := newTestSyncer(Config{Chain: src}, nil, nil, nil, nil, 1)
-		setTestSyncerEvents(s, events)
+		sub := bwmock.NewEventSubscription(t.Context(), src)
+		s := newSyncer(
+			Config{Chain: src, ChainParams: &chainParams},
+			nil, nil, nil, nil, 1, sub,
+		)
 
 		pending := wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 5}}
 		s.pendingDisconnect = &pending
 
-		events <- chain.Event{
+		queuedDisconnect := chain.Event{
 			Type: chain.EventBlockDisconnected,
 			Block: &wtxmgr.BlockMeta{
 				Block: wtxmgr.Block{Height: 4},
 			},
 		}
 
-		// Act: Wait for backend sync to advance past the 1-second poll
-		// tick inside synctest fake time.
-		err := s.waitUntilBackendSynced(t.Context())
+		// Act: Start waitUntilBackendSynced, send more than
+		// cap(sub.Events()) empty connected blocks plus one actionable
+		// disconnect while !IsCurrent(), then advance fake time past
+		// the 1-second poll tick.
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- s.waitUntilBackendSynced(t.Context())
+		}()
 
-		// Assert: waitUntilBackendSynced succeeds once the backend is
-		// current while leaving the queued mailbox event unread.
+		synctest.Wait()
+
+		burst := cap(sub.Events()) + 5
+		for i := range burst {
+			sub.Send(chain.Event{
+				Type: chain.EventBlockConnected,
+				Block: &wtxmgr.BlockMeta{
+					Block: wtxmgr.Block{
+						Height: int32(i + 1),
+						Hash:   chainhash.Hash{byte(i + 1)},
+					},
+				},
+			})
+			synctest.Wait()
+		}
+
+		sub.Send(queuedDisconnect)
+		synctest.Wait()
+
+		time.Sleep(time.Second)
+		synctest.Wait()
+
+		err := <-errCh
+
+		// Assert: The subscription never overflowed, pendingDisconnect
+		// stayed intact, empty blocks were discarded, and only the
+		// actionable disconnect was queued for initChainSync replay.
 		require.NoError(t, err)
-		require.Len(t, events, 1)
+		require.NoError(t, sub.Err())
+		require.Equal(t, &pending, s.pendingDisconnect)
+		require.Equal(t, []chain.Event{queuedDisconnect}, s.pendingEvents)
 	})
 }
 
@@ -10208,4 +10253,353 @@ func TestSyncerDisconnectDoesNotRetryIndeterminateCommit(t *testing.T) {
 		require.ErrorIs(t, err, db.ErrIndeterminateCommit)
 		require.Nil(t, s.pendingDisconnect)
 	})
+}
+
+// TestSyncerPreSyncRecordsCheckpointPayment verifies that
+// processChainEventBeforeSync records a matched EventBlockConnected through
+// ApplyTxBatch without advancing SyncedTo.
+func TestSyncerPreSyncRecordsCheckpointPayment(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Build a syncer over a strict mock Store with one matched
+	// block event.
+	store := &walletmock.Store{}
+	s := newTestSyncer(
+		Config{ChainParams: &chainParams}, nil, nil, nil, store, 7,
+	)
+	t.Cleanup(func() { store.AssertExpectations(t) })
+
+	blockMeta := &wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{
+			Hash:   chainhash.Hash{0x11},
+			Height: 1,
+		},
+		Time: time.Unix(1710000100, 0).UTC(),
+	}
+	payment := wire.NewMsgTx(2)
+	payment.AddTxIn(wire.NewTxIn(&wire.OutPoint{
+		Hash: chainhash.Hash{0x22},
+	}, nil, nil))
+	payment.AddTxOut(wire.NewTxOut(2500, []byte{txscript.OP_TRUE}))
+	paymentRec, err := wtxmgr.NewTxRecordFromMsgTx(payment, blockMeta.Time)
+	require.NoError(t, err)
+
+	store.On("ApplyTxBatch", mock.Anything, mock.MatchedBy(
+		func(params db.TxBatchParams) bool {
+			return params.WalletID == 7 &&
+				params.SyncedTo == nil &&
+				len(params.Transactions) == 1 &&
+				params.Transactions[0].Tx.TxHash() ==
+					paymentRec.Hash
+		},
+	)).Return(nil).Once()
+
+	// Act: Drain the matched connected block through
+	// processChainEventBeforeSync.
+	require.NoError(t, s.processChainEventBeforeSync(t.Context(), chain.Event{
+		Type:        chain.EventBlockConnected,
+		Block:       blockMeta,
+		RelevantTxs: []*wtxmgr.TxRecord{paymentRec},
+	}))
+}
+
+// TestSyncerBackendSyncSurvivesDetachAndCatchUp verifies that draining scoped
+// events during !IsCurrent() catch-up retains a live subscription across more
+// than cap(s.sub.Events) empty connected blocks and replays a pre-sync detach
+// once the backend flips current.
+func TestSyncerBackendSyncSurvivesDetachAndCatchUp(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		t.Helper()
+
+		// Arrange: Wire a Wallet's real syncer to an in-memory scoped
+		// subscription (buffer size 100) while IsCurrent starts false.
+		w, deps := createTestWalletWithMocks(t)
+		sub := bwmock.NewEventSubscription(w.lifetimeCtx, deps.chain)
+		s := newSyncer(
+			w.cfg, w.addrStore, w.txStore, w, w.store, w.id, sub,
+		)
+		w.sync = s
+		w.state = newWalletState(s)
+
+		genesis := db.Block{Hash: *chainParams.GenesisHash}
+		detached := db.Block{
+			Height: 1,
+			Hash:   chainhash.Hash{1},
+		}
+
+		isCurrentCall := deps.chain.On("IsCurrent").Return(false)
+		deps.chain.On("NotifyBlocks").Return(nil).Once()
+		deps.store.On("GetWallet", mock.Anything, w.cfg.Name).Return(
+			&db.WalletInfo{SyncedTo: &genesis}, nil,
+		).Maybe()
+		deps.store.On("ListSyncedBlocks", mock.Anything,
+			db.ListSyncedBlocksQuery{
+				WalletID:    w.id,
+				StartHeight: 0,
+				EndHeight:   0,
+			}).Return([]db.Block{genesis}, nil).Once()
+		deps.store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+			WalletID:    w.id,
+			StartHeight: 1,
+			EndHeight:   math.MaxInt32,
+		}).Return([]db.TxInfo(nil), nil).Once()
+		deps.chain.On("GetBlockHash", int64(0)).Return(
+			chainParams.GenesisHash, nil,
+		).Once()
+		deps.store.On(
+			"DisconnectBlock", mock.Anything, w.id, detached,
+			&genesis, map[uint32]*chainhash.Hash{1: nil},
+		).Return(nil).Once()
+		deps.store.On("LoadWatchSet", mock.Anything, w.id).Return(
+			db.WatchSet{}, nil,
+		).Once()
+		deps.chain.On(
+			"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
+		).Return(nil).Once()
+		deps.chain.On("GetBestBlock").Return(
+			chainParams.GenesisHash, int32(0), nil,
+		).Maybe()
+		deps.store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+			WalletID:    w.id,
+			UnminedOnly: true,
+		}).Return(nil, nil).Maybe()
+
+		w.wg.Go(w.runSyncLoop)
+		t.Cleanup(func() {
+			w.cancel()
+			w.wg.Wait()
+		})
+		synctest.Wait()
+
+		// Act: Publish more than cap(s.sub.Events()) empty connected
+		// blocks while the backend is still catching up so the sync
+		// worker drains the stream continuously without Store writes,
+		// then publish a pre-sync detach that is retained for retry.
+		burst := cap(s.sub.Events()) + 5
+		for i := range burst {
+			sub.Send(chain.Event{
+				Type: chain.EventBlockConnected,
+				Block: &wtxmgr.BlockMeta{
+					Block: wtxmgr.Block{
+						Height: int32(i + 1),
+						Hash:   chainhash.Hash{byte(i + 1)},
+					},
+				},
+			})
+			synctest.Wait()
+		}
+
+		sub.Send(chain.Event{
+			Type: chain.EventBlockDisconnected,
+			Block: &wtxmgr.BlockMeta{
+				Block: wtxmgr.Block{
+					Height: 1,
+					Hash:   detached.Hash,
+				},
+			},
+		})
+		synctest.Wait()
+
+		// Flip backend readiness and advance fake time past the retry
+		// backoff so the worker replays the pending disconnect,
+		// finishes startup, and reports synced.
+		isCurrentCall.Return(true)
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+
+		// Assert: The subscription never overflowed or closed, the
+		// pending disconnect was replayed and cleared, and the worker
+		// reached syncStateSynced.
+		select {
+		case <-s.sub.Done():
+			require.FailNowf(
+				t, "subscription closed",
+				"unexpected stream error: %v", s.sub.Err(),
+			)
+		default:
+		}
+
+		require.NoError(t, s.sub.Err())
+		require.Nil(t, s.pendingDisconnect)
+		require.Empty(t, s.pendingEvents)
+		require.Equal(t, syncStateSynced, s.syncState())
+	})
+}
+
+// TestSyncerInitReplaysPendingEventsAfterDisconnect verifies that initChainSync
+// replays a retained pendingDisconnect first and then replays queued actionable
+// events in source order before checkRollback runs.
+func TestSyncerInitReplaysPendingEventsAfterDisconnect(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Arm pendingDisconnect and one queued EventMempoolTx on a
+	// syncer whose backend is current and synced at genesis.
+	store := &walletmock.Store{}
+	src := &bwmock.Chain{}
+	sub := bwmock.NewEventSubscription(t.Context(), src)
+	s := newSyncer(
+		Config{Chain: src, ChainParams: &chainParams},
+		nil, nil, &Wallet{}, store, 7, sub,
+	)
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		src.AssertExpectations(t)
+	})
+
+	genesis := db.Block{Hash: *chainParams.GenesisHash}
+	detached := db.Block{Height: 1, Hash: chainhash.Hash{1}}
+	pending := wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Height: 1, Hash: detached.Hash},
+	}
+
+	mempoolTx := subscriptionTx([]byte{txscript.OP_TRUE}, 3)
+	mempoolRec, err := wtxmgr.NewTxRecordFromMsgTx(mempoolTx, time.Now())
+	require.NoError(t, err)
+
+	s.pendingDisconnect = &pending
+	s.pendingEvents = []chain.Event{
+		{
+			Type:        chain.EventMempoolTx,
+			RelevantTxs: []*wtxmgr.TxRecord{mempoolRec},
+		},
+	}
+
+	src.On("IsCurrent").Return(true).Twice()
+	src.On("GetBestBlock").Return(chainParams.GenesisHash, int32(0), nil).
+		Maybe()
+	src.On("GetBlockHash", int64(0)).Return(chainParams.GenesisHash, nil).
+		Maybe()
+	store.On("GetWallet", mock.Anything, "").Return(
+		&db.WalletInfo{SyncedTo: &genesis}, nil,
+	).Maybe()
+	store.On("ListSyncedBlocks", mock.Anything, db.ListSyncedBlocksQuery{
+		WalletID:    7,
+		StartHeight: 0,
+		EndHeight:   0,
+	}).Return([]db.Block{genesis}, nil).Once()
+	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID:    7,
+		StartHeight: 1,
+		EndHeight:   math.MaxInt32,
+	}).Return([]db.TxInfo(nil), nil).Once()
+
+	disconnectCall := store.On(
+		"DisconnectBlock", mock.Anything, uint32(7), detached,
+		&genesis, map[uint32]*chainhash.Hash{1: nil},
+	).Return(nil).Once()
+	replayCall := store.On("ApplyTxBatch", mock.Anything, mock.MatchedBy(
+		func(params db.TxBatchParams) bool {
+			return params.WalletID == 7 &&
+				params.SyncedTo == nil &&
+				len(params.Transactions) == 1 &&
+				params.Transactions[0].Tx.TxHash() ==
+					mempoolRec.Hash
+		},
+	)).Return(nil).Once().NotBefore(disconnectCall)
+
+	store.On("LoadWatchSet", mock.Anything, uint32(7)).Return(
+		db.WatchSet{}, nil,
+	).Once().NotBefore(replayCall)
+	src.On(
+		"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
+	).Return(nil).Once()
+	src.On("NotifyBlocks").Return(nil).Once()
+
+	// Act: Run initChainSync to replay the pending disconnect and queued
+	// mempool tx in source order before watch registration.
+	err = s.initChainSync(t.Context())
+
+	// Assert: Initialization succeeds and clears both pending queues.
+	require.NoError(t, err)
+	require.Nil(t, s.pendingDisconnect)
+	require.Empty(t, s.pendingEvents)
+}
+
+// TestReplayPendingEventsDropsInputConflict verifies that replayPendingEvents
+// drops stale unconfirmed events rejected with ErrTxInputConflict or
+// ErrTxInputInvalidParent and continues replaying subsequent queued events.
+func TestReplayPendingEventsDropsInputConflict(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		conflictErr error
+	}{
+		{
+			name:        "tx input conflict",
+			conflictErr: db.ErrTxInputConflict,
+		},
+		{
+			name:        "tx input invalid parent",
+			conflictErr: db.ErrTxInputInvalidParent,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Queue one conflicting mempool tx followed by
+			// one valid mempool tx in pendingEvents.
+			store := &walletmock.Store{}
+			s := newTestSyncer(
+				Config{ChainParams: &chainParams},
+				nil, nil, nil, store, 7,
+			)
+			t.Cleanup(func() { store.AssertExpectations(t) })
+
+			staleTx := subscriptionTx([]byte{txscript.OP_TRUE}, 10)
+			staleRec, err := wtxmgr.NewTxRecordFromMsgTx(
+				staleTx, time.Now(),
+			)
+			require.NoError(t, err)
+
+			validTx := subscriptionTx([]byte{txscript.OP_TRUE}, 11)
+			validRec, err := wtxmgr.NewTxRecordFromMsgTx(
+				validTx, time.Now(),
+			)
+			require.NoError(t, err)
+
+			s.pendingEvents = []chain.Event{
+				{
+					Type:        chain.EventMempoolTx,
+					RelevantTxs: []*wtxmgr.TxRecord{staleRec},
+				},
+				{
+					Type:        chain.EventMempoolTx,
+					RelevantTxs: []*wtxmgr.TxRecord{validRec},
+				},
+			}
+
+			staleCall := store.On(
+				"ApplyTxBatch", mock.Anything, mock.MatchedBy(
+					func(p db.TxBatchParams) bool {
+						return len(p.Transactions) == 1 &&
+							p.Transactions[0].Tx.TxHash() ==
+								staleRec.Hash
+					},
+				),
+			).Return(tc.conflictErr).Once()
+			store.On(
+				"ApplyTxBatch", mock.Anything, mock.MatchedBy(
+					func(p db.TxBatchParams) bool {
+						return len(p.Transactions) == 1 &&
+							p.Transactions[0].Tx.TxHash() ==
+								validRec.Hash
+					},
+				),
+			).Return(nil).Once().NotBefore(staleCall)
+
+			// Act: Replay pendingEvents across the deterministic
+			// input conflict.
+			err = s.replayPendingEvents(t.Context())
+
+			// Assert: Replay succeeds without wedging, drops the
+			// conflicting event, and applies the following event.
+			require.NoError(t, err)
+			require.Empty(t, s.pendingEvents)
+		})
+	}
 }

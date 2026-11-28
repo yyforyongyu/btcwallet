@@ -307,6 +307,11 @@ type syncer struct {
 	// next initialization replays it before startup rollback or later
 	// mailbox events can overtake it.
 	pendingDisconnect *wtxmgr.BlockMeta
+
+	// pendingEvents holds actionable scoped events drained while
+	// pendingDisconnect awaits retry so the subscription never overflows
+	// and source order is preserved across initChainSync replay.
+	pendingEvents []chain.Event
 }
 
 // A compile-time assertion to ensure that syncer implements chainProcessor.
@@ -376,6 +381,68 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 	return s.sub.WatchOutputs(ctx, outpoints)
 }
 
+// hasPendingReplay reports whether a failed disconnect or deferred event queue
+// must be replayed before newer live events may apply directly.
+func (s *syncer) hasPendingReplay() bool {
+	return s.pendingDisconnect != nil || len(s.pendingEvents) > 0
+}
+
+// queuePendingEvent discards empty connected blocks immediately and retains
+// actionable scoped events in source order while a pending disconnect awaits
+// retry.
+func (s *syncer) queuePendingEvent(event chain.Event) {
+	if event.Type == chain.EventBlockConnected && event.Block != nil &&
+		len(event.RelevantTxs) == 0 {
+
+		return
+	}
+
+	s.pendingEvents = append(s.pendingEvents, event)
+}
+
+// replayPendingEvents drains queued actionable events in source order after a
+// pending disconnect succeeds.
+func (s *syncer) replayPendingEvents(ctx context.Context) error {
+	for len(s.pendingEvents) > 0 {
+		event := s.pendingEvents[0]
+
+		err := s.processChainEventBeforeSync(ctx, event)
+		if err != nil {
+			// Drop stale unconfirmed conflicts superseded by
+			// canonical history so later queued events and
+			// initChainSync retries make forward progress.
+			if errors.Is(err, db.ErrTxInputConflict) ||
+				errors.Is(err, db.ErrTxInputInvalidParent) {
+
+				log.Debugf("Dropping conflicting pending "+
+					"chain event: %v", err)
+
+				s.pendingEvents = s.pendingEvents[1:]
+
+				continue
+			}
+
+			// A failed disconnect is now retained in
+			// pendingDisconnect, and an indeterminate commit must
+			// not be replayed again; drop the front entry before
+			// returning so the remaining suffix keeps its order.
+			if event.Type == chain.EventBlockDisconnected ||
+				errors.Is(err, db.ErrIndeterminateCommit) {
+
+				s.pendingEvents = s.pendingEvents[1:]
+			}
+
+			return err
+		}
+
+		s.pendingEvents = s.pendingEvents[1:]
+	}
+
+	s.pendingEvents = nil
+
+	return nil
+}
+
 // watchAddress decodes a receiving script for live and recovery watches.
 // Both paths select the first address using this Wallet's network.
 func (s *syncer) watchAddress(script []byte) (address.Address, error) {
@@ -442,6 +509,15 @@ func (s *syncer) initChainSync(ctx context.Context) error {
 		}
 	}
 
+	// Replay actionable events drained while the failed disconnect awaited
+	// retry before checkRollback inspects the reconciled checkpoint.
+	if len(s.pendingEvents) > 0 {
+		err = s.replayPendingEvents(ctx)
+		if err != nil {
+			return fmt.Errorf("replay pending events: %w", err)
+		}
+	}
+
 	// Check for any reorgs that happened while we were down.
 	err = s.checkRollback(ctx)
 	if err != nil {
@@ -481,18 +557,15 @@ func (s *syncer) initChainSync(ctx context.Context) error {
 }
 
 // waitForRetry lets the worker service scoped chain events across retries while
-// the Wallet controls the retry deadline.
+// the Wallet controls the retry deadline. Event write failures log and
+// continue: unconfirmed mempool conflicts rely on confirmed blocks as
+// authoritative, and transient pre-commit write failures on supplemental
+// pre-sync blocks follow the same log-and-continue policy as synced
+// waitForEvent processing.
 func (s *syncer) waitForRetry(ctx context.Context,
 	retry <-chan time.Time) error {
 
 	for {
-		// Pause mailbox reads while a failed disconnect awaits retry so
-		// queued events cannot overtake the pending rewind.
-		events := s.sub.Events()
-		if s.pendingDisconnect != nil {
-			events = nil
-		}
-
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -500,9 +573,15 @@ func (s *syncer) waitForRetry(ctx context.Context,
 		case <-retry:
 			return nil
 
-		case event, ok := <-events:
+		case event, ok := <-s.sub.Events():
 			if !ok {
 				return ErrWalletShuttingDown
+			}
+
+			if s.hasPendingReplay() {
+				s.queuePendingEvent(event)
+
+				continue
 			}
 
 			err := s.processChainEventBeforeSync(ctx, event)
@@ -532,17 +611,16 @@ func (s *syncer) waitUntilBackendSynced(ctx context.Context) error {
 	defer t.Stop()
 
 	for {
-		// Pause mailbox reads while a failed disconnect awaits retry so
-		// queued events cannot overtake the pending rewind.
-		events := s.sub.Events()
-		if s.pendingDisconnect != nil {
-			events = nil
-		}
-
 		select {
-		case event, ok := <-events:
+		case event, ok := <-s.sub.Events():
 			if !ok {
 				return ErrWalletShuttingDown
+			}
+
+			if s.hasPendingReplay() {
+				s.queuePendingEvent(event)
+
+				continue
 			}
 
 			err := s.processChainEventBeforeSync(ctx, event)
@@ -2058,9 +2136,14 @@ func (s *syncer) processChainEventBeforeSync(ctx context.Context,
 	event chain.Event) error {
 
 	// Known matches are safe to record, but historical scanning must still
-	// visit this height after recovery and watch registration finish. Leave
-	// malformed metadata to the ordinary handler's existing validation.
+	// visit this height after recovery and watch registration finish. Empty
+	// connected blocks drain cleanly without Store writes, while malformed
+	// nil-block metadata reaches ordinary validation below.
 	if event.Type == chain.EventBlockConnected && event.Block != nil {
+		if len(event.RelevantTxs) == 0 {
+			return nil
+		}
+
 		return s.putTxNotifications(
 			ctx, prepareTxMatches(
 				event.RelevantTxs, s.cfg.ChainParams,
