@@ -313,8 +313,8 @@ type syncer struct {
 	pendingDisconnect *wtxmgr.BlockMeta
 
 	// pendingEvents holds actionable scoped events drained while
-	// pendingDisconnect awaits retry so the subscription never overflows
-	// and source order is preserved across initChainSync replay.
+	// pendingDisconnect or startup watch setup awaits initChainSync replay
+	// so the subscription never overflows and source order is preserved.
 	pendingEvents []chain.Event
 }
 
@@ -365,9 +365,13 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 		addrs[i] = addr
 	}
 
-	// Wallet shutdown must still cancel registration. A later sync
-	// initialization reads the persisted watch set again.
-	err = s.sub.WatchAddrs(ctx, addrs)
+	// Wallet shutdown must still cancel registration. Drain scoped events
+	// on this owning goroutine while watch RPCs run so synchronous backend
+	// notifications (for example, mempool spends from NotifySpent) cannot
+	// overflow the bounded subscription buffer.
+	err = s.runWatchWithDrain(ctx, func(watchCtx context.Context) error {
+		return s.sub.WatchAddrs(watchCtx, addrs)
+	})
 	if err != nil {
 		return fmt.Errorf("register addresses: %w", err)
 	}
@@ -382,7 +386,121 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 		outpoints = append(outpoints, &watches.OutPoints[i])
 	}
 
-	return s.sub.WatchOutputs(ctx, outpoints)
+	return s.runWatchWithDrain(ctx, func(watchCtx context.Context) error {
+		return s.sub.WatchOutputs(watchCtx, outpoints)
+	})
+}
+
+// runWatchWithDrain runs a blocking watch registration call while buffering
+// non-empty events from s.sub.Events in memory on the owning goroutine, then
+// applies those buffered events in source order once registration finishes.
+func (s *syncer) runWatchWithDrain(ctx context.Context,
+	register func(context.Context) error) error {
+
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- register(watchCtx)
+	}()
+
+	var (
+		buffered []chain.Event
+		watchErr error
+	)
+
+	for {
+		select {
+		case watchErr = <-done:
+			goto drainRemaining
+
+		case event, ok := <-s.sub.Events():
+			if !ok {
+				cancel()
+				<-done
+
+				return ErrWalletShuttingDown
+			}
+
+			buffered = appendWatchEvent(buffered, event)
+		}
+	}
+
+drainRemaining:
+	// Empty any events already enqueued by the completed watch call before
+	// applying them or starting a subsequent outpoint chunk.
+	for {
+		select {
+		case event, ok := <-s.sub.Events():
+			if !ok {
+				return ErrWalletShuttingDown
+			}
+
+			buffered = appendWatchEvent(buffered, event)
+
+		default:
+			applyErr := s.applyWatchEvents(ctx, buffered)
+
+			return errors.Join(watchErr, applyErr)
+		}
+	}
+}
+
+// appendWatchEvent discards empty pre-sync connected blocks immediately and
+// preserves all actionable events in source order.
+func appendWatchEvent(buffered []chain.Event,
+	event chain.Event) []chain.Event {
+
+	if event.Type == chain.EventBlockConnected && event.Block != nil &&
+		len(event.RelevantTxs) == 0 {
+
+		return buffered
+	}
+
+	return append(buffered, event)
+}
+
+// applyWatchEvents applies scoped events drained during watch registration in
+// source order on the owning goroutine, preserving pending-disconnect order
+// and propagating disconnect or indeterminate-commit failures for retry.
+func (s *syncer) applyWatchEvents(ctx context.Context,
+	events []chain.Event) error {
+
+	var pendingErr error
+	for _, event := range events {
+		if s.hasPendingReplay() {
+			s.queuePendingEvent(event)
+
+			continue
+		}
+
+		err := s.processChainEventBeforeSync(ctx, event)
+		if err == nil {
+			continue
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Propagate failed disconnects (which arm pendingDisconnect)
+		// and indeterminate commits so callers retry before advancing
+		// or processing newer live events.
+		if event.Type == chain.EventBlockDisconnected ||
+			errors.Is(err, db.ErrIndeterminateCommit) {
+
+			pendingErr = errors.Join(pendingErr, err)
+
+			continue
+		}
+
+		log.Errorf("Chain event processing failed during watch "+
+			"setup: %v", err)
+	}
+
+	return pendingErr
 }
 
 // hasPendingReplay reports whether a failed disconnect or deferred event queue
@@ -392,16 +510,10 @@ func (s *syncer) hasPendingReplay() bool {
 }
 
 // queuePendingEvent discards empty connected blocks immediately and retains
-// actionable scoped events in source order while a pending disconnect awaits
-// retry.
+// actionable scoped events in source order while a pending disconnect or
+// startup watch refresh awaits initChainSync replay.
 func (s *syncer) queuePendingEvent(event chain.Event) {
-	if event.Type == chain.EventBlockConnected && event.Block != nil &&
-		len(event.RelevantTxs) == 0 {
-
-		return
-	}
-
-	s.pendingEvents = append(s.pendingEvents, event)
+	s.pendingEvents = appendWatchEvent(s.pendingEvents, event)
 }
 
 // isStalePendingReplayErr reports whether a replayed pre-sync event was
@@ -1361,7 +1473,7 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 }
 
 // putTargetedBatch persists targeted recovery scan results and applies the
-// older retained live observation before refreshLiveWatches drains newer events
+// older retained live observation before syncLiveWatches drains newer events
 // from s.sub.Events.
 func (s *syncer) putTargetedBatch(ctx context.Context,
 	scanState *RecoveryState, results []scanResult,
@@ -1395,8 +1507,8 @@ func (s *syncer) putTargetedBatch(ctx context.Context,
 		s.txManager.notifyTx(ctx, tx.Tx.TxHash())
 	}
 
-	// Replay the older retained event before refreshLiveWatches drains
-	// newer events from s.sub.Events.
+	// Replay the older retained event before syncLiveWatches drains newer
+	// events from s.sub.Events.
 	pendingErr := s.processChainEventBeforeSync(ctx, pending)
 
 	// Targeted scans can also store new addresses and outputs. Register

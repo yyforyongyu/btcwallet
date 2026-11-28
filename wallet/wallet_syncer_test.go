@@ -10768,3 +10768,173 @@ func TestReplayPendingEventsDropsStaleEvents(t *testing.T) {
 		})
 	}
 }
+
+// TestPutSyncBatchAppliesPendingBeforeRefreshLiveWatches verifies that
+// putSyncBatch applies an older queued block confirmation before
+// refreshLiveWatches drains a newer disconnect for that same block.
+func TestPutSyncBatchAppliesPendingBeforeRefreshLiveWatches(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Queue a block 2 confirmation before putSyncBatch commits a
+	// batch that triggers refreshLiveWatches, and deliver block 2's
+	// disconnect during WatchAddrsFromTip.
+	store := &walletmock.Store{}
+	src := &bwmock.Chain{}
+	sub := bwmock.NewEventSubscription(t.Context(), src)
+	s := newSyncer(
+		Config{Chain: src, ChainParams: &chainParams},
+		nil, nil, &Wallet{}, store, 7, sub,
+	)
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		src.AssertExpectations(t)
+	})
+
+	fixture := newStoreScanBatchFixture(t)
+	scanState := NewRecoveryState(0, &chainParams, nil)
+	seedScanStateAccountID(scanState, fixture)
+
+	block2 := &wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{
+			Height: 2,
+			Hash:   chainhash.Hash{2},
+		},
+		Time: time.Unix(1710000200, 0).UTC(),
+	}
+	genesis := db.Block{Hash: *chainParams.GenesisHash}
+	detached := db.Block{
+		Height:    2,
+		Hash:      block2.Hash,
+		Timestamp: block2.Time,
+	}
+
+	payTx := subscriptionTx([]byte{txscript.OP_TRUE}, 20)
+	payRec, err := wtxmgr.NewTxRecordFromMsgTx(payTx, block2.Time)
+	require.NoError(t, err)
+
+	sub.Send(chain.Event{
+		Type:        chain.EventBlockConnected,
+		Block:       block2,
+		RelevantTxs: []*wtxmgr.TxRecord{payRec},
+	})
+
+	scanCall := store.On("ApplyScanBatch", mock.Anything, mock.Anything).
+		Return(nil).Once()
+	pendingCall := store.On("ApplyTxBatch", mock.Anything, mock.MatchedBy(
+		func(params db.TxBatchParams) bool {
+			return params.WalletID == 7 &&
+				params.SyncedTo == nil &&
+				len(params.Transactions) == 1 &&
+				params.Transactions[0].Tx.TxHash() ==
+					payRec.Hash
+		},
+	)).Return(nil).Once().NotBefore(scanCall)
+	watchLoadCall := store.On("LoadWatchSet", mock.Anything, uint32(7)).
+		Return(db.WatchSet{}, nil).Once().NotBefore(pendingCall)
+	watchCall := src.On(
+		"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
+	).Run(func(mock.Arguments) {
+		sub.Send(chain.Event{
+			Type:  chain.EventBlockDisconnected,
+			Block: block2,
+		})
+	}).Return(nil).Once().NotBefore(watchLoadCall)
+
+	src.On("IsCurrent").Return(true).Once().NotBefore(watchCall)
+	src.On("GetBestBlock").Return(chainParams.GenesisHash, int32(0), nil).
+		Maybe()
+	src.On("GetBlockHash", int64(0)).Return(chainParams.GenesisHash, nil).
+		Maybe()
+	store.On("GetWallet", mock.Anything, "").Return(
+		&db.WalletInfo{SyncedTo: &genesis}, nil,
+	).Maybe()
+	store.On("ListSyncedBlocks", mock.Anything, db.ListSyncedBlocksQuery{
+		WalletID:    7,
+		StartHeight: 0,
+		EndHeight:   0,
+	}).Return([]db.Block{genesis}, nil).Once()
+	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID:    7,
+		StartHeight: 1,
+		EndHeight:   math.MaxInt32,
+	}).Return([]db.TxInfo(nil), nil).Once()
+	store.On(
+		"DisconnectBlock", mock.Anything, uint32(7), detached,
+		&genesis, map[uint32]*chainhash.Hash{2: nil},
+	).Return(nil).Once().NotBefore(watchCall)
+
+	// Act: Commit the sync batch so pending applies before
+	// refreshLiveWatches drains the newer disconnect.
+	err = s.putSyncBatch(
+		t.Context(), scanState, []scanResult{fixture.result},
+	)
+
+	// Assert: Ordered mock expectations confirm block 2's confirmation
+	// ran before block 2's disconnect drained during watch setup.
+	require.NoError(t, err)
+}
+
+// TestInitChainSyncFailsWhenWatchDisconnectFails verifies that a failed
+// EventBlockDisconnected drained during initChainSync's refreshLiveWatches
+// propagates an error and queues later drained events instead of stranding
+// replay and letting waitForEvent overtake the pending disconnect.
+func TestInitChainSyncFailsWhenWatchDisconnectFails(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Make initChainSync reach refreshLiveWatches, then deliver a
+	// disconnect whose backend check fails followed by a newer mempool tx.
+	store := &walletmock.Store{}
+	src := &bwmock.Chain{}
+	sub := bwmock.NewEventSubscription(t.Context(), src)
+	s := newSyncer(
+		Config{Chain: src, ChainParams: &chainParams},
+		nil, nil, &Wallet{}, store, 7, sub,
+	)
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		src.AssertExpectations(t)
+	})
+
+	genesis := db.Block{Hash: *chainParams.GenesisHash}
+	detachedMeta := wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Height: 3, Hash: chainhash.Hash{3}},
+	}
+	newerTx := subscriptionTx([]byte{txscript.OP_TRUE}, 30)
+	newerRec, err := wtxmgr.NewTxRecordFromMsgTx(newerTx, time.Now())
+	require.NoError(t, err)
+
+	newerEvent := chain.Event{
+		Type:        chain.EventMempoolTx,
+		RelevantTxs: []*wtxmgr.TxRecord{newerRec},
+	}
+
+	src.On("IsCurrent").Return(true).Once()
+	store.On("GetWallet", mock.Anything, "").Return(
+		&db.WalletInfo{SyncedTo: &genesis}, nil,
+	).Once()
+	store.On("LoadWatchSet", mock.Anything, uint32(7)).Return(
+		db.WatchSet{}, nil,
+	).Once()
+	src.On(
+		"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
+	).Run(func(mock.Arguments) {
+		sub.Send(chain.Event{
+			Type:  chain.EventBlockDisconnected,
+			Block: &detachedMeta,
+		})
+		sub.Send(newerEvent)
+	}).Return(nil).Once()
+	// Flip IsCurrent to false for the drained disconnect so disconnectBlock
+	// fails and arms pendingDisconnect.
+	src.On("IsCurrent").Return(false).Once()
+
+	// Act: Run initChainSync through refreshLiveWatches.
+	err = s.initChainSync(t.Context())
+
+	// Assert: initChainSync returns the disconnect error so runSyncLoop
+	// retries, keeping the failed disconnect armed and queuing the newer
+	// mempool tx without applying it ahead of the disconnect.
+	require.ErrorContains(t, err, "disconnect source is not current")
+	require.Equal(t, &detachedMeta, s.pendingDisconnect)
+	require.Equal(t, []chain.Event{newerEvent}, s.pendingEvents)
+}
