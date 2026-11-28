@@ -6,6 +6,7 @@ import (
 	"math"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -1102,8 +1103,8 @@ func TestControllerStop(t *testing.T) {
 	require.ErrorIs(t, err, ErrWalletStopped)
 }
 
-// TestControllerStopBeforeStart verifies that stop makes an Initialized
-// Wallet terminal without attempting to cancel workers that do not exist.
+// TestControllerStopBeforeStart verifies that stop cancels an Initialized
+// Wallet's lifetime context and marks it terminal without starting workers.
 func TestControllerStopBeforeStart(t *testing.T) {
 	t.Parallel()
 
@@ -1115,10 +1116,48 @@ func TestControllerStopBeforeStart(t *testing.T) {
 	stopErr := w.stop()
 	startErr := w.start(t.Context())
 
-	// Assert: Stop succeeds directly and permanently prevents the retained
-	// Wallet instance from starting later.
+	// Assert: Stop cancels lifetimeCtx, succeeds directly, and permanently
+	// prevents the retained Wallet instance from starting later.
 	require.NoError(t, stopErr)
+	require.ErrorIs(t, w.lifetimeCtx.Err(), context.Canceled)
 	require.ErrorIs(t, startErr, ErrWalletStopped)
+}
+
+// TestWalletMainLoopChainDoneSkipsDuplicateStop verifies that when Wallet.stop
+// has already canceled lifetimeCtx before chainDone closes, mainLoop exits
+// without sending a duplicate requestStop back to Manager.
+func TestWalletMainLoopChainDoneSkipsDuplicateStop(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Repeat with both chainDone and lifetimeCtx.Done() ready so
+	// Go's pseudo-random select exercises the <-chainDone branch.
+	const iterations = 64
+	for range iterations {
+		w, deps := createTestWalletWithMocks(t)
+
+		chainDone := make(chan struct{})
+		close(chainDone)
+		deps.syncer.sub = stubChainEventSub{done: chainDone}
+
+		var stopRequested atomic.Bool
+
+		w.requestStop = func(*Wallet) {
+			stopRequested.Store(true)
+		}
+
+		// Cancel lifetimeCtx first, matching Wallet.stop before w.wg.Wait.
+		w.cancel()
+
+		// Act: Run mainLoop to completion while both channels are closed.
+		w.wg.Add(1)
+
+		go w.mainLoop()
+
+		w.wg.Wait()
+
+		// Assert: mainLoop exits cleanly without re-requesting a stop.
+		require.False(t, stopRequested.Load())
+	}
 }
 
 // TestControllerLock verifies the Lock method. It ensures that the wallet

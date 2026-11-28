@@ -7,9 +7,7 @@ import (
 
 // newManagedWallet constructs a Wallet from backend-validated storage data.
 // The backend remains the owner of every resource referenced by data.
-func newManagedWallet(cfg Config, data *walletData,
-	syncer chainRouter) *Wallet {
-
+func (m *Manager) newManagedWallet(cfg Config, data *walletData) *Wallet {
 	lockTimer := time.NewTimer(0)
 	if !lockTimer.Stop() {
 		<-lockTimer.C
@@ -29,6 +27,7 @@ func newManagedWallet(cfg Config, data *walletData,
 		requestChan:       make(chan any),
 		lifetimeCtx:       lifetimeCtx,
 		cancel:            cancel,
+		requestStop:       m.requestWalletStop,
 		lockTimer:         lockTimer,
 		masterFingerprint: data.masterFingerprint,
 		isWatchOnly:       data.isWatchOnly,
@@ -36,14 +35,14 @@ func newManagedWallet(cfg Config, data *walletData,
 
 	// Allocate routing admission before the Wallet can be published. Its
 	// existing sync worker remains the sole event processor.
-	w.chainSyncer = syncer
+	w.chainSyncer = m.chainSyncer
 	w.chainEventChan = make(chan chainEvent, 1)
 
-	processor := newSyncer(
+	syncer := newSyncer(
 		cfg, w.addrStore, w.txStore, w, w.store, w.id,
-		syncer, w.chainEventChan,
+		m.chainSyncer, w.chainEventChan,
 	)
-	w.sync = processor
+	w.sync = syncer
 	w.state = newWalletState(w.sync)
 
 	return w

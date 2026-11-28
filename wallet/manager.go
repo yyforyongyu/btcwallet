@@ -175,8 +175,14 @@ type Manager struct {
 	// chainEvents borrows the already-started source's one native stream.
 	chainEvents <-chan any
 
-	// requestChan transfers creation to the same owner as native delivery.
+	// requestChan transfers creation requests to the runtime owner.
 	requestChan chan createWalletReq
+
+	// stopReqMu guards stopReqs so Wallet stream-loss reporting never
+	// blocks Wallet.mainLoop against an in-flight Manager request.
+	stopReqMu   sync.Mutex
+	stopReqs    []*Wallet
+	stopReqChan chan struct{}
 
 	// wg joins the runtime before normal Stop disposes Wallets and storage.
 	wg sync.WaitGroup
@@ -255,6 +261,7 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	m := &Manager{
 		wallets:     make(map[string]*Wallet),
 		requestChan: make(chan createWalletReq),
+		stopReqChan: make(chan struct{}, 1),
 		//nolint:staticcheck // Manager still reads the shared queue.
 		chainEvents: cfg.ChainSource.Notifications(),
 		backend:     backend,
@@ -283,7 +290,7 @@ func (m *Manager) startWallets(ctx context.Context) ([]*Wallet, error) {
 			return wallets, err
 		}
 
-		wallet := newManagedWallet(cfg, walletData, m.chainSyncer)
+		wallet := m.newManagedWallet(cfg, walletData)
 		wallets = append(wallets, wallet)
 
 		err = wallet.start(ctx)
@@ -454,6 +461,45 @@ type createWalletResp struct {
 	err    error
 }
 
+// requestWalletStop queues terminal cleanup for the reporting Wallet without
+// blocking Wallet.mainLoop so candidate teardown inside handleCreateWalletReq
+// can never deadlock waiting on Wallet.mainLoop.
+func (m *Manager) requestWalletStop(w *Wallet) {
+	m.stopReqMu.Lock()
+	m.stopReqs = append(m.stopReqs, w)
+	m.stopReqMu.Unlock()
+
+	select {
+	case m.stopReqChan <- struct{}{}:
+	default:
+	}
+}
+
+// drainStopWalletReqs stops each reporting published Wallet and removes it
+// from m.wallets once all admitted work has been joined.
+func (m *Manager) drainStopWalletReqs() {
+	m.stopReqMu.Lock()
+	pending := m.stopReqs
+	m.stopReqs = nil
+	m.stopReqMu.Unlock()
+
+	for _, w := range pending {
+		if m.wallets[w.cfg.Name] != w {
+			continue
+		}
+
+		// Retain ownership until all admitted work is joined.
+		err := w.stop()
+		if err != nil {
+			log.Errorf("Unable to stop Wallet: %v", err)
+
+			continue
+		}
+
+		delete(m.wallets, w.cfg.Name)
+	}
+}
+
 // mainLoop serializes creation and source delivery until the lifetime is
 // canceled. Normal Stop joins the owner before disposing resources.
 func (m *Manager) mainLoop() {
@@ -483,6 +529,9 @@ func (m *Manager) mainLoop() {
 		select {
 		case <-m.lifetimeCtx.Done():
 			return
+
+		case <-m.stopReqChan:
+			m.drainStopWalletReqs()
 
 		case req := <-m.requestChan:
 			err := m.handleCreateWalletReq(req)
@@ -697,7 +746,7 @@ func (m *Manager) createWallet(ctx context.Context,
 		return nil, err
 	}
 
-	return newManagedWallet(walletCfg, data, m.chainSyncer), nil
+	return m.newManagedWallet(walletCfg, data), nil
 }
 
 // validateInitialAccounts checks resolved scope and script ownership before

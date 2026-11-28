@@ -341,10 +341,13 @@ func (w *Wallet) performRuntimeSetup(startCtx context.Context) error {
 // Manager serializes lifecycle operations, so this method never runs alongside
 // start or another stop and needs no additional synchronization primitive.
 func (w *Wallet) stop() error {
-	// A Wallet stopped before its first Start has no workers to cancel or
-	// join, but it must still become terminal so a retained pointer cannot
-	// start a new runtime later.
+	// A Wallet stopped before its first Start has no workers to join, but
+	// it must still cancel its lifetime context and become terminal so any
+	// provisional subscription is released and a retained pointer cannot
+	// start later.
 	if lifecycle(w.state.lifecycle.Load()) == lifecycleInitialized {
+		w.cancel()
+
 		return w.state.toStopped()
 	}
 
@@ -693,42 +696,48 @@ func (w *Wallet) handleRescanReq(r rescanReq) {
 	r.respErrChan <- w.sync.requestScan(w.lifetimeCtx, req)
 }
 
+// routeReq processes serialized control requests inline and spawns concurrent
+// workers for all other admitted Wallet requests.
+func (w *Wallet) routeReq(req any) {
+	switch r := req.(type) {
+	// Perform the unlock.
+	case unlockReq:
+		w.handleUnlockReq(r)
+
+	// Perform an explicit lock and stop the timer.
+	case lockReq:
+		w.handleLockReq(r)
+
+	// Rotate wallet passphrases.
+	case changePassphraseReq:
+		w.handleChangePassphraseReq(r)
+
+	// Cleanup is a control request; acknowledge it inline without launching
+	// another handler to close the same channels.
+	case cancelTxSubscriptionReq:
+		w.cancelTxSubscription(r.sub)
+
+	default:
+		// Non-control requests run concurrently. Register the handler
+		// before launch so Stop drains every accepted request.
+		w.wg.Add(1)
+
+		go w.handleReq(req)
+	}
+}
+
 // mainLoop is the central event loop for the wallet, responsible for
 // coordinating and serializing all lifecycle and authentication requests. It
 // manages the transition between locked and unlocked states and handles the
 // automatic locking of the wallet after a specified duration.
 func (w *Wallet) mainLoop() {
 	defer w.wg.Done()
+	defer w.lockTimer.Stop()
 
 	for {
 		select {
 		case req := <-w.requestChan:
-			// Process incoming serialized requests.
-			switch r := req.(type) {
-			// Perform the unlock.
-			case unlockReq:
-				w.handleUnlockReq(r)
-
-			// Perform an explicit lock and stop the timer.
-			case lockReq:
-				w.handleLockReq(r)
-
-			// Rotate wallet passphrases.
-			case changePassphraseReq:
-				w.handleChangePassphraseReq(r)
-
-			// Cleanup is a control request; acknowledge it inline without
-			// launching another handler to close the same channels.
-			case cancelTxSubscriptionReq:
-				w.cancelTxSubscription(r.sub)
-
-			default:
-				// Non-control requests run concurrently. Register the handler
-				// before launch so Stop drains every accepted request.
-				w.wg.Add(1)
-
-				go w.handleReq(req)
-			}
+			w.routeReq(req)
 
 		// The auto-lock timer has expired. We trigger a lock with a
 		// dummy response channel to avoid nil checks in the handler.
@@ -736,10 +745,27 @@ func (w *Wallet) mainLoop() {
 			log.Infof("Auto-lock timeout fired, locking wallet")
 			w.handleLockReq(newLockReq())
 
+		case <-w.sync.streamDone():
+			// If Wallet.stop already canceled lifetimeCtx, exit
+			// without sending a duplicate stop request back to
+			// Manager.mainLoop while it is waiting on w.wg.
+			if w.lifetimeCtx.Err() != nil {
+				return
+			}
+
+			log.Errorf("Wallet %q chain event stream ended: %v",
+				w.cfg.Name, w.sync.streamErr())
+
+			// Close admission even if the sync worker cannot yet
+			// return. The Manager owns the join and locks the vault
+			// afterwards.
+			w.cancel()
+			w.requestStop(w)
+
+			return
+
 		// The wallet is shutting down. We exit the main loop.
 		case <-w.lifetimeCtx.Done():
-			w.lockTimer.Stop()
-
 			return
 		}
 	}

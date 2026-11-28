@@ -388,6 +388,9 @@ type Wallet struct {
 	chainSyncer    chainRouter
 	chainEventChan chan chainEvent
 
+	// requestStop asks the lifecycle owner to join this Wallet's workers.
+	requestStop func(*Wallet)
+
 	// state maintains the wallet's atomic, three-dimensional status:
 	// Lifecycle (System), Synchronization (Chain), and Authentication
 	// (Security).

@@ -752,6 +752,7 @@ func newManagerLifecycleTest(t *testing.T,
 		cancel:      cancel,
 		wallets:     make(map[string]*Wallet),
 		requestChan: make(chan createWalletReq),
+		stopReqChan: make(chan struct{}, 1),
 		chainEvents: source.Notifications(),
 		backend:     backend,
 		config: ManagerConfig{
@@ -2956,9 +2957,12 @@ func TestManagerChainEventOrder(t *testing.T) {
 	// Three headers expose the capacity-one bound without extra worker queues.
 	notifications := make(chan any, 3)
 
+	walletCtx, walletCancel := context.WithCancel(t.Context())
+
 	w := &Wallet{
 		id:             1,
-		lifetimeCtx:    t.Context(),
+		lifetimeCtx:    walletCtx,
+		cancel:         walletCancel,
 		chainEventChan: make(chan chainEvent, 1),
 	}
 
