@@ -162,15 +162,12 @@ type Manager struct {
 	config ManagerConfig
 
 	// lifetimeCtx outlives construction and startup requests. Wallets keep
-	// their own lifetimes; canceling this one releases shared event delivery.
-	//nolint:containedctx // Manager owns and joins the shared reader lifetime.
+	// their own lifetimes; canceling this one stops the Manager loop.
+	//nolint:containedctx // Manager owns and joins its runtime loop lifetime.
 	lifetimeCtx context.Context
 
-	// cancel signals terminal reader shutdown before draining Wallet work.
+	// cancel signals Manager loop shutdown before draining Wallet work.
 	cancel context.CancelFunc
-
-	// chainEvents borrows the already-started source's one native stream.
-	chainEvents <-chan any
 
 	// requestChan transfers creation requests to the runtime owner.
 	requestChan chan createWalletReq
@@ -259,8 +256,6 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 		wallets:     make(map[string]*Wallet),
 		requestChan: make(chan createWalletReq),
 		stopReqChan: make(chan struct{}, 1),
-		//nolint:staticcheck // Manager still reads the shared queue.
-		chainEvents: cfg.ChainSource.Notifications(),
 		backend:     backend,
 		config:      cfg,
 		lifetimeCtx: lifetimeCtx,
@@ -496,31 +491,9 @@ func (m *Manager) drainStopWalletReqs() {
 	}
 }
 
-// mainLoop serializes creation and source delivery until the lifetime is
+// mainLoop serializes creation and Wallet stop requests until the lifetime is
 // canceled. Normal Stop joins the owner before disposing resources.
 func (m *Manager) mainLoop() {
-	var chainErr error
-
-	// Fatal exits need private cleanup: public Stop would self-join.
-	defer func() {
-		if chainErr == nil {
-			return
-		}
-
-		// Serialize Start's lifetime check and CAS with terminal cleanup.
-		m.Lock()
-		defer m.Unlock()
-
-		// Stop cancels before joining and owns disposal and its errors.
-		// Draining here would consume the errors its caller must receive.
-		if m.lifetimeCtx.Err() != nil {
-			return
-		}
-
-		chainErr = errors.Join(chainErr, m.stopWallets(nil))
-		log.Errorf("Chain notification processing stopped: %v", chainErr)
-	}()
-
 	for {
 		select {
 		case <-m.lifetimeCtx.Done():
@@ -532,15 +505,6 @@ func (m *Manager) mainLoop() {
 		case req := <-m.requestChan:
 			err := m.handleCreateWalletReq(req)
 			if err != nil {
-				return
-			}
-
-		case _, ok := <-m.chainEvents:
-			if !ok {
-				chainErr = errors.New(
-					"chain notification source closed",
-				)
-
 				return
 			}
 		}

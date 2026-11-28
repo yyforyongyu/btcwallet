@@ -132,10 +132,9 @@ func TestReleaseManagerTransfersTeardownOwnership(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: give the harness the strict chain mock required by the
-	// Manager's shared runtime policy. Each Manager borrows its stream
-	// once; the mock never permits teardown to stop that borrowed source.
+	// Manager's shared runtime policy. Manager never calls Notifications
+	// and teardown never stops the caller-owned chain source.
 	chainSource := &bwmock.Chain{}
-	chainSource.On("Notifications").Return((<-chan any)(nil)).Twice()
 	h := &HarnessTest{
 		T:              t,
 		dbType:         "kvdb",
@@ -212,10 +211,9 @@ func testManagerTeardownAfterFailedCreate(t *testing.T, dbType string,
 
 	t.Helper()
 
-	// Arrange: provide the complete Manager policy, including a strict chain
-	// mock whose stream is borrowed once for each Manager.
+	// Arrange: provide the complete Manager policy, including a strict
+	// chain mock that rejects unexpected Notifications or Stop calls.
 	chainSource := &bwmock.Chain{}
-	chainSource.On("Notifications").Return((<-chan any)(nil)).Twice()
 	h := &HarnessTest{
 		T:              t,
 		dbType:         dbType,

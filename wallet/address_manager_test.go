@@ -101,6 +101,79 @@ func TestAddressManagerFallbackDuringStop(t *testing.T) {
 	)
 }
 
+// TestAddressManagerKVDBFallbackDuringStop verifies that an admitted KVDB
+// address derivation paused inside Store returns context.Canceled once
+// Wallet.stop cancels the Wallet lifetime without calling WatchAddrsFromTip.
+func TestAddressManagerKVDBFallbackDuringStop(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Pause KVDB Store derivation until shutdown cancels
+	// lifetimeCtx; register no WatchAddrsFromTip expectation.
+	w, deps := createTestWalletWithMocks(t)
+	startLoadedWalletForTest(t, w)
+
+	enteredChan := make(chan struct{})
+	releaseChan := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(releaseChan) })
+	t.Cleanup(unblock)
+
+	name := "fallback"
+	selector := NewAccountSelectorByName(waddrmgr.KeyScopeBIP0084, name)
+	expectReceivingAccount(t, w, deps, selector, &db.AccountInfo{
+		AccountName: name,
+	})
+	_, stored := storeChild(
+		t, storeDerivationAccountPubKey(t), db.WitnessPubKey, false, 0,
+	)
+	deps.store.On("NewDerivedAddress", mock.Anything,
+		db.NewDerivedAddressParams{
+			WalletID:         w.id,
+			AccountName:      name,
+			Scope:            db.KeyScope(selector.keyScope),
+			Change:           false,
+			RequireChainSync: true,
+		},
+	).Run(func(mock.Arguments) {
+		close(enteredChan)
+
+		<-releaseChan
+	}).Return(&stored, nil).Once()
+	deps.vault.On("Lock").Return().Once()
+
+	resultChan := make(chan addressInfoResp, 1)
+	go func() {
+		info, err := w.NewAddress(t.Context(), selector, false)
+		resultChan <- addressInfoResp{info: info, err: err}
+	}()
+
+	<-enteredChan
+
+	// Act: Begin shutdown while the accepted KVDB request is paused in
+	// Store.
+	stoppedChan := make(chan error, 1)
+	go func() { stoppedChan <- w.stop() }()
+
+	<-w.lifetimeCtx.Done()
+
+	// Assert: Stop waits for accepted Store work; releasing it returns
+	// context.Canceled without invoking WatchAddrsFromTip.
+	select {
+	case err := <-stoppedChan:
+		require.Failf(t, "Stop returned before address work", "%v", err)
+	default:
+	}
+
+	unblock()
+
+	result := <-resultChan
+	require.ErrorIs(t, result.err, context.Canceled)
+	require.Nil(t, result.info.Addr)
+	require.NoError(t, <-stoppedChan)
+	deps.chain.AssertNotCalled(
+		t, "WatchAddrsFromTip", mock.Anything, mock.Anything,
+	)
+}
+
 // storeDerivationAccountPubKey returns a deterministic account-level public key
 // for store-native address derivation tests.
 func storeDerivationAccountPubKey(t *testing.T) *hdkeychain.ExtendedKey {
@@ -2729,7 +2802,6 @@ func TestNewBulkAddressesReplaysCommittedBatch(t *testing.T) {
 	freshChain.On("NotifyBlocks").Run(func(mock.Arguments) {
 		replayed <- restored
 	}).Return(nil).Once()
-	freshChain.On("Notifications").Return((<-chan any)(nil)).Maybe()
 
 	// Act: Fail public delivery, stop the owning Manager to drain the
 	// request loop and close storage, then reopen all durable Wallets.

@@ -87,12 +87,15 @@ type ManagerConfig struct {
 	// panic while the snapshot is built or a managed Wallet uses it.
 	ChainParams chaincfg.Params
 
-	// ChainSource is caller-owned. Manager consumes its notifications once
-	// and routes events by registered Wallet interests for every backend.
-	// Callers must start the source before NewManager.
-	// Callers keep it available until the one valid Manager.Stop completes.
-	// A rejected Stop does not join shutdown. Manager neither starts nor
-	// stops it; nil or typed-nil values may panic when it is used.
+	// ChainSource is caller-owned. Each managed Wallet enrolls its own
+	// lifetime-scoped EventSubscription via SubscribeChainEvents and
+	// receives only events matching its registered watches across every
+	// backend. Manager never reads Notifications(); callers that still rely
+	// on the legacy Notifications queue remain its sole drain owner.
+	// Callers must start the source before NewManager and keep it available
+	// until the one valid Manager.Stop completes. A rejected Stop does not
+	// join shutdown. Manager neither starts nor stops it; nil or typed-nil
+	// values may panic when it is used.
 	ChainSource chain.Interface
 
 	// SyncMethod selects the synchronization strategy shared by all Wallets.

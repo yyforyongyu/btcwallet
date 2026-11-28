@@ -378,7 +378,6 @@ func TestControllerChangePassphraseDrainsDuringManagerStop(t *testing.T) {
 					Return([]*walletData{}, nil).Once()
 
 				source := &bwmock.Chain{}
-				source.On("Notifications").Return((<-chan any)(nil)).Once()
 				manager := newManagerLifecycleTest(t, backend, source)
 
 				_, err := manager.Start(t.Context())
