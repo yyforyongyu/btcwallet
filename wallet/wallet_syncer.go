@@ -241,6 +241,10 @@ type chainProcessor interface {
 	// closes.
 	streamErr() error
 
+	// refreshLiveWatches registers persisted addresses and outpoints for
+	// live notifications before the Wallet is published.
+	refreshLiveWatches(ctx context.Context) error
+
 	// run executes the main synchronization loop.
 	run(ctx context.Context) error
 

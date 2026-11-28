@@ -184,6 +184,12 @@ func (m *mockChainProcessor) syncState() syncState {
 	return args.Get(0).(syncState)
 }
 
+// refreshLiveWatches exposes synchronous startup watch registration to tests.
+func (m *mockChainProcessor) refreshLiveWatches(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
 // syncedTo exposes the processed tip and errors expected by wallet callers.
 func (m *mockChainProcessor) syncedTo(ctx context.Context) (waddrmgr.BlockStamp,
 	error) {

@@ -334,6 +334,32 @@ func (w *Wallet) performRuntimeSetup(startCtx context.Context) error {
 		return fmt.Errorf("delete expired leases: %w", err)
 	}
 
+	// When the chain backend is already current, install persisted watches
+	// synchronously after verifyBirthday sets Neutrino's start-time hint
+	// and before launching Wallet background loops. While a backend is
+	// still catching up (for example, Neutrino during IBD), defer watch
+	// installation to initChainSync so historical catch-up blocks do not
+	// overflow the live event buffer before syncer begins draining. If the
+	// Wallet's chain stream ended during watch registration, classify the
+	// failure as ErrWalletShuttingDown before start cancels lifetimeCtx.
+	if w.cfg.Chain.IsCurrent() {
+		err = w.sync.refreshLiveWatches(startCtx)
+		if err != nil {
+			select {
+			case <-w.sync.streamDone():
+				return fmt.Errorf(
+					"wallet %q chain stream ended during "+
+						"watch setup: %w",
+					w.cfg.Name, ErrWalletShuttingDown,
+				)
+
+			default:
+			}
+
+			return fmt.Errorf("refresh live watches: %w", err)
+		}
+	}
+
 	return nil
 }
 

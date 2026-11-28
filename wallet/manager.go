@@ -281,20 +281,44 @@ func (m *Manager) startWallets(ctx context.Context) ([]*Wallet, error) {
 		}
 
 		//nolint:contextcheck // Enrolled Wallet lifetime outlives Start.
-		wallet := m.newManagedWallet(cfg, walletData)
-		wallets = append(wallets, wallet)
+		wallets = append(wallets, m.newManagedWallet(cfg, walletData))
+	}
 
-		err = wallet.start(ctx)
+	return wallets, m.startAndPublishWallets(ctx, wallets)
+}
+
+// startAndPublishWallets starts each candidate Wallet and verifies that no
+// candidate's chain stream ended before publishing the set into m.wallets.
+func (m *Manager) startAndPublishWallets(ctx context.Context,
+	wallets []*Wallet) error {
+
+	for _, w := range wallets {
+		err := w.start(ctx)
 		if err != nil {
-			return wallets, err
+			return err
 		}
 	}
 
-	for _, wallet := range wallets {
-		m.wallets[wallet.cfg.Name] = wallet
+	// An earlier candidate can retire while a later candidate is starting or
+	// installing watches. Reject the batch if any chain stream ended.
+	for _, w := range wallets {
+		select {
+		case <-w.sync.streamDone():
+			return fmt.Errorf(
+				"wallet %q chain stream ended during "+
+					"startup: %w",
+				w.cfg.Name, ErrWalletShuttingDown,
+			)
+
+		default:
+		}
 	}
 
-	return wallets, nil
+	for _, w := range wallets {
+		m.wallets[w.cfg.Name] = w
+	}
+
+	return nil
 }
 
 // stopWallets stops all Wallets before closing storage. The slice holds Wallets
@@ -525,6 +549,10 @@ func validateManagedWalletName(name string) error {
 // An inactive Manager returns ErrManagerStopped before validating the request.
 // Duplicates return ErrWalletExists without changing the existing Wallet.
 //
+// If startup fails after persistence, Create returns an error and the Wallet
+// remains in the Store. A new Manager can load it with Start. Creating the
+// same name again can return ErrWalletExists.
+//
 // TODO(yy): Add caller context with atomic creation in the context follow-up.
 func (m *Manager) Create(params CreateWalletParams) (*Wallet, error) {
 	if !m.started.Load() {
@@ -580,7 +608,20 @@ func (m *Manager) handleCreateWalletReq(req createWalletReq) error {
 	}
 
 	err = wallet.importInitialAccounts(ctx, params.InitialAccounts)
+	if err == nil {
+		err = m.startAndPublishWallets(ctx, []*Wallet{wallet})
+	}
+
 	if err != nil {
+		// Isolate per-Wallet chain stream retirement during Create so
+		// healthy published sibling Wallets and shared storage stay up.
+		if errors.Is(err, ErrWalletShuttingDown) {
+			err = errors.Join(err, wallet.stop())
+			req.resp <- createWalletResp{err: err}
+
+			return nil
+		}
+
 		// Serialize cleanup with Start. Stop may have claimed shutdown;
 		// it joins us and observes closed storage, avoiding double disposal.
 		m.Lock()
@@ -592,19 +633,6 @@ func (m *Manager) handleCreateWalletReq(req createWalletReq) error {
 		return err
 	}
 
-	err = wallet.start(ctx)
-	if err != nil {
-		// Failed startup needs the same serialized disposal and reply.
-		m.Lock()
-		err = errors.Join(err, m.stopWallets([]*Wallet{wallet}))
-		m.Unlock()
-
-		req.resp <- createWalletResp{err: err}
-
-		return err
-	}
-
-	m.wallets[wallet.cfg.Name] = wallet
 	req.resp <- createWalletResp{wallet: wallet}
 
 	return nil

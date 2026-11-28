@@ -10,6 +10,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
@@ -744,6 +745,14 @@ func newManagerLifecycleTest(t *testing.T,
 
 	// Manager owns the service lifetime; fixture Stop joins before assertions.
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
+	source.On("SubscribeChainEvents", mock.Anything).Return(
+		func(ctx context.Context) chain.EventSubscription {
+			return bwmock.NewEventSubscription(ctx, source)
+		},
+	).Maybe()
+	source.On(
+		"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
+	).Return(nil).Maybe()
 
 	manager := &Manager{
 		lifetimeCtx: lifetimeCtx,
@@ -1450,6 +1459,7 @@ func TestManagerCreateLifecycleSerializesStop(t *testing.T) {
 	manager := newManagerLifecycleTest(t, backend, source)
 	chain, ok := manager.config.ChainSource.(*bwmock.Chain)
 	require.True(t, ok)
+	chain.On("IsCurrent").Return(false).Once()
 	chain.On("IsCurrent").Run(func(mock.Arguments) {
 		close(chainEntered)
 		<-releaseChain
@@ -2694,6 +2704,7 @@ func TestManagerStopsOverflowedWallet(t *testing.T) {
 	release := sync.OnceFunc(func() { close(held) })
 
 	client.On("IsCurrent").Unset()
+	client.On("IsCurrent").Return(false).Once()
 	client.On("IsCurrent").Run(func(mock.Arguments) {
 		close(entered)
 		<-held
@@ -2799,4 +2810,182 @@ func TestManagerStopsOverflowedWallet(t *testing.T) {
 	dupParams.Name = "slow"
 	_, err = m.Create(dupParams)
 	require.ErrorIs(t, err, ErrWalletExists)
+}
+
+// TestStartAndPublishWalletsRejectsEndedStream verifies startAndPublishWallets
+// and Create refuse to publish a Wallet whose EventSubscription ended before
+// publication.
+func TestStartAndPublishWalletsRejectsEndedStream(t *testing.T) {
+	t.Parallel()
+
+	t.Run("multi wallet batch", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange: Assemble two candidate Wallets where the first
+		// candidate's stream closes while the second candidate starts.
+		prepareCandidate := func(
+			name string) (*Wallet, *mockWalletDeps) {
+
+			t.Helper()
+
+			w, deps := createTestWalletWithMocks(t)
+			w.cfg.Name = name
+			w.requestStop = func(*Wallet) {}
+
+			deps.store.On("GetWallet", mock.Anything, name).
+				Return(&db.WalletInfo{
+					BirthdayBlock: &db.Block{},
+				}, nil).Once()
+			deps.store.On(
+				"ListAccounts", mock.Anything,
+				db.ListAccountsQuery{},
+			).Return([]db.AccountInfo{}, nil).Once()
+			deps.store.On(
+				"DeleteExpiredLeases", mock.Anything, uint32(0),
+			).Return(nil).Once()
+			deps.syncer.On("run", mock.Anything).Return(nil).Maybe()
+			deps.vault.On("Lock").Return().Maybe()
+			t.Cleanup(func() { _ = w.stop() })
+
+			return w, deps
+		}
+
+		first, firstDeps := prepareCandidate("first")
+		second, secondDeps := prepareCandidate("second")
+		firstSub, ok := firstDeps.syncer.sub.(*bwmock.EventSubscription)
+		require.True(t, ok)
+
+		firstDeps.chain.On("IsCurrent").Return(false).Once()
+		secondDeps.chain.On("IsCurrent").Run(func(mock.Arguments) {
+			firstSub.Close(nil)
+		}).Return(false).Once()
+
+		m := &Manager{wallets: make(map[string]*Wallet)}
+
+		// Act: Start the batch while the first stream ends during the
+		// second candidate's startup.
+		err := m.startAndPublishWallets(
+			t.Context(), []*Wallet{first, second},
+		)
+
+		// Assert: Batch startup fails with wrapped ErrWalletShuttingDown
+		// naming the retired Wallet and publishes neither candidate.
+		require.ErrorIs(t, err, ErrWalletShuttingDown)
+		require.ErrorContains(t, err, "first")
+		require.Empty(t, m.wallets)
+	})
+
+	t.Run("create overflow keeps sibling alive", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange: Publish one healthy sibling Wallet while IsCurrent
+		// is false so only the second Create's birthday location calls
+		// GetBestBlock, scoping the hold strictly to the candidate.
+		var (
+			mu           sync.Mutex
+			candidateSub *bwmock.EventSubscription
+		)
+
+		entered, held := make(chan struct{}), make(chan struct{})
+		release := sync.OnceFunc(func() { close(held) })
+
+		client := createTestChain(t)
+		client.On("SubscribeChainEvents", mock.Anything).Unset()
+		client.On("SubscribeChainEvents", mock.Anything).Return(
+			func(ctx context.Context) chain.EventSubscription {
+				return bwmock.NewEventSubscription(ctx, client)
+			},
+		).Once()
+		client.On("SubscribeChainEvents", mock.Anything).Return(
+			func(ctx context.Context) chain.EventSubscription {
+				sub := bwmock.NewEventSubscription(ctx, client)
+				mu.Lock()
+				candidateSub = sub
+				mu.Unlock()
+
+				return sub
+			},
+		).Once()
+
+		client.On("GetBestBlock").Unset()
+		client.On("GetBestBlock").Return(
+			chainParams.GenesisHash, int32(0), nil,
+		).Once()
+		client.On("GetBestBlock").Run(func(mock.Arguments) {
+			close(entered)
+			<-held
+		}).Return(chainParams.GenesisHash, int32(0), nil).Once()
+		client.On("GetBestBlock").Return(
+			chainParams.GenesisHash, int32(0), nil,
+		).Maybe()
+
+		m := testSQLiteManagerWithChain(t, client)
+		t.Cleanup(release)
+
+		siblingParams := sqliteCreateParams(t)
+		siblingParams.Name = "sibling-before-overflow"
+		sibling, err := m.Create(siblingParams)
+		require.NoError(t, err)
+
+		type createResult struct {
+			w   *Wallet
+			err error
+		}
+
+		resCh := make(chan createResult, 1)
+		params := sqliteCreateParams(t)
+		params.Name = "overflow-on-create"
+
+		go func() {
+			w, createErr := m.Create(params)
+			resCh <- createResult{w: w, err: createErr}
+		}()
+
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "candidate did not enter setup")
+		}
+
+		// Act: Overflow the provisional candidate's buffer before
+		// releasing its startup birthday lookup.
+		mu.Lock()
+
+		sub := candidateSub
+
+		mu.Unlock()
+
+		overflowCount := cap(sub.Events()) + 1
+		for i := range overflowCount {
+			sub.Send(chain.Event{
+				Type: chain.EventBlockConnected,
+				Block: &wtxmgr.BlockMeta{
+					Block: wtxmgr.Block{
+						Height: int32(i + 1),
+						Hash:   chainhash.Hash{byte(i + 1)},
+					},
+				},
+			})
+		}
+
+		release()
+
+		var res createResult
+		select {
+		case res = <-resCh:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "Create did not return")
+		}
+
+		// Assert: Only the overflowed candidate is rejected while the
+		// healthy sibling stays operational and Manager stops cleanly.
+		require.ErrorIs(t, res.err, ErrWalletShuttingDown)
+		require.ErrorContains(t, res.err, "overflow-on-create")
+		require.Nil(t, res.w)
+
+		info, err := sibling.Info(t.Context())
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		require.NoError(t, m.Stop())
+	})
 }

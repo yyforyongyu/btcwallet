@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -50,9 +51,112 @@ func TestPerformRuntimeSetupRoutesStoreStartup(t *testing.T) {
 	}).Return([]db.AccountInfo{{AccountNumber: &accountNumber0}}, nil).Once()
 	deps.store.On("DeleteExpiredLeases", mock.Anything, w.id).Return(nil).
 		Once()
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 
 	err := w.performRuntimeSetup(t.Context())
 	require.NoError(t, err)
+}
+
+// TestPerformRuntimeSetupDefersWatchesWhenBackendNotCurrent verifies that
+// runtime setup skips synchronous watch installation while the chain backend
+// is still catching up (for example, Neutrino during IBD).
+func TestPerformRuntimeSetupDefersWatchesWhenBackendNotCurrent(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Configure a wallet whose chain backend reports IsCurrent=false;
+	// strict mock expectations forbid refreshLiveWatches during startup.
+	w, deps := createTestWalletWithMocks(t)
+	w.id = 52
+	birthdayBlock := &db.Block{
+		Hash:      chainhash.Hash{52},
+		Height:    100,
+		Timestamp: time.Unix(1710003700, 0),
+	}
+
+	deps.store.On("GetWallet", mock.Anything, "").Return(&db.WalletInfo{
+		Name:          "",
+		BirthdayBlock: birthdayBlock,
+	}, nil).Once()
+	deps.store.On("ListAccounts", mock.Anything, db.ListAccountsQuery{
+		WalletID: w.id,
+	}).Return([]db.AccountInfo(nil), nil).Once()
+	deps.store.On("DeleteExpiredLeases", mock.Anything, w.id).Return(nil).
+		Once()
+	deps.chain.On("IsCurrent").Return(false).Once()
+
+	// Act: Run synchronous runtime setup before the backend is current.
+	err := w.performRuntimeSetup(t.Context())
+
+	// Assert: Setup succeeds without installing live watches prematurely.
+	require.NoError(t, err)
+}
+
+// TestPerformRuntimeSetupWatchSetupErrors verifies that runtime setup
+// classifies a watch failure as ErrWalletShuttingDown when the subscription
+// ends during watch setup, and propagates backend watch errors otherwise.
+func TestPerformRuntimeSetupWatchSetupErrors(t *testing.T) {
+	t.Parallel()
+
+	watchErr := errors.New("watch setup failed")
+	closedDone := make(chan struct{})
+	close(closedDone)
+
+	cases := []struct {
+		name      string
+		sub       chain.EventSubscription
+		wantErrIs error
+	}{
+		{
+			name:      "stream ended during watch setup",
+			sub:       stubChainEventSub{done: closedDone},
+			wantErrIs: ErrWalletShuttingDown,
+		},
+		{
+			name:      "backend watch error propagated",
+			sub:       stubChainEventSub{},
+			wantErrIs: watchErr,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: Configure a current backend whose
+			// refreshLiveWatches returns an error with the case's
+			// subscription state.
+			w, deps := createTestWalletWithMocks(t)
+			w.id = 53
+			w.cfg.Name = "watch-setup"
+			deps.syncer.sub = tc.sub
+			birthdayBlock := &db.Block{
+				Hash:      chainhash.Hash{53},
+				Height:    100,
+				Timestamp: time.Unix(1710003700, 0),
+			}
+
+			deps.store.On("GetWallet", mock.Anything, w.cfg.Name).
+				Return(&db.WalletInfo{
+					Name:          w.cfg.Name,
+					BirthdayBlock: birthdayBlock,
+				}, nil).Once()
+			deps.store.On("ListAccounts", mock.Anything,
+				db.ListAccountsQuery{WalletID: w.id}).
+				Return([]db.AccountInfo(nil), nil).Once()
+			deps.store.On("DeleteExpiredLeases", mock.Anything,
+				w.id).Return(nil).Once()
+			deps.chain.On("IsCurrent").Return(true).Once()
+			deps.syncer.On("refreshLiveWatches", mock.Anything).
+				Return(watchErr).Once()
+
+			// Act: Run synchronous runtime setup.
+			err := w.performRuntimeSetup(t.Context())
+
+			// Assert: Verify the classified error identity.
+			require.ErrorIs(t, err, tc.wantErrIs)
+		})
+	}
 }
 
 // TestHandleUnlockReq verifies that handleUnlockReq unlocks the key vault and
@@ -670,15 +774,21 @@ func TestHandleChangePassphraseReq(t *testing.T) {
 func TestControllerStart(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Use the existing startup fixture with a native client and
-	// verified birthday block, so startup must still prepare its scan hint.
+	// Arrange: Use the existing startup fixture with a native client backed
+	// by a current mock ChainService and verified birthday block, so
+	// startup must prepare its scan hint before watch setup and sync.
 	w, deps := createTestWalletWithMocks(t)
-	native := &chain.NeutrinoClient{}
+	cs := &bwmock.NeutrinoChain{}
+	cs.On("IsCurrent").Return(true).Once()
+	t.Cleanup(func() { cs.AssertExpectations(t) })
+
+	native := &chain.NeutrinoClient{CS: cs}
 	w.cfg.Chain = native
 	birthday := time.Unix(1700000000, 0)
-	expected := &chain.NeutrinoClient{}
+	expected := &chain.NeutrinoClient{CS: cs}
 	expected.SetStartTime(birthday)
 
+	watchReady := make(chan bool, 1)
 	birthdayReady := make(chan bool, 1)
 
 	// 1. Mock verifyBirthday: Expect a call to retrieve the birthday
@@ -701,12 +811,21 @@ func TestControllerStart(t *testing.T) {
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
 
+	// 4. Mock refreshLiveWatches: Verify synchronous watch installation
+	//    observes the verified Neutrino birthday hint and precedes worker
+	//    startup when the backend is current.
+	watchCall := deps.syncer.On(
+		"refreshLiveWatches", mock.Anything,
+	).Return(nil).Run(func(mock.Arguments) {
+		watchReady <- reflect.DeepEqual(expected, native)
+	}).Once()
+
 	// Observe configuration when the worker begins, before it can wait for
 	// currency or activate scanning. Compare with the public setter's result
 	// and report to the test goroutine, which owns all assertions.
 	deps.syncer.On(
 		"run", mock.Anything,
-	).Return(nil).Run(func(mock.Arguments) {
+	).NotBefore(watchCall).Return(nil).Run(func(mock.Arguments) {
 		birthdayReady <- reflect.DeepEqual(expected, native)
 	}).Once()
 
@@ -720,10 +839,11 @@ func TestControllerStart(t *testing.T) {
 		require.NoError(t, w.stop())
 	})
 
-	// Assert: Startup publishes Started only after preparing the persisted
-	// hint, including when the background worker runs immediately. Cleanup
+	// Assert: Startup installs watches after preparing the persisted hint
+	// and publishes Started before the background worker runs. Cleanup
 	// joins both Wallet loops even if this regression assertion fails.
 	require.True(t, w.state.isStarted())
+	require.True(t, <-watchReady, "native birthday precedes watch setup")
 	require.True(t, <-birthdayReady, "native birthday precedes sync startup")
 }
 
@@ -1034,6 +1154,8 @@ func TestControllerStop(t *testing.T) {
 		Return([]db.AccountInfo(nil), nil).Once()
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 
 	// Keep the worker alive after it observes Wallet cancellation so the test
 	// can distinguish shutdown initiation from complete teardown.
@@ -1175,6 +1297,8 @@ func TestControllerLock(t *testing.T) {
 		Return([]db.AccountInfo(nil), nil).Once()
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()
 
 	require.NoError(t, w.start(t.Context()))
@@ -1220,6 +1344,8 @@ func TestControllerUnlock(t *testing.T) {
 		Return([]db.AccountInfo(nil), nil).Once()
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()
 
 	require.NoError(t, w.start(t.Context()))
@@ -1396,6 +1522,8 @@ func TestControllerChangePassphrase(t *testing.T) {
 		Return([]db.AccountInfo(nil), nil).Once()
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()
 
 	require.NoError(t, w.start(t.Context()))
@@ -1537,6 +1665,8 @@ func TestControllerStart_WithAccounts(t *testing.T) {
 
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()
 
 	// Allow Stop to clear secret material.
@@ -1981,6 +2111,8 @@ func TestControllerInfo(t *testing.T) {
 		Return([]db.AccountInfo(nil), nil).Once()
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()
 
 	// Mock the chain backend to return a specific name.
@@ -2250,7 +2382,6 @@ func TestControllerInfoSyncWorkerBackoff(t *testing.T) {
 
 		// Arrange: Use the real worker with the existing Wallet fixture.
 		w, deps := createTestWalletWithMocks(t)
-
 		s := newSyncer(
 			w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
 			bwmock.NewEventSubscription(w.lifetimeCtx, deps.chain),
@@ -2336,7 +2467,6 @@ func TestControllerTargetedScanFailureKeepsWorker(t *testing.T) {
 		// the batch commit only for the queued historical scan.
 		w, deps := createTestWalletWithMocks(t)
 		sub := bwmock.NewEventSubscription(w.lifetimeCtx, deps.chain)
-
 		s := newSyncer(
 			w.cfg, w.addrStore, w.txStore, w, w.store, w.id, sub,
 		)
@@ -2680,6 +2810,8 @@ func TestControllerStart_BirthdayNotSet(t *testing.T) {
 		Return([]db.AccountInfo(nil), nil).Once()
 	deps.store.On("DeleteExpiredLeases", mock.Anything,
 		mock.Anything).Return(nil).Once()
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()
 
 	// Allow Stop to clear secret material.

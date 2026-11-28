@@ -8073,12 +8073,13 @@ func newLiveWatchManager(t *testing.T) (*Manager, *bwmock.Chain, *Wallet) {
 	t.Helper()
 	client := createTestChain(t)
 	manager := testSQLiteManagerWithChain(t, client)
-	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
-	client.On("NotifySpent", mock.Anything).Unset()
 
 	params := sqliteCreateParams(t)
 	w, err := manager.Create(params)
 	require.NoError(t, err)
+
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	client.On("NotifySpent", mock.Anything).Unset()
 
 	// SQL creation persists the root but no receiving account. Prepare one
 	// through the maintained API before exercising address commits.

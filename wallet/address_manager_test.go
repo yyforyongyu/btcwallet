@@ -2785,23 +2785,18 @@ func TestNewBulkAddressesReplaysCommittedBatch(t *testing.T) {
 
 			committed = addrs
 		}).Return(errDBMock).Once()
-	// The fresh worker owns this capture. Publish it after registration
-	// finishes so the test can join replay without racing its writes.
-	var restored []address.Address
 
-	replayed := make(chan []address.Address, 1)
+	var restored []address.Address
 
 	freshChain := createTestChain(t)
 	freshChain.On("IsCurrent").Unset()
-	freshChain.On("IsCurrent").Return(true).Maybe()
+	freshChain.On("IsCurrent").Return(true).Once()
+	freshChain.On("IsCurrent").Return(false).Maybe()
 	freshChain.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
 	freshChain.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			restored, _ = args.Get(1).([]address.Address)
 		}).Return(nil).Once()
-	freshChain.On("NotifyBlocks").Run(func(mock.Arguments) {
-		replayed <- restored
-	}).Return(nil).Once()
 
 	// Act: Fail public delivery, stop the owning Manager to drain the
 	// request loop and close storage, then reopen all durable Wallets.
@@ -2816,21 +2811,14 @@ func TestNewBulkAddressesReplaysCommittedBatch(t *testing.T) {
 	fresh, err := openManager(freshChain).Start(t.Context())
 	require.NoError(t, err)
 
-	// Assert: Delivery exposed no batch but both committed addresses
-	// survived closing the database and were replayed by sync initialization.
-	// Start itself need not join replay; bound the wait for the fresh worker.
+	// Assert: Delivery exposed no batch, both committed addresses survived
+	// closing the database, and Start installed their live watches
+	// synchronously before publishing the reopened Wallet.
 	require.ErrorIs(t, deliveryErr, errDBMock)
 	require.Nil(t, batch)
 	require.Len(t, committed, 2)
 	require.Len(t, fresh, 1)
-
-	select {
-	case got := <-replayed:
-		require.Equal(t, committed, got)
-
-	case <-time.After(5 * time.Second):
-		t.Fatal("committed batch was not replayed after reopening")
-	}
+	require.Equal(t, committed, restored)
 }
 
 // TestAllocateNextKeyReturnsLocator verifies selector and branch handling,
@@ -3346,6 +3334,7 @@ func TestNewAddressSQLiteConcurrentEmptyBranch(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "concurrent.sqlite")
 	_, w := newReceivingSQLiteWallet(t, path, chainMock)
+
 	selector := NewAccountSelectorByName(waddrmgr.KeyScopeBIP0084, "recv")
 
 	enteredChan := make(chan struct{})
@@ -3459,8 +3448,8 @@ func TestNewAddressKVDBAllocatesSuccessive(t *testing.T) {
 func TestNewAddressKVDBRoutesLiveTransactions(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Keep the real kvdb allocation path, and publish a payment
-	// into the test event stream inside WatchAddrsFromTip before
+	// Arrange: Keep the real kvdb allocation path, and deliver a payment
+	// into the Wallet's mock subscription inside WatchAddrsFromTip before
 	// NewAddress can return to its caller.
 	m := testKVDBManager(t)
 
