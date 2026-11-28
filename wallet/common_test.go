@@ -187,7 +187,6 @@ func testSQLManager(tb testing.TB, store *walletmock.Store) *Manager {
 		},
 	}
 
-	m.chainSyncer = newChainSyncer(m.config.ChainSource, &m.config.ChainParams)
 	// This Store fixture has no native input; the owner serves Create.
 	m.started.Store(true)
 	m.wg.Go(m.mainLoop)
@@ -335,9 +334,9 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 			ChainParams: &chainParams,
 		},
 	}
-	// Match managed assembly so every producer declares its routing interest.
-	w.chainSyncer = newChainSyncer(mockChain, &chainParams)
-	w.chainEventChan = make(chan chainEvent, 1)
+	// Match managed assembly so every producer registers watches on a
+	// scoped subscription owned by the sync worker for the Wallet's
+	// lifetime.
 	mockSyncer.sub = bwmock.NewEventSubscription(ctx, mockChain)
 	w.cache = newStoreRuntimeCache(mockStore)
 
@@ -461,6 +460,10 @@ func createStartedWalletWithID(t *testing.T, walletID uint32) (*Wallet,
 	deps.store.On("DeleteExpiredLeases", mock.Anything, mock.Anything).
 		Return(nil).
 		Once()
+
+	// Mock synchronous watch registration (runtime startup).
+	deps.chain.On("IsCurrent").Return(true).Once()
+	deps.syncer.On("refreshLiveWatches", mock.Anything).Return(nil).Once()
 
 	// Mock the syncer run.
 	deps.syncer.On("run", mock.Anything).Return(nil).Once()

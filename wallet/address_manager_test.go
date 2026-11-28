@@ -34,13 +34,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestAddressManagerFallbackDuringStop keeps the Store's reuse-or-allocate
-// request and registration inside the accepted request during shutdown.
+// TestAddressManagerFallbackDuringStop verifies that an admitted SQL address
+// allocation paused during Store access returns context.Canceled once
+// Wallet.stop cancels the Wallet lifetime without calling WatchAddrsFromTip.
 func TestAddressManagerFallbackDuringStop(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Pause the Store request until shutdown closes admission, then
-	// let it return a child that must still be registered.
+	// Arrange: Pause the Store request until shutdown cancels w.lifetimeCtx,
+	// then let it return a persisted child whose watch registration must
+	// abort before native backend I/O.
 	w, deps := createSQLWalletWithMocks(t)
 	startLoadedWalletForTest(t, w)
 
@@ -54,7 +56,7 @@ func TestAddressManagerFallbackDuringStop(t *testing.T) {
 	expectReceivingAccount(t, w, deps, selector, &db.AccountInfo{
 		AccountName: name,
 	})
-	addr, stored := storeChild(
+	_, stored := storeChild(
 		t, storeDerivationAccountPubKey(t), db.WitnessPubKey, false, 0,
 	)
 	expectOldestUnusedOrNew(t, w, deps, selector, false, stored).
@@ -63,9 +65,6 @@ func TestAddressManagerFallbackDuringStop(t *testing.T) {
 
 			<-releaseChan
 		})
-	deps.chain.On(
-		"WatchAddrsFromTip", w.lifetimeCtx, []address.Address{addr},
-	).Return(nil).Once()
 	deps.vault.On("Lock").Return().Once()
 
 	resultChan := make(chan addressInfoResp, 1)
@@ -76,27 +75,30 @@ func TestAddressManagerFallbackDuringStop(t *testing.T) {
 
 	<-enteredChan
 
-	// Act: Begin shutdown while the accepted request is paused. It must still
-	// register its address without another admission.
+	// Act: Begin shutdown while the accepted request is paused in Store.
 	stoppedChan := make(chan error, 1)
 	go func() { stoppedChan <- w.stop() }()
 
 	<-w.lifetimeCtx.Done()
 
-	// Assert: Stop waits for accepted work, and release permits the request
-	// to return its address. Fixture cleanup verifies chain registration.
+	// Assert: Stop waits for accepted Store work before returning;
+	// releasing Store lets watch registration observe the canceled lifetime
+	// and return context.Canceled with zero WatchAddrsFromTip calls.
 	select {
 	case err := <-stoppedChan:
-		t.Fatalf("Stop returned before address work: %v", err)
+		require.Failf(t, "Stop returned before address work", "%v", err)
 	default:
 	}
 
 	unblock()
 
 	result := <-resultChan
-	require.NoError(t, result.err)
-	require.Equal(t, addr, result.info.Addr)
+	require.ErrorIs(t, result.err, context.Canceled)
+	require.Nil(t, result.info.Addr)
 	require.NoError(t, <-stoppedChan)
+	deps.chain.AssertNotCalled(
+		t, "WatchAddrsFromTip", mock.Anything, mock.Anything,
+	)
 }
 
 // storeDerivationAccountPubKey returns a deterministic account-level public key
@@ -3334,11 +3336,13 @@ func TestNewAddressSQLiteConcurrentEmptyBranch(t *testing.T) {
 func TestNewAddressKVDBAllocatesSuccessive(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: create a kvdb Wallet whose chain accepts each notification.
+	// Arrange: create a kvdb Wallet whose chain accepts each tip watch.
 	m := testKVDBManager(t)
 	chainMock, ok := m.config.ChainSource.(*bwmock.Chain)
 	require.True(t, ok)
-	chainMock.On("NotifyReceived", mock.Anything).Return(nil).Times(3)
+	chainMock.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	chainMock.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
+		Return(nil).Times(3)
 
 	params := sqliteCreateParams(t)
 	params.PubPassphrase = []byte("public")
@@ -3379,12 +3383,13 @@ func TestNewAddressKVDBAllocatesSuccessive(t *testing.T) {
 }
 
 // TestNewAddressKVDBRoutesLiveTransactions prevents native address activation
-// from bypassing Manager ownership and losing the first payment notification.
+// from losing the first payment emitted during WatchAddrsFromTip.
 func TestNewAddressKVDBRoutesLiveTransactions(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Keep the real kvdb allocation path, but emit a payment inside
-	// its native subscription call, before NewAddress can return to its caller.
+	// Arrange: Keep the real kvdb allocation path, and publish a payment
+	// into the test event stream inside WatchAddrsFromTip before
+	// NewAddress can return to its caller.
 	m := testKVDBManager(t)
 
 	// The kvdb fixture supplies this concrete mock for native expectations.
@@ -3395,42 +3400,62 @@ func TestNewAddressKVDBRoutesLiveTransactions(t *testing.T) {
 	w, err := m.Create(params)
 	require.NoError(t, err)
 
+	s, ok := w.sync.(*syncer)
+	require.True(t, ok)
+
+	sub, ok := s.sub.(*bwmock.EventSubscription)
+	require.True(t, ok)
+
 	var (
 		callbackErr error
 		record      *wtxmgr.TxRecord
-		matched     TxEntries
 	)
-	client.On("NotifyReceived", mock.MatchedBy(
+
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	client.On("WatchAddrsFromTip", mock.Anything, mock.MatchedBy(
 		func(addrs []address.Address) bool { return len(addrs) == 1 },
 	)).Run(func(args mock.Arguments) {
-		addrs, ok := args.Get(0).([]address.Address)
+		addrs, ok := args.Get(1).([]address.Address)
 		if !ok {
 			callbackErr = errors.New("unexpected subscription addresses")
 			return
 		}
 
-		// Return callback failures to the test goroutine: the native method
-		// runs on Wallet's request worker, where FailNow is not permitted.
+		// Verify ownership was registered through EventSubscription
+		// before forwarding to WatchAddrsFromTip so bypassing the
+		// subscription cannot pass this test.
+		if !sub.HasWatchedAddr(addrs[0]) {
+			callbackErr = errors.New(
+				"address not registered on EventSubscription",
+			)
+
+			return
+		}
+
+		// Return callback failures to the test goroutine: the native
+		// method runs on Wallet's request worker, where FailNow is not
+		// permitted.
 		script, err := txscript.PayToAddrScript(addrs[0])
 		if err != nil {
 			callbackErr = err
 			return
 		}
 		tx := wire.NewMsgTx(2)
+		tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: 1}, nil, nil))
 		tx.AddTxOut(&wire.TxOut{Value: 1, PkScript: script})
 		record, callbackErr = wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
 		if callbackErr != nil {
 			return
 		}
 
-		events := m.chainSyncer.routeChainEvent(
-			chain.RelevantTx{TxRecord: record}, []*Wallet{w},
-		)
-		matched = events[w.id].matches
+		sub.Send(chain.Event{
+			Type:        chain.EventMempoolTx,
+			RelevantTxs: []*wtxmgr.TxRecord{record},
+		})
 	}).Return(nil).Once()
 
-	// Act: Allocate through the public single-address API; its response joins
-	// the callback before the test inspects the captured routing result.
+	// Act: Allocate through the public single-address API; its response
+	// joins the callback before the test inspects the persisted tx.
 	_, err = w.NewAddress(
 		t.Context(), NewAccountSelectorByNumber(
 			waddrmgr.KeyScopeBIP0084, 0,
@@ -3438,9 +3463,12 @@ func TestNewAddressKVDBRoutesLiveTransactions(t *testing.T) {
 	)
 
 	// Assert: Ownership was visible during activation rather than installed
-	// afterward. Fixture cleanup verifies the one native subscription call.
+	// afterward, so the Wallet's sync worker records the mempool payment.
 	require.NoError(t, err)
 	require.NoError(t, callbackErr)
-	require.Len(t, matched, 1)
-	require.Same(t, record, matched[0].Rec)
+	require.NotNil(t, record)
+	require.Eventually(t, func() bool {
+		_, err := w.GetTx(t.Context(), record.Hash)
+		return err == nil
+	}, 5*time.Second, 10*time.Millisecond)
 }

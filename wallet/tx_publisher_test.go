@@ -1192,7 +1192,8 @@ func TestPublishTx(t *testing.T) {
 			// native send. Fixture cleanup verifies the mock once.
 			w, m := createStartedWalletWithMocks(t)
 
-			m.chain.On("NotifyReceived", addrs).Return(tc.notifyErr).Once()
+			m.chain.On("WatchAddrsFromTip", w.lifetimeCtx, addrs).
+				Return(tc.notifyErr).Once()
 
 			m.chain.On("SendRawTransaction", tx, false).
 				Return(nil, tc.sendErr).Once()
@@ -1248,7 +1249,9 @@ func TestBroadcastSuccess(t *testing.T) {
 		Status:       db.TxStatusPublished,
 		Label:        testTxLabel,
 	}, nil).Once()
-	m.chain.On("NotifyReceived", []address.Address{addr}).Return(nil).Once()
+	m.chain.On(
+		"WatchAddrsFromTip", w.lifetimeCtx, []address.Address{addr},
+	).Return(nil).Once()
 	m.chain.On("SendRawTransaction", tx, false).Return(nil, nil).Once()
 
 	// Act: Publish through the public Wallet entry point with both owned
@@ -1336,8 +1339,9 @@ func TestBroadcastAlreadyBroadcastedAtPublish(t *testing.T) {
 			}, nil).Once()
 
 			// publishTx sees the duplicate only at send time.
-			m.chain.On("NotifyReceived",
-				mock.Anything).Return(nil).Once()
+			m.chain.On(
+				"WatchAddrsFromTip", w.lifetimeCtx, mock.Anything,
+			).Return(nil).Once()
 			m.chain.On("SendRawTransaction",
 				mock.Anything, mock.Anything,
 			).Return(nil, tc.sendErr).Once()
@@ -1494,7 +1498,8 @@ func TestBroadcastPublishFailsRetainsTx(t *testing.T) {
 		SerializedTx: serializeTx(t, tx),
 		Status:       db.TxStatusPublished,
 	}, nil).Once()
-	m.chain.On("NotifyReceived", mock.Anything).Return(nil).Once()
+	m.chain.On("WatchAddrsFromTip", w.lifetimeCtx, mock.Anything).
+		Return(nil).Once()
 	m.chain.On("SendRawTransaction", tx, false).
 		Return(nil, errPublish).Once()
 
@@ -1538,7 +1543,8 @@ func TestBroadcastRegistrationFailsRetainsTx(t *testing.T) {
 		SerializedTx: serializeTx(t, tx),
 		Status:       db.TxStatusPublished,
 	}, nil).Once()
-	m.chain.On("NotifyReceived", mock.Anything).Return(errDummy).Once()
+	m.chain.On("WatchAddrsFromTip", w.lifetimeCtx, mock.Anything).
+		Return(errDummy).Once()
 
 	// Act: Fail publication before the chain send can run.
 	err := w.Broadcast(t.Context(), tx, "")
@@ -1599,7 +1605,9 @@ func TestBroadcastScriptRejectionRemovesTx(t *testing.T) {
 				SerializedTx: serializeTx(t, tx),
 				Status:       db.TxStatusPublished,
 			}, nil).Once()
-			m.chain.On("NotifyReceived", mock.Anything).Return(nil).Once()
+			m.chain.On(
+				"WatchAddrsFromTip", w.lifetimeCtx, mock.Anything,
+			).Return(nil).Once()
 			m.chain.On("SendRawTransaction", tx, false).
 				Return(nil, chain.ErrScriptVerifyFlag).Once()
 			m.store.On("DeleteUnminedTx", mock.Anything,
@@ -1651,7 +1659,8 @@ func TestBroadcastCleanupFailsRetainsSweep(t *testing.T) {
 		SerializedTx: serializeTx(t, tx),
 		Status:       db.TxStatusPublished,
 	}, nil).Once()
-	m.chain.On("NotifyReceived", mock.Anything).Return(nil).Once()
+	m.chain.On("WatchAddrsFromTip", w.lifetimeCtx, mock.Anything).
+		Return(nil).Once()
 	m.chain.On("SendRawTransaction", tx, false).
 		Return(nil, chain.ErrScriptVerifyFlag).Once()
 	m.store.On("DeleteUnminedTx", mock.Anything,
@@ -1795,7 +1804,8 @@ func TestBroadcastUnrelatedPublishFailsNoRemove(t *testing.T) {
 	}).Return((*db.TxDetailInfo)(nil), db.ErrTxNotFound).Once()
 
 	// A script rejection would authorize cleanup of a recorded transaction.
-	m.chain.On("NotifyReceived", mock.Anything).Return(nil).Once()
+	m.chain.On("WatchAddrsFromTip", w.lifetimeCtx, mock.Anything).
+		Return(nil).Once()
 	m.chain.On("SendRawTransaction",
 		mock.Anything, mock.Anything,
 	).Return(nil, chain.ErrScriptVerifyFlag).Once()
@@ -1943,7 +1953,8 @@ func TestBroadcastRetryLiveDuplicateIdempotent(t *testing.T) {
 	).Return(nil).Once()
 
 	// Recording succeeded idempotently, so publishing proceeds as normal.
-	m.chain.On("NotifyReceived", mock.Anything).Return(nil).Once()
+	m.chain.On("WatchAddrsFromTip", w.lifetimeCtx, mock.Anything).
+		Return(nil).Once()
 	m.chain.On("SendRawTransaction",
 		mock.Anything, mock.Anything,
 	).Return(nil, nil).Once()
@@ -2199,8 +2210,12 @@ func TestBroadcastReorgPublishFailureRetainsSpend(t *testing.T) {
 						Allowed: true,
 					},
 				}, nil).Once()
-			client.On("NotifyReceived", mock.Anything).
-				Return(nil).Once()
+			client.On(
+				"WatchAddrsFromTip", mock.Anything, mock.Anything,
+			).Unset()
+			client.On(
+				"WatchAddrsFromTip", w.lifetimeCtx, mock.Anything,
+			).Return(nil).Once()
 			client.On("SendRawTransaction", mock.Anything, false).
 				Return(nil, tc.sendErr).Once()
 
@@ -2315,7 +2330,9 @@ func TestBroadcastDelayedReplyKeepsSyncerCandidate(t *testing.T) {
 				},
 			}, nil,
 		).Once()
-	client.On("NotifyReceived", mock.Anything).Return(nil).Once()
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	client.On("WatchAddrsFromTip", w.lifetimeCtx, mock.Anything).
+		Return(nil).Once()
 	client.On("SendRawTransaction", b, false).
 		Return((*chainhash.Hash)(nil), nil).Once().
 		Run(
@@ -2366,10 +2383,7 @@ func TestBroadcastDelayedReplyKeepsSyncerCandidate(t *testing.T) {
 	record, err := wtxmgr.NewTxRecordFromMsgTx(c, time.Now())
 	require.NoError(t, err)
 
-	s := newSyncer(
-		w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
-		w.chainSyncer, w.chainEventChan,
-	)
+	s := newSyncer(w.cfg, w.addrStore, w.txStore, w, w.store, w.id, nil)
 
 	// Act: Commit C through the actual notification path while B's reply is
 	// held, then release the reply and wait for the public Broadcast result.
@@ -2449,7 +2463,9 @@ func TestBroadcastNeutrinoCancellationRetainsCandidates(t *testing.T) {
 	client.On("BackEnd").Return("neutrino").Maybe()
 	client.On("TestMempoolAccept", mock.Anything, float64(0)).
 		Return(nil, chain.ErrUnimplemented).Once()
-	client.On("NotifyReceived", mock.Anything).Return(nil).Once()
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	client.On("WatchAddrsFromTip", w.lifetimeCtx, mock.Anything).
+		Return(nil).Once()
 	client.On("SendRawTransaction", b, false).
 		Return((*chainhash.Hash)(nil), nil).Once().
 		Run(
@@ -2532,8 +2548,7 @@ func TestRebroadcastStaleSnapshotKeepsDeletedBranch(t *testing.T) {
 		},
 	)
 	s := newSyncer(
-		w.cfg, w.addrStore, w.txStore, w, snapshotStore, w.id,
-		w.chainSyncer, w.chainEventChan,
+		w.cfg, w.addrStore, w.txStore, w, snapshotStore, w.id, nil,
 	)
 
 	// Act: Run the actual syncer retry against the captured, now stale rows.
@@ -2632,7 +2647,9 @@ func TestRebroadcastLateRejectionKeepsNewWitness(t *testing.T) {
 
 	client.On("TestMempoolAccept", mock.Anything, float64(0)).
 		Return(nil, chain.ErrUnimplemented).Twice()
-	client.On("NotifyReceived", mock.Anything).Return(nil).Twice()
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	client.On("WatchAddrsFromTip", w.lifetimeCtx, mock.Anything).
+		Return(nil).Twice()
 
 	var deleteErr, broadcastErr error
 	client.On("SendRawTransaction", old, false).

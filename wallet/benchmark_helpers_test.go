@@ -21,6 +21,7 @@ import (
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet/internal/bwtest"
@@ -292,21 +293,13 @@ type benchmarkWallet struct {
 	allTxs []*wire.MsgTx
 }
 
-// setupBenchmarkWallet creates a wallet with test data based on the provided
-// configuration. It distributes accounts evenly across the specified scopes
-// and returns the wallet along with the outpoints of all created UTXOs. If
-// config.miner is provided, the wallet is connected to the btcd node via RPC.
-func setupBenchmarkWallet(tb testing.TB,
-	cfg benchmarkWalletConfig) *benchmarkWallet {
+// initBenchmarkWalletRuntime ensures legacy benchmark wallets have the config,
+// lifetime context, scoped syncer, controller channels, and lock timer needed
+// by production Wallet APIs.
+func initBenchmarkWalletRuntime(tb testing.TB, w *Wallet,
+	chainSource chain.Interface) {
 
 	tb.Helper()
-
-	// Since testWallet requires a *testing.T, we can't pass the benchmark's
-	// *testing.B. Instead, we create a setup *testing.T and manually fail
-	// the benchmark if the setup fails.
-	setupT := &testing.T{}
-	w := testWallet(setupT)
-	require.False(tb, setupT.Failed(), "testWallet setup failed")
 
 	// Backfill Config and State for benchmarks comparing new APIs.
 	// Legacy testWallet does not populate these.
@@ -320,17 +313,23 @@ func setupBenchmarkWallet(tb testing.TB,
 
 	// Select the backend before the owner captures it, so subscription and
 	// publication cannot silently use different sources.
-	if cfg.chainSource != nil {
-		w.cfg.Chain = cfg.chainSource
+	if chainSource != nil {
+		w.cfg.Chain = chainSource
 	}
 
-	w.chainSyncer = newChainSyncer(w.cfg.Chain, w.cfg.ChainParams)
-	w.chainEventChan = make(chan chainEvent, 1)
+	// Legacy benchmark setup lacks the maintained lifetime. Initialize it
+	// so scoped subscriptions and mainLoop share production shutdown
+	// semantics.
+	if w.lifetimeCtx == nil {
+		w.lifetimeCtx, w.cancel = context.WithCancel(
+			context.Background(),
+		)
+	}
 
 	if w.sync == nil {
 		w.sync = newSyncer(
 			w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
-			w.chainSyncer, w.chainEventChan,
+			bwmock.NewEventSubscription(w.lifetimeCtx, w.cfg.Chain),
 		)
 	}
 
@@ -347,12 +346,25 @@ func setupBenchmarkWallet(tb testing.TB,
 			<-w.lockTimer.C
 		}
 	}
+}
 
-	// Legacy benchmark setup lacks the maintained lifetime. Initialize it so
-	// routed calls and mainLoop share production shutdown semantics.
-	if w.lifetimeCtx == nil {
-		w.lifetimeCtx, w.cancel = context.WithCancel(context.Background())
-	}
+// setupBenchmarkWallet creates a wallet with test data based on the provided
+// configuration. It distributes accounts evenly across the specified scopes
+// and returns the wallet along with the outpoints of all created UTXOs. If
+// config.miner is provided, the wallet is connected to the btcd node via RPC.
+func setupBenchmarkWallet(tb testing.TB,
+	cfg benchmarkWalletConfig) *benchmarkWallet {
+
+	tb.Helper()
+
+	// Since testWallet requires a *testing.T, we can't pass the benchmark's
+	// *testing.B. Instead, we create a setup *testing.T and manually fail
+	// the benchmark if the setup fails.
+	setupT := &testing.T{}
+	w := testWallet(setupT)
+	require.False(tb, setupT.Failed(), "testWallet setup failed")
+
+	initBenchmarkWalletRuntime(tb, w, cfg.chainSource)
 
 	// Force state to Started to satisfy validateStarted() in new APIs.
 	err := w.state.toStarting()

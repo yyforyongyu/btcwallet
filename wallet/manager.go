@@ -161,9 +161,6 @@ type Manager struct {
 	// config is the immutable shared policy retained at construction.
 	config ManagerConfig
 
-	// chainSyncer owns live routing for every Wallet served by this Manager.
-	chainSyncer chainRouter
-
 	// lifetimeCtx outlives construction and startup requests. Wallets keep
 	// their own lifetimes; canceling this one releases shared event delivery.
 	//nolint:containedctx // Manager owns and joins the shared reader lifetime.
@@ -270,8 +267,6 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 		cancel:      cancel,
 	}
 
-	m.chainSyncer = newChainSyncer(m.config.ChainSource, &m.config.ChainParams)
-
 	return m, nil
 }
 
@@ -290,6 +285,7 @@ func (m *Manager) startWallets(ctx context.Context) ([]*Wallet, error) {
 			return wallets, err
 		}
 
+		//nolint:contextcheck // Enrolled Wallet lifetime outlives Start.
 		wallet := m.newManagedWallet(cfg, walletData)
 		wallets = append(wallets, wallet)
 
@@ -539,7 +535,7 @@ func (m *Manager) mainLoop() {
 				return
 			}
 
-		case event, ok := <-m.chainEvents:
+		case _, ok := <-m.chainEvents:
 			if !ok {
 				chainErr = errors.New(
 					"chain notification source closed",
@@ -547,50 +543,8 @@ func (m *Manager) mainLoop() {
 
 				return
 			}
-
-			chainErr = m.dispatchChainEvent(m.lifetimeCtx, event)
-			if chainErr != nil {
-				// Canceled delivery releases the source reader during shutdown.
-				return
-			}
 		}
 	}
-}
-
-// chainRecipients snapshots the current Wallets owned by this loop turn.
-func (m *Manager) chainRecipients() []*Wallet {
-	wallets := make([]*Wallet, 0, len(m.wallets))
-	for _, w := range m.wallets {
-		wallets = append(wallets, w)
-	}
-
-	return wallets
-}
-
-// dispatchChainEvent admits source-ordered events to existing Wallet workers.
-// Capacity-one mailboxes deliberately backpressure the sole reader; Wallet
-// and reader cancellation both release delivery during terminal shutdown.
-func (m *Manager) dispatchChainEvent(ctx context.Context, n any) error {
-	wallets := m.chainRecipients()
-
-	events := m.chainSyncer.routeChainEvent(n, wallets)
-	log.Debugf("Routing chain event %T to %d Wallets", n, len(events))
-
-	for _, w := range wallets {
-		event, relevant := events[w.id]
-		if !relevant {
-			continue
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-w.lifetimeCtx.Done():
-		case w.chainEventChan <- event:
-		}
-	}
-
-	return nil
 }
 
 // validateManagedWalletName rejects an absent durable identity before cache,
@@ -746,6 +700,7 @@ func (m *Manager) createWallet(ctx context.Context,
 		return nil, err
 	}
 
+	//nolint:contextcheck // Enrolled Wallet lifetime outlives Create.
 	return m.newManagedWallet(walletCfg, data), nil
 }
 

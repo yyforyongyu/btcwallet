@@ -32,7 +32,8 @@ var (
 )
 
 // TestChangeAllocationDuringStop verifies both admitted authoring entrypoints
-// finish allocating change after shutdown closes admission.
+// fail with context.Canceled without registering watches once stop cancels the
+// Wallet lifetime, while Stop waits for the paused Store access to drain.
 func TestChangeAllocationDuringStop(t *testing.T) {
 	t.Parallel()
 
@@ -41,13 +42,22 @@ func TestChangeAllocationDuringStop(t *testing.T) {
 			t.Parallel()
 
 			// Arrange: pause coin selection inside an admitted request.
+			// Omit WatchAddrsFromTip expectations so any late backend
+			// watch call fails the mock immediately.
 			w, deps := createStartedSQLWalletWithMocks(t)
 			deps.syncer.On("syncState").Return(syncStateSynced).Once()
 
 			// Pay half the fixture coin so change is kept and allocation
 			// runs once selection resumes.
 			fixture := expectDefaultAuthoringSources(t, w, deps)
-			expectKeptChange(t, w, deps)
+			changeScript := expectFreshChangeAddress(
+				t, w, deps, defaultAccountName,
+				waddrmgr.KeyScopeBIP0086, db.TaprootPubKey,
+			)
+			_, _, changeKey := expectedStoreAddress(
+				t, storeDerivationAccountPubKey(t),
+				db.TaprootPubKey, 1, 0,
+			)
 
 			payment := wire.TxOut{
 				Value: 50_000, PkScript: fixture.payment.PkScript,
@@ -107,9 +117,22 @@ func TestChangeAllocationDuringStop(t *testing.T) {
 					t, w, deps, fixture.inputAddr, db.WitnessPubKey,
 					fixture.inputKey.PubKey(),
 				)
-				expectFundingLease(w, deps, []wire.OutPoint{
-					fixture.utxo.OutPoint,
-				}, nil)
+				deps.store.On(
+					"GetAddress", mock.Anything,
+					db.GetAddressQuery{
+						WalletID:     w.id,
+						ScriptPubKey: changeScript,
+					},
+				).Return(&db.AddressInfo{
+					AddrType:          db.TaprootPubKey,
+					HasDerivationPath: true,
+					KeyScope: db.KeyScope(
+						waddrmgr.KeyScopeBIP0086,
+					),
+					Branch:       1,
+					ScriptPubKey: changeScript,
+					PubKey:       changeKey,
+				}, nil).Once()
 			}
 
 			result := make(chan error, 1)
@@ -141,14 +164,15 @@ func TestChangeAllocationDuringStop(t *testing.T) {
 			require.NoError(t, err)
 			unblock()
 
-			// Assert: accepted authoring and Stop both finish normally.
+			// Assert: WatchAddrs observes the canceled Wallet lifetime with
+			// zero WatchAddrsFromTip calls while Stop drains cleanly.
 			resultErr, err := waitForReq(ctx, result)
 			require.NoError(t, err)
 
 			stopErr, err := waitForReq(ctx, stopped)
 			require.NoError(t, err)
 			require.NoError(t, stopErr)
-			require.NoError(t, resultErr)
+			require.ErrorIs(t, resultErr, context.Canceled)
 		})
 	}
 }

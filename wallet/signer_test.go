@@ -2077,10 +2077,11 @@ func newSQLAddressSigningWallet(t *testing.T) (*Wallet, *bwmock.Chain,
 		id: walletInfo.ID,
 	}
 
-	// Supply the same routing dependency as Manager assembly before address
-	// or import calls can activate native notifications on this fixture.
-	w.chainSyncer = newChainSyncer(chain, &chainParams)
-	w.chainEventChan = make(chan chainEvent, 1)
+	// Supply the same scoped watch dependency as Manager assembly before
+	// address or import calls can activate native notifications.
+	w.sync = &mockChainProcessor{
+		sub: bwmock.NewEventSubscription(ctx, chain),
+	}
 
 	// Disable auto-lock timing so this fixture exercises only its API call.
 	w.lockTimer.Stop()
@@ -3308,10 +3309,11 @@ func startSQLScriptWallet(t *testing.T, store db.Store,
 		id: walletID,
 	}
 
-	// Supply the same routing dependency as Manager assembly before address
-	// or import calls can activate native notifications on this fixture.
-	w.chainSyncer = newChainSyncer(chain, &chainParams)
-	w.chainEventChan = make(chan chainEvent, 1)
+	// Supply the same scoped watch dependency as Manager assembly before
+	// address or import calls can activate native notifications.
+	w.sync = &mockChainProcessor{
+		sub: bwmock.NewEventSubscription(ctx, chain),
+	}
 
 	// Disable auto-lock timing so this fixture exercises only its API call.
 	w.lockTimer.Stop()

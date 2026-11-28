@@ -33,16 +33,13 @@ func (m *Manager) newManagedWallet(cfg Config, data *walletData) *Wallet {
 		isWatchOnly:       data.isWatchOnly,
 	}
 
-	// Allocate routing admission before the Wallet can be published. Its
-	// existing sync worker remains the sole event processor.
-	w.chainSyncer = m.chainSyncer
-	w.chainEventChan = make(chan chainEvent, 1)
-
-	syncer := newSyncer(
+	// Enroll this Wallet's lifetime-scoped chain subscription before
+	// publication. Its existing sync worker owns the subscription and
+	// remains the sole event processor.
+	w.sync = newSyncer(
 		cfg, w.addrStore, w.txStore, w, w.store, w.id,
-		m.chainSyncer, w.chainEventChan,
+		cfg.Chain.SubscribeChainEvents(lifetimeCtx),
 	)
-	w.sync = syncer
 	w.state = newWalletState(w.sync)
 
 	return w

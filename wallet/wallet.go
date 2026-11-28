@@ -383,11 +383,6 @@ type Wallet struct {
 	// chain loop, scanning, and reorganization handling.
 	sync chainProcessor
 
-	// chainSyncer is the Manager's required routing owner for every backend.
-	// The Wallet and its processor share it and the bounded event inbox.
-	chainSyncer    chainRouter
-	chainEventChan chan chainEvent
-
 	// requestStop asks the lifecycle owner to join this Wallet's workers.
 	requestStop func(*Wallet)
 

@@ -2251,10 +2251,12 @@ func TestControllerInfoSyncWorkerBackoff(t *testing.T) {
 
 		// Arrange: Use the real worker with the existing Wallet fixture.
 		w, deps := createTestWalletWithMocks(t)
-		w.sync = newSyncer(
+
+		s := newSyncer(
 			w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
-			w.chainSyncer, w.chainEventChan,
+			bwmock.NewEventSubscription(w.lifetimeCtx, deps.chain),
 		)
+		w.sync = s
 		w.state = newWalletState(w.sync)
 
 		tip := &db.Block{
@@ -2334,9 +2336,10 @@ func TestControllerTargetedScanFailureKeepsWorker(t *testing.T) {
 		// Arrange: Start the real worker at a matching tip and fail
 		// the batch commit only for the queued historical scan.
 		w, deps := createTestWalletWithMocks(t)
+		sub := bwmock.NewEventSubscription(w.lifetimeCtx, deps.chain)
+
 		s := newSyncer(
-			w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
-			w.chainSyncer, w.chainEventChan,
+			w.cfg, w.addrStore, w.txStore, w, w.store, w.id, sub,
 		)
 		w.sync = s
 		w.state = newWalletState(s)
@@ -2417,9 +2420,10 @@ func TestControllerTargetedScanFailureKeepsWorker(t *testing.T) {
 
 		synctest.Wait()
 
-		w.chainEventChan <- chainEvent{
-			notification: chain.FilteredBlockConnected{Block: block},
-		}
+		sub.Send(chain.Event{
+			Type:  chain.EventBlockConnected,
+			Block: block,
+		})
 
 		// Assert: Let the worker settle before cleanup verifies persistence
 		// and the single initialization through the mock expectations.
@@ -2957,9 +2961,13 @@ func TestWaitForBackoffStableRun(t *testing.T) {
 func TestWaitForBackoff_UnstableRun(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Create a wallet with an open, idle mailbox.
+	// Arrange: Create a wallet with an open, idle event subscription.
 	w := &Wallet{
-		sync:        &syncer{chainEventChan: make(chan chainEvent)},
+		sync: &syncer{
+			sub: stubChainEventSub{
+				events: make(chan chain.Event),
+			},
+		},
 		lifetimeCtx: context.Background(),
 	}
 
