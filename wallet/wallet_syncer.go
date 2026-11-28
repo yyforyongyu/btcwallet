@@ -1288,7 +1288,7 @@ func (s *syncer) applyStoreTxBatch(ctx context.Context,
 // putSyncBatch records recovery scan results and synced blocks through the
 // store.
 func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
-	results []scanResult) (resultErr error) {
+	results []scanResult) error {
 
 	// Rollback invalidates fetched facts before persistence. Ordinary work
 	// stays behind this attempt, including conversion or Store failures.
@@ -1297,18 +1297,11 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 		return err
 	}
 
-	// Retained observations must not checkpoint an unfetched next block:
-	// live matches can omit recovery addresses until historical scanning.
-	// A zero-value EventUnknown is a no-op.
-	defer func() {
-		resultErr = errors.Join(
-			resultErr, s.processChainEventBeforeSync(ctx, pending),
-		)
-	}()
-
 	params, err := s.storeScanBatchParams(scanState, results, true)
 	if err != nil {
-		return err
+		return errors.Join(
+			err, s.processChainEventBeforeSync(ctx, pending),
+		)
 	}
 
 	refreshWatches := len(params.Horizons) > 0 || len(params.Transactions) > 0
@@ -1325,13 +1318,24 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 	// also mirrors the tip into the legacy addrStore.
 	err = s.store.ApplyScanBatch(ctx, params)
 	if err != nil {
-		return fmt.Errorf("apply sync scan batch: %w", err)
+		return errors.Join(
+			fmt.Errorf("apply sync scan batch: %w", err),
+			s.processChainEventBeforeSync(ctx, pending),
+		)
 	}
 
 	// The existing Store commit owns persistence and tip advancement. The
 	// Wallet notifier only reads the result and offers best-effort delivery.
 	for _, tx := range params.Transactions {
 		s.txManager.notifyTx(ctx, tx.Tx.TxHash())
+	}
+
+	// Apply the older retained observation before refreshLiveWatches drains
+	// newer events from s.sub.Events so a later disconnect cannot run ahead
+	// of an earlier confirmation. A zero-value EventUnknown is a no-op.
+	err = s.processChainEventBeforeSync(ctx, pending)
+	if err != nil {
+		return err
 	}
 
 	// A committed horizon or credit can introduce watches after startup;
@@ -1343,13 +1347,16 @@ func (s *syncer) putSyncBatch(ctx context.Context, scanState *RecoveryState,
 	return nil
 }
 
-// putTargetedBatch records targeted recovery scan results through the store.
+// putTargetedBatch persists targeted recovery scan results and applies the
+// older retained live observation before refreshLiveWatches drains newer events
+// from s.sub.Events.
 func (s *syncer) putTargetedBatch(ctx context.Context,
-	scanState *RecoveryState, results []scanResult) error {
+	scanState *RecoveryState, results []scanResult,
+	pending chain.Event) (error, error) {
 
 	params, err := s.storeScanBatchParams(scanState, results, false)
 	if err != nil {
-		return err
+		return err, s.processChainEventBeforeSync(ctx, pending)
 	}
 
 	// Cover the commit boundary as well as registration: Info treats an
@@ -1365,7 +1372,8 @@ func (s *syncer) putTargetedBatch(ctx context.Context,
 			s.state.Store(uint32(syncStateRescanning))
 		}
 
-		return fmt.Errorf("apply targeted scan batch: %w", err)
+		return fmt.Errorf("apply targeted scan batch: %w", err),
+			s.processChainEventBeforeSync(ctx, pending)
 	}
 
 	// Historical observations use the same Wallet payload and queue policy,
@@ -1374,13 +1382,17 @@ func (s *syncer) putTargetedBatch(ctx context.Context,
 		s.txManager.notifyTx(ctx, tx.Tx.TxHash())
 	}
 
+	// Replay the older retained event before refreshLiveWatches drains
+	// newer events from s.sub.Events.
+	pendingErr := s.processChainEventBeforeSync(ctx, pending)
+
 	// Targeted scans can also store new addresses and outputs. Register
 	// them after the commit using the scan worker's lifetime context.
 	if len(params.Horizons) > 0 || len(params.Transactions) > 0 {
-		return s.refreshLiveWatches(ctx)
+		return s.refreshLiveWatches(ctx), pendingErr
 	}
 
-	return nil
+	return nil, pendingErr
 }
 
 // mergeScanHorizons records the highest discovered child index per branch scope
@@ -2441,16 +2453,17 @@ func (s *syncer) scanWithTargets(ctx context.Context,
 
 		// Keep the range's own result separate from retained live work:
 		// a failed observation must not discard the remaining account scan.
+		var pendingErr error
+
 		pending, err := s.checkForRollbackBeforeCommit(ctx)
 		if err == nil {
-			err = s.putTargetedBatch(ctx, scanState, results)
+			err, pendingErr = s.putTargetedBatch(
+				ctx, scanState, results, pending,
+			)
+		} else {
+			pendingErr = s.processChainEventBeforeSync(ctx, pending)
 		}
 
-		// The selected accounts cannot prove full-wallet historical
-		// coverage. Replay known matches without a checkpoint; preserve
-		// any error until this accepted range finishes. An empty event
-		// remains a no-op.
-		pendingErr := s.processChainEventBeforeSync(ctx, pending)
 		eventErr = errors.Join(eventErr, pendingErr)
 
 		if errors.Is(err, ErrStateChanged) {

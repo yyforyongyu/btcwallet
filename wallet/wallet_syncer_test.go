@@ -3057,13 +3057,15 @@ func TestPutTargetedBatchStore(t *testing.T) {
 
 	// Act: Submit targeted recovery through the existing batch boundary
 	// without converting matched addresses into explicit credits.
-	err := s.putTargetedBatch(
+	batchErr, pendingErr := s.putTargetedBatch(
 		t.Context(), scanState, []scanResult{fixture.result},
+		chain.Event{},
 	)
 
 	// Assert: The Store receives candidates and horizons but no synced
 	// blocks, preserving live-tip ownership and receiving policy.
-	require.NoError(t, err)
+	require.NoError(t, batchErr)
+	require.NoError(t, pendingErr)
 	store.AssertExpectations(t)
 }
 
@@ -8154,14 +8156,15 @@ func TestLiveWatchTargetedBatchCancellation(t *testing.T) {
 
 	// Act: Commit the batch and attempt its watch registration
 	// using the same context that the sync worker receives.
-	err := s.putTargetedBatch(
-		ctx, scanState, []scanResult{fixture.result},
+	batchErr, pendingErr := s.putTargetedBatch(
+		ctx, scanState, []scanResult{fixture.result}, chain.Event{},
 	)
 
 	// Assert: Readiness is already false at the commit, cancellation
 	// reaches registration, and shared mock cleanup rejects native calls.
 	require.False(t, committing.Synced)
-	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, batchErr, context.Canceled)
+	require.NoError(t, pendingErr)
 }
 
 // TestLiveWatchTargetedCommitUncertainty keeps readiness revoked when the
@@ -8195,13 +8198,15 @@ func TestLiveWatchTargetedCommitUncertainty(t *testing.T) {
 	deps.chain.On("BackEnd").Return("mock").Once()
 
 	// Act: Attempt the targeted write without retrying an uncertain commit.
-	err := s.putTargetedBatch(
+	batchErr, pendingErr := s.putTargetedBatch(
 		t.Context(), scanState, []scanResult{fixture.result},
+		chain.Event{},
 	)
 
 	// Assert: Preserve the classified failure for the worker and keep public
 	// readiness false until initialization rereads the durable watch set.
-	require.ErrorIs(t, err, dbruntime.ErrAmbiguousTxCommit)
+	require.ErrorIs(t, batchErr, dbruntime.ErrAmbiguousTxCommit)
+	require.NoError(t, pendingErr)
 	info, err := w.Info(t.Context())
 	require.NoError(t, err)
 	require.False(t, info.Synced)
