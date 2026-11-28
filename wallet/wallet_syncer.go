@@ -399,17 +399,46 @@ func (s *syncer) registerLiveWatches(ctx context.Context,
 		return nil
 	}
 
+	return s.watchOutpoints(ctx, watches.OutPoints, applyEvents)
+}
+
+// watchOutpoints registers persisted outpoints in chunks sized below the
+// subscription buffer capacity while draining scoped events on the owning
+// goroutine.
+func (s *syncer) watchOutpoints(ctx context.Context,
+	rawOutpoints []wire.OutPoint, applyEvents bool) error {
+
 	// Bind each registration pointer to its distinct output in the snapshot.
-	outpoints := make([]*wire.OutPoint, 0, len(watches.OutPoints))
-	for i := range watches.OutPoints {
-		outpoints = append(outpoints, &watches.OutPoints[i])
+	outpoints := make([]*wire.OutPoint, 0, len(rawOutpoints))
+	for i := range rawOutpoints {
+		outpoints = append(outpoints, &rawOutpoints[i])
 	}
 
-	return s.runWatchWithDrain(
-		ctx, func(watchCtx context.Context) error {
-			return s.sub.WatchOutputs(watchCtx, outpoints)
-		}, applyEvents,
-	)
+	// Chunk output watches below the subscription buffer capacity when the
+	// stream is buffered so synchronous per-outpoint mempool deliveries
+	// cannot fill the channel before the owning goroutine drains it.
+	const watchChunkDivisor = 2
+
+	chunkSize := len(outpoints)
+	if bufCap := cap(s.sub.Events()); bufCap > 0 {
+		chunkSize = max(1, bufCap/watchChunkDivisor)
+	}
+
+	for start := 0; start < len(outpoints); start += chunkSize {
+		end := min(start+chunkSize, len(outpoints))
+		chunk := outpoints[start:end]
+
+		err := s.runWatchWithDrain(
+			ctx, func(watchCtx context.Context) error {
+				return s.sub.WatchOutputs(watchCtx, chunk)
+			}, applyEvents,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // runWatchWithDrain runs a blocking watch registration call while buffering

@@ -10663,6 +10663,85 @@ func TestSyncerInitReplaysPendingEventsAfterDisconnect(t *testing.T) {
 	require.Empty(t, s.pendingEvents)
 }
 
+// TestSyncLiveWatchesDrainsEventsDuringOutpointWatch verifies that
+// syncLiveWatches buffers and drains s.sub.Events across chunked
+// WatchOutputs calls so an unthrottled burst of more than cap(sub.Events())
+// mempool spends cannot overflow the bounded subscription.
+func TestSyncLiveWatchesDrainsEventsDuringOutpointWatch(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Prepare cap(sub.Events()) + 20 watched outpoints with each
+	// spend tx explicitly referencing its matching outpoint, and have
+	// NotifySpent emit each chunk's spends without artificial throttling.
+	store := &walletmock.Store{}
+	src := &bwmock.Chain{}
+	sub := bwmock.NewEventSubscription(t.Context(), src)
+	s := newSyncer(
+		Config{Chain: src, ChainParams: &chainParams},
+		nil, nil, &Wallet{}, store, 7, sub,
+	)
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		src.AssertExpectations(t)
+	})
+
+	count := cap(sub.Events()) + 20
+	outpoints := make([]wire.OutPoint, count)
+	spendsByOp := make(map[wire.OutPoint]*wtxmgr.TxRecord, count)
+
+	for i := range count {
+		op := wire.OutPoint{
+			Hash:  chainhash.Hash{byte(i + 1), byte(i >> 8)},
+			Index: uint32(i),
+		}
+		outpoints[i] = op
+
+		tx := wire.NewMsgTx(2)
+		tx.AddTxIn(wire.NewTxIn(&op, nil, nil))
+		tx.AddTxOut(wire.NewTxOut(1000, []byte{txscript.OP_TRUE}))
+
+		rec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+		require.NoError(t, err)
+
+		spendsByOp[op] = rec
+	}
+
+	store.On("LoadWatchSet", mock.Anything, uint32(7)).Return(
+		db.WatchSet{OutPoints: outpoints}, nil,
+	).Once()
+	src.On(
+		"WatchAddrsFromTip", mock.Anything, []address.Address(nil),
+	).Return(nil).Once()
+	store.On("ApplyTxBatch", mock.Anything, mock.Anything).Return(nil).
+		Times(count)
+
+	src.On("NotifySpent", mock.Anything).Run(func(args mock.Arguments) {
+		ops, _ := args.Get(0).([]*wire.OutPoint)
+		for _, op := range ops {
+			rec := spendsByOp[*op]
+			sub.Send(chain.Event{
+				Type:        chain.EventMempoolTx,
+				RelevantTxs: []*wtxmgr.TxRecord{rec},
+			})
+		}
+	}).Return(nil)
+
+	// Act: Install persisted watches during sync while NotifySpent emits an
+	// unthrottled burst exceeding the subscription buffer capacity.
+	err := s.syncLiveWatches(t.Context())
+
+	// Assert: Watch installation succeeds, every spend was persisted, and
+	// the subscription never overflowed or closed.
+	require.NoError(t, err)
+	require.NoError(t, sub.Err())
+
+	select {
+	case <-sub.Done():
+		require.FailNow(t, "subscription closed unexpectedly")
+	default:
+	}
+}
+
 // TestReplayPendingEventsDropsStaleEvents verifies that replayPendingEvents
 // drops stale events rejected with ErrTxInputConflict, ErrTxInputInvalidParent,
 // or ErrBlockMismatch and continues replaying subsequent queued events.
