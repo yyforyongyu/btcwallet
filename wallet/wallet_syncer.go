@@ -404,6 +404,20 @@ func (s *syncer) queuePendingEvent(event chain.Event) {
 	s.pendingEvents = append(s.pendingEvents, event)
 }
 
+// isStalePendingReplayErr reports whether a replayed pre-sync event was
+// deterministically superseded by canonical history and should be dropped
+// instead of blocking later queued events.
+func isStalePendingReplayErr(event chain.Event, err error) bool {
+	if errors.Is(err, db.ErrTxInputConflict) ||
+		errors.Is(err, db.ErrTxInputInvalidParent) {
+
+		return true
+	}
+
+	return event.Type == chain.EventBlockConnected &&
+		errors.Is(err, db.ErrBlockMismatch)
+}
+
 // replayPendingEvents drains queued actionable events in source order after a
 // pending disconnect succeeds.
 func (s *syncer) replayPendingEvents(ctx context.Context) error {
@@ -412,14 +426,13 @@ func (s *syncer) replayPendingEvents(ctx context.Context) error {
 
 		err := s.processChainEventBeforeSync(ctx, event)
 		if err != nil {
-			// Drop stale unconfirmed conflicts superseded by
-			// canonical history so later queued events and
-			// initChainSync retries make forward progress.
-			if errors.Is(err, db.ErrTxInputConflict) ||
-				errors.Is(err, db.ErrTxInputInvalidParent) {
-
-				log.Debugf("Dropping conflicting pending "+
-					"chain event: %v", err)
+			// Drop stale unconfirmed conflicts and non-canonical
+			// connected blocks superseded by canonical history so
+			// later queued events and initChainSync retries make
+			// forward progress.
+			if isStalePendingReplayErr(event, err) {
+				log.Debugf("Dropping stale pending chain "+
+					"event: %v", err)
 
 				s.pendingEvents = s.pendingEvents[1:]
 

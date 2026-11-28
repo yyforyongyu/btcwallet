@@ -10663,23 +10663,41 @@ func TestSyncerInitReplaysPendingEventsAfterDisconnect(t *testing.T) {
 	require.Empty(t, s.pendingEvents)
 }
 
-// TestReplayPendingEventsDropsInputConflict verifies that replayPendingEvents
-// drops stale unconfirmed events rejected with ErrTxInputConflict or
-// ErrTxInputInvalidParent and continues replaying subsequent queued events.
-func TestReplayPendingEventsDropsInputConflict(t *testing.T) {
+// TestReplayPendingEventsDropsStaleEvents verifies that replayPendingEvents
+// drops stale events rejected with ErrTxInputConflict, ErrTxInputInvalidParent,
+// or ErrBlockMismatch and continues replaying subsequent queued events.
+func TestReplayPendingEventsDropsStaleEvents(t *testing.T) {
 	t.Parallel()
+
+	orphanBlock := &wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{
+			Height: 2,
+			Hash:   chainhash.Hash{2},
+		},
+		Time: time.Unix(1710000200, 0).UTC(),
+	}
 
 	cases := []struct {
 		name        string
+		eventType   chain.EventType
+		block       *wtxmgr.BlockMeta
 		conflictErr error
 	}{
 		{
 			name:        "tx input conflict",
+			eventType:   chain.EventMempoolTx,
 			conflictErr: db.ErrTxInputConflict,
 		},
 		{
 			name:        "tx input invalid parent",
+			eventType:   chain.EventMempoolTx,
 			conflictErr: db.ErrTxInputInvalidParent,
+		},
+		{
+			name:        "non-canonical block mismatch",
+			eventType:   chain.EventBlockConnected,
+			block:       orphanBlock,
+			conflictErr: db.ErrBlockMismatch,
 		},
 	}
 
@@ -10687,8 +10705,8 @@ func TestReplayPendingEventsDropsInputConflict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Arrange: Queue one conflicting mempool tx followed by
-			// one valid mempool tx in pendingEvents.
+			// Arrange: Queue one stale event followed by one valid
+			// mempool tx in pendingEvents.
 			store := &walletmock.Store{}
 			s := newTestSyncer(
 				Config{ChainParams: &chainParams},
@@ -10710,7 +10728,8 @@ func TestReplayPendingEventsDropsInputConflict(t *testing.T) {
 
 			s.pendingEvents = []chain.Event{
 				{
-					Type:        chain.EventMempoolTx,
+					Type:        tc.eventType,
+					Block:       tc.block,
 					RelevantTxs: []*wtxmgr.TxRecord{staleRec},
 				},
 				{
@@ -10739,11 +10758,11 @@ func TestReplayPendingEventsDropsInputConflict(t *testing.T) {
 			).Return(nil).Once().NotBefore(staleCall)
 
 			// Act: Replay pendingEvents across the deterministic
-			// input conflict.
+			// stale-event rejection.
 			err = s.replayPendingEvents(t.Context())
 
 			// Assert: Replay succeeds without wedging, drops the
-			// conflicting event, and applies the following event.
+			// stale event, and applies the following event.
 			require.NoError(t, err)
 			require.Empty(t, s.pendingEvents)
 		})
