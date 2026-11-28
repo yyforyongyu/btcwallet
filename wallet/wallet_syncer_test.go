@@ -11079,3 +11079,122 @@ func TestRefreshLiveWatchesStartupQueuesDisconnect(t *testing.T) {
 		s.pendingEvents,
 	)
 }
+
+// TestScanWithTargetsPostCommitWatchDisconnectKeepsSyncing verifies that a
+// successful EventBlockDisconnected drained during putTargetedBatch's watch
+// refresh keeps the Wallet in syncStateSyncing on scanWithTargets exit until
+// normal catch-up restores tip parity.
+func TestScanWithTargetsPostCommitWatchDisconnectKeepsSyncing(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Seed a real SQLite Wallet synced to block A1, then run a
+	// targeted scan whose post-commit watch refresh drains a disconnect
+	// for A1 that rewinds the checkpoint back to genesis.
+	_, liveSource, w := newLiveWatchManager(t)
+	ctx := t.Context()
+
+	liveSource.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	selector := NewAccountSelectorByName(
+		waddrmgr.KeyScopeBIP0084, waddrmgr.DefaultAccountName,
+	)
+	recv, err := w.NewAddress(ctx, selector, false)
+	require.NoError(t, err)
+
+	script, err := txscript.PayToAddrScript(recv.Addr)
+	require.NoError(t, err)
+
+	genesis := *chainParams.GenesisHash
+	blockA := wire.NewMsgBlock(&wire.BlockHeader{
+		PrevBlock: genesis,
+		Timestamp: time.Unix(20, 0).UTC(),
+	})
+	payTx := subscriptionTx(script, 93)
+	require.NoError(t, blockA.AddTransaction(payTx))
+
+	blockAHash := blockA.BlockHash()
+	blockBHash := chainhash.Hash{2}
+	genesisTime := chainParams.GenesisBlock.Header.Timestamp.UTC()
+
+	require.NoError(t, w.store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: w.id,
+		SyncedBlocks: []db.Block{
+			{Height: 0, Hash: genesis, Timestamp: genesisTime},
+			{
+				Height:    1,
+				Hash:      blockAHash,
+				Timestamp: blockA.Header.Timestamp,
+			},
+		},
+	}))
+
+	src := &bwmock.Chain{}
+	t.Cleanup(func() { src.AssertExpectations(t) })
+
+	cfg := w.cfg
+	cfg.Chain = src
+	cfg.SyncMethod = SyncMethodFullBlocks
+
+	s := newTestSyncer(cfg, nil, nil, nil, w.store, w.id)
+	s.state.Store(uint32(syncStateSynced))
+
+	state := newWalletState(s)
+	state.lifecycle.Store(uint32(lifecycleStarted))
+
+	sub, ok := s.sub.(*bwmock.EventSubscription)
+	require.True(t, ok)
+
+	src.On("GetBestBlock").Return(&blockAHash, int32(1), nil).Once()
+	src.On("GetBlockHashes", int64(1), int64(1)).Return(
+		[]chainhash.Hash{blockAHash}, nil,
+	).Once()
+	src.On("GetBlocks", []chainhash.Hash{blockAHash}).Return(
+		[]*wire.MsgBlock{blockA}, nil,
+	).Once()
+	src.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Run(
+		func(mock.Arguments) {
+			sub.Send(chain.Event{
+				Type: chain.EventBlockDisconnected,
+				Block: &wtxmgr.BlockMeta{
+					Block: wtxmgr.Block{
+						Height: 1,
+						Hash:   blockAHash,
+					},
+					Time: blockA.Header.Timestamp,
+				},
+			})
+		},
+	).Return(nil).Once()
+	src.On("IsCurrent").Return(true).Once()
+	src.On("GetBestBlock").Return(&blockBHash, int32(1), nil).Twice()
+	src.On("GetBlockHash", int64(0)).Return(&genesis, nil).Once()
+	src.On("GetBlockHeader", &genesis).Return(
+		&chainParams.GenesisBlock.Header, nil,
+	).Once()
+	expectDisconnectHeaders(src, 1, genesis, blockBHash)
+	src.On("NotifySpent", mock.Anything).Return(nil).Maybe()
+
+	// Act: Execute the targeted rescan across block A1 while post-commit
+	// watch refresh processes the disconnect to genesis.
+	err = s.scanWithTargets(ctx, &scanReq{
+		typ:        scanTypeTargeted,
+		startBlock: waddrmgr.BlockStamp{Height: 1},
+		targets: []waddrmgr.AccountScope{
+			{
+				Scope:   waddrmgr.KeyScopeBIP0084,
+				Account: waddrmgr.DefaultAccountNum,
+			},
+		},
+	})
+
+	// Assert: The checkpoint rewound to genesis and readiness stays
+	// revoked in syncStateSyncing until full catch-up restores tip parity.
+	require.NoError(t, err)
+
+	tip, err := s.syncedTo(ctx)
+	require.NoError(t, err)
+	require.Zero(t, tip.Height)
+	require.Equal(t, syncStateSyncing, s.syncState())
+	require.ErrorIs(t, state.validateSynced(), ErrStateForbidden)
+}

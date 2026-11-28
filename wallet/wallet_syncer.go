@@ -316,6 +316,10 @@ type syncer struct {
 	// pendingDisconnect or startup watch setup awaits initChainSync replay
 	// so the subscription never overflows and source order is preserved.
 	pendingEvents []chain.Event
+
+	// watchDisconnected records that an EventBlockDisconnected succeeded
+	// during post-commit watch registration within an active targeted scan.
+	watchDisconnected bool
 }
 
 // A compile-time assertion to ensure that syncer implements chainProcessor.
@@ -547,6 +551,10 @@ func (s *syncer) applyWatchEvents(ctx context.Context,
 
 		err := s.processChainEventBeforeSync(ctx, event)
 		if err == nil {
+			if event.Type == chain.EventBlockDisconnected {
+				s.watchDisconnected = true
+			}
+
 			continue
 		}
 
@@ -2592,20 +2600,38 @@ func (s *syncer) loadTargetedScanTip(ctx context.Context,
 	return state, height, nil
 }
 
+// finishTargetedScan reconciles sync readiness and retained live-event errors
+// when scanWithTargets exits.
+func (s *syncer) finishTargetedScan(eventErr error, resultErr *error) {
+	if eventErr != nil || s.watchDisconnected {
+		s.state.Store(uint32(syncStateSyncing))
+	}
+
+	if eventErr != nil {
+		*resultErr = errors.Join(*resultErr, eventErr)
+	}
+}
+
+// restoreTargetedRescanState returns readiness to rescanning after a targeted
+// batch commit unless a post-commit watch disconnect rewound the checkpoint.
+func (s *syncer) restoreTargetedRescanState() {
+	if !s.watchDisconnected {
+		s.state.Store(uint32(syncStateRescanning))
+	}
+}
+
 // scanWithTargets performs a targeted rescan for specific accounts without
 // rewinding the global sync state.
 func (s *syncer) scanWithTargets(ctx context.Context,
 	req *scanReq) (resultErr error) {
 
+	s.watchDisconnected = false
+
 	// A retained live-event failure must reach the ordinary worker retry
 	// policy, but only after this accepted account range has finished.
 	var eventErr error
 	defer func() {
-		if eventErr != nil {
-			s.state.Store(uint32(syncStateSyncing))
-
-			resultErr = errors.Join(resultErr, eventErr)
-		}
+		s.finishTargetedScan(eventErr, &resultErr)
 	}()
 
 	// Failed registration keeps readiness revoked until initialization retries.
@@ -2679,7 +2705,7 @@ func (s *syncer) scanWithTargets(ctx context.Context,
 			return err
 		}
 
-		s.state.Store(uint32(syncStateRescanning))
+		s.restoreTargetedRescanState()
 
 		// Advance startHeight; batch size is bounded.
 		startHeight += int32(len(results))
